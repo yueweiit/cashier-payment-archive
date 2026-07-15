@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -97,6 +98,8 @@ def init_db() -> None:
                 summary TEXT,
                 style_name TEXT,
                 amount REAL,
+                paid_amount REAL,
+                pending_amount REAL,
                 currency TEXT DEFAULT 'CNY',
                 project TEXT,
                 bu TEXT,
@@ -129,6 +132,43 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_payment_batch ON payment_requests(batch_id);
             CREATE INDEX IF NOT EXISTS idx_payment_hash ON payment_requests(content_hash);
             CREATE INDEX IF NOT EXISTS idx_payment_dingding ON payment_requests(dingding_id);
+
+            CREATE TABLE IF NOT EXISTS payment_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL REFERENCES payment_requests(id) ON DELETE CASCADE,
+                copied_from_payment_id INTEGER REFERENCES payment_records(id) ON DELETE SET NULL,
+                root_payment_id INTEGER,
+                amount REAL NOT NULL,
+                payment_date TEXT,
+                payer TEXT,
+                payment_account TEXT,
+                bank_reference TEXT,
+                remark TEXT,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                content_hash TEXT,
+                created_by INTEGER REFERENCES users(id),
+                updated_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_payment_records_request ON payment_records(request_id);
+            CREATE INDEX IF NOT EXISTS idx_payment_records_root ON payment_records(root_payment_id);
+            CREATE INDEX IF NOT EXISTS idx_payment_records_hash ON payment_records(request_id, content_hash);
+
+            CREATE TABLE IF NOT EXISTS payment_vouchers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_id INTEGER NOT NULL REFERENCES payment_records(id) ON DELETE CASCADE,
+                label TEXT,
+                file_path TEXT NOT NULL,
+                original_filename TEXT,
+                mime_type TEXT,
+                file_size INTEGER,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_payment_vouchers_payment ON payment_vouchers(payment_id);
 
             CREATE TABLE IF NOT EXISTS attachment_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,6 +213,19 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS batch_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL REFERENCES request_batches(id) ON DELETE CASCADE,
+                snapshot_type TEXT NOT NULL CHECK(snapshot_type IN ('baseline','pre_restore')),
+                token TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_batch_snapshots_batch_type
+                ON batch_snapshots(batch_id, snapshot_type, created_at);
+
             CREATE TABLE IF NOT EXISTS dictionaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
@@ -189,6 +242,11 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                key TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
             """
         )
         migrate_schema(conn)
@@ -204,14 +262,243 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "payment_requests", "copied_from_request_id", "INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL")
     ensure_column(conn, "payment_requests", "general_manager_approval_date", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_opinion", "TEXT")
+    migrate_payment_amounts(conn)
     ensure_column(conn, "audit_logs", "operation_id", "TEXT")
     ensure_column(conn, "attachment_links", "attachment_type", "TEXT NOT NULL DEFAULT 'link'")
     ensure_column(conn, "attachment_links", "file_path", "TEXT")
     ensure_column(conn, "attachment_links", "original_filename", "TEXT")
     ensure_column(conn, "attachment_links", "mime_type", "TEXT")
     ensure_column(conn, "attachment_links", "file_size", "INTEGER")
+    ensure_batch_snapshots_table(conn)
     migrate_approval_date_values(conn)
+    ensure_payment_detail_tables(conn)
+    migrate_payment_summaries_to_details(conn)
+    refresh_payment_summaries(conn)
     migrate_role_dictionary(conn)
+    migrate_external_department_sheets(conn)
+
+
+def migrate_external_department_sheets(conn: sqlite3.Connection) -> None:
+    migration_key = "external_department_sheets_v1"
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE key = ?", (migration_key,)).fetchone():
+        return
+    rows = conn.execute(
+        """
+        SELECT id, source_sheet, raw_extra_json
+        FROM payment_requests
+        WHERE source_sheet IN ('运营支出', '采购支出')
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            raw_extra = json.loads(row["raw_extra_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        external_source = raw_extra.get("external_source") or {}
+        if external_source.get("system") != "dingtalk_expense_database":
+            continue
+        department = str(external_source.get("applicant_department") or "").strip() or "未归属部门"
+        conn.execute("UPDATE payment_requests SET source_sheet = ? WHERE id = ?", (department, row["id"]))
+    conn.execute(
+        "INSERT INTO schema_migrations (key, applied_at) VALUES (?, ?)",
+        (migration_key, now_iso()),
+    )
+
+
+def migrate_payment_amounts(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(payment_requests)").fetchall()}
+    had_paid_amount = "paid_amount" in existing
+    ensure_column(conn, "payment_requests", "paid_amount", "REAL")
+    ensure_column(conn, "payment_requests", "pending_amount", "REAL")
+    if not had_paid_amount:
+        conn.execute(
+            """
+            UPDATE payment_requests
+            SET paid_amount = CASE
+                WHEN finance_review = '已付款' AND amount IS NOT NULL THEN amount
+                ELSE 0
+            END
+            """
+        )
+    else:
+        conn.execute("UPDATE payment_requests SET paid_amount = 0 WHERE paid_amount IS NULL")
+    conn.execute(
+        """
+        UPDATE payment_requests
+        SET pending_amount = CASE
+            WHEN amount IS NULL THEN NULL
+            ELSE ROUND(amount - COALESCE(paid_amount, 0), 2)
+        END
+        """
+    )
+
+
+def ensure_batch_snapshots_table(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS batch_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL REFERENCES request_batches(id) ON DELETE CASCADE,
+            snapshot_type TEXT NOT NULL CHECK(snapshot_type IN ('baseline','pre_restore')),
+            token TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL,
+            created_by INTEGER REFERENCES users(id),
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_batch_snapshots_batch_type
+            ON batch_snapshots(batch_id, snapshot_type, created_at);
+        """
+    )
+
+
+def ensure_payment_detail_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS payment_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL REFERENCES payment_requests(id) ON DELETE CASCADE,
+            copied_from_payment_id INTEGER REFERENCES payment_records(id) ON DELETE SET NULL,
+            root_payment_id INTEGER,
+            amount REAL NOT NULL,
+            payment_date TEXT,
+            payer TEXT,
+            payment_account TEXT,
+            bank_reference TEXT,
+            remark TEXT,
+            source_type TEXT NOT NULL DEFAULT 'manual',
+            content_hash TEXT,
+            created_by INTEGER REFERENCES users(id),
+            updated_by INTEGER REFERENCES users(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_payment_records_request ON payment_records(request_id);
+        CREATE INDEX IF NOT EXISTS idx_payment_records_root ON payment_records(root_payment_id);
+        CREATE INDEX IF NOT EXISTS idx_payment_records_hash ON payment_records(request_id, content_hash);
+
+        CREATE TABLE IF NOT EXISTS payment_vouchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payment_id INTEGER NOT NULL REFERENCES payment_records(id) ON DELETE CASCADE,
+            label TEXT,
+            file_path TEXT NOT NULL,
+            original_filename TEXT,
+            mime_type TEXT,
+            file_size INTEGER,
+            created_by INTEGER REFERENCES users(id),
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_payment_vouchers_payment ON payment_vouchers(payment_id);
+
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            key TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
+        """
+    )
+
+
+def payment_record_hash(
+    request_id: int,
+    amount: Any,
+    payment_date: Any,
+    payer: Any,
+    bank_reference: Any,
+) -> str:
+    parts = [str(request_id), str(amount or ""), str(payment_date or ""), str(payer or ""), str(bank_reference or "")]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def migrate_payment_summaries_to_details(conn: sqlite3.Connection) -> None:
+    migration_key = "payment_records_from_summary_v1"
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE key = ?", (migration_key,)).fetchone():
+        return
+    rows = conn.execute(
+        """
+        SELECT id, paid_amount, actual_payment_date, payer, payment_account, created_by, updated_by, created_at, updated_at
+        FROM payment_requests
+        WHERE COALESCE(paid_amount, 0) > 0
+          AND NOT EXISTS (
+              SELECT 1 FROM payment_records WHERE payment_records.request_id = payment_requests.id
+          )
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        timestamp = row["updated_at"] or row["created_at"] or now_iso()
+        cursor = conn.execute(
+            """
+            INSERT INTO payment_records (
+                request_id, amount, payment_date, payer, payment_account,
+                remark, source_type, content_hash, created_by, updated_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'legacy_migration', ?, ?, ?, ?, ?)
+            """,
+            (
+                row["id"],
+                round(float(row["paid_amount"]), 2),
+                row["actual_payment_date"],
+                row["payer"],
+                row["payment_account"],
+                "由历史累计已支付金额迁移",
+                payment_record_hash(row["id"], row["paid_amount"], row["actual_payment_date"], row["payer"], None),
+                row["created_by"],
+                row["updated_by"] or row["created_by"],
+                row["created_at"] or timestamp,
+                timestamp,
+            ),
+        )
+        conn.execute("UPDATE payment_records SET root_payment_id = ? WHERE id = ?", (cursor.lastrowid, cursor.lastrowid))
+    conn.execute("INSERT INTO schema_migrations (key, applied_at) VALUES (?, ?)", (migration_key, now_iso()))
+
+
+def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int] = None) -> None:
+    if request_id is None:
+        requests = conn.execute("SELECT id, amount FROM payment_requests ORDER BY id").fetchall()
+    else:
+        requests = conn.execute("SELECT id, amount FROM payment_requests WHERE id = ?", (request_id,)).fetchall()
+    for request in requests:
+        aggregate = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS paid_amount, COUNT(*) AS payment_count FROM payment_records WHERE request_id = ?",
+            (request["id"],),
+        ).fetchone()
+        latest = conn.execute(
+            """
+            SELECT payment_date, payer FROM payment_records
+            WHERE request_id = ?
+            ORDER BY CASE WHEN payment_date IS NULL OR TRIM(payment_date) = '' THEN 1 ELSE 0 END,
+                     payment_date DESC, id DESC
+            LIMIT 1
+            """,
+            (request["id"],),
+        ).fetchone()
+        payable = float(request["amount"] or 0)
+        paid = round(float(aggregate["paid_amount"] or 0), 2)
+        pending = round(payable - paid, 2) if request["amount"] is not None else None
+        if paid <= 0:
+            finance_review = "未付款"
+        elif pending is not None and pending <= 0:
+            finance_review = "已付款"
+        else:
+            finance_review = "部分付款"
+        conn.execute(
+            """
+            UPDATE payment_requests
+            SET paid_amount = ?, pending_amount = ?, finance_review = ?,
+                payment_status = ?, actual_payment_date = ?, payer = ?
+            WHERE id = ?
+            """,
+            (
+                paid,
+                pending,
+                finance_review,
+                finance_review,
+                latest["payment_date"] if latest else None,
+                latest["payer"] if latest else None,
+                request["id"],
+            ),
+        )
 
 
 def normalize_user_role(role: Optional[str]) -> str:

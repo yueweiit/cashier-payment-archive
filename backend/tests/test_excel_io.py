@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from openpyxl import load_workbook
 
-from backend.app.excel_io import export_workbook, normalize_request_business_fields, parse_weekly_excel
+from backend.app.excel_io import export_workbook, normalize_request_business_fields, parse_weekly_excel, safe_sheet_title
 
 
 SAMPLE = Path("/Users/smk/Downloads/20260626~20260707请款明细.xlsx")
@@ -87,6 +87,33 @@ def test_partial_finance_review_is_not_normalized_as_paid():
     assert status_row["payment_status"] is None
 
 
+def test_partial_payment_amounts_are_normalized_and_exported():
+    row = {
+        "amount": 100,
+        "paid_amount": 35.5,
+        "pending_amount": 999,
+        "finance_review": "未付款",
+        "payment_status": "",
+        "remark": "",
+    }
+    normalize_request_business_fields(row)
+    assert row["paid_amount"] == 35.5
+    assert row["pending_amount"] == 64.5
+    assert row["finance_review"] == "部分付款"
+
+    content = export_workbook(
+        {"name": "部分付款测试", "end_date": "2026-07-07"},
+        [{"id": 1, "source_sheet": "手工录入", **row}],
+        {},
+    )
+    workbook = load_workbook(io.BytesIO(content), data_only=False)
+    worksheet = workbook.worksheets[0]
+    headers = [cell.value for cell in worksheet[1]]
+    assert headers[4:7] == ["应付金额", "已支付金额", "待付款金额"]
+    assert [worksheet.cell(2, column).value for column in range(5, 8)] == [100, 35.5, 64.5]
+    assert all(str(worksheet.cell(3, column).value).startswith("=SUM(") for column in range(5, 8))
+
+
 def test_weekly_excel_extracts_embedded_images():
     if not SAMPLE.exists():
         return
@@ -113,3 +140,28 @@ def test_export_workbook_roundtrip_bytes():
     workbook = load_workbook(io.BytesIO(content))
     headers = [cell.value for worksheet in workbook.worksheets for row in worksheet.iter_rows(max_row=2) for cell in row]
     assert "付款情况" not in headers
+    assert "已支付金额" in headers
+    assert "待付款金额" in headers
+
+
+def test_department_sheet_titles_are_safe_and_unique():
+    used: set[str] = set()
+    first = safe_sheet_title("产品/采购:中国区*2026?very-long-department-name", used)
+    second = safe_sheet_title("产品\\采购:中国区*2026?very-long-department-name", used)
+    assert len(first) <= 31
+    assert len(second) <= 31
+    assert not any(character in first + second for character in "[]:*?/\\")
+    assert first.casefold() != second.casefold()
+
+    content = export_workbook(
+        {"name": "部门 Sheet 测试", "end_date": "2026-07-15"},
+        [
+            {"id": 1, "source_sheet": "付款明细", "summary": "部门与标准付款明细页同名"},
+            {"id": 2, "source_sheet": "A/B", "summary": "非法字符一"},
+            {"id": 3, "source_sheet": "A\\B", "summary": "非法字符二"},
+        ],
+        {},
+    )
+    workbook = load_workbook(io.BytesIO(content))
+    assert len(workbook.sheetnames) == len({name.casefold() for name in workbook.sheetnames})
+    assert all(len(name) <= 31 for name in workbook.sheetnames)

@@ -1,16 +1,18 @@
 import { ClipboardEvent, FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlignLeft,
+  AlertTriangle,
   Archive,
-  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Download,
+  Database,
   FileSpreadsheet,
   Filter,
   History,
   Image as ImageIcon,
   LogOut,
+  MoreHorizontal,
   Paperclip,
   Plus,
   RefreshCcw,
@@ -22,14 +24,37 @@ import {
   Undo2,
   Users,
 } from "lucide-react";
-import { api, AttachmentLink, AuditLog, Batch, PaymentRequest, RolloverCopyMode, User, UserRole } from "./api";
+import {
+  api,
+  AttachmentLink,
+  AuditLog,
+  Batch,
+  ExternalExpenseImportResult,
+  ExternalExpensePreview,
+  ExternalExpensePreviewFilter,
+  ExternalExpensePreviewRow,
+  ExternalExpenseResultFilter,
+  ExternalExpenseSourceType,
+  ExternalSourceSnapshot,
+  PaymentRecord,
+  PaymentRecordPayload,
+  PaymentRequest,
+  PaymentSummary,
+  PaymentVoucher,
+  RolloverCopyMode,
+  User,
+  UserRole,
+} from "./api";
 
 type Tab = "workspace" | "archive" | "admin";
+type RequestEditorTab = "request" | "approval" | "payments" | "attachments";
+type PendingEditorNavigation =
+  | { kind: "close" }
+  | { kind: "switch"; request: Partial<PaymentRequest>; initialTab: RequestEditorTab };
 
 const emptyRequest: Partial<PaymentRequest> = {
   payment_account: "私户",
   invoice_status: "无票",
-  finance_review: "未付款",
   currency: "CNY",
 };
 
@@ -50,6 +75,7 @@ const roleLabels: Record<UserRole, string> = {
 };
 
 const financeControlledFields = new Set<keyof PaymentRequest>([
+  "paid_amount",
   "finance_review",
   "finance_manager_approval",
   "actual_payment_date",
@@ -61,12 +87,22 @@ const generalManagerControlledFields = new Set<keyof PaymentRequest>([
   "general_manager_approval_date",
   "general_manager_opinion",
 ]);
+const calculatedRequestFields = new Set<keyof PaymentRequest>([
+  "paid_amount",
+  "pending_amount",
+  "finance_review",
+  "actual_payment_date",
+  "payer",
+  "payment_status",
+]);
+const moneyFields = new Set<keyof PaymentRequest>(["amount", "paid_amount", "pending_amount"]);
 
 function isPrivilegedRole(role: UserRole) {
   return role === "admin" || role === "general_manager";
 }
 
 function canEditRequestField(role: UserRole, field: keyof PaymentRequest) {
+  if (calculatedRequestFields.has(field)) return false;
   if (isPrivilegedRole(role)) return true;
   if (role === "finance") return !generalManagerControlledFields.has(field);
   return !financeControlledFields.has(field) && !generalManagerControlledFields.has(field);
@@ -79,6 +115,8 @@ const fieldLabels: Record<string, string> = {
   summary: "摘要",
   style_name: "款式",
   amount: "应付金额",
+  paid_amount: "已支付金额",
+  pending_amount: "待付款金额（自动计算）",
   project: "项目归属",
   bu: "BU归属",
   payee_account: "收款账户/账号",
@@ -118,6 +156,8 @@ const gridColumns: GridColumn[] = [
   { key: "expense_type", label: "费用性质", width: 120 },
   { key: "summary", label: "摘要", width: 360 },
   { key: "amount", label: "应付金额", width: 120, type: "number" },
+  { key: "paid_amount", label: "已支付金额", width: 120, type: "number" },
+  { key: "pending_amount", label: "待付款金额", width: 120, type: "number" },
   { key: "project", label: "项目归属", width: 160 },
   { key: "payee_account", label: "收款信息/账号", width: 210 },
   { key: "payee_name", label: "账户名", width: 140 },
@@ -292,18 +332,7 @@ function Shell({
       </header>
       <main className="main-pane">
         <header className="topbar">
-          <div>
-            <h1>{tabTitle(tab)}</h1>
-            {selectedBatch && <span>{selectedBatch.name}</span>}
-          </div>
-          {tab === "workspace" && (
-            <TopbarImportActions
-              selectedBatch={selectedBatch}
-              reloadBatches={loadBatches}
-              onImported={() => setWorkspaceRefreshToken((value) => value + 1)}
-              setMessage={setMessage}
-            />
-          )}
+          <h1>{tabTitle(tab)}</h1>
         </header>
         {tab === "workspace" && (
           <Workspace
@@ -313,10 +342,11 @@ function Shell({
             setSelectedBatchId={setSelectedBatchId}
             reloadBatches={loadBatches}
             refreshToken={workspaceRefreshToken}
+            onImported={() => setWorkspaceRefreshToken((value) => value + 1)}
             setMessage={setMessage}
           />
         )}
-        {tab === "archive" && <ArchiveView batches={batches} selectedBatch={selectedBatch} setSelectedBatchId={setSelectedBatchId} reloadBatches={loadBatches} setMessage={setMessage} />}
+        {tab === "archive" && <ArchiveView user={user} batches={batches} selectedBatch={selectedBatch} setSelectedBatchId={setSelectedBatchId} reloadBatches={loadBatches} setMessage={setMessage} />}
         {tab === "admin" && <AdminView setMessage={setMessage} />}
       </main>
     </div>
@@ -333,11 +363,13 @@ function tabTitle(tab: Tab) {
 
 function TopbarImportActions({
   selectedBatch,
+  hasUnsavedChanges,
   reloadBatches,
   onImported,
   setMessage,
 }: {
   selectedBatch: Batch | null;
+  hasUnsavedChanges: boolean;
   reloadBatches: () => Promise<void>;
   onImported: () => void;
   setMessage: (message: string) => void;
@@ -347,7 +379,8 @@ function TopbarImportActions({
   const [mapping, setMapping] = useState<Record<string, string> | null>(null);
   const [headers, setHeaders] = useState<string[]>([]);
   const [mappingOpen, setMappingOpen] = useState(false);
-  const [busyAction, setBusyAction] = useState<"weekly" | "dingtalk" | "rollback" | null>(null);
+  const [externalImportOpen, setExternalImportOpen] = useState(false);
+  const [busyAction, setBusyAction] = useState<"weekly" | "dingtalk" | "sync-metadata" | "rollback" | null>(null);
   const [weeklyInputKey, setWeeklyInputKey] = useState(0);
   const [dingtalkInputKey, setDingtalkInputKey] = useState(0);
 
@@ -406,7 +439,24 @@ function TopbarImportActions({
       const res = await api.rollbackLatestImport(selectedBatch.id);
       await reloadBatches();
       onImported();
-      setMessage(`已撤回最近导入：删除 ${res.deleted_requests} 条记录、${res.deleted_attachments} 个附件`);
+      setMessage(
+        `已撤回最近导入：删除 ${res.deleted_requests} 条请款、${res.deleted_payments} 笔付款、${res.deleted_attachments + res.deleted_payment_vouchers} 个附件/凭证`,
+      );
+    } catch (err) {
+      setMessage((err as Error).message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function syncExternalMetadata() {
+    if (!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null) return;
+    setMessage("");
+    setBusyAction("sync-metadata");
+    try {
+      await api.syncExternalExpenseMetadata(selectedBatch.id);
+      await reloadBatches();
+      onImported();
     } catch (err) {
       setMessage((err as Error).message);
     } finally {
@@ -416,52 +466,80 @@ function TopbarImportActions({
 
   return (
     <>
-      <div className="topbar-import" aria-label="导入">
-        <div className="topbar-import-group">
-          <label className="compact-file-button">
-            <FileSpreadsheet size={15} />
-            周报 Excel
-            <input
-              key={weeklyInputKey}
-              type="file"
-              accept=".xlsx,.xls"
-              onChange={(event) => setWeeklyFile(event.target.files?.[0] || null)}
-            />
-          </label>
-          <span className="compact-file-name" title={weeklyFile?.name || ""}>{weeklyFile?.name || "未选择"}</span>
-          <button className="primary-button compact-import-button" type="button" onClick={uploadWeekly} disabled={!weeklyFile || busyAction !== null}>
-            <Upload size={15} />
-            {busyAction === "weekly" ? "导入中" : "导入"}
-          </button>
+      <section className="import-toolbar-panel" aria-label="数据导入">
+        <div className="import-toolbar-title">
+          <strong>数据导入</strong>
+          <small>导入本批次数据</small>
         </div>
-        <div className="topbar-import-group">
-          <label className="compact-file-button">
-            <FileSpreadsheet size={15} />
-            钉钉导出表
-            <input
-              key={dingtalkInputKey}
-              type="file"
-              accept=".xlsx,.xls,.csv"
-              onChange={(event) => {
-                setDingtalkFile(event.target.files?.[0] || null);
-                setMapping(null);
-                setHeaders([]);
-              }}
-            />
-          </label>
-          <span className="compact-file-name" title={dingtalkFile?.name || ""}>{dingtalkFile?.name || "未选择"}</span>
-          <button className="primary-button compact-import-button" type="button" onClick={() => uploadDingTalk(false)} disabled={!dingtalkFile || busyAction !== null}>
-            <Upload size={15} />
-            {busyAction === "dingtalk" ? "处理中" : "识别"}
-          </button>
+        <div className="topbar-import">
+          <div className="topbar-import-group">
+            <label className="compact-file-button">
+              <FileSpreadsheet size={15} />
+              周报 Excel
+              <input
+                key={weeklyInputKey}
+                type="file"
+                accept=".xlsx,.xls"
+                onChange={(event) => setWeeklyFile(event.target.files?.[0] || null)}
+              />
+            </label>
+            <span className="compact-file-name" title={weeklyFile?.name || ""}>{weeklyFile?.name || "未选择"}</span>
+            <button className="primary-button compact-import-button" type="button" onClick={uploadWeekly} disabled={!weeklyFile || busyAction !== null}>
+              <Upload size={15} />
+              {busyAction === "weekly" ? "导入中" : "导入"}
+            </button>
+          </div>
+          <div className="topbar-import-group">
+            <label className="compact-file-button">
+              <FileSpreadsheet size={15} />
+              钉钉导出表
+              <input
+                key={dingtalkInputKey}
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                onChange={(event) => {
+                  setDingtalkFile(event.target.files?.[0] || null);
+                  setMapping(null);
+                  setHeaders([]);
+                }}
+              />
+            </label>
+            <span className="compact-file-name" title={dingtalkFile?.name || ""}>{dingtalkFile?.name || "未选择"}</span>
+            <button className="primary-button compact-import-button" type="button" onClick={() => uploadDingTalk(false)} disabled={!dingtalkFile || busyAction !== null}>
+              <Upload size={15} />
+              {busyAction === "dingtalk" ? "处理中" : "识别"}
+            </button>
+          </div>
+          <div className="topbar-import-group external-source-import-group">
+            <button
+              className="ghost-button compact-import-button"
+              type="button"
+              onClick={() => setExternalImportOpen(true)}
+              disabled={!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
+              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能向草稿批次导入" : "从钉钉支出中间表拉取"}
+            >
+              <Database size={15} />
+              从中间表拉取
+            </button>
+            <button
+              className="ghost-button compact-import-button"
+              type="button"
+              onClick={syncExternalMetadata}
+              disabled={!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
+              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能同步草稿批次" : "按钉钉单号刷新审批状态、申请人和部门"}
+            >
+              <RefreshCcw size={15} />
+              {busyAction === "sync-metadata" ? "同步中" : "同步钉钉状态"}
+            </button>
+          </div>
+          <div className="topbar-import-group rollback-import-group">
+            <button className="ghost-button danger-button compact-import-button" type="button" onClick={rollbackLatestImport} disabled={!selectedBatch || busyAction !== null}>
+              <Undo2 size={15} />
+              {busyAction === "rollback" ? "撤回中" : "撤回最近导入"}
+            </button>
+          </div>
         </div>
-        <div className="topbar-import-group rollback-import-group">
-          <button className="ghost-button danger-button compact-import-button" type="button" onClick={rollbackLatestImport} disabled={!selectedBatch || busyAction !== null}>
-            <Undo2 size={15} />
-            {busyAction === "rollback" ? "撤回中" : "撤回最近导入"}
-          </button>
-        </div>
-      </div>
+      </section>
       {mappingOpen && mapping && (
         <Modal title="钉钉字段映射" onClose={() => setMappingOpen(false)}>
           <div className="mapping-table compact-mapping-table">
@@ -485,8 +563,306 @@ function TopbarImportActions({
           </div>
         </Modal>
       )}
+      {externalImportOpen && selectedBatch && (
+        <ExternalExpenseImportDialog
+          batch={selectedBatch}
+          onClose={() => setExternalImportOpen(false)}
+          onImported={async () => {
+            await reloadBatches();
+            onImported();
+          }}
+          setMessage={setMessage}
+        />
+      )}
     </>
   );
+}
+
+function ExternalExpenseImportDialog({
+  batch,
+  onClose,
+  onImported,
+  setMessage,
+}: {
+  batch: Batch;
+  onClose: () => void;
+  onImported: () => Promise<void>;
+  setMessage: (message: string) => void;
+}) {
+  const defaultDates = externalImportDefaultDates(batch);
+  const [dateFrom, setDateFrom] = useState(defaultDates.dateFrom);
+  const [dateTo, setDateTo] = useState(defaultDates.dateTo);
+  const [sourceTypes, setSourceTypes] = useState<ExternalExpenseSourceType[]>(["operation", "purchase"]);
+  const [approvalNo, setApprovalNo] = useState("");
+  const [applicantIds, setApplicantIds] = useState<string[]>([]);
+  const [applicantQuery, setApplicantQuery] = useState("");
+  const [preview, setPreview] = useState<ExternalExpensePreview | null>(null);
+  const [resultFilter, setResultFilter] = useState<ExternalExpenseResultFilter>("matched");
+  const [previewPage, setPreviewPage] = useState(1);
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<ExternalExpenseImportResult | null>(null);
+
+  useEffect(() => {
+    void queryPreview(true);
+  }, []);
+
+  function rowKey(row: Pick<ExternalExpensePreviewRow, "source_type" | "source_id">) {
+    return `${row.source_type}:${row.source_id}`;
+  }
+
+  function validateFilters() {
+    if (!sourceTypes.length) return "请至少选择一个支出来源";
+    if (approvalNo.trim()) return "";
+    if (!dateFrom || !dateTo) return "请选择申请开始和结束日期";
+    const start = new Date(`${dateFrom}T00:00:00`);
+    const end = new Date(`${dateTo}T00:00:00`);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return "申请日期格式无效";
+    if (end < start) return "申请结束日期不能早于开始日期";
+    const days = Math.round((end.getTime() - start.getTime()) / 86400000) + 1;
+    if (days > 31) return "单次查询的申请日期范围不能超过 31 天";
+    return "";
+  }
+
+  async function queryPreview(resetSelection = false) {
+    const validationError = validateFilters();
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+    setLoading(true);
+    setError("");
+    if (resetSelection) setResult(null);
+    try {
+      const payload: ExternalExpensePreviewFilter = {
+        batch_id: batch.id,
+        date_from: dateFrom,
+        date_to: dateTo,
+        source_types: sourceTypes,
+        approval_no: approvalNo.trim(),
+        applicant_ids: applicantIds,
+        result_filter: "matched",
+        page: 1,
+        page_size: 50,
+      };
+      const response = await api.previewExternalExpenses(payload);
+      setPreview(response);
+      setPreviewPage(1);
+      if (resetSelection) {
+        setResultFilter("matched");
+        setSelectedKeys(new Set());
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function toggleSource(sourceType: ExternalExpenseSourceType) {
+    setSourceTypes((current) => current.includes(sourceType) ? current.filter((value) => value !== sourceType) : [...current, sourceType]);
+  }
+
+  function toggleApplicant(id: string) {
+    setApplicantIds((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
+  }
+
+  function toggleRow(row: ExternalExpensePreviewRow) {
+    if (!row.importable) return;
+    const key = rowKey(row);
+    setSelectedKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  function toggleCurrentPage() {
+    if (!preview) return;
+    const keys = pagePreviewRows.filter((row) => row.importable).map(rowKey);
+    const allSelected = keys.length > 0 && keys.every((key) => selectedKeys.has(key));
+    setSelectedKeys((current) => {
+      const next = new Set(current);
+      keys.forEach((key) => allSelected ? next.delete(key) : next.add(key));
+      return next;
+    });
+  }
+
+  async function importSelected() {
+    if (!selectedKeys.size || selectedKeys.size > 200) return;
+    setImporting(true);
+    setError("");
+    setResult(null);
+    try {
+      const items = Array.from(selectedKeys).map((key) => {
+        const separator = key.indexOf(":");
+        return {
+          source_type: key.slice(0, separator) as ExternalExpenseSourceType,
+          source_id: key.slice(separator + 1),
+        };
+      });
+      const response = await api.importExternalExpenses(batch.id, items);
+      setResult(response);
+      setSelectedKeys(new Set());
+      await onImported();
+      await queryPreview(false);
+      const summaryMessage = `中间表导入完成：新增 ${response.imported_rows} 条，重复 ${response.duplicate_rows} 条，无效 ${response.invalid_rows} 条`;
+      setMessage(summaryMessage);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  const filteredApplicantOptions = (preview?.applicant_options || []).filter((option) => {
+    const query = applicantQuery.trim().toLowerCase();
+    return option.name.toLowerCase().includes(query) || String(option.department || "").toLowerCase().includes(query);
+  });
+  const allPreviewRows = preview?.all_rows || preview?.rows || [];
+  const filteredPreviewRows = allPreviewRows.filter((row) => {
+    if (resultFilter === "importable") return row.importable;
+    if (resultFilter === "duplicates") return row.duplicate != null;
+    if (resultFilter === "warnings") return row.warnings.length > 0;
+    if (resultFilter === "invalid") return row.errors.length > 0;
+    return true;
+  });
+  const previewPageSize = 50;
+  const previewTotalPages = Math.max(1, Math.ceil(filteredPreviewRows.length / previewPageSize));
+  const currentPreviewPage = Math.min(previewPage, previewTotalPages);
+  const pagePreviewRows = filteredPreviewRows.slice(
+    (currentPreviewPage - 1) * previewPageSize,
+    currentPreviewPage * previewPageSize,
+  );
+  const pageImportableKeys = pagePreviewRows.filter((row) => row.importable).map(rowKey);
+  const allPageSelected = pageImportableKeys.length > 0 && pageImportableKeys.every((key) => selectedKeys.has(key));
+  const resultFilterOptions: Array<{ value: ExternalExpenseResultFilter; label: string; count: number }> = preview ? [
+    { value: "matched", label: "匹配", count: preview.summary.matched },
+    { value: "importable", label: "可导入", count: preview.summary.importable },
+    { value: "duplicates", label: "已存在", count: preview.summary.duplicates },
+    { value: "warnings", label: "有警告", count: preview.summary.warnings },
+    { value: "invalid", label: "不可导入", count: preview.summary.invalid },
+  ] : [];
+
+  return (
+    <Modal title="从钉钉支出中间表拉取" onClose={() => { if (!importing) onClose(); }} className="external-expense-modal">
+      <form className="external-expense-filters" onSubmit={(event) => { event.preventDefault(); void queryPreview(true); }}>
+        <div className="external-source-selector">
+          <span>支出来源</span>
+          <label><input type="checkbox" checked={sourceTypes.includes("operation")} onChange={() => toggleSource("operation")} />运营支出</label>
+          <label><input type="checkbox" checked={sourceTypes.includes("purchase")} onChange={() => toggleSource("purchase")} />采购支出</label>
+        </div>
+        <label title={approvalNo.trim() ? "已按钉钉单号精确查询，日期范围不参与筛选" : undefined}>申请开始日期<input type="date" value={dateFrom} disabled={Boolean(approvalNo.trim())} onChange={(event) => setDateFrom(event.target.value)} /></label>
+        <label title={approvalNo.trim() ? "已按钉钉单号精确查询，日期范围不参与筛选" : undefined}>申请结束日期<input type="date" value={dateTo} disabled={Boolean(approvalNo.trim())} onChange={(event) => setDateTo(event.target.value)} /></label>
+        <label>钉钉单号<input value={approvalNo} onChange={(event) => { setApprovalNo(event.target.value); if (event.target.value.trim()) setError(""); }} placeholder="精确匹配，忽略日期" /></label>
+        <div className="external-applicant-picker">
+          <label>申请人<input value={applicantQuery} onChange={(event) => setApplicantQuery(event.target.value)} placeholder="搜索并多选申请人" /></label>
+          <div className="external-applicant-options">
+            {filteredApplicantOptions.length === 0 && <span>查询后显示申请人选项</span>}
+            {filteredApplicantOptions.map((option) => (
+              <label key={option.id} title={`钉钉用户 ID：${option.id}`}>
+                <input type="checkbox" checked={applicantIds.includes(option.id)} onChange={() => toggleApplicant(option.id)} />
+                <span className="external-applicant-option-text">
+                  <strong>{option.name}</strong>
+                  <small>{option.department || "部门未知"}</small>
+                </span>
+                <small>{option.count}</small>
+              </label>
+            ))}
+          </div>
+        </div>
+        <button className="primary-button external-query-button" type="submit" disabled={loading || importing}>
+          <Search size={16} />{loading ? "查询中" : "查询"}
+        </button>
+      </form>
+
+      {applicantIds.length > 0 && (
+        <div className="external-selected-applicants">
+          {applicantIds.map((id) => {
+            const option = preview?.applicant_options.find((candidate) => candidate.id === id);
+            return <button type="button" key={id} onClick={() => toggleApplicant(id)} title={`钉钉用户 ID：${id}`}>{option?.name || "未识别人员"} ×</button>;
+          })}
+        </div>
+      )}
+      {error && <p className="error-text external-import-error">{error}</p>}
+      {result && (
+        <div className="external-import-result">
+          已导入 <strong>{result.imported_rows}</strong> 条，跳过重复 <strong>{result.duplicate_rows}</strong> 条，无效 <strong>{result.invalid_rows}</strong> 条，含警告 <strong>{result.warnings}</strong> 条。
+        </div>
+      )}
+      {preview && (
+        <>
+          <div className="external-preview-summary">
+            {resultFilterOptions.map((option) => (
+              <button
+                className={`external-preview-filter${resultFilter === option.value ? " active" : ""}`}
+                type="button"
+                key={option.value}
+                aria-pressed={resultFilter === option.value}
+                disabled={loading || importing}
+                onClick={() => {
+                  setResultFilter(option.value);
+                  setPreviewPage(1);
+                }}
+              >
+                {option.label} <strong>{option.count}</strong>
+              </button>
+            ))}
+          </div>
+          <div className="external-preview-table-wrap">
+            <table className="data-table external-preview-table">
+              <thead>
+                <tr>
+                  <th className="external-select-col"><input type="checkbox" aria-label="选择当前页可导入记录" checked={allPageSelected} onChange={toggleCurrentPage} /></th>
+                  <th>来源</th><th>申请日期</th><th>钉钉单号</th><th>申请人</th><th>状态</th><th>摘要</th><th>金额</th><th>收款信息</th><th>校验结果</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pagePreviewRows.length === 0 && <tr><td colSpan={10} className="external-empty-row">没有符合条件的记录</td></tr>}
+                {pagePreviewRows.map((row) => (
+                  <tr key={rowKey(row)} className={!row.importable ? "external-row-disabled" : row.warnings.length ? "external-row-warning" : ""}>
+                    <td className="external-select-col"><input type="checkbox" aria-label={`选择 ${row.approval_no}`} disabled={!row.importable} checked={selectedKeys.has(rowKey(row))} onChange={() => toggleRow(row)} /></td>
+                    <td>{row.source_label}</td>
+                    <td>{row.application_date || "—"}</td>
+                    <td className="mono">{row.approval_no || "—"}</td>
+                    <td title={row.applicant_id ? `钉钉用户 ID：${row.applicant_id}` : undefined}><strong>{row.applicant || "—"}</strong><small>{row.applicant_department || ""}</small></td>
+                    <td><ExternalApprovalBadge status={row.approval_status} result={row.approval_result} /></td>
+                    <td className="external-summary-cell" title={row.summary}>{row.summary || "—"}</td>
+                    <td className="amount">{row.amount === undefined || row.amount === null ? "—" : formatMoney(row.amount)}</td>
+                    <td className="external-beneficiary-cell" title={row.beneficiary}>{row.beneficiary || "—"}</td>
+                    <td><ExternalExpenseValidation row={row} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="external-pagination">
+            <span>第 {currentPreviewPage} / {previewTotalPages} 页，共 {filteredPreviewRows.length} 条</span>
+            <div>
+              <button className="ghost-button" type="button" disabled={loading || currentPreviewPage <= 1} onClick={() => setPreviewPage(currentPreviewPage - 1)}><ChevronLeft size={15} />上一页</button>
+              <button className="ghost-button" type="button" disabled={loading || currentPreviewPage >= previewTotalPages} onClick={() => setPreviewPage(currentPreviewPage + 1)}>下一页<ChevronRight size={15} /></button>
+            </div>
+          </div>
+        </>
+      )}
+      <div className="external-import-actions">
+        <span>{selectedKeys.size > 200 ? "单次最多选择 200 条" : `已选择 ${selectedKeys.size} 条`}</span>
+        <button className="primary-button" type="button" onClick={importSelected} disabled={importing || selectedKeys.size === 0 || selectedKeys.size > 200}>
+          <Download size={16} />{importing ? "导入中" : `导入选中 ${selectedKeys.size} 条`}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function ExternalExpenseValidation({ row }: { row: ExternalExpensePreviewRow }) {
+  if (row.duplicate) return <span className="external-validation duplicate">已存在：{row.duplicate.batch_name}</span>;
+  if (row.errors.length) return <span className="external-validation invalid">{row.errors.join("；")}</span>;
+  if (row.warnings.length) return <span className="external-validation warning"><AlertTriangle size={13} />{row.warnings.join("；")}</span>;
+  return <span className="external-validation ready">可导入</span>;
 }
 
 function Workspace({
@@ -496,14 +872,16 @@ function Workspace({
   setSelectedBatchId,
   reloadBatches,
   refreshToken,
+  onImported,
   setMessage,
 }: {
   user: User;
   batches: Batch[];
   selectedBatch: Batch | null;
-  setSelectedBatchId: (id: number) => void;
+  setSelectedBatchId: (id: number | null) => void;
   reloadBatches: () => Promise<void>;
   refreshToken: number;
+  onImported: () => void;
   setMessage: (message: string) => void;
 }) {
   const [gridRows, setGridRows] = useState<GridRow[]>([]);
@@ -520,10 +898,12 @@ function Workspace({
   const [editorDraft, setEditorDraft] = useState<Partial<PaymentRequest> | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
   const [attachmentCounts, setAttachmentCounts] = useState<Record<number, number>>({});
-  const [attachmentsByRequest, setAttachmentsByRequest] = useState<Record<number, AttachmentLink[]>>({});
-  const [previewImages, setPreviewImages] = useState<{ images: AttachmentLink[]; index: number } | null>(null);
   const [selectedRows, setSelectedRows] = useState<number[]>([]);
-  const [bulkStatus, setBulkStatus] = useState("已付款");
+  const [editorInitialTab, setEditorInitialTab] = useState<RequestEditorTab>("request");
+  const [pendingEditorNavigation, setPendingEditorNavigation] = useState<PendingEditorNavigation | null>(null);
+  const [editorNavigationBusy, setEditorNavigationBusy] = useState(false);
+  const [batchMenuOpen, setBatchMenuOpen] = useState(false);
+  const batchMenuRef = useRef<HTMLDivElement | null>(null);
   const [reason, setReason] = useState("");
   const hasUnsavedChanges = dirtyCells.size > 0 || deletedLocalIds.size > 0;
 
@@ -532,23 +912,19 @@ function Workspace({
     const [requestsRes, attachmentsRes] = await Promise.all([api.requests(selectedBatch.id, {}), api.batchAttachments(selectedBatch.id)]);
     const attachmentGroups = groupAttachmentsByRequest(attachmentsRes.attachments);
     setGridRows(toGridRows(requestsRes.requests));
-    setAttachmentsByRequest(attachmentGroups);
     setAttachmentCounts(countAttachmentsByGroup(attachmentGroups));
     setDirtyCells(new Set());
     setDeletedLocalIds(new Set());
     setSelectedRows([]);
-    setPreviewImages(null);
   }
 
   async function refreshAttachmentCounts() {
     if (!selectedBatch) {
       setAttachmentCounts({});
-      setAttachmentsByRequest({});
       return;
     }
     const res = await api.batchAttachments(selectedBatch.id);
     const attachmentGroups = groupAttachmentsByRequest(res.attachments);
-    setAttachmentsByRequest(attachmentGroups);
     setAttachmentCounts(countAttachmentsByGroup(attachmentGroups));
   }
 
@@ -567,6 +943,8 @@ function Workspace({
     () => ({
       count: visibleActiveRows.length,
       amount: visibleActiveRows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0),
+      paidAmount: visibleActiveRows.reduce((sum, row) => sum + (Number(row.paid_amount) || 0), 0),
+      pendingAmount: visibleActiveRows.reduce((sum, row) => sum + (Number(row.pending_amount) || 0), 0),
     }),
     [visibleActiveRows],
   );
@@ -581,8 +959,13 @@ function Workspace({
   const defaultSourceSheet = activeSheet === ALL_SHEET ? "手工录入" : activeSheet;
   const canArchiveBatch = ["finance", "general_manager", "admin"].includes(user.role);
   const canRestoreBatch = isPrivilegedRole(user.role);
+  const canManageDraftState = selectedBatch?.status === "draft" && isPrivilegedRole(user.role);
   const canEditGrid = selectedBatch?.status !== "archived" || isPrivilegedRole(user.role);
-  const canBulkUpdatePayment = canEditGrid && canEditRequestField(user.role, "finance_review");
+  const batchPayableAmount = Number(selectedBatch?.total_amount) || 0;
+  const batchPaidAmount = Number(selectedBatch?.total_paid_amount) || 0;
+  const paymentProgress = batchPayableAmount > 0
+    ? Math.min(100, Math.max(0, (batchPaidAmount / batchPayableAmount) * 100))
+    : 0;
   const activeSheetPendingDeleteCount = activeSheetRows.filter((row) => row.__deleted).length;
   const canDeleteActiveSheet = canEditGrid && activeSheet !== ALL_SHEET && activeSheetRows.some((row) => !row.__deleted);
   const canRestoreActiveSheetDelete = canEditGrid && activeSheet !== ALL_SHEET && activeSheetRows.some((row) => row.__deleted);
@@ -602,60 +985,111 @@ function Workspace({
     if (!sheetTabs.some((tab) => tab.key === activeSheet)) setActiveSheet(ALL_SHEET);
   }, [activeSheet, sheetTabs]);
 
+  useEffect(() => {
+    if (!batchMenuOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!batchMenuRef.current?.contains(event.target as Node)) setBatchMenuOpen(false);
+    };
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setBatchMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [batchMenuOpen]);
+
   function guardedSelectBatch(id: number) {
     if (hasUnsavedChanges && !window.confirm("当前表格有未保存更改，切换批次会丢失这些更改。继续切换吗？")) return;
     setSelectedBatchId(id);
   }
 
-  async function saveRequest(payload: Partial<PaymentRequest>, options: { closeEditor?: boolean } = {}) {
+  async function saveRequest(payload: Partial<PaymentRequest>) {
     if (!selectedBatch) return;
+    const writablePayload = withoutDerivedPaymentFields(payload);
+    let savedRequest: PaymentRequest;
     if (payload.id) {
-      await api.updateRequest(selectedBatch.id, payload.id, { ...payload, reason });
+      const result = await api.updateRequest(selectedBatch.id, payload.id, { ...writablePayload, reason });
+      savedRequest = result.request;
     } else {
-      await api.createRequest(selectedBatch.id, payload);
+      const result = await api.createRequest(selectedBatch.id, writablePayload);
+      savedRequest = result.request;
     }
-    if (options.closeEditor ?? true) setEditing(null);
+    setEditing(savedRequest);
     setEditorDraft(null);
     setEditorDirty(false);
     setReason("");
     await loadRequests();
     await reloadBatches();
     setMessage("已保存");
+    return savedRequest;
   }
 
-  async function openRequestEditor(request: Partial<PaymentRequest>) {
-    if (editing && editorDirty) {
-      const shouldSave = window.confirm("当前抽屉有未保存改动，是否先保存再切换到这条请款？");
-      if (!shouldSave) return;
-      try {
-        await saveRequest(editorDraft || editing, { closeEditor: false });
-      } catch (err) {
-        setMessage((err as Error).message);
-        return;
-      }
-    }
+  function activateRequestEditor(request: Partial<PaymentRequest>, initialTab: RequestEditorTab) {
     setEditing(request);
+    setEditorInitialTab(initialTab);
     setEditorDraft(null);
     setEditorDirty(false);
     setReason("");
   }
 
-  function openAttachmentsFromGrid(request: PaymentRequest) {
-    const attachments = attachmentsByRequest[request.id] || [];
-    if (attachments.length > 0 && attachments.every(isImageAttachment)) {
-      setPreviewImages({ images: attachments, index: 0 });
-      return;
-    }
-    openRequestEditor(request);
+  function resetRequestEditor() {
+    setEditing(null);
+    setEditorInitialTab("request");
+    setEditorDraft(null);
+    setEditorDirty(false);
+    setPendingEditorNavigation(null);
+    setReason("");
   }
 
-  async function bulkUpdate() {
-    if (!selectedBatch || selectedRows.length === 0 || !canBulkUpdatePayment) return;
-    await Promise.all(selectedRows.map((id) => api.updateRequest(selectedBatch.id, id, { finance_review: bulkStatus, reason })));
-    setSelectedRows([]);
-    setReason("");
-    await loadRequests();
-    setMessage("批量更新完成");
+  function openRequestEditor(request: Partial<PaymentRequest>, initialTab: RequestEditorTab = "request") {
+    if (editing?.id && request.id && editing.id === request.id) {
+      setEditorInitialTab(initialTab);
+      return;
+    }
+    if (editing && editorDirty) {
+      setPendingEditorNavigation({ kind: "switch", request, initialTab });
+      return;
+    }
+    activateRequestEditor(request, initialTab);
+  }
+
+  function openAttachmentsFromGrid(request: PaymentRequest) {
+    openRequestEditor(request, "attachments");
+  }
+
+  function closeRequestEditor() {
+    if (editorDirty) {
+      setPendingEditorNavigation({ kind: "close" });
+      return;
+    }
+    resetRequestEditor();
+  }
+
+  async function saveBeforeEditorNavigation() {
+    if (!pendingEditorNavigation || !editing) return;
+    const navigation = pendingEditorNavigation;
+    setEditorNavigationBusy(true);
+    try {
+      await saveRequest(editorDraft || editing);
+      setPendingEditorNavigation(null);
+      if (navigation.kind === "close") resetRequestEditor();
+      else activateRequestEditor(navigation.request, navigation.initialTab);
+    } catch (err) {
+      setMessage((err as Error).message);
+    } finally {
+      setEditorNavigationBusy(false);
+    }
+  }
+
+  function discardBeforeEditorNavigation() {
+    if (!pendingEditorNavigation) return;
+    const navigation = pendingEditorNavigation;
+    setPendingEditorNavigation(null);
+    if (navigation.kind === "close") resetRequestEditor();
+    else activateRequestEditor(navigation.request, navigation.initialTab);
   }
 
   async function saveGridChanges() {
@@ -674,6 +1108,63 @@ function Workspace({
     await loadRequests();
     await reloadBatches();
     setMessage("表格更改已保存");
+  }
+
+  async function discardUnsavedChanges() {
+    if (!hasUnsavedChanges && !editorDirty) return;
+    if (!window.confirm("确定放弃当前页面尚未保存的修改吗？已保存的数据不会变化。")) return;
+    setEditingSheet(null);
+    setNewSheetName(null);
+    setEditing(null);
+    setEditorDraft(null);
+    setEditorDirty(false);
+    setReason("");
+    await loadRequests();
+    setMessage("未保存修改已放弃");
+  }
+
+  async function restoreInitialDraftState() {
+    if (!selectedBatch || !canManageDraftState) return;
+    if (
+      !window.confirm(
+        `确定将草稿“${selectedBatch.name}”还原到初始状态吗？\n\n当前已经保存的新增、修改、删除、付款和附件变更都会被撤回；页面上未保存的修改也会被放弃。系统会先保留一份还原前快照。`,
+      )
+    ) return;
+    await api.restoreBatchBaseline(selectedBatch.id);
+    setEditingSheet(null);
+    setNewSheetName(null);
+    setEditing(null);
+    setEditorDraft(null);
+    setEditorDirty(false);
+    setReason("");
+    await loadRequests();
+    await reloadBatches();
+    setMessage("草稿已还原到初始状态");
+  }
+
+  async function setCurrentBaseline() {
+    if (!selectedBatch || !canManageDraftState) return;
+    if (hasUnsavedChanges || editorDirty) {
+      setMessage("请先保存或放弃未保存修改，再设置还原点");
+      return;
+    }
+    if (!window.confirm(`确定把草稿“${selectedBatch.name}”当前状态设为新的还原点吗？之后一键还原会回到现在。`)) return;
+    await api.setBatchBaseline(selectedBatch.id);
+    setMessage("当前草稿状态已设为还原点");
+  }
+
+  async function deleteCurrentDraft() {
+    if (!selectedBatch || !canManageDraftState) return;
+    if (!window.confirm(`确定删除草稿批次“${selectedBatch.name}”吗？删除后该批次下的请款、付款明细和附件凭证也会删除。`)) return;
+    await api.deleteBatch(selectedBatch.id);
+    setEditing(null);
+    setEditorDraft(null);
+    setEditorDirty(false);
+    setSelectedRows([]);
+    setActiveSheet(ALL_SHEET);
+    setSelectedBatchId(null);
+    await reloadBatches();
+    setMessage("草稿批次已删除");
   }
 
   async function archiveCurrentBatch() {
@@ -887,66 +1378,120 @@ function Workspace({
 
   return (
     <div className="workspace-grid">
-      <section className="batch-toolbar-panel">
-        <div className="batch-picker">
-          <label>
-            当前批次
-            <select value={selectedBatch.id} onChange={(event) => guardedSelectBatch(Number(event.target.value))}>
-              {batches.map((batch) => (
-                <option key={batch.id} value={batch.id}>{batch.name}</option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className="batch-summary">
-          <span>状态</span>
-          <div className="status-control">
-            <StatusPill value={selectedBatch.status === "archived" ? "已归档" : "草稿"} />
+      <section className="batch-overview-panel">
+        <div className="batch-overview-head">
+          <div className="batch-context">
+            <div className="batch-picker">
+              <label>
+                当前批次
+                <select value={selectedBatch.id} onChange={(event) => guardedSelectBatch(Number(event.target.value))}>
+                  {batches.map((batch) => (
+                    <option key={batch.id} value={batch.id}>{batch.name}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <button className="ghost-button batch-create-button" onClick={() => setCreateDialogOpen(true)}>
+              <Plus size={16} />
+              新建批次
+            </button>
+            <div className="batch-context-meta">
+              <div className="batch-context-item">
+                <span>状态</span>
+                <StatusPill value={selectedBatch.status === "archived" ? "已归档" : "草稿"} />
+              </div>
+              <div className="batch-context-item batch-period">
+                <span>期间</span>
+                <strong>{formatDateRange(selectedBatch.start_date, selectedBatch.end_date)}</strong>
+              </div>
+            </div>
+          </div>
+          <div className="batch-primary-actions">
+            <button className="primary-button" onClick={() => setRolloverDialogOpen(true)}>
+              <Archive size={16} />
+              从上周生成本周
+            </button>
             {selectedBatch.status === "draft" && canArchiveBatch && (
-              <button className="mini-button" onClick={archiveCurrentBatch} type="button">
-                <Archive size={14} />
+              <button className="ghost-button" onClick={archiveCurrentBatch} type="button">
+                <Archive size={16} />
                 归档
               </button>
             )}
             {selectedBatch.status === "archived" && canRestoreBatch && (
-              <button className="mini-button" onClick={restoreCurrentBatchDraft} type="button">
-                <RefreshCcw size={14} />
+              <button className="ghost-button" onClick={restoreCurrentBatchDraft} type="button">
+                <RefreshCcw size={16} />
                 恢复草稿
               </button>
             )}
+            {canManageDraftState && (
+              <div className="batch-more" ref={batchMenuRef}>
+                <button
+                  className="ghost-button"
+                  type="button"
+                  aria-haspopup="menu"
+                  aria-expanded={batchMenuOpen}
+                  onClick={() => setBatchMenuOpen((open) => !open)}
+                >
+                  <MoreHorizontal size={16} />
+                  更多
+                </button>
+                {batchMenuOpen && (
+                  <div className="batch-more-menu" role="menu">
+                    <button type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void setCurrentBaseline(); }}>
+                      <Save size={16} />
+                      设为还原点
+                    </button>
+                    <button type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void restoreInitialDraftState(); }}>
+                      <Undo2 size={16} />
+                      还原到初始状态
+                    </button>
+                    <div className="batch-more-separator" role="separator" />
+                    <button className="danger-menu-item" type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void deleteCurrentDraft(); }}>
+                      <Trash2 size={16} />
+                      删除当前草稿
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
-        <div className="batch-summary">
-          <span>期间</span>
-          <strong>{formatDateRange(selectedBatch.start_date, selectedBatch.end_date)}</strong>
+        <div className="batch-metric-grid">
+          <div className="batch-metric-card">
+            <span>批次记录</span>
+            <strong>{selectedBatch.request_count || 0} 条</strong>
+          </div>
+          <div className="batch-metric-card">
+            <span>批次应付</span>
+            <strong>{formatMoney(batchPayableAmount)}</strong>
+          </div>
+          <div className="batch-metric-card">
+            <span>累计已支付</span>
+            <strong>{formatMoney(batchPaidAmount)}</strong>
+          </div>
+          <div className="batch-metric-card">
+            <span>待付款</span>
+            <strong>{formatMoney(selectedBatch.total_pending_amount || 0)}</strong>
+          </div>
         </div>
-        <div className="batch-summary">
-          <span>批次记录</span>
-          <strong>{selectedBatch.request_count || 0} 条</strong>
-        </div>
-        <div className="batch-summary">
-          <span>批次金额</span>
-          <strong>{formatMoney(selectedBatch.total_amount || 0)}</strong>
-        </div>
-        <div className="batch-actions">
-          <button className="ghost-button" onClick={() => setCreateDialogOpen(true)}>
-            <Plus size={16} />
-            新建批次
-          </button>
-          <button className="primary-button" onClick={() => setRolloverDialogOpen(true)}>
-            <Archive size={16} />
-            从上周生成本周
-          </button>
+        <div className="payment-progress">
+          <div className="payment-progress-label">
+            <span>付款进度</span>
+            <strong>{paymentProgress.toFixed(1)}%</strong>
+          </div>
+          <div className="payment-progress-track" role="progressbar" aria-label="批次付款进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Number(paymentProgress.toFixed(1))}>
+            <div className="payment-progress-fill" style={{ width: `${paymentProgress}%` }} />
+          </div>
         </div>
       </section>
+      <TopbarImportActions
+        selectedBatch={selectedBatch}
+        hasUnsavedChanges={hasUnsavedChanges || editorDirty}
+        reloadBatches={reloadBatches}
+        onImported={onImported}
+        setMessage={setMessage}
+      />
       <section className="content-panel">
-        <div className="metric-row">
-          <Metric label="当前记录数" value={`${visibleTotals.count}`} />
-          <Metric label="当前金额合计" value={formatMoney(visibleTotals.amount)} />
-          <Metric label="已付款单数" value={`${financeReviewCounts.paid} 单`} />
-          <Metric label="部分付款单数" value={`${financeReviewCounts.partial} 单`} />
-          <Metric label="未付款单数" value={`${financeReviewCounts.unpaid} 单`} />
-        </div>
         <div className="toolbar">
           <div className="search-box">
             <Search size={16} />
@@ -992,6 +1537,26 @@ function Workspace({
             <Save size={16} />
             保存更改
           </button>
+          <button className="ghost-button" onClick={discardUnsavedChanges} onKeyDown={(event) => activateButtonByKeyboard(event, discardUnsavedChanges)} disabled={!hasUnsavedChanges && !editorDirty}>
+            <Undo2 size={16} />
+            放弃未保存修改
+          </button>
+        </div>
+        <div className="filtered-summary-bar" aria-label="当前筛选结果">
+          <div className="filtered-summary-count">
+            <span>当前筛选</span>
+            <strong>{visibleTotals.count} 条</strong>
+          </div>
+          <div className="filtered-summary-amounts">
+            <span>应付 <strong>{formatMoney(visibleTotals.amount)}</strong></span>
+            <span>已付 <strong>{formatMoney(visibleTotals.paidAmount)}</strong></span>
+            <span>待付 <strong>{formatMoney(visibleTotals.pendingAmount)}</strong></span>
+          </div>
+          <div className="filtered-summary-statuses">
+            <span className="summary-status paid">已付款 {financeReviewCounts.paid} 单</span>
+            <span className="summary-status partial">部分付款 {financeReviewCounts.partial} 单</span>
+            <span className="summary-status unpaid">未付款 {financeReviewCounts.unpaid} 单</span>
+          </div>
         </div>
         <div className="sheet-tabs" role="tablist" aria-label="Sheet 分页">
           {sheetTabs.map((tab) => (
@@ -1083,18 +1648,6 @@ function Workspace({
         {selectedRows.length > 0 && (
           <div className="bulk-bar">
             <span>已选 {selectedRows.length} 条</span>
-            {canBulkUpdatePayment && (
-              <>
-                <select value={bulkStatus} onChange={(event) => setBulkStatus(event.target.value)}>
-                  {financeApprovalOptions.map((option) => <option key={option} value={option}>{option}</option>)}
-                </select>
-                {selectedBatch.status === "archived" && isPrivilegedRole(user.role) && <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="更正原因" />}
-                <button className="primary-button" onClick={bulkUpdate}>
-                  <CheckCircle2 size={16} />
-                  批量更新财务审批
-                </button>
-              </>
-            )}
             <button className="ghost-button" onClick={markDeleteSelected}>
               <Trash2 size={16} />
               删除所选行
@@ -1112,6 +1665,7 @@ function Workspace({
           readOnly={selectedBatch.status === "archived" && !isPrivilegedRole(user.role)}
           canEditField={(field) => canEditGrid && canEditRequestField(user.role, field)}
           onEdit={openRequestEditor}
+          onOpenPayments={(request) => openRequestEditor(request, "payments")}
           onOpenAttachments={openAttachmentsFromGrid}
           attachmentCounts={attachmentCounts}
           onSave={saveGridChanges}
@@ -1149,29 +1703,49 @@ function Workspace({
         <RequestEditor
           key={editing.id ? `request-${editing.id}` : "request-new"}
           batch={selectedBatch}
+          user={user}
           request={editing}
+          initialTab={editorInitialTab}
+          confirmationOpen={Boolean(pendingEditorNavigation)}
           reason={reason}
           setReason={setReason}
-          onCancel={() => {
-            setEditing(null);
-            setEditorDraft(null);
-            setEditorDirty(false);
-          }}
+          onCancel={closeRequestEditor}
           onSave={saveRequest}
           onDraftChange={setEditorDraft}
           onDirtyChange={setEditorDirty}
           onAttachmentsChanged={refreshAttachmentCounts}
+          onPaymentsChanged={async (updatedRequest) => {
+            setEditing(updatedRequest);
+            await loadRequests();
+            await reloadBatches();
+          }}
           canEditAttachments={selectedBatch.status !== "archived" || isPrivilegedRole(user.role)}
           canEditField={(field) => canEditGrid && canEditRequestField(user.role, field)}
         />
       )}
-      {previewImages && (
-        <ImagePreviewDialog
-          images={previewImages.images}
-          index={previewImages.index}
-          onIndexChange={(index) => setPreviewImages({ ...previewImages, index })}
-          onClose={() => setPreviewImages(null)}
-        />
+      {pendingEditorNavigation && (
+        <Modal
+          title={pendingEditorNavigation.kind === "close" ? "关闭编辑请款" : "切换请款记录"}
+          onClose={() => setPendingEditorNavigation(null)}
+        >
+          <p className="editor-navigation-message">
+            当前请款有未保存修改，请选择如何处理。
+          </p>
+          <div className="editor-navigation-actions">
+            <button className="ghost-button" type="button" onClick={() => setPendingEditorNavigation(null)} disabled={editorNavigationBusy}>
+              返回编辑
+            </button>
+            <button className="danger-button" type="button" onClick={discardBeforeEditorNavigation} disabled={editorNavigationBusy}>
+              {pendingEditorNavigation.kind === "close" ? "放弃并关闭" : "放弃并切换"}
+            </button>
+            <button className="primary-button" type="button" onClick={saveBeforeEditorNavigation} disabled={editorNavigationBusy}>
+              <Save size={16} />
+              {editorNavigationBusy
+                ? "保存中"
+                : pendingEditorNavigation.kind === "close" ? "保存并关闭" : "保存并切换"}
+            </button>
+          </div>
+        </Modal>
       )}
     </div>
   );
@@ -1255,10 +1829,10 @@ function CreateBatchPanel({
   );
 }
 
-function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+function Modal({ title, onClose, children, className = "" }: { title: string; onClose: () => void; children: ReactNode; className?: string }) {
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="modal-panel" role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
+      <section className={`modal-panel ${className}`.trim()} role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-head">
           <h2>{title}</h2>
           <button className="ghost-button" onClick={onClose} type="button">关闭</button>
@@ -1384,6 +1958,7 @@ function EditablePaymentGrid({
   setSelectedRows,
   readOnly,
   onEdit,
+  onOpenPayments,
   onOpenAttachments,
   attachmentCounts,
   onSave,
@@ -1399,6 +1974,7 @@ function EditablePaymentGrid({
   selectedRows: number[];
   setSelectedRows: (ids: number[]) => void;
   onEdit: (request: PaymentRequest) => void;
+  onOpenPayments: (request: PaymentRequest) => void;
   onOpenAttachments: (request: PaymentRequest) => void;
   attachmentCounts: Record<number, number>;
   readOnly: boolean;
@@ -1456,8 +2032,11 @@ function EditablePaymentGrid({
   function updateCell(rowIndex: number, column: GridColumn, value: string) {
     if (readOnly || !canEditField(column.key)) return;
     const nextRows = [...rows];
-    const row = { ...nextRows[rowIndex] };
-    row[column.key] = normalizeCellValue(column, value) as never;
+    const row = withPaymentAmountChange(
+      { ...nextRows[rowIndex] },
+      column.key,
+      normalizeCellValue(column, value),
+    );
     nextRows[rowIndex] = row;
     const nextDirty = new Set(dirtyCells);
     nextDirty.add(`${row.__localId}:${column.key}`);
@@ -1534,11 +2113,11 @@ function EditablePaymentGrid({
       while (targetRowIndex >= nextRows.length) {
         nextRows.push({ ...emptyRequest, __localId: newLocalId(), __isNew: true, source_sheet: defaultSourceSheet });
       }
-        const targetRow = { ...nextRows[targetRowIndex] };
+        let targetRow = { ...nextRows[targetRowIndex] };
         sourceRow.forEach((cellValue, colOffset) => {
           const column = gridColumns[activeCell.col + colOffset];
           if (!column || !canEditField(column.key)) return;
-          targetRow[column.key] = normalizeCellValue(column, cellValue) as never;
+          targetRow = withPaymentAmountChange(targetRow, column.key, normalizeCellValue(column, cellValue));
           nextDirty.add(`${targetRow.__localId}:${column.key}`);
       });
       nextRows[targetRowIndex] = targetRow;
@@ -1565,7 +2144,9 @@ function EditablePaymentGrid({
           <thead>
             <tr>
               <th className="checkbox-col" style={{ width: 52, minWidth: 52 }}></th>
+              <th className="payment-detail-col" style={{ width: 120, minWidth: 120 }}>付款明细</th>
               <th className="attachment-col" style={{ width: 112, minWidth: 112 }}>附件</th>
+              <th className="external-status-col">钉钉状态</th>
               {gridColumns.map((column) => (
                 <th key={column.key} style={{ width: column.width, minWidth: column.width }}>{column.label}</th>
               ))}
@@ -1576,6 +2157,22 @@ function EditablePaymentGrid({
               <tr key={row.__localId} className={deletedLocalIds.has(row.__localId) ? "row-deleted" : ""} onDoubleClick={() => row.id && onEdit(row as PaymentRequest)}>
                 <td className="checkbox-col">
                   {row.id && <input type="checkbox" checked={selectedRows.includes(row.id)} onChange={() => toggle(row.id!)} />}
+                </td>
+                <td className="payment-detail-col">
+                  {row.id ? (
+                    <button
+                      className={row.payment_count ? "payment-detail-chip has-payments" : "payment-detail-chip"}
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onOpenPayments(row as PaymentRequest);
+                      }}
+                    >
+                      {row.payment_count ? `付款 ${row.payment_count} 笔` : "未付款"}
+                    </button>
+                  ) : (
+                    <span className="muted-chip">先保存</span>
+                  )}
                 </td>
                 <td className="attachment-col">
                   {row.id ? (
@@ -1594,6 +2191,11 @@ function EditablePaymentGrid({
                     <span className="muted-chip">先保存</span>
                   )}
                 </td>
+	                <td className="external-status-col">
+	                  {row.raw_extra?.external_source
+	                    ? <ExternalApprovalBadge source={row.raw_extra.external_source} snapshot />
+	                    : <span className="external-status-empty">—</span>}
+	                </td>
 	                {gridColumns.map((column, colIndex) => {
 	                  const dirty = dirtyCells.has(`${row.__localId}:${column.key}`);
 	                  const cellValue = cellDisplayValue(row, column);
@@ -1602,7 +2204,7 @@ function EditablePaymentGrid({
 	                  const cellReadOnly = readOnly || row.__deleted || !canEditField(column.key);
 	                  const fieldClass = [
 	                    column.key === "dingding_id" ? "mono" : "",
-	                    column.key === "amount" ? "amount-input" : "",
+	                    moneyFields.has(column.key) ? "amount-input" : "",
 	                    shouldWrap ? "wrap-field" : "",
 	                    !canEditField(column.key) ? "readonly-field" : "",
 	                  ].filter(Boolean).join(" ");
@@ -1640,6 +2242,8 @@ function EditablePaymentGrid({
                           data-cell={`${rowIndex}-${colIndex}`}
                           className={fieldClass}
                           type={column.type === "number" ? "number" : column.type === "date" ? "date" : "text"}
+                          min={column.key === "paid_amount" ? 0 : undefined}
+                          step={column.type === "number" ? "0.01" : undefined}
                           value={cellValue}
                           title={cellValue}
 	                          readOnly={cellReadOnly}
@@ -1663,7 +2267,10 @@ function EditablePaymentGrid({
 
 function RequestEditor({
   batch,
+  user,
   request,
+  initialTab,
+  confirmationOpen,
   reason,
   setReason,
   onCancel,
@@ -1671,27 +2278,36 @@ function RequestEditor({
   onDraftChange,
   onDirtyChange,
   onAttachmentsChanged,
+  onPaymentsChanged,
   canEditAttachments,
   canEditField,
 }: {
   batch: Batch;
+  user: User;
   request: Partial<PaymentRequest>;
+  initialTab: RequestEditorTab;
+  confirmationOpen: boolean;
   reason: string;
   setReason: (value: string) => void;
   onCancel: () => void;
-  onSave: (request: Partial<PaymentRequest>) => Promise<void> | void;
+  onSave: (request: Partial<PaymentRequest>) => Promise<PaymentRequest | undefined>;
   onDraftChange?: (request: Partial<PaymentRequest> | null) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onAttachmentsChanged?: () => Promise<void> | void;
+  onPaymentsChanged?: (request: PaymentRequest) => Promise<void> | void;
   canEditAttachments: boolean;
   canEditField: (field: keyof PaymentRequest) => boolean;
 }) {
   const [form, setForm] = useState<Partial<PaymentRequest>>(request);
+  const [activeTab, setActiveTab] = useState<RequestEditorTab>(initialTab);
   const [attachments, setAttachments] = useState<AttachmentLink[]>([]);
   const [attachmentForm, setAttachmentForm] = useState({ label: "", url_path: "" });
   const [imageLabel, setImageLabel] = useState("");
   const [imageFile, setImageFile] = useState<File | null>(null);
+  const [attachmentMode, setAttachmentMode] = useState<"image" | "link" | null>(null);
   const [uploadingImage, setUploadingImage] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const [previewImages, setPreviewImages] = useState<{ images: AttachmentLink[]; index: number } | null>(null);
   const fields: Array<keyof PaymentRequest> = [
     "dingding_id",
@@ -1699,6 +2315,8 @@ function RequestEditor({
     "expense_type",
     "summary",
     "amount",
+    "paid_amount",
+    "pending_amount",
     "project",
     "payee_account",
     "payee_name",
@@ -1714,6 +2332,12 @@ function RequestEditor({
     "source_sheet",
   ];
   const isDirty = requestFormDirty(request, form, fields);
+  const canManagePayments = ["finance", "general_manager", "admin"].includes(user.role)
+    && (batch.status === "draft" || isPrivilegedRole(user.role));
+  const canCorrectArchived = batch.status === "archived" && isPrivilegedRole(user.role);
+  const payableAmount = Number(form.amount || 0);
+  const paidAmount = Number(form.paid_amount || 0);
+  const pendingAmount = Number(form.pending_amount ?? Math.max(0, payableAmount - paidAmount));
 
   useEffect(() => {
     setForm(request);
@@ -1721,8 +2345,14 @@ function RequestEditor({
     setAttachmentForm({ label: "", url_path: "" });
     setImageLabel("");
     setImageFile(null);
+    setAttachmentMode(null);
+    setSaveError("");
     setPreviewImages(null);
   }, [request]);
+
+  useEffect(() => {
+    setActiveTab(!request.id && (initialTab === "payments" || initialTab === "attachments") ? "request" : initialTab);
+  }, [initialTab, request.id]);
 
   useEffect(() => {
     onDraftChange?.(form);
@@ -1748,11 +2378,20 @@ function RequestEditor({
     api.attachments(batch.id, request.id).then((res) => setAttachments(res.attachments)).catch(() => setAttachments([]));
   }, [batch.id, request.id]);
 
+  useEffect(() => {
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape" && !previewImages && !confirmationOpen) onCancel();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [confirmationOpen, onCancel, previewImages]);
+
   async function addAttachment() {
     if (!form.id || !canEditAttachments || !attachmentForm.url_path.trim()) return;
     const res = await api.createAttachment(batch.id, form.id, attachmentForm);
     setAttachments([...attachments, res.attachment]);
     setAttachmentForm({ label: "", url_path: "" });
+    setAttachmentMode(null);
     await onAttachmentsChanged?.();
   }
 
@@ -1764,6 +2403,7 @@ function RequestEditor({
       setAttachments([...attachments, res.attachment]);
       setImageLabel("");
       setImageFile(null);
+      setAttachmentMode(null);
       await onAttachmentsChanged?.();
     } finally {
       setUploadingImage(false);
@@ -1784,106 +2424,257 @@ function RequestEditor({
     setPreviewImages({ images, index });
   }
 
+  function renderField(field: keyof PaymentRequest, options: { span?: boolean } = {}) {
+    const fieldEditable = canEditField(field);
+    const className = options.span ? "editor-field span-2" : "editor-field";
+    const label = fieldLabels[field] || field;
+    const value = form[field];
+    if (!fieldEditable) {
+      return (
+        <div className={`${className} editor-readonly-field`} key={field}>
+          <span>{label}</span>
+          {field === "finance_review" ? (
+            <StatusPill value={String(value || "未付款")} />
+          ) : (
+            <strong>{moneyFields.has(field) ? formatMoney(Number(value || 0)) : String(value || "未填写")}</strong>
+          )}
+        </div>
+      );
+    }
+    return (
+      <label className={className} key={field}>
+        {label}
+        {selectOptionsForField(field, String(value || "")) ? (
+          <select value={String(value || "")} onChange={(event) => setForm(withPaymentAmountChange(form, field, event.target.value))}>
+            {selectOptionsForField(field, String(value || ""))!.map((option) => (
+              <option key={option} value={option}>{option || "未选择"}</option>
+            ))}
+          </select>
+        ) : field === "summary" || field === "remark" || field === "general_manager_opinion" ? (
+          <textarea className={field === "summary" ? "summary-textarea" : ""} value={String(value || "")} onChange={(event) => setForm({ ...form, [field]: event.target.value })} />
+        ) : (
+          <input
+            type={moneyFields.has(field) ? "number" : field.includes("date") ? "date" : "text"}
+            step={moneyFields.has(field) ? "0.01" : undefined}
+            value={String(value ?? "")}
+            onChange={(event) => {
+              const nextValue = moneyFields.has(field)
+                ? (event.target.value === "" ? undefined : Number(event.target.value))
+                : event.target.value;
+              setForm(withPaymentAmountChange(form, field, nextValue));
+            }}
+          />
+        )}
+      </label>
+    );
+  }
+
+  async function saveRequestForm() {
+    if (!isDirty || saving) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      const savedRequest = await onSave(form);
+      if (savedRequest) setForm(savedRequest);
+    } catch (err) {
+      setSaveError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function discardRequestChanges() {
+    setForm(request);
+    setSaveError("");
+  }
+
+  const editorTabs: Array<{ key: RequestEditorTab; label: string; disabled?: boolean }> = [
+    { key: "request", label: "请款信息" },
+    { key: "approval", label: "审批信息" },
+    { key: "payments", label: `付款明细 ${Number(form.payment_count || 0)}`, disabled: !form.id },
+    { key: "attachments", label: `附件 ${attachments.length}`, disabled: !form.id },
+  ];
+
   return (
     <div className="drawer">
-      <div className="drawer-head">
-        <h2>{form.id ? "编辑请款" : "新增请款"}</h2>
-        <button className="ghost-button" onClick={onCancel}>关闭</button>
-      </div>
-      <div className="form-grid">
-        {fields.map((field) => {
-          const fieldEditable = canEditField(field);
-          return (
-          <label key={field} className={field === "summary" || field === "remark" || field === "general_manager_opinion" ? "span-2" : ""}>
-            {fieldLabels[field] || field}
-            {selectOptionsForField(field, String(form[field] || "")) ? (
-              <select
-                value={String(form[field] || "")}
-                disabled={!fieldEditable}
-                onChange={(event) => setForm({ ...form, [field]: event.target.value })}
-              >
-                {selectOptionsForField(field, String(form[field] || ""))!.map((option) => (
-                  <option key={option} value={option}>{option || "未选择"}</option>
-                ))}
-              </select>
-            ) : field === "summary" || field === "remark" || field === "general_manager_opinion" ? (
-              <textarea className={field === "summary" ? "summary-textarea" : ""} value={String(form[field] || "")} readOnly={!fieldEditable} onChange={(event) => setForm({ ...form, [field]: event.target.value })} />
-            ) : (
-              <input
-                type={field === "amount" ? "number" : field.includes("date") ? "date" : "text"}
-                value={String(form[field] || "")}
-                readOnly={!fieldEditable}
-                onChange={(event) => setForm({ ...form, [field]: field === "amount" ? Number(event.target.value) : event.target.value })}
-              />
-            )}
-          </label>
-          );
-        })}
-        {batch.status === "archived" && (
-          <label className="span-2">
-            更正原因
-            <textarea value={reason} onChange={(event) => setReason(event.target.value)} />
-          </label>
+      <header className="request-editor-header">
+        <div className="request-editor-title-row">
+          <div className="request-editor-title">
+            <div>
+              <h2>{form.id ? "编辑请款" : "新增请款"}</h2>
+              <StatusPill value={String(form.finance_review || "未付款")} />
+              {form.raw_extra?.external_source && (
+                <ExternalApprovalBadge source={form.raw_extra.external_source} snapshot />
+              )}
+            </div>
+            <span title={String(form.summary || "")}>{form.summary || "尚未填写摘要"}</span>
+            <small>{form.dingding_id ? `钉钉单号：${form.dingding_id}` : "钉钉单号未填写"}</small>
+          </div>
+          <button className="ghost-button" onClick={onCancel} type="button">关闭</button>
+        </div>
+        <div className="request-editor-overview">
+          <div><span>应付金额</span><strong>{formatMoney(payableAmount)}</strong></div>
+          <div><span>累计已付</span><strong>{formatMoney(paidAmount)}</strong></div>
+          <div><span>待付款</span><strong>{formatMoney(pendingAmount)}</strong></div>
+        </div>
+        <nav className="request-editor-tabs" aria-label="请款编辑区域">
+          {editorTabs.map((tab) => (
+            <button
+              key={tab.key}
+              className={activeTab === tab.key ? "active" : ""}
+              type="button"
+              disabled={tab.disabled}
+              title={tab.disabled ? "请先保存请款" : undefined}
+              aria-current={activeTab === tab.key ? "page" : undefined}
+              onClick={() => setActiveTab(tab.key)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+      </header>
+      <div className="request-editor-content">
+        {activeTab === "request" && (
+          <div className="editor-tab-panel">
+            {!form.id && <div className="editor-info-banner">首次保存后即可录入付款和上传附件。</div>}
+            <section className="editor-form-section">
+              <div className="editor-section-head">
+                <div><h3>基本信息</h3><p>请款来源、归属和用途说明</p></div>
+              </div>
+              <div className="editor-form-grid">
+                {renderField("dingding_id")}
+                {renderField("payment_account")}
+                {renderField("expense_type")}
+                {renderField("project")}
+                {renderField("source_sheet")}
+                {renderField("summary", { span: true })}
+              </div>
+            </section>
+            <section className="editor-form-section">
+              <div className="editor-section-head">
+                <div><h3>金额与收款</h3><p>应付金额、收款资料和开票信息</p></div>
+              </div>
+              <div className="editor-form-grid">
+                {renderField("amount")}
+                {renderField("needed_payment_date")}
+                {renderField("payee_account")}
+                {renderField("payee_name")}
+                {renderField("bank_name")}
+                {renderField("invoice_status")}
+                {renderField("remark", { span: true })}
+              </div>
+            </section>
+          </div>
         )}
-        {form.id && (
-          <div className="span-2 attachment-box">
-            <div className="section-title">附件</div>
-            <div className="attachment-form image-upload-form">
-              <input placeholder="图片名称，可选" value={imageLabel} onChange={(event) => setImageLabel(event.target.value)} disabled={!canEditAttachments} />
-              <input
-                type="file"
-                accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
-                disabled={!canEditAttachments}
-                onChange={(event) => setImageFile(event.target.files?.[0] || null)}
-              />
-              <button className="primary-button" onClick={uploadImageAttachment} type="button" disabled={!canEditAttachments || !imageFile || uploadingImage}>
-                <ImageIcon size={16} />
-                {uploadingImage ? "上传中" : "上传图片"}
-              </button>
-            </div>
-            <div className="attachment-form">
-              <input placeholder="名称" value={attachmentForm.label} onChange={(event) => setAttachmentForm({ ...attachmentForm, label: event.target.value })} disabled={!canEditAttachments} />
-              <input placeholder="流程链接或本地路径" value={attachmentForm.url_path} onChange={(event) => setAttachmentForm({ ...attachmentForm, url_path: event.target.value })} disabled={!canEditAttachments} />
-              <button className="ghost-button" onClick={addAttachment} type="button" disabled={!canEditAttachments}>添加</button>
-            </div>
-            <div className="attachment-list">
-              {attachments.map((item) => (
-                <div key={item.id} className="attachment-item">
-                  {isImageAttachment(item) && (
-                    <button className="attachment-thumb-button" type="button" onClick={() => previewAttachment(item)}>
-                      <img className="attachment-thumb" src={attachmentImageUrl(item)} alt={attachmentTitle(item, "图片附件")} />
+        {activeTab === "approval" && (
+          <div className="editor-tab-panel">
+            <section className="editor-form-section">
+              <div className="editor-section-head">
+                <div><h3>审批信息</h3><p>付款状态由付款明细自动计算，审批字段继续按角色维护</p></div>
+              </div>
+              <div className="editor-form-grid">
+                {renderField("finance_review")}
+                {renderField("actual_payment_date")}
+                {renderField("general_manager_approval")}
+                {renderField("general_manager_approval_date")}
+                {renderField("general_manager_opinion", { span: true })}
+              </div>
+            </section>
+          </div>
+        )}
+        {activeTab === "payments" && form.id && (
+          <div className="editor-tab-panel">
+            <PaymentDetailsPanel
+              batch={batch}
+              request={form as PaymentRequest}
+              reason={reason}
+              canManage={canManagePayments}
+              onRequestChanged={async (updatedRequest) => {
+                setForm((current) => ({ ...current, ...updatedRequest }));
+                await onPaymentsChanged?.(updatedRequest);
+              }}
+            />
+          </div>
+        )}
+        {activeTab === "attachments" && form.id && (
+          <div className="editor-tab-panel">
+            <section className="editor-form-section attachment-manager">
+              <div className="editor-section-head attachment-section-head">
+                <div><h3>请款附件</h3><p>合同、发票等资料；付款凭证请在对应付款记录中维护</p></div>
+                {canEditAttachments && (
+                  <div className="attachment-mode-actions">
+                    <button className={attachmentMode === "image" ? "ghost-button active-toggle" : "ghost-button"} type="button" onClick={() => setAttachmentMode(attachmentMode === "image" ? null : "image")}>
+                      <ImageIcon size={16} />上传图片
                     </button>
-                  )}
-                  {!isImageAttachment(item) && (
-                    <div className="attachment-thumb-placeholder">
-                      <Paperclip size={20} />
-                    </div>
-                  )}
-                  <div className="attachment-meta">
-                    <strong>{attachmentTitle(item, "附件")}</strong>
-                    <span>{isImageAttachment(item) ? item.original_filename || item.url_path : item.url_path}</span>
+                    <button className={attachmentMode === "link" ? "ghost-button active-toggle" : "ghost-button"} type="button" onClick={() => setAttachmentMode(attachmentMode === "link" ? null : "link")}>
+                      <Paperclip size={16} />添加链接
+                    </button>
                   </div>
-                  <div className="attachment-actions">
-                    {isImageAttachment(item) && (
-                      <button className="ghost-button" type="button" onClick={() => previewAttachment(item)}>
-                        <ImageIcon size={14} />
-                        预览
-                      </button>
-                    )}
-                    {canEditAttachments && <button type="button" onClick={() => removeAttachment(item.id)}>删除</button>}
-                  </div>
+                )}
+              </div>
+              {attachmentMode === "image" && (
+                <div className="attachment-create-panel">
+                  <input placeholder="图片名称，可选" value={imageLabel} onChange={(event) => setImageLabel(event.target.value)} />
+                  <input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" onChange={(event) => setImageFile(event.target.files?.[0] || null)} />
+                  <button className="primary-button" onClick={uploadImageAttachment} type="button" disabled={!imageFile || uploadingImage}>
+                    <Upload size={16} />{uploadingImage ? "上传中" : "上传图片"}
+                  </button>
                 </div>
-              ))}
-            </div>
+              )}
+              {attachmentMode === "link" && (
+                <div className="attachment-create-panel">
+                  <input placeholder="名称" value={attachmentForm.label} onChange={(event) => setAttachmentForm({ ...attachmentForm, label: event.target.value })} />
+                  <input placeholder="流程链接或本地路径" value={attachmentForm.url_path} onChange={(event) => setAttachmentForm({ ...attachmentForm, url_path: event.target.value })} />
+                  <button className="primary-button" onClick={addAttachment} type="button" disabled={!attachmentForm.url_path.trim()}>添加链接</button>
+                </div>
+              )}
+              <div className="attachment-list">
+                {attachments.length === 0 && <div className="empty-attachment-state">尚无请款附件</div>}
+                {attachments.map((item) => (
+                  <div key={item.id} className="attachment-item">
+                    {isImageAttachment(item) ? (
+                      <button className="attachment-thumb-button" type="button" onClick={() => previewAttachment(item)}>
+                        <img className="attachment-thumb" src={attachmentImageUrl(item)} alt={attachmentTitle(item, "图片附件")} />
+                      </button>
+                    ) : (
+                      <div className="attachment-thumb-placeholder"><Paperclip size={20} /></div>
+                    )}
+                    <div className="attachment-meta">
+                      <strong>{attachmentTitle(item, "附件")}</strong>
+                      <span>{isImageAttachment(item) ? item.original_filename || item.url_path : item.url_path}</span>
+                    </div>
+                    <div className="attachment-actions">
+                      {isImageAttachment(item) && <button className="ghost-button" type="button" onClick={() => previewAttachment(item)}><ImageIcon size={14} />预览</button>}
+                      {canEditAttachments && <button type="button" onClick={() => removeAttachment(item.id)}>删除</button>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
           </div>
         )}
       </div>
-      <div className="drawer-actions">
-        <button className="primary-button" onClick={() => onSave(form)}>
-          <Save size={16} />
-          保存
-        </button>
-      </div>
+      <footer className="request-editor-footer">
+        {canCorrectArchived && (
+          <label className="archived-reason-field">
+            归档更正原因
+            <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="修改请款、付款或附件前必须填写" />
+          </label>
+        )}
+        {saveError && <p className="error-text editor-save-error">{saveError}</p>}
+        <div className="request-editor-actions">
+          <div className={isDirty ? "editor-save-state dirty" : "editor-save-state"}>
+            <strong>{isDirty ? "有未保存修改" : "已保存"}</strong>
+            <span>{activeTab === "payments" || activeTab === "attachments" ? "付款和附件保存后立即生效" : "保存请款后继续留在当前抽屉"}</span>
+          </div>
+          <div>
+            <button className="ghost-button" type="button" onClick={discardRequestChanges} disabled={!isDirty || saving}>放弃修改</button>
+            <button className="primary-button" type="button" onClick={saveRequestForm} disabled={!isDirty || saving}>
+              <Save size={16} />{saving ? "保存中" : "保存请款"}
+            </button>
+          </div>
+        </div>
+      </footer>
       {previewImages && (
         <ImagePreviewDialog
           images={previewImages.images}
@@ -1893,6 +2684,311 @@ function RequestEditor({
         />
       )}
     </div>
+  );
+}
+
+const emptyPaymentForm: PaymentRecordPayload = {
+  amount: 0,
+  payment_date: "",
+  payer: "",
+  payment_account: "",
+  bank_reference: "",
+  remark: "",
+};
+
+function PaymentDetailsPanel({
+  batch,
+  request,
+  reason,
+  canManage,
+  onRequestChanged,
+}: {
+  batch: Batch;
+  request: PaymentRequest;
+  reason: string;
+  canManage: boolean;
+  onRequestChanged: (request: PaymentRequest) => Promise<void> | void;
+}) {
+  const [payments, setPayments] = useState<PaymentRecord[]>([]);
+  const [summary, setSummary] = useState<PaymentSummary>({
+    amount: request.amount,
+    paid_amount: Number(request.paid_amount || 0),
+    pending_amount: request.pending_amount,
+    finance_review: request.finance_review || "未付款",
+    payment_count: Number(request.payment_count || 0),
+    actual_payment_date: request.actual_payment_date,
+    payer: request.payer,
+  });
+  const [paymentForm, setPaymentForm] = useState<PaymentRecordPayload>({ ...emptyPaymentForm, payment_account: request.payment_account || "" });
+  const [editingPaymentId, setEditingPaymentId] = useState<number | null>(null);
+  const [paymentFormOpen, setPaymentFormOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const paymentFormRef = useRef<HTMLDivElement | null>(null);
+
+  async function loadPayments() {
+    const result = await api.payments(batch.id, request.id);
+    setPayments(result.payments);
+    setSummary(result.summary);
+  }
+
+  useEffect(() => {
+    setPaymentForm({ ...emptyPaymentForm, payment_account: request.payment_account || "" });
+    setEditingPaymentId(null);
+    setPaymentFormOpen(false);
+    loadPayments().catch((err) => setError((err as Error).message));
+  }, [batch.id, request.id]);
+
+  useEffect(() => {
+    if (!paymentFormOpen) return;
+    const timer = window.setTimeout(() => paymentFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 40);
+    return () => window.clearTimeout(timer);
+  }, [editingPaymentId, paymentFormOpen]);
+
+  const editingPayment = payments.find((payment) => payment.id === editingPaymentId);
+  const maxPayable = roundMoney(Number(summary.pending_amount || 0) + Number(editingPayment?.amount || 0));
+  const paymentProgress = Number(summary.amount || 0) > 0
+    ? Math.min(100, Math.max(0, (Number(summary.paid_amount || 0) / Number(summary.amount || 0)) * 100))
+    : 0;
+
+  function resetPaymentForm(closeForm = true) {
+    setEditingPaymentId(null);
+    setPaymentForm({ ...emptyPaymentForm, payment_account: request.payment_account || "" });
+    if (closeForm) setPaymentFormOpen(false);
+  }
+
+  function beginCreatePayment() {
+    resetPaymentForm(false);
+    setError("");
+    setPaymentFormOpen(true);
+  }
+
+  function beginEdit(payment: PaymentRecord) {
+    setEditingPaymentId(payment.id);
+    setPaymentForm({
+      amount: payment.amount,
+      payment_date: payment.payment_date || "",
+      payer: payment.payer || "",
+      payment_account: payment.payment_account || "",
+      bank_reference: payment.bank_reference || "",
+      remark: payment.remark || "",
+    });
+    setError("");
+    setPaymentFormOpen(true);
+  }
+
+  async function savePayment() {
+    if (!canManage || !paymentForm.payment_date || Number(paymentForm.amount) <= 0) {
+      setError("请填写有效的本次金额和付款日期");
+      return;
+    }
+    if (Number(paymentForm.amount) > maxPayable + 0.000001) {
+      setError(`本次金额不能超过 ${formatMoney(maxPayable)}`);
+      return;
+    }
+    if (batch.status === "archived" && !reason.trim()) {
+      setError("归档后更正付款必须填写原因");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const payload = { ...paymentForm, reason };
+      const result = editingPaymentId
+        ? await api.updatePayment(batch.id, request.id, editingPaymentId, payload)
+        : await api.createPayment(batch.id, request.id, payload);
+      resetPaymentForm();
+      await loadPayments();
+      await onRequestChanged(result.request);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removePayment(payment: PaymentRecord) {
+    if (!canManage || payment.inherited || !window.confirm(`确定删除这笔 ${formatMoney(payment.amount)} 的付款记录吗？`)) return;
+    if (batch.status === "archived" && !reason.trim()) {
+      setError("归档后删除付款必须填写原因");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.deletePayment(batch.id, request.id, payment.id, reason);
+      if (editingPaymentId === payment.id) resetPaymentForm();
+      await loadPayments();
+      await onRequestChanged(result.request);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function uploadVouchers(payment: PaymentRecord, files: FileList | null) {
+    if (!files?.length || !canManage || payment.inherited) return;
+    setBusy(true);
+    setError("");
+    try {
+      for (const file of Array.from(files)) {
+        await api.uploadPaymentVoucher(batch.id, request.id, payment.id, file, file.name, reason);
+      }
+      await loadPayments();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeVoucher(payment: PaymentRecord, voucher: PaymentVoucher) {
+    if (!canManage || payment.inherited) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.deletePaymentVoucher(batch.id, request.id, payment.id, voucher.id, reason);
+      await loadPayments();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="payment-details-box">
+      <div className="section-title-row">
+        <div>
+          <div className="section-title">付款明细</div>
+          <small>汇总金额和付款状态由明细自动计算</small>
+        </div>
+        <div className="payment-section-actions">
+          <StatusPill value={summary.finance_review} />
+          {canManage && maxPayable > 0 && !paymentFormOpen && (
+            <button className="primary-button" type="button" onClick={beginCreatePayment}>
+              <Plus size={16} />新增付款
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="payment-summary-grid">
+        <div><span>应付金额</span><strong>{formatMoney(summary.amount || 0)}</strong></div>
+        <div><span>累计已付</span><strong>{formatMoney(summary.paid_amount || 0)}</strong></div>
+        <div><span>待付款</span><strong>{formatMoney(summary.pending_amount || 0)}</strong></div>
+      </div>
+      <div className="payment-detail-progress">
+        <div><span>付款进度</span><strong>{paymentProgress.toFixed(1)}%</strong></div>
+        <div className="payment-progress-track" role="progressbar" aria-label="请款付款进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Number(paymentProgress.toFixed(1))}>
+          <div className="payment-progress-fill" style={{ width: `${paymentProgress}%` }} />
+        </div>
+      </div>
+      {error && <p className="error-text payment-error">{error}</p>}
+      <div className="payment-record-list">
+        {payments.length === 0 && (
+          <div className="empty-payment-state">
+            <span>尚无付款记录</span>
+            {canManage && maxPayable > 0 && !paymentFormOpen && (
+              <button className="primary-button" type="button" onClick={beginCreatePayment}>录入第一笔付款</button>
+            )}
+          </div>
+        )}
+        {payments.map((payment, index) => (
+          <article className="payment-record-card" key={payment.id}>
+            <div className="payment-record-head">
+              <div>
+                <strong>第 {index + 1} 笔 · {formatMoney(payment.amount)}</strong>
+                <span>{payment.payment_date || "日期未知"} · {payment.payer || "付款人未填写"}</span>
+              </div>
+              <span className={payment.inherited ? "source-badge inherited" : "source-badge"}>{paymentSourceLabel(payment.source_type)}</span>
+            </div>
+            <div className="payment-record-meta">
+              <span>账户：{payment.payment_account || "未填写"}</span>
+              <span>流水号：{payment.bank_reference || "未填写"}</span>
+              <span>录入人：{payment.creator_name || "系统"}</span>
+              {payment.remark && <span className="payment-remark">备注：{payment.remark}</span>}
+            </div>
+            <div className="payment-voucher-list">
+              {payment.vouchers.map((voucher) => (
+                <div className="payment-voucher" key={voucher.id}>
+                  <a href={voucher.file_url} target="_blank" rel="noreferrer" title={voucher.original_filename || voucher.label || "付款凭证"}>
+                    {voucher.voucher_type === "image" ? (
+                      <img src={voucher.file_url} alt={voucher.original_filename || "付款凭证"} />
+                    ) : (
+                      <span className="pdf-voucher">PDF</span>
+                    )}
+                  </a>
+                  <span>{voucher.original_filename || voucher.label || "付款凭证"}</span>
+                  {canManage && !payment.inherited && (
+                    <button type="button" onClick={() => removeVoucher(payment, voucher)} disabled={busy}>删除</button>
+                  )}
+                </div>
+              ))}
+              {canManage && !payment.inherited && (
+                <label className="voucher-upload-button">
+                  <Upload size={15} />
+                  上传凭证
+                  <input
+                    type="file"
+                    multiple
+                    accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,application/pdf"
+                    onChange={(event) => {
+                      uploadVouchers(payment, event.target.files);
+                      event.currentTarget.value = "";
+                    }}
+                    disabled={busy}
+                  />
+                </label>
+              )}
+            </div>
+            {canManage && !payment.inherited && (
+              <div className="payment-record-actions">
+                <button className="ghost-button" type="button" onClick={() => beginEdit(payment)} disabled={busy}>编辑</button>
+                <button className="danger-button" type="button" onClick={() => removePayment(payment)} disabled={busy}>删除</button>
+              </div>
+            )}
+          </article>
+        ))}
+      </div>
+      {canManage && paymentFormOpen && (
+        <div className="payment-entry-form" ref={paymentFormRef}>
+          <div className="payment-form-title span-2">
+            <div><strong>{editingPaymentId ? "编辑付款" : "新增付款"}</strong><span>金额和付款日期为必填项</span></div>
+            <button className="ghost-button" type="button" onClick={() => resetPaymentForm()} disabled={busy}>取消</button>
+          </div>
+          <label>
+            本次金额（最大 {formatMoney(maxPayable)}）
+            <input type="number" min="0.01" max={maxPayable} step="0.01" value={paymentForm.amount || ""} onChange={(event) => setPaymentForm({ ...paymentForm, amount: Number(event.target.value) })} />
+          </label>
+          <label>
+            付款日期
+            <input type="date" value={paymentForm.payment_date} onChange={(event) => setPaymentForm({ ...paymentForm, payment_date: event.target.value })} />
+          </label>
+          <label>
+            付款人
+            <input value={paymentForm.payer || ""} onChange={(event) => setPaymentForm({ ...paymentForm, payer: event.target.value })} />
+          </label>
+          <label>
+            付款账户
+            <input value={paymentForm.payment_account || ""} onChange={(event) => setPaymentForm({ ...paymentForm, payment_account: event.target.value })} />
+          </label>
+          <label>
+            银行流水号
+            <input value={paymentForm.bank_reference || ""} onChange={(event) => setPaymentForm({ ...paymentForm, bank_reference: event.target.value })} />
+          </label>
+          <label className="span-2">
+            备注
+            <textarea value={paymentForm.remark || ""} onChange={(event) => setPaymentForm({ ...paymentForm, remark: event.target.value })} />
+          </label>
+          <div className="payment-entry-actions span-2">
+            <button className="primary-button" type="button" onClick={savePayment} disabled={busy || maxPayable <= 0}>
+              <Save size={16} />{busy ? "保存中" : editingPaymentId ? "保存付款修改" : "新增付款"}
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1962,12 +3058,14 @@ function ImagePreviewDialog({
 }
 
 function ArchiveView({
+  user,
   batches,
   selectedBatch,
   setSelectedBatchId,
   reloadBatches,
   setMessage,
 }: {
+  user: User;
   batches: Batch[];
   selectedBatch: Batch | null;
   setSelectedBatchId: (id: number) => void;
@@ -1989,7 +3087,7 @@ function ArchiveView({
 
   async function deleteDraft(batch: Batch) {
     if (batch.status !== "draft") return;
-    if (!window.confirm(`确定删除草稿批次“${batch.name}”吗？删除后该批次下的请款明细和图片附件也会删除。`)) return;
+    if (!window.confirm(`确定删除草稿批次“${batch.name}”吗？删除后该批次下的请款、付款明细和附件凭证也会删除。`)) return;
     await api.deleteBatch(batch.id);
     if (selectedBatch?.id === batch.id) setLogs([]);
     await reloadBatches();
@@ -2007,7 +3105,9 @@ function ArchiveView({
                 <th>期间</th>
                 <th>状态</th>
                 <th>记录数</th>
-                <th>金额</th>
+                <th>应付金额</th>
+                <th>已支付金额</th>
+                <th>待付款金额</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -2019,6 +3119,8 @@ function ArchiveView({
                   <td><StatusPill value={batch.status === "archived" ? "已归档" : "草稿"} /></td>
                   <td>{batch.request_count || 0}</td>
                   <td className="amount">{formatMoney(batch.total_amount || 0)}</td>
+                  <td className="amount">{formatMoney(batch.total_paid_amount || 0)}</td>
+                  <td className="amount">{formatMoney(batch.total_pending_amount || 0)}</td>
                   <td className="action-cell">
                     <button className="ghost-button" onClick={(event) => {
                       event.stopPropagation();
@@ -2034,7 +3136,7 @@ function ArchiveView({
                       <History size={15} />
                       日志
                     </button>
-                    {batch.status === "draft" && (
+                    {batch.status === "draft" && isPrivilegedRole(user.role) && (
                       <button className="danger-button" onClick={(event) => {
                         event.stopPropagation();
                         deleteDraft(batch);
@@ -2055,12 +3157,13 @@ function ArchiveView({
           <Archive size={16} />
           归档当前批次
         </button>
-        <div className="section-title">审计日志</div>
+        <div className="section-title">操作日志</div>
         <div className="audit-list">
           {logs.map((log) => (
             <div key={log.id} className="audit-item">
-              <strong>{log.action}</strong>
+              <strong>{auditActionLabel(log.action)}</strong>
               <span>{log.actor_name || "系统"} · {log.created_at}</span>
+              {auditDetail(log) && <p>{auditDetail(log)}</p>}
               {log.reason && <p>{log.reason}</p>}
             </div>
           ))}
@@ -2068,6 +3171,24 @@ function ArchiveView({
       </section>
     </div>
   );
+}
+
+function auditActionLabel(action: string) {
+  const labels: Record<string, string> = {
+    "external_expenses.metadata_sync": "同步钉钉状态",
+  };
+  return labels[action] || action;
+}
+
+function auditDetail(log: AuditLog) {
+  if (log.action !== "external_expenses.metadata_sync" || !log.new_value || typeof log.new_value !== "object") return "";
+  const value = log.new_value as Partial<{
+    matched: number;
+    unmatched: number;
+    conflicts: number;
+    updated_requests: number;
+  }>;
+  return `匹配 ${Number(value.matched || 0)} 个单号，未匹配 ${Number(value.unmatched || 0)} 个，来源冲突 ${Number(value.conflicts || 0)} 个，更新 ${Number(value.updated_requests || 0)} 条请款`;
 }
 
 function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
@@ -2314,6 +3435,7 @@ function dirtyRowIds(dirtyCells: Set<string>) {
 function stripGridRow(row: GridRow): Partial<PaymentRequest> {
   const output: Partial<PaymentRequest> = {};
   gridColumns.forEach((column) => {
+    if (calculatedRequestFields.has(column.key)) return;
     const value = row[column.key];
     if (value !== undefined && value !== null && value !== "") {
       output[column.key] = value as never;
@@ -2326,6 +3448,28 @@ function stripGridRow(row: GridRow): Partial<PaymentRequest> {
   return output;
 }
 
+function withoutDerivedPaymentFields(request: Partial<PaymentRequest>): Partial<PaymentRequest> {
+  const output: Partial<PaymentRequest> = {};
+  Object.entries(request).forEach(([key, value]) => {
+    if (key === "id" || calculatedRequestFields.has(key as keyof PaymentRequest)) return;
+    output[key as keyof PaymentRequest] = value as never;
+  });
+  return output;
+}
+
+function paymentSourceLabel(sourceType: string) {
+  const labels: Record<string, string> = {
+    manual: "本周录入",
+    rollover: "结转继承",
+    legacy_migration: "历史迁移",
+    legacy_normalization: "历史归一",
+    snapshot_legacy: "历史快照",
+    excel_summary: "Excel 汇总导入",
+    excel_detail: "Excel 明细导入",
+  };
+  return labels[sourceType] || sourceType || "系统记录";
+}
+
 function rowHasContent(row: GridRow) {
   return gridColumns.some((column) => {
     const value = row[column.key];
@@ -2336,6 +3480,46 @@ function rowHasContent(row: GridRow) {
 function normalizeCellValue(column: GridColumn, value: string) {
   if (column.type === "number") return value.trim() === "" ? undefined : Number(value);
   return value;
+}
+
+function withPaymentAmountChange<T extends Partial<PaymentRequest>>(
+  request: T,
+  field: keyof PaymentRequest,
+  value: unknown,
+): T {
+  const next = { ...request, [field]: value } as T;
+  if (!moneyFields.has(field) && field !== "finance_review") return next;
+
+  const amount = optionalNumber(next.amount);
+  let paidAmount = optionalNumber(next.paid_amount) ?? 0;
+  if (field === "finance_review" && value === "已付款" && amount !== undefined) {
+    paidAmount = amount;
+    next.paid_amount = paidAmount;
+  } else if (field === "finance_review" && value === "未付款") {
+    paidAmount = 0;
+    next.paid_amount = 0;
+  } else if (field === "finance_review" && value === "部分付款" && amount !== undefined && paidAmount >= amount) {
+    paidAmount = 0;
+    next.paid_amount = 0;
+  }
+
+  next.pending_amount = amount === undefined ? undefined : roundMoney(amount - paidAmount);
+  if ((field === "amount" || field === "paid_amount") && paidAmount > 0 && amount !== undefined) {
+    next.finance_review = paidAmount >= amount ? "已付款" : "部分付款";
+  } else if (field === "paid_amount" && paidAmount === 0) {
+    next.finance_review = "未付款";
+  }
+  return next;
+}
+
+function optionalNumber(value: unknown) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function roundMoney(value: number) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
 function cellDisplayValue(row: GridRow, column: GridColumn) {
@@ -2361,12 +3545,80 @@ function parseClipboardTable(text: string) {
   return lines.map((line) => line.split("\t"));
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function externalImportDefaultDates(batch: Batch) {
+  const today = new Date();
+  const fallbackEnd = localIsoDate(today);
+  const fallbackStartDate = new Date(today);
+  fallbackStartDate.setDate(fallbackStartDate.getDate() - 6);
+  const batchStart = batch.start_date || "";
+  const batchEnd = batch.end_date || "";
+  if (!batchStart || !batchEnd) return { dateFrom: localIsoDate(fallbackStartDate), dateTo: fallbackEnd };
+  const start = new Date(`${batchStart}T00:00:00`);
+  const end = new Date(`${batchEnd}T00:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
+    return { dateFrom: localIsoDate(fallbackStartDate), dateTo: fallbackEnd };
+  }
+  if ((end.getTime() - start.getTime()) / 86400000 > 30) {
+    const clampedStart = new Date(end);
+    clampedStart.setDate(clampedStart.getDate() - 30);
+    return { dateFrom: localIsoDate(clampedStart), dateTo: batchEnd };
+  }
+  return { dateFrom: batchStart, dateTo: batchEnd };
+}
+
+function localIsoDate(value: Date) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function ExternalApprovalBadge({
+  status,
+  result,
+  source,
+  snapshot = false,
+}: {
+  status?: string;
+  result?: string;
+  source?: ExternalSourceSnapshot;
+  snapshot?: boolean;
+}) {
+  const lookupStatus = source?.lookup_status;
+  const normalized = String(source?.approval_status || status || "").toUpperCase();
+  const normalizedResult = String(source?.approval_result || result || "").toLowerCase();
+  const state = lookupStatus === "conflict"
+    ? "conflict"
+    : lookupStatus === "unmatched"
+      ? "unmatched"
+      : normalizedResult === "refuse"
+        ? "refused"
+        : normalized === "TERMINATED"
+          ? "terminated"
+          : normalized === "COMPLETED"
+            ? "completed"
+            : normalized === "RUNNING"
+              ? "running"
+              : "unknown";
+  const labels: Record<string, string> = {
+    completed: "已完成",
+    running: "审批中",
+    terminated: "已终止",
+    refused: "已拒绝",
+    unmatched: "未匹配",
+    conflict: "来源冲突",
+    unknown: source || status ? "未知" : "—",
+  };
+  const syncedAt = source?.metadata_synced_at;
+  const title = syncedAt
+    ? `最近同步：${formatDateTime(syncedAt)}`
+    : snapshot
+      ? "钉钉审批状态为导入时快照，可点击“同步钉钉状态”刷新"
+      : undefined;
   return (
-    <div className="metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
+    <span className={`external-approval-badge ${state}`} title={title}>
+      {snapshot && !syncedAt && state !== "unmatched" && state !== "conflict" ? "导入时·" : ""}{labels[state]}
+    </span>
   );
 }
 
@@ -2404,6 +3656,11 @@ function attachmentTitle(attachment: AttachmentLink, fallback: string) {
 
 function formatMoney(value: number) {
   return new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 2 }).format(value || 0);
+}
+
+function formatDateTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
 
 function formatDateRange(start?: string, end?: string) {

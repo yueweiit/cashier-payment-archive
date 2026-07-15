@@ -87,3 +87,48 @@ def save_embedded_image_attachments(
         else:
             skipped += 1
     return saved, skipped
+
+
+def save_embedded_payment_vouchers(
+    conn: Connection,
+    batch_id: int,
+    payment_id: int,
+    row: Dict[str, Any],
+    user_id: Optional[int],
+) -> Tuple[int, int]:
+    saved = 0
+    skipped = 0
+    for image in row.get("_embedded_images", []) or []:
+        data = image.get("data")
+        if not isinstance(data, bytes) or not data or len(data) > MAX_IMAGE_BYTES:
+            skipped += 1
+            continue
+        extension = normalize_image_extension(image)
+        directory = DATA_DIR / "uploads" / "payment-vouchers" / str(batch_id) / str(payment_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        original_filename = clean_filename(str(image.get("filename") or f"excel_payment_voucher{extension}"))
+        if Path(original_filename).suffix.lower() not in IMAGE_EXTENSIONS:
+            original_filename = f"{original_filename}{extension}"
+        target = directory / f"{uuid.uuid4().hex}{extension}"
+        target.write_bytes(data)
+        relative_path = target.relative_to(DATA_DIR)
+        conn.execute(
+            """
+            INSERT INTO payment_vouchers (
+                payment_id, label, file_path, original_filename, mime_type,
+                file_size, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payment_id,
+                image.get("label"),
+                str(relative_path),
+                original_filename,
+                image.get("mime_type") or "image/png",
+                len(data),
+                user_id,
+                now_iso(),
+            ),
+        )
+        saved += 1
+    return saved, skipped

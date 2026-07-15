@@ -8,10 +8,20 @@ from typing import Any, Dict, Optional
 from .attachment_io import save_embedded_image_attachments
 from .db import DATA_DIR, connect, init_db, now_iso, row_to_dict, write_audit
 from .excel_io import parse_batch_dates, parse_weekly_excel
-from .main import insert_request, write_import_job
+from .main import import_excel_payment_details, insert_request, write_import_job
+from .snapshots import create_batch_snapshot
 
 
-BUSINESS_TABLES = ["audit_logs", "import_jobs", "attachment_links", "payment_requests", "request_batches"]
+BUSINESS_TABLES = [
+    "audit_logs",
+    "import_jobs",
+    "payment_vouchers",
+    "payment_records",
+    "attachment_links",
+    "batch_snapshots",
+    "payment_requests",
+    "request_batches",
+]
 
 
 def reset_business_tables(conn) -> None:
@@ -25,6 +35,8 @@ def reset_uploads_dir() -> None:
     uploads_dir = DATA_DIR / "uploads"
     shutil.rmtree(uploads_dir, ignore_errors=True)
     uploads_dir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(DATA_DIR / "snapshots", ignore_errors=True)
+    (DATA_DIR / "snapshots").mkdir(parents=True, exist_ok=True)
 
 
 def save_source_copy(source_path: Path, source_bytes: bytes) -> Path:
@@ -52,6 +64,8 @@ def rebuild_weekly_data(source: Path | str) -> Dict[str, Any]:
         raise FileNotFoundError(f"Excel 文件不存在: {source_path}")
     source_bytes = source_path.read_bytes()
     rows, meta = parse_weekly_excel(source_path)
+    payment_details = meta.pop("payment_details", [])
+    payment_detail_sheet_present = bool(meta.get("payment_detail_sheet_present"))
     start_date, end_date, default_name = parse_batch_dates(source_path.name)
     init_db()
     reset_uploads_dir()
@@ -69,18 +83,36 @@ def rebuild_weekly_data(source: Path | str) -> Dict[str, Any]:
         )
         batch_id = int(cursor.lastrowid)
         request_ids: list[int] = []
+        imported_summaries: Dict[int, float] = {}
         saved_images = 0
         skipped_images = 0
         for row in rows:
-            request_id = insert_request(conn, batch_id, row, actor_id, "admin")
+            request_id = insert_request(
+                conn,
+                batch_id,
+                row,
+                actor_id,
+                "admin",
+                create_summary_payment=not payment_detail_sheet_present,
+            )
             request_ids.append(request_id)
+            imported_summaries[request_id] = round(float(row.get("paid_amount") or 0), 2)
             row_saved_images, row_skipped_images = save_embedded_image_attachments(conn, batch_id, request_id, row, actor_id)
             saved_images += row_saved_images
             skipped_images += row_skipped_images
         meta.setdefault("images", {})["saved"] = saved_images
         meta["images"]["save_skipped"] = skipped_images
+        if payment_detail_sheet_present:
+            meta["payment_details"] = import_excel_payment_details(
+                conn,
+                batch_id,
+                payment_details,
+                int(actor_id) if actor_id is not None else 1,
+                imported_summaries,
+            )
         meta["source_copy"] = str(saved_copy.relative_to(DATA_DIR))
         job_id = write_import_job(conn, "weekly-excel-rebuild", source_path.name, "imported", batch_id, rows, [], meta, actor_id)
+        create_batch_snapshot(conn, batch_id, "baseline", actor_id, replace_existing=True)
         batch = row_to_dict(conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone())
         write_audit(
             conn,

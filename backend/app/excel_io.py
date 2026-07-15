@@ -24,6 +24,8 @@ CORE_FIELDS = {
     "summary": "摘要",
     "style_name": "款式",
     "amount": "应付金额",
+    "paid_amount": "已支付金额",
+    "pending_amount": "待付款金额",
     "project": "项目归属",
     "bu": "BU归属",
     "payee_account": "收款账户",
@@ -72,6 +74,8 @@ KNOWN_HEADER_ALIASES = {
     "summary": ["摘要", "支付节点明细", "事由", "付款事由", "申请内容", "明细"],
     "style_name": ["款式", "产品款式"],
     "amount": ["应付金额", "金额", "付款金额", "申请金额", "报销金额"],
+    "paid_amount": ["已支付金额", "已付款金额", "已付金额", "累计支付金额"],
+    "pending_amount": ["待付款金额", "未付款金额", "剩余应付金额", "剩余付款金额"],
     "project": ["项目归属", "项目", "所属项目"],
     "bu": ["BU归属", "BU"],
     "payee_account": ["收款信息", "收款账户", "账号", "银行账号", "收款账号"],
@@ -93,14 +97,29 @@ KNOWN_HEADER_ALIASES = {
 
 
 SHEET_HEADERS = {
-    "main": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "项目归属", "收款信息", "开票情况", "需求付款日期", "财务审批", "财务付款时间", "总经理审批", "总经理审批时间", "总经理意见", "备注"],
-    "mold": ["序号", "钉钉申请单号", "付款账户", "款式", "支付节点明细", "应付金额", "账户名", "需求付款日期", "财务审批", "财务付款时间", "备注", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
-    "yuewei": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "项目归属", "账号", "账户名", "开户行", "开票情况", "需求付款日期", "负责人确认", "财务审批", "财务付款时间", "备注", "逾期情况", "总经理审批", "总经理审批时间", "总经理意见", "备注", "付款人"],
-    "logistics": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "BU归属", "项目归属", "账号", "账户名", "开户行", "开票情况", "需求付款日期", "负责人确认", "财务审批", "财务付款时间", "备注", "总经理意见"],
-    "hr": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "账户名", "项目", "开票情况", "需求付款日期", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
-    "reimburse": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "开票情况", "收款账户", "项目归属", "备注", "财务审批", "财务付款时间", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
-    "growth": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "收款账户", "备注", "财务审批", "财务付款时间", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
+    "main": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "项目归属", "收款信息", "开票情况", "需求付款日期", "财务审批", "财务付款时间", "总经理审批", "总经理审批时间", "总经理意见", "备注"],
+    "mold": ["序号", "钉钉申请单号", "付款账户", "款式", "支付节点明细", "应付金额", "已支付金额", "待付款金额", "账户名", "需求付款日期", "财务审批", "财务付款时间", "备注", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
+    "yuewei": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "项目归属", "账号", "账户名", "开户行", "开票情况", "需求付款日期", "负责人确认", "财务审批", "财务付款时间", "备注", "逾期情况", "总经理审批", "总经理审批时间", "总经理意见", "备注", "付款人"],
+    "logistics": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "BU归属", "项目归属", "账号", "账户名", "开户行", "开票情况", "需求付款日期", "负责人确认", "财务审批", "财务付款时间", "备注", "总经理意见"],
+    "hr": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "账户名", "项目", "开票情况", "需求付款日期", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
+    "reimburse": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "开票情况", "收款账户", "项目归属", "备注", "财务审批", "财务付款时间", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
+    "growth": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "收款账户", "备注", "财务审批", "财务付款时间", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
 }
+
+PAYMENT_DETAIL_SHEET = "付款明细"
+PAYMENT_DETAIL_HEADERS = [
+    "请款标识",
+    "钉钉单号",
+    "来源 Sheet",
+    "付款日期",
+    "本次金额",
+    "付款人",
+    "付款账户",
+    "流水号",
+    "备注",
+    "来源标记",
+    "凭证信息",
+]
 
 
 def parse_batch_dates(filename: str) -> Tuple[Optional[str], Optional[str], str]:
@@ -341,6 +360,18 @@ def normalize_request_business_fields(row: Dict[str, Any]) -> Dict[str, Any]:
         final_finance_review = "已付款" if has_payment_date else "未付款"
     if final_finance_review not in FINANCE_REVIEW_OPTIONS:
         final_finance_review = "未付款"
+
+    amount = amount_number(row.get("amount"))
+    paid_amount = amount_number(row.get("paid_amount"))
+    if paid_amount is None:
+        paid_amount = amount if final_finance_review == "已付款" and amount is not None else 0.0
+    pending_amount = round(amount - paid_amount, 2) if amount is not None else None
+    if amount is not None and paid_amount > 0:
+        final_finance_review = "已付款" if pending_amount <= 0 else "部分付款"
+
+    row["amount"] = amount
+    row["paid_amount"] = paid_amount
+    row["pending_amount"] = pending_amount
     row["finance_review"] = final_finance_review
     row["payment_status"] = None
     return row
@@ -445,6 +476,8 @@ def row_from_sheet(
         "summary": stringify(first_value(values_by_header, ["摘要", "支付节点明细"])),
         "style_name": stringify(first_value(values_by_header, ["款式"])),
         "amount": amount_number(first_value(values_by_header, ["应付金额"])),
+        "paid_amount": amount_number(first_value(values_by_header, ["已支付金额", "已付款金额", "已付金额"])),
+        "pending_amount": amount_number(first_value(values_by_header, ["待付款金额", "未付款金额", "剩余应付金额"])),
         "project": stringify(first_value(values_by_header, ["项目归属", "项目"])),
         "bu": stringify(first_value(values_by_header, ["BU归属"])),
         "payee_account": stringify(first_value(values_by_header, ["收款信息", "收款账户", "账号"])),
@@ -567,8 +600,16 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
     rows: List[Dict[str, Any]] = []
     sheet_summaries = []
     image_summary = {"found": 0, "attached": 0, "skipped": 0}
+    payment_details: List[Dict[str, Any]] = []
+    payment_detail_sheet_present = False
     for ws_values in wb_values.worksheets:
         ws_formulas = wb_formulas[ws_values.title]
+        if normalize_header(ws_values.title) == normalize_header(PAYMENT_DETAIL_SHEET):
+            payment_detail_sheet_present = True
+            parsed_details, detail_summary = parse_payment_detail_sheet(ws_values)
+            payment_details.extend(parsed_details)
+            sheet_summaries.append(detail_summary)
+            continue
         header_row = detect_header_row(ws_values)
         if not header_row:
             image_counts = collect_embedded_images(ws_values, {})
@@ -589,7 +630,64 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
         for key in image_summary:
             image_summary[key] += image_counts[key]
         sheet_summaries.append({"sheet": ws_values.title, "imported": imported, "header_row": header_row, "images": image_counts})
-    return rows, {"sheets": sheet_summaries, "images": image_summary}
+    return rows, {
+        "sheets": sheet_summaries,
+        "images": image_summary,
+        "payment_detail_sheet_present": payment_detail_sheet_present,
+        "payment_details": payment_details,
+    }
+
+
+def parse_payment_detail_sheet(ws) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    header_row = None
+    header_lookup: Dict[str, int] = {}
+    for row_idx in range(1, min(ws.max_row, 8) + 1):
+        candidate = {
+            normalize_header(ws.cell(row_idx, col).value): col
+            for col in range(1, ws.max_column + 1)
+            if normalize_header(ws.cell(row_idx, col).value)
+        }
+        if "本次金额" in candidate and ("请款标识" in candidate or "钉钉单号" in candidate):
+            header_row = row_idx
+            header_lookup = candidate
+            break
+    if header_row is None:
+        return [], {"sheet": ws.title, "imported": 0, "skipped": "invalid_payment_header", "images": {"found": 0, "attached": 0, "skipped": len(getattr(ws, "_images", []) or [])}}
+
+    def cell_value(row_idx: int, header: str) -> Any:
+        col = header_lookup.get(normalize_header(header))
+        return ws.cell(row_idx, col).value if col else None
+
+    details: List[Dict[str, Any]] = []
+    rows_by_source_row: Dict[int, Dict[str, Any]] = {}
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        raw_request_id = cell_value(row_idx, "请款标识")
+        raw_amount = cell_value(row_idx, "本次金额")
+        raw_date = cell_value(row_idx, "付款日期")
+        if all(value in (None, "") for value in (raw_request_id, raw_amount, raw_date, cell_value(row_idx, "钉钉单号"))):
+            continue
+        try:
+            request_id = int(raw_request_id) if raw_request_id not in (None, "") else None
+        except (TypeError, ValueError):
+            request_id = None
+        detail = {
+            "request_id": request_id,
+            "dingding_id": stringify(cell_value(row_idx, "钉钉单号")),
+            "source_sheet": stringify(cell_value(row_idx, "来源 Sheet")),
+            "payment_date": date_string(raw_date),
+            "amount": amount_number(raw_amount),
+            "payer": stringify(cell_value(row_idx, "付款人")),
+            "payment_account": stringify(cell_value(row_idx, "付款账户")),
+            "bank_reference": stringify(cell_value(row_idx, "流水号")),
+            "remark": stringify(cell_value(row_idx, "备注")),
+            "source_type": stringify(cell_value(row_idx, "来源标记")) or "excel_detail",
+            "voucher_info": stringify(cell_value(row_idx, "凭证信息")),
+            "source_row": row_idx,
+        }
+        details.append(detail)
+        rows_by_source_row[row_idx] = detail
+    image_counts = collect_embedded_images(ws, rows_by_source_row)
+    return details, {"sheet": ws.title, "imported": len(details), "header_row": header_row, "images": image_counts}
 
 
 def detect_table_headers(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
@@ -659,7 +757,7 @@ def parse_dingtalk_file(path: Path, mapping: Dict[str, str]) -> Tuple[List[Dict[
         }
         for field, header in mapping.items():
             value = source.get(header)
-            if field == "amount":
+            if field in {"amount", "paid_amount", "pending_amount"}:
                 row[field] = amount_number(value)
             elif field in {"needed_payment_date", "actual_payment_date", "general_manager_approval_date"}:
                 row[field] = date_string(value)
@@ -687,7 +785,12 @@ def sheet_kind(sheet_name: str) -> str:
     return "main"
 
 
-def export_workbook(batch: Dict[str, Any], records: List[Dict[str, Any]], attachments: Dict[int, List[Dict[str, Any]]]) -> bytes:
+def export_workbook(
+    batch: Dict[str, Any],
+    records: List[Dict[str, Any]],
+    attachments: Dict[int, List[Dict[str, Any]]],
+    payments: Optional[List[Dict[str, Any]]] = None,
+) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
     groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -699,19 +802,115 @@ def export_workbook(batch: Dict[str, Any], records: List[Dict[str, Any]], attach
     if not groups:
         groups[sheet_name_for_summary(batch.get("end_date"))] = []
 
+    used_sheet_titles: set[str] = set()
     for sheet_name, sheet_records in groups.items():
         kind = sheet_kind(sheet_name)
-        ws = wb.create_sheet(safe_sheet_title(sheet_name))
+        ws = wb.create_sheet(safe_sheet_title(sheet_name, used_sheet_titles))
         write_sheet(ws, kind, sheet_name, sheet_records, attachments)
+
+    payment_ws = wb.create_sheet(safe_sheet_title(PAYMENT_DETAIL_SHEET, used_sheet_titles))
+    write_payment_detail_sheet(payment_ws, payments or [])
 
     output = io.BytesIO()
     wb.save(output)
     return output.getvalue()
 
 
-def safe_sheet_title(title: str) -> str:
-    title = re.sub(r"[\[\]:*?/\\]", "_", title)[:31]
-    return title or "Sheet"
+def write_payment_detail_sheet(ws, payments: List[Dict[str, Any]]) -> None:
+    image_count = max(
+        (
+            len(
+                [
+                    voucher
+                    for voucher in payment.get("vouchers", [])
+                    if str(voucher.get("mime_type") or "").startswith("image/") and voucher.get("absolute_path")
+                ]
+            )
+            for payment in payments
+        ),
+        default=0,
+    )
+    image_headers = [f"凭证图片{index + 1}" for index in range(image_count)]
+    headers = PAYMENT_DETAIL_HEADERS + image_headers
+    header_fill = PatternFill("solid", fgColor="315B7D")
+    thin = Side(style="thin", color="D6DEE2")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(1, col, header)
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+    for row_idx, payment in enumerate(payments, start=2):
+        vouchers = payment.get("vouchers", []) or []
+        voucher_text = "\n".join(
+            f"{voucher.get('original_filename') or voucher.get('label') or '凭证'}: {voucher.get('file_url') or ''}".rstrip(": ")
+            for voucher in vouchers
+        )
+        values = [
+            payment.get("request_id"),
+            payment.get("dingding_id"),
+            payment.get("request_source_sheet") or payment.get("source_sheet"),
+            payment.get("payment_date"),
+            payment.get("amount"),
+            payment.get("payer"),
+            payment.get("payment_account"),
+            payment.get("bank_reference"),
+            payment.get("remark"),
+            payment.get("source_type"),
+            voucher_text or None,
+        ]
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(row_idx, col, value)
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.cell(row_idx, 5).number_format = '#,##0.00'
+        if payment.get("payment_date"):
+            ws.cell(row_idx, 4).number_format = "yyyy-mm-dd"
+        image_vouchers = [
+            voucher
+            for voucher in vouchers
+            if str(voucher.get("mime_type") or "").startswith("image/") and voucher.get("absolute_path")
+        ]
+        if image_vouchers:
+            ws.row_dimensions[row_idx].height = 78
+        for index, voucher in enumerate(image_vouchers[:image_count]):
+            col = len(PAYMENT_DETAIL_HEADERS) + index + 1
+            cell = ws.cell(row_idx, col)
+            cell.border = border
+            path = Path(str(voucher["absolute_path"]))
+            if not path.exists():
+                continue
+            try:
+                image = ExcelImage(str(path))
+            except Exception:
+                continue
+            scale = min(120 / max(image.width, 1), 92 / max(image.height, 1), 1)
+            image.width = int(image.width * scale)
+            image.height = int(image.height * scale)
+            ws.add_image(image, f"{get_column_letter(col)}{row_idx}")
+    widths = [14, 22, 22, 14, 14, 16, 18, 22, 30, 18, 42]
+    for col, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    for col in range(len(PAYMENT_DETAIL_HEADERS) + 1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 18
+    ws.freeze_panes = "A2"
+    ws.sheet_view.showGridLines = False
+
+
+def safe_sheet_title(title: str, used_titles: Optional[set[str]] = None) -> str:
+    base = re.sub(r"[\[\]:*?/\\]", "_", title).strip()[:31] or "Sheet"
+    if used_titles is None:
+        return base
+    candidate = base
+    index = 2
+    normalized_used = {value.casefold() for value in used_titles}
+    while candidate.casefold() in normalized_used:
+        suffix = f"~{index}"
+        candidate = f"{base[:31 - len(suffix)]}{suffix}"
+        index += 1
+    used_titles.add(candidate)
+    return candidate
 
 
 def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], attachments: Dict[int, List[Dict[str, Any]]]) -> None:
@@ -734,9 +933,11 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
         ws.cell(1, 1, value=f"{sheet_name}应付款合计")
         ws.cell(1, 1).fill = title_fill
         ws.cell(1, 1).font = Font(bold=True)
-        amount_col = headers.index("应付金额") + 1
         last_row = max(3, len(records) + 2)
-        ws.cell(1, amount_col, value=f"=SUM({get_column_letter(amount_col)}3:{get_column_letter(amount_col)}{last_row})")
+        for header in ("应付金额", "已支付金额", "待付款金额"):
+            amount_col = headers.index(header) + 1
+            ws.cell(1, amount_col, value=f"=SUM({get_column_letter(amount_col)}3:{get_column_letter(amount_col)}{last_row})")
+            ws.cell(1, amount_col).number_format = '#,##0.00'
         header_row = 2
         data_start = 3
     else:
@@ -757,7 +958,7 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
             cell = ws.cell(row_idx, col, value=value)
             cell.border = border
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-            if headers[col - 1] in {"应付金额"}:
+            if headers[col - 1] in {"应付金额", "已支付金额", "待付款金额"}:
                 cell.number_format = '#,##0.00'
             if ("日期" in headers[col - 1] or "时间" in headers[col - 1]) and value:
                 cell.number_format = "yyyy-mm-dd"
@@ -774,9 +975,11 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
 
     if kind != "mold" and records:
         total_row = data_start + len(records)
-        amount_col = headers.index("应付金额") + 1
-        ws.cell(total_row, amount_col, value=f"=SUM({get_column_letter(amount_col)}{data_start}:{get_column_letter(amount_col)}{total_row - 1})")
-        ws.cell(total_row, amount_col - 1, value="合计")
+        amount_columns = [headers.index(header) + 1 for header in ("应付金额", "已支付金额", "待付款金额")]
+        for amount_col in amount_columns:
+            ws.cell(total_row, amount_col, value=f"=SUM({get_column_letter(amount_col)}{data_start}:{get_column_letter(amount_col)}{total_row - 1})")
+            ws.cell(total_row, amount_col).number_format = '#,##0.00'
+        ws.cell(total_row, amount_columns[0] - 1, value="合计")
         for col in range(1, len(export_headers) + 1):
             ws.cell(total_row, col).fill = light_fill
             ws.cell(total_row, col).border = border
@@ -787,7 +990,7 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
             width = 36
         elif header in {"钉钉申请单号", "收款账户", "收款信息", "账户名", "开户行"}:
             width = 22
-        elif header in {"应付金额"}:
+        elif header in {"应付金额", "已支付金额", "待付款金额"}:
             width = 14
         elif header.startswith("图片附件"):
             width = 18
@@ -814,6 +1017,10 @@ def values_for_headers(headers: List[str], record: Dict[str, Any]) -> List[Any]:
             values.append(record.get("style_name"))
         elif header == "应付金额":
             values.append(record.get("amount"))
+        elif header == "已支付金额":
+            values.append(record.get("paid_amount"))
+        elif header == "待付款金额":
+            values.append(record.get("pending_amount"))
         elif header in {"项目归属", "项目"}:
             values.append(record.get("project"))
         elif header == "BU归属":
