@@ -1,9 +1,13 @@
 import base64
 import io
+import json
 import os
 import shutil
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -16,6 +20,9 @@ from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 
 from backend.app.db import connect, now_iso
+from backend.app.external_expenses import ExternalExpenseError, _preview_conditions, applicant_name_from_title, map_external_expense
+from backend.app.excel_io import export_workbook
+from backend.app import main as main_module
 from backend.app.main import app
 from backend.app.normalize_payment_data import normalize_payment_data
 from backend.app.rebuild_weekly_data import rebuild_weekly_data
@@ -27,6 +34,61 @@ SAMPLE = Path("/Users/smk/Downloads/20260626~20260707请款明细.xlsx")
 def login(client: TestClient, username: str = "admin", password: str = "admin123") -> None:
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200
+
+
+def external_expense_test_row(
+    approval_no: str,
+    source_id: str,
+    *,
+    source_type: str = "operation",
+    status: str = "RUNNING",
+    amount: float = 123.45,
+    beneficiary: str = "测试收款信息",
+    warnings=None,
+) -> dict:
+    source_label = "运营支出" if source_type == "operation" else "采购支出"
+    request_data = {
+        "dingding_id": approval_no,
+        "expense_type": "测试支出",
+        "summary": "中间表测试",
+        "amount": amount,
+        "currency": "CNY",
+        "payee_account": beneficiary or None,
+        "source_sheet": "测试部门",
+        "raw_extra": {
+            "external_source": {
+                "system": "dingtalk_expense_database",
+                "table": f"approval_expense_{source_type}",
+                "record_id": source_id,
+                "approval_no": approval_no,
+                "approval_status": status,
+                "applicant_id": "test-user-id",
+                "applicant": "测试申请人",
+                "applicant_department": "测试部门",
+                "application_date": "2026-07-15",
+            }
+        },
+    }
+    return {
+        "source_type": source_type,
+        "source_label": source_label,
+        "source_id": source_id,
+        "application_date": "2026-07-15",
+        "approval_no": approval_no,
+        "applicant_id": "test-user-id",
+        "applicant": "测试申请人",
+        "applicant_department": "测试部门",
+        "approval_status": status,
+        "approval_result": "agree",
+        "summary": "中间表测试",
+        "amount": amount,
+        "beneficiary": beneficiary,
+        "needed_payment_date": "2026-07-20",
+        "warnings": warnings or [],
+        "errors": [],
+        "source_conflict": False,
+        "request_data": request_data,
+    }
 
 
 def test_rollover_copies_only_unfinished_rows():
@@ -59,10 +121,11 @@ def test_rollover_copies_only_unfinished_rows():
         assert "付款情况" not in exported_headers
         assert sum(len(getattr(worksheet, "_images", [])) for worksheet in exported_workbook.worksheets) == 9
         source_requests = client.get(f"/api/batches/{source_batch_id}/requests").json()["requests"]
-        partial_source_id = source_requests[0]["id"]
-        partial_update = client.patch(
-            f"/api/batches/{source_batch_id}/requests/{partial_source_id}",
-            json={"finance_review": "部分付款", "actual_payment_date": "2026-07-10"},
+        partial_source = next(row for row in source_requests if row["finance_review"] == "未付款" and float(row.get("amount") or 0) > 1)
+        partial_source_id = partial_source["id"]
+        partial_update = client.post(
+            f"/api/batches/{source_batch_id}/requests/{partial_source_id}/payments",
+            json={"amount": round(float(partial_source["amount"]) / 2, 2), "payment_date": "2026-07-10"},
         )
         assert partial_update.status_code == 200
         assert partial_update.json()["request"]["finance_review"] == "部分付款"
@@ -155,9 +218,6 @@ def test_bulk_save_create_update_delete_and_rollback():
                         "expense_type": "材料款",
                         "summary": "测试请款",
                         "amount": 123.45,
-                        "payment_status": "待付款",
-                        "finance_review": "待批付",
-                        "actual_payment_date": "2026-07-09",
                         "general_manager_approval": "存在争议",
                         "general_manager_approval_date": "2026-07-10",
                     }
@@ -168,14 +228,19 @@ def test_bulk_save_create_update_delete_and_rollback():
         )
         assert created.status_code == 200
         request_id = created.json()["created"][0]
-        updated = client.patch(
+        blocked_summary_update = client.patch(
             f"/api/batches/{batch_id}/requests/bulk",
             json={"creates": [], "updates": [{"id": request_id, "finance_review": "已付款"}], "deletes": []},
         )
-        assert updated.status_code == 200
+        assert blocked_summary_update.status_code == 400
+        paid = client.post(
+            f"/api/batches/{batch_id}/requests/{request_id}/payments",
+            json={"amount": 123.45, "payment_date": "2026-07-09"},
+        )
+        assert paid.status_code == 200
         row = client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]
         assert row["finance_review"] == "已付款"
-        assert row["payment_status"] is None
+        assert row["payment_status"] == "已付款"
         assert row["actual_payment_date"] == "2026-07-09"
         assert row["general_manager_approval"] == "存在争议"
         assert row["general_manager_approval_date"] == "2026-07-10"
@@ -208,6 +273,101 @@ def test_bulk_save_create_update_delete_and_rollback():
         )
         assert deleted.status_code == 200
         assert client.get(f"/api/batches/{batch_id}/requests").json()["totals"]["count"] == 0
+
+
+def test_partial_payment_amounts_are_calculated_and_summarized():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "partial-payment-test", "start_date": "2026-07-01", "end_date": "2026-07-07"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+        created = client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"summary": "分三次付款", "amount": 100},
+        )
+        assert created.status_code == 200
+        row = created.json()["request"]
+        assert row["paid_amount"] == 0
+        assert row["pending_amount"] == 100
+        assert row["finance_review"] == "未付款"
+
+        direct_update = client.patch(
+            f"/api/batches/{batch_id}/requests/{row['id']}",
+            json={"paid_amount": 30},
+        )
+        assert direct_update.status_code == 400
+
+        for index, amount in enumerate((30, 20, 50), start=1):
+            payment = client.post(
+                f"/api/batches/{batch_id}/requests/{row['id']}/payments",
+                json={"amount": amount, "payment_date": f"2026-07-{index + 9:02d}", "payer": f"付款人{index}"},
+            )
+            assert payment.status_code == 200
+            updated_row = payment.json()["request"]
+            expected_paid = sum((30, 20, 50)[:index])
+            assert updated_row["paid_amount"] == expected_paid
+            assert updated_row["pending_amount"] == 100 - expected_paid
+            assert updated_row["finance_review"] == ("已付款" if index == 3 else "部分付款")
+
+        detail = client.get(f"/api/batches/{batch_id}/requests/{row['id']}/payments").json()
+        assert detail["summary"]["payment_count"] == 3
+        assert len(detail["payments"]) == 3
+
+        overpaid = client.post(
+            f"/api/batches/{batch_id}/requests/{row['id']}/payments",
+            json={"amount": 0.01, "payment_date": "2026-07-13"},
+        )
+        assert overpaid.status_code == 400
+
+        totals = client.get(f"/api/batches/{batch_id}/requests").json()["totals"]
+        assert totals == {"count": 1, "amount": 100.0, "paid_amount": 100.0, "pending_amount": 0.0}
+        batch_totals = next(item for item in client.get("/api/batches").json()["batches"] if item["id"] == batch_id)
+        assert batch_totals["total_amount"] == 100
+        assert batch_totals["total_paid_amount"] == 100
+        assert batch_totals["total_pending_amount"] == 0
+
+        increased = client.patch(
+            f"/api/batches/{batch_id}/requests/{row['id']}",
+            json={"amount": 120},
+        )
+        assert increased.status_code == 200
+        assert increased.json()["request"]["paid_amount"] == 100
+        assert increased.json()["request"]["pending_amount"] == 20
+        assert increased.json()["request"]["finance_review"] == "部分付款"
+
+
+def test_concurrent_payments_cannot_exceed_request_amount():
+    with TestClient(app) as setup_client:
+        login(setup_client)
+        batch = setup_client.post(
+            "/api/batches",
+            json={"name": "concurrent-payment-test", "start_date": "2026-07-01", "end_date": "2026-07-07"},
+        ).json()["batch"]
+        request = setup_client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"summary": "并发付款", "amount": 100},
+        ).json()["request"]
+
+    def submit_payment() -> int:
+        with TestClient(app) as client:
+            login(client)
+            response = client.post(
+                f"/api/batches/{batch['id']}/requests/{request['id']}/payments",
+                json={"amount": 80, "payment_date": "2026-07-10"},
+            )
+            return response.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = sorted(executor.map(lambda _: submit_payment(), range(2)))
+    assert statuses == [200, 400]
+    with TestClient(app) as client:
+        login(client)
+        detail = client.get(f"/api/batches/{batch['id']}/requests/{request['id']}/payments").json()
+        assert detail["summary"]["paid_amount"] == 80
+        assert detail["summary"]["pending_amount"] == 20
+        assert detail["summary"]["payment_count"] == 1
 
 
 def test_admin_can_restore_archived_batch_to_draft():
@@ -263,7 +423,7 @@ def test_role_permissions_user_crud_and_audit_logs():
         batch_id = batch["id"]
         created = admin_client.post(
             f"/api/batches/{batch_id}/requests",
-            json={"summary": "权限测试", "amount": 10, "finance_review": "未付款", "general_manager_approval": "同意付款"},
+            json={"summary": "权限测试", "amount": 10, "general_manager_approval": "同意付款"},
         )
         assert created.status_code == 200
         request_id = created.json()["request"]["id"]
@@ -273,14 +433,14 @@ def test_role_permissions_user_crud_and_audit_logs():
             f"/api/batches/{batch_id}/requests/{request_id}",
             json={"summary": "业务改摘要", "finance_review": "已付款"},
         )
-        assert blocked_business.status_code == 403
+        assert blocked_business.status_code == 400
         allowed_business = business_client.patch(
             f"/api/batches/{batch_id}/requests/{request_id}",
-            json={"summary": "业务改摘要", "finance_review": "未付款", "general_manager_approval": "同意付款"},
+            json={"summary": "业务改摘要"},
         )
         assert allowed_business.status_code == 200
         assert allowed_business.json()["request"]["summary"] == "业务改摘要"
-        business_create = business_client.post(
+        blocked_business_create = business_client.post(
             f"/api/batches/{batch_id}/requests",
             json={
                 "summary": "业务新增",
@@ -290,26 +450,36 @@ def test_role_permissions_user_crud_and_audit_logs():
                 "general_manager_opinion": "不应保存",
             },
         )
+        assert blocked_business_create.status_code == 400
+        business_create = business_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"summary": "业务新增", "amount": 20},
+        )
         assert business_create.status_code == 200
         business_row = business_create.json()["request"]
         assert business_row["finance_review"] == "未付款"
-        assert business_row["payment_status"] is None
+        assert business_row["payment_status"] == "未付款"
         assert business_row["actual_payment_date"] is None
         assert business_row["general_manager_opinion"] is None
 
         login(finance_client, "finance-user", "fin123")
-        finance_update = finance_client.patch(
-            f"/api/batches/{batch_id}/requests/{request_id}",
-            json={"finance_review": "已付款", "actual_payment_date": "2026-07-10"},
+        blocked_payment_api = business_client.post(
+            f"/api/batches/{batch_id}/requests/{request_id}/payments",
+            json={"amount": 1, "payment_date": "2026-07-10"},
         )
-        assert finance_update.status_code == 200
-        assert finance_update.json()["request"]["finance_review"] == "已付款"
-        partial_finance_update = finance_client.patch(
-            f"/api/batches/{batch_id}/requests/{request_id}",
-            json={"finance_review": "部分付款", "actual_payment_date": "2026-07-10"},
+        assert blocked_payment_api.status_code == 403
+        partial_finance_update = finance_client.post(
+            f"/api/batches/{batch_id}/requests/{request_id}/payments",
+            json={"amount": 4, "payment_date": "2026-07-10"},
         )
         assert partial_finance_update.status_code == 200
         assert partial_finance_update.json()["request"]["finance_review"] == "部分付款"
+        finance_update = finance_client.post(
+            f"/api/batches/{batch_id}/requests/{request_id}/payments",
+            json={"amount": 6, "payment_date": "2026-07-11"},
+        )
+        assert finance_update.status_code == 200
+        assert finance_update.json()["request"]["finance_review"] == "已付款"
         blocked_finance = finance_client.patch(
             f"/api/batches/{batch_id}/requests/{request_id}",
             json={"general_manager_opinion": "财务不能改总经理意见"},
@@ -362,6 +532,7 @@ def test_role_permissions_user_crud_and_audit_logs():
         actions = [log["action"] for log in logs]
         assert "request.create" in actions
         assert "request.update" in actions
+        assert "payment.create" in actions
         with connect() as conn:
             user_actions = {
                 row["action"]
@@ -385,7 +556,6 @@ def test_image_attachment_upload_and_export():
                 "summary": "带图片附件",
                 "amount": 100,
                 "source_sheet": "图片测试",
-                "actual_payment_date": "2026-07-09",
                 "general_manager_approval_date": "2026-07-10",
             },
         )
@@ -417,6 +587,284 @@ def test_image_attachment_upload_and_export():
         assert "总经理审批时间" in headers
         assert "总经理意见" in headers
         assert worksheet._images
+
+
+def test_restore_draft_baseline_restores_saved_rows_and_attachments():
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+    )
+    second_png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFElEQVR42mP8z8BQz0AEYBxVSFIBADuVBAXnTKiNAAAAAElFTkSuQmCC"
+    )
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "restore-test", "start_date": "2026-07-01", "end_date": "2026-07-07"}).json()["batch"]
+        batch_id = batch["id"]
+        created = client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"dingding_id": "RESTORE-1", "summary": "基线记录", "amount": 100, "source_sheet": "还原测试"},
+        )
+        assert created.status_code == 200
+        request_id = created.json()["request"]["id"]
+        uploaded = client.post(
+            f"/api/batches/{batch_id}/requests/{request_id}/attachments/image",
+            files={"file": ("baseline.png", io.BytesIO(png_bytes), "image/png")},
+        )
+        assert uploaded.status_code == 200
+        baseline_attachment = uploaded.json()["attachment"]
+        baseline_file_path = TEST_DIR / "data" / baseline_attachment["file_path"]
+        assert baseline_file_path.exists()
+        baseline = client.post(f"/api/batches/{batch_id}/snapshots/baseline")
+        assert baseline.status_code == 200
+        assert baseline.json()["snapshot"]["request_count"] == 1
+        assert baseline.json()["snapshot"]["attachment_count"] == 1
+
+        updated = client.patch(
+            f"/api/batches/{batch_id}/requests/{request_id}",
+            json={"summary": "已经保存的错误修改", "amount": 999},
+        )
+        assert updated.status_code == 200
+        extra = client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"dingding_id": "RESTORE-EXTRA", "summary": "应被还原删除", "amount": 1},
+        )
+        assert extra.status_code == 200
+        extra_id = extra.json()["request"]["id"]
+        second_attachment = client.post(
+            f"/api/batches/{batch_id}/requests/{extra_id}/attachments/image",
+            files={"file": ("extra.png", io.BytesIO(second_png_bytes), "image/png")},
+        )
+        assert second_attachment.status_code == 200
+        extra_file_path = TEST_DIR / "data" / second_attachment.json()["attachment"]["file_path"]
+        assert extra_file_path.exists()
+        deleted_attachment = client.delete(f"/api/batches/{batch_id}/requests/{request_id}/attachments/{baseline_attachment['id']}")
+        assert deleted_attachment.status_code == 200
+        assert not baseline_file_path.exists()
+
+        restored = client.post(f"/api/batches/{batch_id}/restore-baseline")
+        assert restored.status_code == 200
+        payload = restored.json()
+        assert payload["before"]["requests"] == 2
+        assert payload["after"]["requests"] == 1
+        rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        assert len(rows) == 1
+        assert rows[0]["dingding_id"] == "RESTORE-1"
+        assert rows[0]["summary"] == "基线记录"
+        assert rows[0]["amount"] == 100
+        attachments = client.get(f"/api/batches/{batch_id}/attachments").json()["attachments"]
+        assert len(attachments) == 1
+        assert attachments[0]["id"] == baseline_attachment["id"]
+        assert baseline_file_path.exists()
+        assert not extra_file_path.exists()
+        downloaded = client.get(attachments[0]["file_url"])
+        assert downloaded.status_code == 200
+        assert downloaded.content == png_bytes
+        with connect() as conn:
+            pre_restore_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM batch_snapshots WHERE batch_id = ? AND snapshot_type = 'pre_restore'",
+                (batch_id,),
+            ).fetchone()["count"]
+            assert pre_restore_count == 1
+        actions = [log["action"] for log in client.get(f"/api/batches/{batch_id}/audit").json()["logs"]]
+        assert "batch.snapshot.baseline" in actions
+        assert "batch.restore_baseline" in actions
+
+
+def test_payment_vouchers_snapshot_rollover_and_archived_corrections():
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+    )
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "payment-snapshot-test", "start_date": "2026-07-01", "end_date": "2026-07-07"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+        request = client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"dingding_id": "PAY-SNAPSHOT-1", "summary": "付款快照", "amount": 100, "source_sheet": "付款测试"},
+        ).json()["request"]
+        payment = client.post(
+            f"/api/batches/{batch_id}/requests/{request['id']}/payments",
+            json={"amount": 40, "payment_date": "2026-07-10", "payer": "出纳A", "bank_reference": "FLOW-1"},
+        ).json()["payment"]
+        image_voucher = client.post(
+            f"/api/batches/{batch_id}/requests/{request['id']}/payments/{payment['id']}/vouchers",
+            files={"file": ("proof.png", io.BytesIO(png_bytes), "image/png")},
+        )
+        assert image_voucher.status_code == 200
+        assert image_voucher.json()["voucher"]["voucher_type"] == "image"
+        pdf_voucher = client.post(
+            f"/api/batches/{batch_id}/requests/{request['id']}/payments/{payment['id']}/vouchers",
+            files={"file": ("proof.pdf", io.BytesIO(b"%PDF-1.4\n%%EOF"), "application/pdf")},
+        )
+        assert pdf_voucher.status_code == 200
+        assert pdf_voucher.json()["voucher"]["voucher_type"] == "pdf"
+        baseline = client.post(f"/api/batches/{batch_id}/snapshots/baseline")
+        assert baseline.status_code == 200
+        assert baseline.json()["snapshot"]["payment_count"] == 1
+        assert baseline.json()["snapshot"]["payment_voucher_count"] == 2
+
+        changed = client.patch(
+            f"/api/batches/{batch_id}/requests/{request['id']}/payments/{payment['id']}",
+            json={"amount": 60, "payment_date": "2026-07-11"},
+        )
+        assert changed.status_code == 200
+        deleted_voucher = client.delete(
+            f"/api/batches/{batch_id}/requests/{request['id']}/payments/{payment['id']}/vouchers/{image_voucher.json()['voucher']['id']}"
+        )
+        assert deleted_voucher.status_code == 200
+        restored = client.post(f"/api/batches/{batch_id}/restore-baseline")
+        assert restored.status_code == 200
+        restored_detail = client.get(f"/api/batches/{batch_id}/requests/{request['id']}/payments").json()
+        assert restored_detail["summary"]["paid_amount"] == 40
+        assert restored_detail["summary"]["pending_amount"] == 60
+        assert len(restored_detail["payments"]) == 1
+        assert len(restored_detail["payments"][0]["vouchers"]) == 2
+
+        rollover = client.post(
+            f"/api/batches/{batch_id}/rollover",
+            json={"name": "payment-rollover", "start_date": "2026-07-08", "end_date": "2026-07-14", "copy_mode": "all"},
+        )
+        assert rollover.status_code == 200
+        target_batch_id = rollover.json()["batch"]["id"]
+        target_request = client.get(f"/api/batches/{target_batch_id}/requests").json()["requests"][0]
+        inherited = client.get(f"/api/batches/{target_batch_id}/requests/{target_request['id']}/payments").json()["payments"][0]
+        assert inherited["inherited"] is True
+        assert inherited["amount"] == 40
+        assert len(inherited["vouchers"]) == 2
+        blocked_inherited = client.patch(
+            f"/api/batches/{target_batch_id}/requests/{target_request['id']}/payments/{inherited['id']}",
+            json={"amount": 30, "payment_date": "2026-07-12"},
+        )
+        assert blocked_inherited.status_code == 400
+
+        source_changed = client.patch(
+            f"/api/batches/{batch_id}/requests/{request['id']}/payments/{payment['id']}",
+            json={"amount": 50, "payment_date": "2026-07-12"},
+        )
+        assert source_changed.status_code == 200
+        target_after_source_change = client.get(
+            f"/api/batches/{target_batch_id}/requests/{target_request['id']}/payments"
+        ).json()["payments"][0]
+        assert target_after_source_change["amount"] == 40
+
+        assert client.post(f"/api/batches/{batch_id}/archive").status_code == 200
+        missing_reason = client.patch(
+            f"/api/batches/{batch_id}/requests/{request['id']}/payments/{payment['id']}",
+            json={"amount": 45, "payment_date": "2026-07-12"},
+        )
+        assert missing_reason.status_code == 400
+        corrected = client.patch(
+            f"/api/batches/{batch_id}/requests/{request['id']}/payments/{payment['id']}",
+            json={"amount": 45, "payment_date": "2026-07-12", "reason": "银行回单金额更正"},
+        )
+        assert corrected.status_code == 200
+        logs = client.get(f"/api/batches/{batch_id}/audit").json()["logs"]
+        assert any(log["action"] == "payment.correction" and log["reason"] == "银行回单金额更正" for log in logs)
+
+
+def test_excel_payment_detail_import_export_duplicate_and_rollback(tmp_path):
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+    )
+    voucher_path = tmp_path / "excel-proof.png"
+    voucher_path.write_bytes(png_bytes)
+    record = {
+        "id": 999999,
+        "dingding_id": "EXCEL-PAY-1",
+        "summary": "Excel 分次付款",
+        "amount": 100,
+        "paid_amount": 30,
+        "pending_amount": 70,
+        "finance_review": "部分付款",
+        "source_sheet": "Excel付款测试",
+    }
+    detail = {
+        "request_id": 999999,
+        "dingding_id": "EXCEL-PAY-1",
+        "request_source_sheet": "Excel付款测试",
+        "payment_date": "2026-07-10",
+        "amount": 30,
+        "payer": "Excel出纳",
+        "payment_account": "公户",
+        "bank_reference": "EXCEL-FLOW-1",
+        "remark": "首笔",
+        "source_type": "excel_detail",
+        "vouchers": [
+            {
+                "id": 1,
+                "payment_id": 1,
+                "original_filename": "excel-proof.png",
+                "mime_type": "image/png",
+                "file_url": "/api/payment-vouchers/1/file",
+                "absolute_path": str(voucher_path),
+            }
+        ],
+    }
+    workbook_bytes = export_workbook(
+        {"name": "Excel付款导入", "end_date": "2026-07-07"},
+        [record],
+        {},
+        [detail, {**detail, "vouchers": []}],
+    )
+    with TestClient(app) as client:
+        login(client)
+        imported = client.post(
+            "/api/import/weekly-excel",
+            files={
+                "file": (
+                    "excel-payment-detail.xlsx",
+                    io.BytesIO(workbook_bytes),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+        assert imported.status_code == 200
+        payload = imported.json()
+        batch_id = payload["batch_id"]
+        assert payload["meta"]["payment_details"]["imported"] == 1
+        assert payload["meta"]["payment_details"]["duplicates"] == 1
+        assert payload["meta"]["payment_details"]["saved_vouchers"] == 1
+        request = client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]
+        assert request["paid_amount"] == 30
+        assert request["pending_amount"] == 70
+        assert request["payment_count"] == 1
+        payments = client.get(f"/api/batches/{batch_id}/requests/{request['id']}/payments").json()["payments"]
+        assert len(payments) == 1
+        assert len(payments[0]["vouchers"]) == 1
+
+        exported = client.get(f"/api/batches/{batch_id}/export.xlsx")
+        assert exported.status_code == 200
+        exported_workbook = load_workbook(io.BytesIO(exported.content))
+        payment_sheet = exported_workbook["付款明细"]
+        headers = [cell.value for cell in payment_sheet[1]]
+        assert headers[:11] == ["请款标识", "钉钉单号", "来源 Sheet", "付款日期", "本次金额", "付款人", "付款账户", "流水号", "备注", "来源标记", "凭证信息"]
+        assert payment_sheet.cell(2, 5).value == 30
+        assert len(payment_sheet._images) == 1
+
+        rolled_back = client.post(f"/api/batches/{batch_id}/imports/latest/rollback")
+        assert rolled_back.status_code == 200
+        assert rolled_back.json()["deleted_payments"] == 1
+        assert rolled_back.json()["deleted_payment_vouchers"] == 1
+        assert client.get(f"/api/batches/{batch_id}/requests").json()["totals"]["count"] == 0
+
+
+def test_restore_and_delete_draft_require_privileged_role():
+    with TestClient(app) as admin_client, TestClient(app) as business_client:
+        login(admin_client)
+        business_user = admin_client.post(
+            "/api/admin/users",
+            json={"username": "restore-biz", "password": "biz123", "display_name": "业务还原", "role": "business", "active": True},
+        )
+        assert business_user.status_code == 200
+        batch = admin_client.post("/api/batches", json={"name": "restore-permission", "start_date": "2026-07-01", "end_date": "2026-07-07"}).json()["batch"]
+        login(business_client, "restore-biz", "biz123")
+        blocked_restore = business_client.post(f"/api/batches/{batch['id']}/restore-baseline")
+        assert blocked_restore.status_code == 403
+        blocked_delete = business_client.delete(f"/api/batches/{batch['id']}")
+        assert blocked_delete.status_code == 403
 
 
 def test_delete_draft_batch_and_keep_archived_batches():
@@ -604,25 +1052,26 @@ def test_normalize_payment_data_repairs_saved_rows_and_dictionary():
             partial_row = conn.execute("SELECT * FROM payment_requests WHERE dingding_id = 'FIX-5'").fetchone()
             assert paid_row["finance_review"] == "已付款"
             assert paid_row["general_manager_approval"] is None
-            assert paid_row["payment_status"] is None
+            assert paid_row["payment_status"] == "已付款"
+            assert conn.execute("SELECT COUNT(*) AS count FROM payment_records WHERE request_id = ?", (paid_row["id"],)).fetchone()["count"] == 1
             assert "已经支付14500元" in paid_row["remark"]
             assert "我要审核一下" in paid_row["general_manager_opinion"]
             assert not paid_row["remark"] or "我要审核一下" not in paid_row["remark"]
             assert advance_row["finance_review"] == "未付款"
             assert advance_row["general_manager_approval"] is None
-            assert advance_row["payment_status"] is None
+            assert advance_row["payment_status"] == "未付款"
             assert "无票" in advance_row["remark"]
             assert "Tiffany垫付" in advance_row["general_manager_opinion"]
             assert "Tiffany垫付" not in advance_row["remark"]
             assert "原付款情况：同意支付" in advance_row["remark"]
             assert raw_extra_row["finance_review"] == "未付款"
-            assert raw_extra_row["payment_status"] is None
+            assert raw_extra_row["payment_status"] == "未付款"
             assert "Tiffany垫付" in raw_extra_row["remark"]
             assert dispute_row["general_manager_approval"] == "存在争议"
             assert "CMA船司" in dispute_row["general_manager_opinion"]
             assert dispute_row["remark"] == "广州思辉新"
-            assert partial_row["finance_review"] == "部分付款"
-            assert partial_row["payment_status"] is None
+            assert partial_row["finance_review"] == "未付款"
+            assert partial_row["payment_status"] == "未付款"
             assert conn.execute("SELECT active FROM dictionaries WHERE kind = 'payment_status' AND value = '待付款'").fetchone()["active"] == 0
             active_payment_status_values = {
                 row["value"]
@@ -634,6 +1083,410 @@ def test_normalize_payment_data_repairs_saved_rows_and_dictionary():
                 for row in conn.execute("SELECT value FROM dictionaries WHERE kind = 'finance_review' AND active = 1").fetchall()
             }
             assert active_finance_values == {"未付款", "部分付款", "已付款"}
+
+
+def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
+    purchase = map_external_expense(
+        {
+            "source_type": "purchase",
+            "source_id": "501",
+            "effective_date": date(2026, 7, 15),
+            "approval_no": "PURCHASE-501",
+            "creator_name": "user-purchase-501",
+            "applicant_department": "采购部",
+            "approval_title": "备用姓名提交的采购支出",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "中国China",
+            "beneficiary": None,
+            "expense_type": "订单采购",
+            "summary": None,
+            "project": "项目A",
+            "needed_payment_date": None,
+            "source_currency": None,
+            "source_amount": Decimal("90"),
+            "base_currency_amount": Decimal("100.25"),
+            "order_name": "订单A",
+            "product_name": "产品A",
+            "source_created_at": datetime(2026, 7, 15, 9, 10),
+            "source_updated_at": datetime(2026, 7, 15, 10, 10),
+            "raw_data": {
+                "formComponentValues": [
+                    {"name": "收款人beneficiario", "value": "供应商A 账号1"},
+                    {"name": "收款人beneficiario", "value": "供应商B 账号2"},
+                    {"name": "规格明细需求说明Descripción", "value": "采购测试摘要"},
+                    {"name": "付款日期Fecha de pago", "value": "2026-07-20"},
+                ]
+            },
+        },
+        {"user-purchase-501": "快照表姓名"},
+    )
+    assert purchase["amount"] == 100.25
+    assert purchase["beneficiary"] == "供应商A 账号1 / 供应商B 账号2"
+    assert purchase["summary"] == "采购测试摘要"
+    assert purchase["needed_payment_date"] == "2026-07-20"
+    assert "存在多个收款人，请确认" in purchase["warnings"]
+    assert purchase["request_data"]["currency"] == "CNY"
+    assert purchase["request_data"]["payee_account"] == purchase["beneficiary"]
+    assert purchase["request_data"]["raw_extra"]["external_source"]["approval_status"] == "RUNNING"
+    assert purchase["applicant"] == "快照表姓名"
+    assert purchase["applicant_id"] == "user-purchase-501"
+    assert purchase["request_data"]["source_sheet"] == "采购部"
+    assert purchase["request_data"]["raw_extra"]["external_source"]["applicant_name_source"] == "ding_user_snapshot"
+
+    refused = map_external_expense(
+        {
+            "source_type": "operation",
+            "source_id": "601",
+            "effective_date": date(2026, 7, 15),
+            "approval_no": "OP-601",
+            "creator_name": "运营申请人",
+            "applicant_department": "运营部",
+            "approval_title": "Title enviado por Operador Uno",
+            "approval_status": "COMPLETED",
+            "approval_result": "refuse",
+            "execution_region": "中国China",
+            "beneficiary": "工资卡",
+            "expense_type": "管理费用",
+            "summary": "运营测试摘要",
+            "project": None,
+            "needed_payment_date": "2026-07-21",
+            "source_currency": "美元",
+            "source_amount": Decimal("10"),
+            "base_currency_amount": Decimal("72.3"),
+            "source_created_at": datetime(2026, 7, 15, 9, 10),
+            "source_updated_at": datetime(2026, 7, 15, 10, 10),
+            "raw_data": {},
+        }
+    )
+    assert refused["amount"] == 72.3
+    assert "审批结果为拒绝" in refused["errors"]
+    assert refused["applicant"] == "Operador Uno"
+
+
+def test_external_expense_applicant_title_patterns():
+    assert applicant_name_from_title("张三提交的运营支出") == "张三"
+    assert applicant_name_from_title("Solicitud enviado por Zhang San") == "Zhang San"
+    assert applicant_name_from_title("Expense submitted by John Smith") == "John Smith"
+    assert applicant_name_from_title("Jane Doe's Purchase Expense") == "Jane Doe"
+    assert applicant_name_from_title("无法识别的标题") == ""
+
+
+def test_external_expense_exact_approval_number_ignores_dates():
+    exact_sql, exact_params = _preview_conditions(None, None, ["operation", "purchase"], " 202607071704000140246 ", [])
+    assert "effective_date" not in exact_sql
+    assert "BTRIM(approval_no) = %s" in exact_sql
+    assert "base_currency_amount <> 0" in exact_sql
+    assert exact_params[-1] == "202607071704000140246"
+
+    dated_sql, dated_params = _preview_conditions(date(2026, 7, 1), date(2026, 7, 15), ["operation"], "", [])
+    assert "effective_date BETWEEN %s AND %s" in dated_sql
+    assert dated_params[:2] == [date(2026, 7, 1), date(2026, 7, 15)]
+
+
+def test_external_expense_zero_amount_is_not_importable():
+    zero_amount = map_external_expense(
+        {
+            "source_type": "operation",
+            "source_id": "zero-amount",
+            "effective_date": date(2026, 7, 15),
+            "approval_no": "ZERO-AMOUNT",
+            "creator_name": "zero-user",
+            "approval_title": "零金额申请人提交的运营支出",
+            "applicant_department": "测试部门",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "中国China",
+            "beneficiary": "测试收款人",
+            "base_currency_amount": Decimal("0"),
+            "raw_data": {},
+        }
+    )
+    assert "应付金额为 0，暂不导入" in zero_amount["errors"]
+    assert "应付金额为 0" not in zero_amount["warnings"]
+
+
+def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch):
+    duplicate_row = external_expense_test_row("EXT-DUPLICATE", "701")
+    new_row = external_expense_test_row("EXT-NEW", "702", status="COMPLETED", warnings=["缺少收款信息"], beneficiary="")
+    invalid_row = external_expense_test_row("EXT-INVALID", "703")
+    invalid_row["errors"] = ["金额缺失"]
+
+    def fake_preview(**kwargs):
+        if kwargs["approval_no"] == "EXT-NEW":
+            assert kwargs["date_from"] is None
+            assert kwargs["date_to"] is None
+        else:
+            assert kwargs["date_from"] == date(2026, 7, 1)
+            assert kwargs["date_to"] == date(2026, 7, 15)
+        assert kwargs["source_types"] == ["operation", "purchase"]
+        assert kwargs["applicant_ids"] == []
+        return {
+            "rows": [duplicate_row, new_row, invalid_row],
+            "applicant_options": [{"id": "test-user-id", "name": "测试申请人", "department": "测试部门", "count": 3}],
+        }
+
+    def fake_fetch(items):
+        by_id = {"701": duplicate_row, "702": new_row, "703": invalid_row}
+        return [by_id[item["source_id"]] for item in items if item["source_id"] in by_id]
+
+    monkeypatch.setattr(main_module, "preview_external_expenses", fake_preview)
+    monkeypatch.setattr(main_module, "fetch_external_expenses", fake_fetch)
+
+    with TestClient(app) as client:
+        login(client)
+        old_batch = client.post("/api/batches", json={"name": "external-old", "start_date": "2026-06-01", "end_date": "2026-06-07"}).json()["batch"]
+        existing = client.post(
+            f"/api/batches/{old_batch['id']}/requests",
+            json={"dingding_id": " EXT-DUPLICATE ", "summary": "历史记录", "amount": 1},
+        )
+        assert existing.status_code == 200
+        target_batch = client.post("/api/batches", json={"name": "external-target", "start_date": "2026-07-01", "end_date": "2026-07-15"}).json()["batch"]
+        target_id = target_batch["id"]
+
+        preview_filter = {
+            "batch_id": target_id,
+            "date_from": "2026-07-01",
+            "date_to": "2026-07-15",
+            "source_types": ["operation", "purchase"],
+            "approval_no": "",
+            "applicant_ids": [],
+            "page": 1,
+            "page_size": 50,
+        }
+        preview = client.post("/api/external-expenses/preview", json=preview_filter)
+        assert preview.status_code == 200
+        payload = preview.json()
+        expected_summary = {"matched": 3, "importable": 1, "duplicates": 1, "warnings": 1, "invalid": 1}
+        assert payload["summary"] == expected_summary
+        assert payload["pagination"]["total"] == 3
+        assert [row["approval_no"] for row in payload["all_rows"]] == ["EXT-DUPLICATE", "EXT-NEW", "EXT-INVALID"]
+        duplicate_preview = next(row for row in payload["rows"] if row["approval_no"] == "EXT-DUPLICATE")
+        new_preview = next(row for row in payload["rows"] if row["approval_no"] == "EXT-NEW")
+        assert duplicate_preview["importable"] is False
+        assert duplicate_preview["duplicate"]["batch_name"] == "external-old"
+        assert new_preview["importable"] is True
+
+        exact_number_without_dates = client.post(
+            "/api/external-expenses/preview",
+            json={**preview_filter, "date_from": "", "date_to": "not-a-date", "approval_no": "EXT-NEW"},
+        )
+        assert exact_number_without_dates.status_code == 200
+
+        expected_filtered_rows = {
+            "importable": ["EXT-NEW"],
+            "duplicates": ["EXT-DUPLICATE"],
+            "warnings": ["EXT-NEW"],
+            "invalid": ["EXT-INVALID"],
+        }
+        for result_filter, expected_approval_nos in expected_filtered_rows.items():
+            filtered = client.post(
+                "/api/external-expenses/preview",
+                json={**preview_filter, "result_filter": result_filter},
+            )
+            assert filtered.status_code == 200
+            filtered_payload = filtered.json()
+            assert filtered_payload["summary"] == expected_summary
+            assert [row["approval_no"] for row in filtered_payload["rows"]] == expected_approval_nos
+            assert [row["approval_no"] for row in filtered_payload["all_rows"]] == ["EXT-DUPLICATE", "EXT-NEW", "EXT-INVALID"]
+            assert filtered_payload["pagination"]["total"] == len(expected_approval_nos)
+
+        invalid_result_filter = client.post(
+            "/api/external-expenses/preview",
+            json={**preview_filter, "result_filter": "unknown"},
+        )
+        assert invalid_result_filter.status_code == 400
+
+        invalid_range = client.post(
+            "/api/external-expenses/preview",
+            json={"batch_id": target_id, "date_from": "2026-01-01", "date_to": "2026-03-01", "source_types": ["operation"]},
+        )
+        assert invalid_range.status_code == 400
+
+        imported = client.post(
+            f"/api/batches/{target_id}/imports/external-expenses",
+            json={"items": [{"source_type": "operation", "source_id": "702"}]},
+        )
+        assert imported.status_code == 200
+        assert imported.json()["imported_rows"] == 1
+        assert imported.json()["warnings"] == 1
+        requests = client.get(f"/api/batches/{target_id}/requests").json()["requests"]
+        assert len(requests) == 1
+        request = requests[0]
+        assert request["dingding_id"] == "EXT-NEW"
+        assert request["paid_amount"] == 0
+        assert request["pending_amount"] == new_row["amount"]
+        assert request["finance_review"] == "未付款"
+        assert request["raw_extra"]["external_source"]["approval_status"] == "COMPLETED"
+        with connect() as conn:
+            job = conn.execute("SELECT * FROM import_jobs WHERE id = ?", (imported.json()["job_id"],)).fetchone()
+            assert job["kind"] == "external-expenses"
+            audit = conn.execute("SELECT 1 FROM audit_logs WHERE action = 'import.external_expenses' AND batch_id = ?", (target_id,)).fetchone()
+            assert audit
+
+        repeated = client.post(
+            f"/api/batches/{target_id}/imports/external-expenses",
+            json={"items": [{"source_type": "operation", "source_id": "702"}]},
+        )
+        assert repeated.status_code == 200
+        assert repeated.json()["imported_rows"] == 0
+        assert repeated.json()["duplicate_rows"] == 1
+        assert repeated.json()["job_id"] is None
+
+        rolled_back = client.post(f"/api/batches/{target_id}/imports/latest/rollback")
+        assert rolled_back.status_code == 200
+        assert rolled_back.json()["deleted_requests"] == 1
+        assert client.get(f"/api/batches/{target_id}/requests").json()["totals"]["count"] == 0
+
+
+def test_external_expense_concurrent_dedupe_and_source_failure_are_atomic(monkeypatch):
+    concurrent_row = external_expense_test_row("EXT-CONCURRENT", "801")
+    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda items: [concurrent_row])
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "external-concurrent", "start_date": "2026-07-15", "end_date": "2026-07-15"}).json()["batch"]
+
+    def submit_import():
+        with TestClient(app) as thread_client:
+            login(thread_client)
+            response = thread_client.post(
+                f"/api/batches/{batch['id']}/imports/external-expenses",
+                json={"items": [{"source_type": "operation", "source_id": "801"}]},
+            )
+            assert response.status_code == 200
+            return response.json()["imported_rows"]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        imported_counts = sorted(executor.map(lambda _: submit_import(), range(2)))
+    assert imported_counts == [0, 1]
+    with connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS count FROM payment_requests WHERE TRIM(dingding_id) = 'EXT-CONCURRENT'").fetchone()["count"] == 1
+
+    def fail_source(items):
+        raise ExternalExpenseError("来源数据库暂时不可用")
+
+    monkeypatch.setattr(main_module, "fetch_external_expenses", fail_source)
+    with TestClient(app) as client:
+        login(client)
+        failed_batch = client.post("/api/batches", json={"name": "external-failure", "start_date": "2026-07-15", "end_date": "2026-07-15"}).json()["batch"]
+        failed = client.post(
+            f"/api/batches/{failed_batch['id']}/imports/external-expenses",
+            json={"items": [{"source_type": "operation", "source_id": "999"}]},
+        )
+        assert failed.status_code == 502
+        assert client.get(f"/api/batches/{failed_batch['id']}/requests").json()["totals"]["count"] == 0
+        with connect() as conn:
+            assert conn.execute("SELECT COUNT(*) AS count FROM import_jobs WHERE batch_id = ?", (failed_batch["id"],)).fetchone()["count"] == 0
+
+
+def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(monkeypatch):
+    metadata = [
+        {
+            "approval_no": "SYNC-MATCH",
+            "source_type": "operation",
+            "source_label": "运营支出",
+            "source_id": "901",
+            "table": "approval_expense_operation",
+            "record_id": "901",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "applicant_id": "user-901",
+            "applicant": "同步申请人",
+            "applicant_name_source": "ding_user_snapshot",
+            "applicant_department": "产品与采购部",
+        },
+        {
+            "approval_no": "SYNC-CONFLICT",
+            "source_type": "operation",
+            "source_label": "运营支出",
+            "source_id": "902",
+            "approval_status": "COMPLETED",
+        },
+        {
+            "approval_no": "SYNC-CONFLICT",
+            "source_type": "purchase",
+            "source_label": "采购支出",
+            "source_id": "903",
+            "approval_status": "TERMINATED",
+        },
+    ]
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda approval_nos: metadata)
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "metadata-sync", "start_date": "2026-07-15", "end_date": "2026-07-15"}).json()["batch"]
+        batch_id = batch["id"]
+        request_ids = []
+        for dingding_id, amount, source_sheet in (
+            ("SYNC-MATCH", 100, "用户手动 Sheet"),
+            ("SYNC-MATCH", 101, "用户手动 Sheet"),
+            ("SYNC-CONFLICT", 200, "冲突 Sheet"),
+            ("SYNC-MISSING", 300, "未匹配 Sheet"),
+        ):
+            response = client.post(
+                f"/api/batches/{batch_id}/requests",
+                json={"dingding_id": dingding_id, "amount": amount, "source_sheet": source_sheet},
+            )
+            assert response.status_code == 200
+            request_ids.append(response.json()["request"]["id"])
+
+        synced = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
+        assert synced.status_code == 200
+        assert synced.json() == {
+            "status": "synced",
+            "batch_id": batch_id,
+            "unique_approval_nos": 3,
+            "matched": 1,
+            "unmatched": 1,
+            "conflicts": 1,
+            "updated_requests": 4,
+        }
+        rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        by_id = {row["id"]: row for row in rows}
+        matched_source = by_id[request_ids[0]]["raw_extra"]["external_source"]
+        assert matched_source["lookup_status"] == "matched"
+        assert matched_source["approval_status"] == "RUNNING"
+        assert matched_source["applicant"] == "同步申请人"
+        assert matched_source["applicant_department"] == "产品与采购部"
+        assert by_id[request_ids[0]]["amount"] == 100
+        assert by_id[request_ids[0]]["source_sheet"] == "用户手动 Sheet"
+        assert by_id[request_ids[2]]["raw_extra"]["external_source"]["lookup_status"] == "conflict"
+        assert by_id[request_ids[3]]["raw_extra"]["external_source"]["lookup_status"] == "unmatched"
+        with connect() as conn:
+            audit_row = conn.execute(
+                "SELECT new_value_json FROM audit_logs WHERE batch_id = ? AND action = 'external_expenses.metadata_sync'",
+                (batch_id,),
+            ).fetchone()
+            assert audit_row is not None
+            assert json.loads(audit_row["new_value_json"]) == {
+                "unique_approval_nos": 3,
+                "matched": 1,
+                "unmatched": 1,
+                "conflicts": 1,
+                "updated_requests": 4,
+            }
+
+        archived = client.post(f"/api/batches/{batch_id}/archive")
+        assert archived.status_code == 200
+        rejected = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
+        assert rejected.status_code == 400
+
+        failure_batch = client.post("/api/batches", json={"name": "metadata-sync-failure"}).json()["batch"]
+        created = client.post(
+            f"/api/batches/{failure_batch['id']}/requests",
+            json={"dingding_id": "SYNC-FAIL", "amount": 50, "raw_extra": {"kept": True}},
+        ).json()["request"]
+
+        def fail_metadata(approval_nos):
+            raise ExternalExpenseError("来源数据库暂时不可用")
+
+        monkeypatch.setattr(main_module, "fetch_external_expense_metadata", fail_metadata)
+        failed = client.post(f"/api/batches/{failure_batch['id']}/external-expenses/sync-metadata")
+        assert failed.status_code == 502
+        unchanged = client.get(f"/api/batches/{failure_batch['id']}/requests").json()["requests"][0]
+        assert unchanged["id"] == created["id"]
+        assert unchanged["raw_extra"] == {"kept": True}
 
 
 def teardown_module():

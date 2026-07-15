@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .db import connect, init_db, now_iso, row_to_dict, write_audit
+from .db import connect, init_db, now_iso, payment_record_hash, refresh_payment_summaries, row_to_dict, write_audit
 from .excel_io import content_hash, normalize_request_business_fields
 
 
 NORMALIZED_FIELDS = (
+    "paid_amount",
+    "pending_amount",
     "finance_review",
     "general_manager_approval",
     "general_manager_approval_date",
@@ -97,17 +99,18 @@ def normalize_finance_review_dictionary(conn) -> None:
         )
 
 
-def normalize_payment_requests(conn) -> int:
+def normalize_payment_requests(conn, source_rows: Optional[Dict[int, Dict[str, Any]]] = None) -> int:
     rows = conn.execute("SELECT * FROM payment_requests ORDER BY id").fetchall()
     changed_count = 0
     for db_row in rows:
         original = row_to_dict(db_row)
+        source_original = (source_rows or {}).get(int(original["id"]), original)
         raw_manager_text = raw_extra_value(
-            original,
+            source_original,
             ("总经理批复", "总经理确认", "总经理审批"),
             original.get("general_manager_approval"),
         )
-        normalized = source_row_for_normalization(original)
+        normalized = source_row_for_normalization(source_original)
         normalize_request_business_fields(normalized)
         remark_removals = [normalized.get("general_manager_opinion")]
         manager_opinion = str(normalized.get("general_manager_opinion") or "")
@@ -136,20 +139,74 @@ def normalize_payment_requests(conn) -> int:
     return changed_count
 
 
+def create_normalized_legacy_payments(conn) -> int:
+    rows = conn.execute(
+        """
+        SELECT * FROM payment_requests
+        WHERE COALESCE(paid_amount, 0) > 0
+          AND NOT EXISTS (
+              SELECT 1 FROM payment_records WHERE payment_records.request_id = payment_requests.id
+          )
+        ORDER BY id
+        """
+    ).fetchall()
+    created = 0
+    for row in rows:
+        amount = round(float(row["paid_amount"]), 2)
+        timestamp = row["updated_at"] or row["created_at"] or now_iso()
+        cursor = conn.execute(
+            """
+            INSERT INTO payment_records (
+                request_id, amount, payment_date, payer, payment_account,
+                remark, source_type, content_hash, created_by, updated_by,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'legacy_normalization', ?, ?, ?, ?, ?)
+            """,
+            (
+                row["id"],
+                amount,
+                row["actual_payment_date"],
+                row["payer"],
+                row["payment_account"],
+                "由历史数据归一生成",
+                payment_record_hash(row["id"], amount, row["actual_payment_date"], row["payer"], None),
+                row["created_by"],
+                row["updated_by"] or row["created_by"],
+                row["created_at"] or timestamp,
+                timestamp,
+            ),
+        )
+        conn.execute("UPDATE payment_records SET root_payment_id = ? WHERE id = ?", (cursor.lastrowid, cursor.lastrowid))
+        created += 1
+    return created
+
+
 def normalize_payment_data() -> Dict[str, int]:
+    source_rows: Dict[int, Dict[str, Any]] = {}
+    with connect() as conn:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'payment_requests'"
+        ).fetchone()
+        if table_exists:
+            source_rows = {
+                int(row["id"]): row_to_dict(row)
+                for row in conn.execute("SELECT * FROM payment_requests").fetchall()
+            }
     init_db()
     with connect() as conn:
-        changed_rows = normalize_payment_requests(conn)
+        changed_rows = normalize_payment_requests(conn, source_rows)
+        created_payments = create_normalized_legacy_payments(conn)
+        refresh_payment_summaries(conn)
         normalize_finance_review_dictionary(conn)
         write_audit(
             conn,
             None,
             "maintenance.normalize_payment_data",
             "system",
-            new_value={"changed_rows": changed_rows},
+            new_value={"changed_rows": changed_rows, "created_payments": created_payments},
             reason="财务审批状态归一",
         )
-    return {"changed_rows": changed_rows}
+    return {"changed_rows": changed_rows, "created_payments": created_payments}
 
 
 def main() -> None:
