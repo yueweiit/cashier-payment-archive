@@ -270,6 +270,11 @@ export type UserPayload = {
   active: boolean;
 };
 export type UserUpdatePayload = Partial<Pick<User, "role" | "display_name" | "active">> & { password?: string };
+export type ChangePasswordPayload = {
+  current_password: string;
+  new_password: string;
+  confirm_password: string;
+};
 export type RolloverPayload = Pick<Batch, "name"> & {
   start_date?: string;
   end_date?: string;
@@ -295,6 +300,8 @@ export const api = {
     request<{ user: User }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<{ status: string }>("/api/auth/logout", { method: "POST" }),
   me: () => request<{ user: User }>("/api/me"),
+  changePassword: (payload: ChangePasswordPayload) =>
+    request<{ status: string; signed_out_sessions: number }>("/api/auth/change-password", { method: "POST", body: JSON.stringify(payload) }),
   batches: () => request<{ batches: Batch[] }>("/api/batches"),
   createBatch: (payload: Partial<Batch>) => request<{ batch: Batch }>("/api/batches", { method: "POST", body: JSON.stringify(payload) }),
   deleteBatch: (id: number) => request<{ status: string }>(`/api/batches/${id}`, { method: "DELETE" }),

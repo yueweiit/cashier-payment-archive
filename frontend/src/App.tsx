@@ -1,4 +1,4 @@
-import { ClipboardEvent, FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ClipboardEvent, FormEvent, Fragment, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlignLeft,
   AlertTriangle,
@@ -273,6 +273,8 @@ function Shell({
   const [batches, setBatches] = useState<Batch[]>([]);
   const [selectedBatchId, setSelectedBatchId] = useState<number | null>(null);
   const [workspaceRefreshToken, setWorkspaceRefreshToken] = useState(0);
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
+  const [accountNotice, setAccountNotice] = useState("");
 
   const selectedBatch = batches.find((batch) => batch.id === selectedBatchId) || batches[0] || null;
 
@@ -289,6 +291,12 @@ function Shell({
   useEffect(() => {
     loadBatches().catch((err) => setMessage((err as Error).message));
   }, []);
+
+  useEffect(() => {
+    if (!accountNotice) return;
+    const timer = window.setTimeout(() => setAccountNotice(""), 3000);
+    return () => window.clearTimeout(timer);
+  }, [accountNotice]);
 
   async function logout() {
     await api.logout();
@@ -319,11 +327,12 @@ function Shell({
           )}
         </nav>
         <div className="app-userbar">
-          <div className="app-user">
+          <button className="app-user account-button" type="button" title="修改密码" aria-label={`${user.display_name}，${roleLabels[user.role]}，修改密码`} onClick={() => setPasswordDialogOpen(true)}>
             <span>{user.display_name}</span>
             <small>{roleLabels[user.role]}</small>
-          </div>
+          </button>
           {message && <span className="toast">{message}</span>}
+          {accountNotice && <span className="toast account-notice" role="status">{accountNotice}</span>}
           <button className="icon-text" onClick={logout}>
             <LogOut size={15} />
             退出
@@ -349,7 +358,95 @@ function Shell({
         {tab === "archive" && <ArchiveView user={user} batches={batches} selectedBatch={selectedBatch} setSelectedBatchId={setSelectedBatchId} reloadBatches={loadBatches} setMessage={setMessage} />}
         {tab === "admin" && <AdminView setMessage={setMessage} />}
       </main>
+      {passwordDialogOpen && (
+        <ChangePasswordDialog
+          onClose={() => setPasswordDialogOpen(false)}
+          onSuccess={(signedOutSessions) => {
+            setPasswordDialogOpen(false);
+            setAccountNotice(`密码已修改，其他设备的登录会话已退出${signedOutSessions ? `（${signedOutSessions} 个）` : ""}`);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function ChangePasswordDialog({ onClose, onSuccess }: { onClose: () => void; onSuccess: (signedOutSessions: number) => void }) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  function close() {
+    if (!submitting) onClose();
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      setError("当前密码、新密码和确认密码不能为空");
+      return;
+    }
+    if (newPassword.length < 6) {
+      setError("新密码至少需要 6 位");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError("两次输入的新密码不一致");
+      return;
+    }
+    if (newPassword === currentPassword) {
+      setError("新密码不能与当前密码相同");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const result = await api.changePassword({
+        current_password: currentPassword,
+        new_password: newPassword,
+        confirm_password: confirmPassword,
+      });
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      onSuccess(result.signed_out_sessions);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal title="修改密码" onClose={close} className="change-password-modal">
+      <form className="change-password-form" onSubmit={submit}>
+        <p className="form-hint">修改成功后，当前设备保持登录，其他设备将自动退出。</p>
+        <label>
+          当前密码
+          <input type="password" autoComplete="current-password" autoFocus value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} disabled={submitting} />
+        </label>
+        <label>
+          新密码
+          <input type="password" autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} disabled={submitting} />
+          <small>至少 6 位，且不能与当前密码相同。</small>
+        </label>
+        <label>
+          确认新密码
+          <input type="password" autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} disabled={submitting} />
+        </label>
+        {error && <p className="error-text" role="alert">{error}</p>}
+        <div className="change-password-actions">
+          <button className="ghost-button" type="button" onClick={close} disabled={submitting}>取消</button>
+          <button className="primary-button" type="submit" disabled={submitting}>
+            <Save size={16} />
+            {submitting ? "修改中" : "确认修改"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -1495,7 +1592,7 @@ function Workspace({
         <div className="toolbar">
           <div className="search-box">
             <Search size={16} />
-            <input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} placeholder="搜索单号、摘要、收款方、项目" />
+            <input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} placeholder="搜索单号、申请人、摘要、收款方、项目" />
           </div>
           <input value={filters.payment_account} onChange={(event) => setFilters({ ...filters, payment_account: event.target.value })} placeholder="付款账户" />
           <input value={filters.invoice_status} onChange={(event) => setFilters({ ...filters, invoice_status: event.target.value })} placeholder="开票情况" />
@@ -2148,7 +2245,10 @@ function EditablePaymentGrid({
               <th className="attachment-col" style={{ width: 112, minWidth: 112 }}>附件</th>
               <th className="external-status-col">钉钉状态</th>
               {gridColumns.map((column) => (
-                <th key={column.key} style={{ width: column.width, minWidth: column.width }}>{column.label}</th>
+                <Fragment key={column.key}>
+                  <th style={{ width: column.width, minWidth: column.width }}>{column.label}</th>
+                  {column.key === "dingding_id" && <th className="applicant-col">申请人</th>}
+                </Fragment>
               ))}
             </tr>
           </thead>
@@ -2209,51 +2309,58 @@ function EditablePaymentGrid({
 	                    !canEditField(column.key) ? "readonly-field" : "",
 	                  ].filter(Boolean).join(" ");
                   return (
-                    <td key={column.key} className={dirty ? "dirty-cell" : ""} style={{ width: column.width, minWidth: column.width, maxWidth: column.width }}>
-                      {selectOptions ? (
-                        <select
-                          data-cell={`${rowIndex}-${colIndex}`}
-                          className={fieldClass}
-                          value={cellValue}
-	                          disabled={cellReadOnly}
-                          onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
-                          onKeyDown={(event) => handleSelectKeyDown(event, rowIndex, colIndex)}
-                          onChange={(event) => updateCell(rowIndex, column, event.target.value)}
-                        >
-                          {selectOptions.map((option) => (
-                            <option key={option} value={option}>{option || "未选择"}</option>
-                          ))}
-                        </select>
-                      ) : shouldWrap ? (
-                        <textarea
-                          data-cell={`${rowIndex}-${colIndex}`}
-                          className={fieldClass}
-                          rows={wrappedTextRows(cellValue, column)}
-                          value={cellValue}
-                          title={cellValue}
-	                          readOnly={cellReadOnly}
-                          onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
-                          onPaste={handlePaste}
-                          onKeyDown={(event) => handleKeyDown(event, rowIndex, colIndex)}
-                          onChange={(event) => updateCell(rowIndex, column, event.target.value)}
-                        />
-                      ) : (
-                        <input
-                          data-cell={`${rowIndex}-${colIndex}`}
-                          className={fieldClass}
-                          type={column.type === "number" ? "number" : column.type === "date" ? "date" : "text"}
-                          min={column.key === "paid_amount" ? 0 : undefined}
-                          step={column.type === "number" ? "0.01" : undefined}
-                          value={cellValue}
-                          title={cellValue}
-	                          readOnly={cellReadOnly}
-                          onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
-                          onPaste={handlePaste}
-                          onKeyDown={(event) => handleKeyDown(event, rowIndex, colIndex)}
-                          onChange={(event) => updateCell(rowIndex, column, event.target.value)}
-                        />
+                    <Fragment key={column.key}>
+                      <td className={dirty ? "dirty-cell" : ""} style={{ width: column.width, minWidth: column.width, maxWidth: column.width }}>
+                        {selectOptions ? (
+                          <select
+                            data-cell={`${rowIndex}-${colIndex}`}
+                            className={fieldClass}
+                            value={cellValue}
+	                            disabled={cellReadOnly}
+                            onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
+                            onKeyDown={(event) => handleSelectKeyDown(event, rowIndex, colIndex)}
+                            onChange={(event) => updateCell(rowIndex, column, event.target.value)}
+                          >
+                            {selectOptions.map((option) => (
+                              <option key={option} value={option}>{option || "未选择"}</option>
+                            ))}
+                          </select>
+                        ) : shouldWrap ? (
+                          <textarea
+                            data-cell={`${rowIndex}-${colIndex}`}
+                            className={fieldClass}
+                            rows={wrappedTextRows(cellValue, column)}
+                            value={cellValue}
+                            title={cellValue}
+	                            readOnly={cellReadOnly}
+                            onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
+                            onPaste={handlePaste}
+                            onKeyDown={(event) => handleKeyDown(event, rowIndex, colIndex)}
+                            onChange={(event) => updateCell(rowIndex, column, event.target.value)}
+                          />
+                        ) : (
+                          <input
+                            data-cell={`${rowIndex}-${colIndex}`}
+                            className={fieldClass}
+                            type={column.type === "number" ? "number" : column.type === "date" ? "date" : "text"}
+                            min={column.key === "paid_amount" ? 0 : undefined}
+                            step={column.type === "number" ? "0.01" : undefined}
+                            value={cellValue}
+                            title={cellValue}
+	                            readOnly={cellReadOnly}
+                            onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
+                            onPaste={handlePaste}
+                            onKeyDown={(event) => handleKeyDown(event, rowIndex, colIndex)}
+                            onChange={(event) => updateCell(rowIndex, column, event.target.value)}
+                          />
+                        )}
+                      </td>
+                      {column.key === "dingding_id" && (
+                        <td className="applicant-col">
+                          <RequestApplicant request={row} />
+                        </td>
                       )}
-                    </td>
+                    </Fragment>
                   );
                 })}
               </tr>
@@ -2543,6 +2650,10 @@ function RequestEditor({
               </div>
               <div className="editor-form-grid">
                 {renderField("dingding_id")}
+                <div className="editor-field editor-readonly-field">
+                  <span>申请人</span>
+                  <strong className="editor-applicant-value"><RequestApplicant request={form} /></strong>
+                </div>
                 {renderField("payment_account")}
                 {renderField("expense_type")}
                 {renderField("project")}
@@ -3398,6 +3509,8 @@ function rowMatchesFilters(
   if (q) {
     const haystack = [
       row.dingding_id,
+      requestApplicantName(row),
+      requestApplicantDepartment(row),
       row.summary,
       row.payee_name,
       row.payee_account,
@@ -3571,6 +3684,28 @@ function localIsoDate(value: Date) {
   const month = String(value.getMonth() + 1).padStart(2, "0");
   const day = String(value.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function requestApplicantName(request: Partial<PaymentRequest>) {
+  return String(request.raw_extra?.external_source?.applicant || "").trim();
+}
+
+function requestApplicantDepartment(request: Partial<PaymentRequest>) {
+  return String(request.raw_extra?.external_source?.applicant_department || "").trim();
+}
+
+function RequestApplicant({ request }: { request: Partial<PaymentRequest> }) {
+  const source = request.raw_extra?.external_source;
+  const name = requestApplicantName(request);
+  const department = requestApplicantDepartment(request);
+  const applicantId = String(source?.applicant_id || "").trim();
+  const title = [department && `部门：${department}`, applicantId && `钉钉用户 ID：${applicantId}`].filter(Boolean).join("\n") || undefined;
+  return (
+    <span className={name ? "request-applicant" : "request-applicant empty"} title={title}>
+      <span>{name || "—"}</span>
+      {department && <small>{department}</small>}
+    </span>
+  );
 }
 
 function ExternalApprovalBadge({

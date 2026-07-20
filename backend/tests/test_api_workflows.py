@@ -388,6 +388,100 @@ def test_admin_can_restore_archived_batch_to_draft():
         assert "batch.unarchive" in actions
 
 
+def test_all_roles_can_change_own_password_and_other_sessions_are_revoked():
+    accounts = [
+        ("self-password-business", "业务改密", "business", "business-old", "business-new"),
+        ("self-password-finance", "财务改密", "finance", "finance-old", "finance-new"),
+        ("self-password-manager", "总经理改密", "general_manager", "manager-old", "manager-new"),
+    ]
+    with TestClient(app) as admin_client:
+        login(admin_client)
+        created_user_ids = []
+        for username, display_name, role, old_password, _ in accounts:
+            created = admin_client.post(
+                "/api/admin/users",
+                json={"username": username, "password": old_password, "display_name": display_name, "role": role, "active": True},
+            )
+            assert created.status_code == 200
+            created_user_ids.append(created.json()["user"]["id"])
+
+        business = accounts[0]
+        with TestClient(app) as current_client, TestClient(app) as other_client:
+            login(current_client, business[0], business[3])
+            login(other_client, business[0], business[3])
+
+            assert current_client.post(
+                "/api/auth/change-password",
+                json={"current_password": "", "new_password": business[4], "confirm_password": business[4]},
+            ).status_code == 400
+            assert current_client.post(
+                "/api/auth/change-password",
+                json={"current_password": business[3], "new_password": "12345", "confirm_password": "12345"},
+            ).status_code == 400
+            assert current_client.post(
+                "/api/auth/change-password",
+                json={"current_password": business[3], "new_password": business[4], "confirm_password": "different"},
+            ).status_code == 400
+            assert current_client.post(
+                "/api/auth/change-password",
+                json={"current_password": "wrong-password", "new_password": business[4], "confirm_password": business[4]},
+            ).status_code == 400
+            assert current_client.post(
+                "/api/auth/change-password",
+                json={"current_password": business[3], "new_password": business[3], "confirm_password": business[3]},
+            ).status_code == 400
+
+            changed = current_client.post(
+                "/api/auth/change-password",
+                json={"current_password": business[3], "new_password": business[4], "confirm_password": business[4]},
+            )
+            assert changed.status_code == 200
+            assert changed.json() == {"status": "ok", "signed_out_sessions": 1}
+            assert current_client.get("/api/me").status_code == 200
+            assert other_client.get("/api/me").status_code == 401
+
+        old_login = admin_client.post("/api/auth/login", json={"username": business[0], "password": business[3]})
+        assert old_login.status_code == 401
+        with TestClient(app) as new_login_client:
+            login(new_login_client, business[0], business[4])
+
+        for username, _, _, old_password, new_password in accounts[1:]:
+            with TestClient(app) as role_client:
+                login(role_client, username, old_password)
+                changed = role_client.post(
+                    "/api/auth/change-password",
+                    json={"current_password": old_password, "new_password": new_password, "confirm_password": new_password},
+                )
+                assert changed.status_code == 200
+                assert role_client.get("/api/me").status_code == 200
+            with TestClient(app) as new_login_client:
+                login(new_login_client, username, new_password)
+
+        admin_changed = admin_client.post(
+            "/api/auth/change-password",
+            json={"current_password": "admin123", "new_password": "admin456", "confirm_password": "admin456"},
+        )
+        assert admin_changed.status_code == 200
+        assert admin_client.get("/api/me").status_code == 200
+        admin_restored = admin_client.post(
+            "/api/auth/change-password",
+            json={"current_password": "admin456", "new_password": "admin123", "confirm_password": "admin123"},
+        )
+        assert admin_restored.status_code == 200
+
+        with connect() as conn:
+            audit_rows = conn.execute(
+                "SELECT old_value_json, new_value_json FROM audit_logs WHERE action = 'user.change_password'"
+            ).fetchall()
+        assert len(audit_rows) >= 5
+        audit_payload = json.dumps([dict(row) for row in audit_rows], ensure_ascii=False)
+        assert "password_hash" not in audit_payload
+        for password in [value for account in accounts for value in account[3:]] + ["admin123", "admin456"]:
+            assert password not in audit_payload
+        for user_id in created_user_ids:
+            assert admin_client.delete(f"/api/admin/users/{user_id}").status_code == 200
+
+
 def test_role_permissions_user_crud_and_audit_logs():
     with TestClient(app) as admin_client, TestClient(app) as business_client, TestClient(app) as finance_client, TestClient(app) as manager_client:
         login(admin_client)

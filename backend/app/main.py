@@ -72,6 +72,12 @@ class LoginIn(BaseModel):
     password: str
 
 
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_password: str
+
+
 class BatchIn(BaseModel):
     name: str
     start_date: Optional[str] = None
@@ -510,6 +516,58 @@ def logout(request: Request, response: Response) -> Dict[str, str]:
 @app.get("/api/me")
 def me(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
     return {"user": user_public(user)}
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    payload: ChangePasswordIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    if not payload.current_password or not payload.new_password or not payload.confirm_password:
+        raise HTTPException(status_code=400, detail="当前密码、新密码和确认密码不能为空")
+    if len(payload.new_password) < 6:
+        raise HTTPException(status_code=400, detail="新密码至少需要 6 位")
+    if payload.new_password != payload.confirm_password:
+        raise HTTPException(status_code=400, detail="两次输入的新密码不一致")
+
+    current_token = request.cookies.get("session")
+    if not current_token:
+        raise HTTPException(status_code=401, detail="登录已失效")
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE id = ? AND active = 1 AND deleted_at IS NULL",
+            (user["id"],),
+        ).fetchone()
+        if not row or not verify_password(payload.current_password, row["password_hash"]):
+            raise HTTPException(status_code=400, detail="当前密码错误")
+        if verify_password(payload.new_password, row["password_hash"]):
+            raise HTTPException(status_code=400, detail="新密码不能与当前密码相同")
+
+        signed_out_sessions = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM sessions WHERE user_id = ? AND token <> ?",
+                (user["id"], current_token),
+            ).fetchone()["count"]
+        )
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(payload.new_password), user["id"]),
+        )
+        conn.execute(
+            "DELETE FROM sessions WHERE user_id = ? AND token <> ?",
+            (user["id"], current_token),
+        )
+        write_audit(
+            conn,
+            user["id"],
+            "user.change_password",
+            "user",
+            user["id"],
+            new_value={"signed_out_sessions": signed_out_sessions},
+        )
+    return {"status": "ok", "signed_out_sessions": signed_out_sessions}
 
 
 @app.get("/api/batches")
