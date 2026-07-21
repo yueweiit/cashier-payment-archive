@@ -14,6 +14,7 @@ export type Batch = {
   end_date?: string;
   status: "draft" | "archived";
   source_file?: string;
+  sheet_order?: string[];
   request_count?: number;
   total_amount?: number;
   total_paid_amount?: number;
@@ -309,6 +310,11 @@ export const api = {
   rolloverBatch: (sourceBatchId: number, payload: RolloverPayload) =>
     request<{ batch: Batch; copied_count: number; copy_mode: RolloverCopyMode; operation_id: string }>(`/api/batches/${sourceBatchId}/rollover`, { method: "POST", body: JSON.stringify(payload) }),
   batch: (id: number) => request<{ batch: Batch; stats: Array<Record<string, unknown>> }>(`/api/batches/${id}`),
+  updateSheetOrder: (id: number, sheetOrder: string[]) =>
+    request<{ batch: Batch }>(`/api/batches/${id}/sheet-order`, {
+      method: "PUT",
+      body: JSON.stringify({ sheet_order: sheetOrder }),
+    }),
   archive: (id: number) => request<{ batch: Batch }>(`/api/batches/${id}/archive`, { method: "POST" }),
   unarchive: (id: number) => request<{ batch: Batch }>(`/api/batches/${id}/unarchive`, { method: "POST" }),
   setBatchBaseline: (id: number) => request<{ snapshot: BatchSnapshot }>(`/api/batches/${id}/snapshots/baseline`, { method: "POST" }),

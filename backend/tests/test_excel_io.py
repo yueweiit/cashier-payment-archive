@@ -166,3 +166,22 @@ def test_department_sheet_titles_are_safe_and_unique():
     workbook = load_workbook(io.BytesIO(content))
     assert len(workbook.sheetnames) == len({name.casefold() for name in workbook.sheetnames})
     assert all(len(name) <= 31 for name in workbook.sheetnames)
+
+
+def test_export_workbook_uses_saved_sheet_order():
+    content = export_workbook(
+        {
+            "name": "Sheet 顺序测试",
+            "end_date": "2026-07-21",
+            "sheet_order": ["供应商", "财务中心", "采购中心"],
+        },
+        [
+            {"id": 1, "source_sheet": "采购中心", "amount": 100, "summary": "采购"},
+            {"id": 2, "source_sheet": "供应商", "amount": 200, "summary": "供应商"},
+            {"id": 3, "source_sheet": "财务中心", "amount": 300, "summary": "财务"},
+        ],
+        {},
+    )
+    workbook = load_workbook(io.BytesIO(content))
+    assert workbook.sheetnames[:3] == ["供应商", "财务中心", "采购中心"]
+    assert workbook.sheetnames[-1] == "付款明细"

@@ -37,7 +37,7 @@ def connect() -> sqlite3.Connection:
 
 def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     data = dict(row)
-    for key in ("raw_extra_json", "errors_json", "mapping_json", "old_value_json", "new_value_json"):
+    for key in ("raw_extra_json", "sheet_order_json", "errors_json", "mapping_json", "old_value_json", "new_value_json"):
         if key in data and data[key]:
             try:
                 data[key.replace("_json", "")] = json.loads(data[key])
@@ -81,6 +81,7 @@ def init_db() -> None:
                 end_date TEXT,
                 status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','archived')),
                 source_file TEXT,
+                sheet_order_json TEXT,
                 created_by INTEGER REFERENCES users(id),
                 archived_by INTEGER REFERENCES users(id),
                 archived_at TEXT,
@@ -260,6 +261,7 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "users", "deleted_at", "TEXT")
     ensure_column(conn, "users", "deleted_by", "INTEGER REFERENCES users(id)")
     ensure_column(conn, "request_batches", "parent_batch_id", "INTEGER REFERENCES request_batches(id) ON DELETE SET NULL")
+    ensure_column(conn, "request_batches", "sheet_order_json", "TEXT")
     ensure_column(conn, "payment_requests", "copied_from_request_id", "INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL")
     ensure_column(conn, "payment_requests", "applicant", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_approval_date", "TEXT")

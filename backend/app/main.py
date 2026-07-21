@@ -91,6 +91,10 @@ class RolloverIn(BaseModel):
     copy_mode: str = "unfinished"
 
 
+class SheetOrderIn(BaseModel):
+    sheet_order: list[str] = Field(default_factory=list)
+
+
 class RequestIn(BaseModel):
     dingding_id: Optional[str] = None
     applicant: Optional[str] = None
@@ -627,8 +631,8 @@ def rollover_batch(
             """
             INSERT INTO request_batches (
                 parent_batch_id, name, start_date, end_date, status,
-                source_file, created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?)
+                source_file, sheet_order_json, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?)
             """,
             (
                 source_batch_id,
@@ -636,6 +640,7 @@ def rollover_batch(
                 payload.start_date,
                 payload.end_date,
                 f"rollover:{source['name']}",
+                source["sheet_order_json"],
                 user["id"],
                 timestamp,
                 timestamp,
@@ -734,6 +739,61 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
             (batch_id,),
         ).fetchall()
     return {"batch": row_to_dict(row), "stats": rows_to_dicts(stats)}
+
+
+@app.put("/api/batches/{batch_id}/sheet-order")
+def update_batch_sheet_order(
+    batch_id: int,
+    payload: SheetOrderIn,
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    requested_order: list[str] = []
+    seen: set[str] = set()
+    for value in payload.sheet_order:
+        name = str(value or "").strip()
+        if not name or name == "全部" or len(name) > 200 or name in seen:
+            continue
+        requested_order.append(name)
+        seen.add(name)
+    if len(requested_order) > 200:
+        raise HTTPException(status_code=400, detail="Sheet 数量不能超过 200 个")
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        batch = require_batch(conn, batch_id)
+        if batch["status"] == "archived":
+            raise HTTPException(status_code=400, detail="归档批次不能调整 Sheet 顺序")
+        existing_names = {
+            str(row["sheet_name"] or "").strip()
+            for row in conn.execute(
+                """
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name
+                FROM payment_requests
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchall()
+        }
+        final_order = [name for name in requested_order if name in existing_names]
+        final_order.extend(sorted(existing_names - set(final_order)))
+        old_order = batch_sheet_order(row_to_dict(batch))
+        timestamp = now_iso()
+        conn.execute(
+            "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(final_order, ensure_ascii=False), timestamp, batch_id),
+        )
+        updated = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
+        write_audit(
+            conn,
+            user["id"],
+            "batch.sheet_order.update",
+            "batch",
+            batch_id,
+            batch_id=batch_id,
+            old_value={"sheet_order": old_order},
+            new_value={"sheet_order": final_order},
+        )
+    return {"batch": row_to_dict(updated)}
 
 
 @app.post("/api/batches/{batch_id}/archive")
@@ -2421,6 +2481,25 @@ def require_batch(conn, batch_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="批次不存在")
     return row
+
+
+def batch_sheet_order(batch: Dict[str, Any]) -> list[str]:
+    value = batch.get("sheet_order")
+    if value is None and batch.get("sheet_order_json"):
+        try:
+            value = json.loads(batch["sheet_order_json"])
+        except (TypeError, json.JSONDecodeError):
+            value = []
+    if not isinstance(value, list):
+        return []
+    order: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        name = str(item or "").strip()
+        if name and name not in seen:
+            order.append(name)
+            seen.add(name)
+    return order
 
 
 def validate_external_expense_filter(payload: ExternalExpensePreviewIn) -> tuple[Optional[date], Optional[date]]:

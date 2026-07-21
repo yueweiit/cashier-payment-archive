@@ -36,6 +36,39 @@ def login(client: TestClient, username: str = "admin", password: str = "admin123
     assert response.status_code == 200
 
 
+def test_sheet_order_is_saved_and_inherited_by_rollover():
+    with TestClient(app) as client:
+        login(client)
+        source = client.post(
+            "/api/batches",
+            json={"name": "Sheet 排序来源", "start_date": "2026-07-16", "end_date": "2026-07-21"},
+        ).json()["batch"]
+        for sheet_name in ("采购中心", "财务中心", "供应商"):
+            created = client.post(
+                f"/api/batches/{source['id']}/requests",
+                json={"source_sheet": sheet_name, "payment_account": "私户", "amount": 100},
+            )
+            assert created.status_code == 200
+
+        order = ["供应商", "财务中心", "采购中心"]
+        saved = client.put(f"/api/batches/{source['id']}/sheet-order", json={"sheet_order": order})
+        assert saved.status_code == 200
+        assert saved.json()["batch"]["sheet_order"] == order
+        assert client.get(f"/api/batches/{source['id']}").json()["batch"]["sheet_order"] == order
+
+        exported = client.get(f"/api/batches/{source['id']}/export.xlsx")
+        assert exported.status_code == 200
+        workbook = load_workbook(io.BytesIO(exported.content))
+        assert workbook.sheetnames[:3] == order
+
+        rollover = client.post(
+            f"/api/batches/{source['id']}/rollover",
+            json={"name": "Sheet 排序结转", "start_date": "2026-07-22", "end_date": "2026-07-28", "copy_mode": "all"},
+        )
+        assert rollover.status_code == 200
+        assert rollover.json()["batch"]["sheet_order"] == order
+
+
 def external_expense_test_row(
     approval_no: str,
     source_id: str,

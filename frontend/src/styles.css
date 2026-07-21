@@ -948,6 +948,27 @@ textarea {
   white-space: nowrap;
 }
 
+.sheet-tab[draggable="true"] {
+  cursor: grab;
+  user-select: none;
+}
+
+.sheet-tab[draggable="true"]:active {
+  cursor: grabbing;
+}
+
+.sheet-tab.dragging {
+  opacity: 0.45;
+}
+
+.sheet-tab.drag-over-before {
+  box-shadow: inset 3px 0 0 #21766f !important;
+}
+
+.sheet-tab.drag-over-after {
+  box-shadow: inset -3px 0 0 #21766f !important;
+}
+
 .sheet-tab.active {
   border-color: #21766f;
   border-bottom-color: #ffffff;

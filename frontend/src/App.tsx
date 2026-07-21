@@ -1,4 +1,4 @@
-import { ClipboardEvent, FormEvent, Fragment, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ClipboardEvent, DragEvent, FormEvent, Fragment, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlignLeft,
   AlertTriangle,
@@ -990,6 +990,10 @@ function Workspace({
   const [activeSheet, setActiveSheet] = useState(ALL_SHEET);
   const [editingSheet, setEditingSheet] = useState<{ key: string; value: string } | null>(null);
   const [newSheetName, setNewSheetName] = useState<string | null>(null);
+  const [sheetOrder, setSheetOrder] = useState<string[]>([]);
+  const [draggedSheet, setDraggedSheet] = useState<string | null>(null);
+  const [sheetDropTarget, setSheetDropTarget] = useState<{ key: string; position: "before" | "after" } | null>(null);
+  const [sheetOrderSaving, setSheetOrderSaving] = useState(false);
   const [wrapText, setWrapText] = useState(false);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [rolloverDialogOpen, setRolloverDialogOpen] = useState(false);
@@ -1031,7 +1035,13 @@ function Workspace({
     loadRequests().catch((err) => setMessage((err as Error).message));
   }, [selectedBatch?.id, refreshToken]);
 
-  const sheetTabs = useMemo(() => getSheetTabs(gridRows), [gridRows]);
+  useEffect(() => {
+    setSheetOrder(selectedBatch?.sheet_order || []);
+    setDraggedSheet(null);
+    setSheetDropTarget(null);
+  }, [selectedBatch?.id, selectedBatch?.sheet_order]);
+
+  const sheetTabs = useMemo(() => getSheetTabs(gridRows, sheetOrder), [gridRows, sheetOrder]);
   const visibleRows = useMemo(() => gridRows.filter((row) => rowMatchesFilters(row, filters, activeSheet)), [gridRows, filters, activeSheet]);
   const visibleActiveRows = useMemo(() => visibleRows.filter((row) => !row.__deleted), [visibleRows]);
   const activeSheetRows = useMemo(
@@ -1060,6 +1070,7 @@ function Workspace({
   const canRestoreBatch = isPrivilegedRole(user.role);
   const canManageDraftState = selectedBatch?.status === "draft" && isPrivilegedRole(user.role);
   const canEditGrid = selectedBatch?.status !== "archived" || isPrivilegedRole(user.role);
+  const canReorderSheets = selectedBatch?.status === "draft" && !hasUnsavedChanges && !sheetOrderSaving;
   const batchPayableAmount = Number(selectedBatch?.total_amount) || 0;
   const batchPaidAmount = Number(selectedBatch?.total_paid_amount) || 0;
   const paymentProgress = batchPayableAmount > 0
@@ -1068,6 +1079,60 @@ function Workspace({
   const activeSheetPendingDeleteCount = activeSheetRows.filter((row) => row.__deleted).length;
   const canDeleteActiveSheet = canEditGrid && activeSheet !== ALL_SHEET && activeSheetRows.some((row) => !row.__deleted);
   const canRestoreActiveSheetDelete = canEditGrid && activeSheet !== ALL_SHEET && activeSheetRows.some((row) => row.__deleted);
+
+  function handleSheetDragStart(event: DragEvent<HTMLButtonElement>, sheetKey: string) {
+    if (!canReorderSheets || sheetKey === ALL_SHEET) {
+      event.preventDefault();
+      return;
+    }
+    setDraggedSheet(sheetKey);
+    setActiveSheet(sheetKey);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", sheetKey);
+  }
+
+  function handleSheetDragOver(event: DragEvent<HTMLButtonElement>, sheetKey: string) {
+    if (!draggedSheet || sheetKey === ALL_SHEET || sheetKey === draggedSheet) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const position = event.clientX < bounds.left + bounds.width / 2 ? "before" : "after";
+    setSheetDropTarget({ key: sheetKey, position });
+  }
+
+  async function handleSheetDrop(event: DragEvent<HTMLButtonElement>, targetKey: string) {
+    event.preventDefault();
+    const sourceKey = draggedSheet || event.dataTransfer.getData("text/plain");
+    const position = sheetDropTarget?.key === targetKey ? sheetDropTarget.position : "before";
+    setDraggedSheet(null);
+    setSheetDropTarget(null);
+    if (!selectedBatch || !sourceKey || sourceKey === targetKey || !canReorderSheets) return;
+
+    const previousOrder = sheetTabs.filter((tab) => tab.key !== ALL_SHEET).map((tab) => tab.key);
+    const nextOrder = previousOrder.filter((key) => key !== sourceKey);
+    const targetIndex = nextOrder.indexOf(targetKey);
+    if (targetIndex < 0) return;
+    nextOrder.splice(targetIndex + (position === "after" ? 1 : 0), 0, sourceKey);
+    if (nextOrder.every((key, index) => key === previousOrder[index])) return;
+
+    setSheetOrder(nextOrder);
+    setSheetOrderSaving(true);
+    try {
+      await api.updateSheetOrder(selectedBatch.id, nextOrder);
+      await reloadBatches();
+      setMessage("Sheet 顺序已保存");
+    } catch (error) {
+      setSheetOrder(previousOrder);
+      setMessage((error as Error).message);
+    } finally {
+      setSheetOrderSaving(false);
+    }
+  }
+
+  function handleSheetDragEnd() {
+    setDraggedSheet(null);
+    setSheetDropTarget(null);
+  }
 
   useEffect(() => {
     const handler = (event: BeforeUnloadEvent) => {
@@ -1203,6 +1268,11 @@ function Workspace({
       .map((localId) => gridRows.find((row) => row.__localId === localId)?.id)
       .filter((id): id is number => Boolean(id));
     await api.bulkSaveRequests(selectedBatch.id, { creates, updates, deletes, reason });
+    const savedSheetOrder = getSheetTabs(gridRows, sheetOrder)
+      .filter((tab) => tab.key !== ALL_SHEET && !tab.pendingDelete)
+      .map((tab) => tab.key);
+    await api.updateSheetOrder(selectedBatch.id, savedSheetOrder);
+    setSheetOrder(savedSheetOrder);
     setReason("");
     await loadRequests();
     await reloadBatches();
@@ -1218,6 +1288,7 @@ function Workspace({
     setEditorDraft(null);
     setEditorDirty(false);
     setReason("");
+    setSheetOrder(selectedBatch?.sheet_order || []);
     await loadRequests();
     setMessage("未保存修改已放弃");
   }
@@ -1340,6 +1411,7 @@ function Workspace({
     const nextDirty = new Set(dirtyCells);
     nextDirty.add(`${row.__localId}:source_sheet`);
     setDirtyCells(nextDirty);
+    setSheetOrder((current) => current.includes(name) ? current : [...current, name]);
     setFilters({ q: "", payment_account: "", invoice_status: "", finance_review: "", general_manager_approval: "" });
     setActiveSheet(name);
     setNewSheetName(null);
@@ -1389,6 +1461,10 @@ function Workspace({
     affectedRows.forEach((row) => nextDirty.add(`${row.__localId}:source_sheet`));
     setGridRows(gridRows.map((row) => (normalizeSheetName(row.source_sheet) === oldName ? { ...row, source_sheet: newName } : row)));
     setDirtyCells(nextDirty);
+    setSheetOrder((current) => {
+      const next = current.map((name) => name === oldName ? newName : name);
+      return next.includes(newName) ? next : [...next, newName];
+    });
     setActiveSheet(newName);
     setEditingSheet(null);
     setMessage(`Sheet 已重命名为 ${newName}，请保存更改`);
@@ -1678,16 +1754,24 @@ function Workspace({
                 className={[
                   activeSheet === tab.key ? "sheet-tab active" : "sheet-tab",
                   tab.pendingDelete ? "pending-delete" : "",
+                  draggedSheet === tab.key ? "dragging" : "",
+                  sheetDropTarget?.key === tab.key ? `drag-over-${sheetDropTarget.position}` : "",
                 ].filter(Boolean).join(" ")}
                 onPointerDown={() => setActiveSheet(tab.key)}
                 onClick={() => setActiveSheet(tab.key)}
                 onFocus={() => setActiveSheet(tab.key)}
                 onDoubleClick={() => beginRenameSheet(tab.key)}
                 onKeyDown={(event) => activateButtonByKeyboard(event, () => setActiveSheet(tab.key))}
+                draggable={canReorderSheets && tab.key !== ALL_SHEET}
+                onDragStart={(event) => handleSheetDragStart(event, tab.key)}
+                onDragOver={(event) => handleSheetDragOver(event, tab.key)}
+                onDrop={(event) => handleSheetDrop(event, tab.key)}
+                onDragEnd={handleSheetDragEnd}
                 role="tab"
                 aria-selected={activeSheet === tab.key}
+                aria-grabbed={draggedSheet === tab.key}
                 type="button"
-                title={tab.key === ALL_SHEET ? "全部 Sheet" : "双击重命名"}
+                title={tab.key === ALL_SHEET ? "全部 Sheet" : canReorderSheets ? "拖拽调整顺序，双击重命名" : hasUnsavedChanges ? "请先保存当前修改，再调整顺序" : "双击重命名"}
               >
                 <span>{tab.label}</span>
                 <small>{tab.count}</small>
@@ -3459,7 +3543,7 @@ function activateButtonByKeyboard(event: KeyboardEvent<HTMLButtonElement>, actio
   action();
 }
 
-function getSheetTabs(rows: GridRow[]): SheetTab[] {
+function getSheetTabs(rows: GridRow[], sheetOrder: string[] = []): SheetTab[] {
   const counts = new Map<string, { active: number; deleted: number }>();
   rows.forEach((row) => {
     const sheetName = normalizeSheetName(row.source_sheet);
@@ -3471,8 +3555,18 @@ function getSheetTabs(rows: GridRow[]): SheetTab[] {
     }
     counts.set(sheetName, count);
   });
+  const orderIndex = new Map(sheetOrder.map((name, index) => [name, index]));
   const sheetTabs = Array.from(counts.entries())
-    .sort(([left], [right]) => left.localeCompare(right, "zh-CN"))
+    .sort(([left], [right]) => {
+      const leftIndex = orderIndex.get(left);
+      const rightIndex = orderIndex.get(right);
+      if (leftIndex !== undefined || rightIndex !== undefined) {
+        if (leftIndex === undefined) return 1;
+        if (rightIndex === undefined) return -1;
+        return leftIndex - rightIndex;
+      }
+      return left.localeCompare(right, "zh-CN");
+    })
     .map(([sheetName, count]) => ({
       key: sheetName,
       label: sheetName,

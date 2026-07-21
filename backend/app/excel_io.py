@@ -809,8 +809,28 @@ def export_workbook(
     if not groups:
         groups[sheet_name_for_summary(batch.get("end_date"))] = []
 
+    raw_sheet_order = batch.get("sheet_order")
+    if not isinstance(raw_sheet_order, list) and batch.get("sheet_order_json"):
+        try:
+            raw_sheet_order = json.loads(batch["sheet_order_json"])
+        except (TypeError, json.JSONDecodeError):
+            raw_sheet_order = []
+    raw_sheet_order = raw_sheet_order if isinstance(raw_sheet_order, list) else []
+    export_order: list[str] = []
+    for item in raw_sheet_order:
+        source = str(item or "").strip()
+        if source.startswith("汇总") or source == "钉钉导入":
+            source = sheet_name_for_summary(batch.get("end_date"))
+        if source and source not in export_order:
+            export_order.append(source)
+    order_index = {name: index for index, name in enumerate(export_order)}
+    ordered_groups = sorted(
+        groups.items(),
+        key=lambda item: (order_index.get(item[0], len(order_index)), list(groups).index(item[0])),
+    )
+
     used_sheet_titles: set[str] = set()
-    for sheet_name, sheet_records in groups.items():
+    for sheet_name, sheet_records in ordered_groups:
         kind = sheet_kind(sheet_name)
         ws = wb.create_sheet(safe_sheet_title(sheet_name, used_sheet_titles))
         write_sheet(ws, kind, sheet_name, sheet_records, attachments)
