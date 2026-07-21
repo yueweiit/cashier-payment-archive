@@ -110,6 +110,7 @@ function canEditRequestField(role: UserRole, field: keyof PaymentRequest) {
 
 const fieldLabels: Record<string, string> = {
   dingding_id: "钉钉申请单号",
+  applicant: "申请人",
   payment_account: "付款账户",
   expense_type: "费用性质",
   summary: "摘要",
@@ -152,6 +153,7 @@ type GridColumn = {
 
 const gridColumns: GridColumn[] = [
   { key: "dingding_id", label: "钉钉申请单号", width: 190 },
+  { key: "applicant", label: "申请人", width: 190 },
   { key: "payment_account", label: "付款账户", width: 110 },
   { key: "expense_type", label: "费用性质", width: 120 },
   { key: "summary", label: "摘要", width: 360 },
@@ -2245,10 +2247,7 @@ function EditablePaymentGrid({
               <th className="attachment-col" style={{ width: 112, minWidth: 112 }}>附件</th>
               <th className="external-status-col">钉钉状态</th>
               {gridColumns.map((column) => (
-                <Fragment key={column.key}>
-                  <th style={{ width: column.width, minWidth: column.width }}>{column.label}</th>
-                  {column.key === "dingding_id" && <th className="applicant-col">申请人</th>}
-                </Fragment>
+                <th key={column.key} style={{ width: column.width, minWidth: column.width }}>{column.label}</th>
               ))}
             </tr>
           </thead>
@@ -2309,9 +2308,25 @@ function EditablePaymentGrid({
 	                    !canEditField(column.key) ? "readonly-field" : "",
 	                  ].filter(Boolean).join(" ");
                   return (
-                    <Fragment key={column.key}>
-                      <td className={dirty ? "dirty-cell" : ""} style={{ width: column.width, minWidth: column.width, maxWidth: column.width }}>
-                        {selectOptions ? (
+                    <td key={column.key} className={`${dirty ? "dirty-cell " : ""}${column.key === "applicant" ? "applicant-edit-cell" : ""}`.trim()} style={{ width: column.width, minWidth: column.width, maxWidth: column.width }}>
+                        {column.key === "applicant" ? (
+                          <div className="applicant-editor-cell">
+                            <input
+                              data-cell={`${rowIndex}-${colIndex}`}
+                              className={fieldClass}
+                              type="text"
+                              value={cellValue}
+                              title={requestApplicantTitle(row)}
+                              readOnly={cellReadOnly}
+                              placeholder="请输入申请人"
+                              onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
+                              onPaste={handlePaste}
+                              onKeyDown={(event) => handleKeyDown(event, rowIndex, colIndex)}
+                              onChange={(event) => updateCell(rowIndex, column, event.target.value)}
+                            />
+                            <small>{requestApplicantMeta(row)}</small>
+                          </div>
+                        ) : selectOptions ? (
                           <select
                             data-cell={`${rowIndex}-${colIndex}`}
                             className={fieldClass}
@@ -2355,12 +2370,6 @@ function EditablePaymentGrid({
                           />
                         )}
                       </td>
-                      {column.key === "dingding_id" && (
-                        <td className="applicant-col">
-                          <RequestApplicant request={row} />
-                        </td>
-                      )}
-                    </Fragment>
                   );
                 })}
               </tr>
@@ -2418,6 +2427,7 @@ function RequestEditor({
   const [previewImages, setPreviewImages] = useState<{ images: AttachmentLink[]; index: number } | null>(null);
   const fields: Array<keyof PaymentRequest> = [
     "dingding_id",
+    "applicant",
     "payment_account",
     "expense_type",
     "summary",
@@ -2535,7 +2545,7 @@ function RequestEditor({
     const fieldEditable = canEditField(field);
     const className = options.span ? "editor-field span-2" : "editor-field";
     const label = fieldLabels[field] || field;
-    const value = form[field];
+    const value = field === "applicant" ? requestApplicantName(form) : form[field];
     if (!fieldEditable) {
       return (
         <div className={`${className} editor-readonly-field`} key={field}>
@@ -2650,9 +2660,16 @@ function RequestEditor({
               </div>
               <div className="editor-form-grid">
                 {renderField("dingding_id")}
-                <div className="editor-field editor-readonly-field">
-                  <span>申请人</span>
-                  <strong className="editor-applicant-value"><RequestApplicant request={form} /></strong>
+                <div className="editor-applicant-field">
+                  {renderField("applicant")}
+                  <div className="editor-applicant-meta">
+                    <span>{requestApplicantMeta(form)}</span>
+                    {form.raw_extra?.external_source?.applicant && form.applicant != null && (
+                      <button type="button" className="text-button" onClick={() => setForm({ ...form, applicant: null })}>
+                        恢复为钉钉姓名
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {renderField("payment_account")}
                 {renderField("expense_type")}
@@ -3636,6 +3653,7 @@ function roundMoney(value: number) {
 }
 
 function cellDisplayValue(row: GridRow, column: GridColumn) {
+  if (column.key === "applicant") return requestApplicantName(row);
   const value = row[column.key];
   if (value === undefined || value === null) return "";
   return String(value);
@@ -3687,25 +3705,29 @@ function localIsoDate(value: Date) {
 }
 
 function requestApplicantName(request: Partial<PaymentRequest>) {
-  return String(request.raw_extra?.external_source?.applicant || "").trim();
+  if (request.applicant !== undefined && request.applicant !== null) return String(request.applicant).trim();
+  const sourceName = String(request.raw_extra?.external_source?.applicant || "").trim();
+  if (["unknown", "unknown user", "null", "none", "n/a", "-"].includes(sourceName.toLowerCase())) return "未识别人员";
+  return sourceName;
 }
 
 function requestApplicantDepartment(request: Partial<PaymentRequest>) {
   return String(request.raw_extra?.external_source?.applicant_department || "").trim();
 }
 
-function RequestApplicant({ request }: { request: Partial<PaymentRequest> }) {
-  const source = request.raw_extra?.external_source;
-  const name = requestApplicantName(request);
+function requestApplicantMeta(request: Partial<PaymentRequest>) {
   const department = requestApplicantDepartment(request);
-  const applicantId = String(source?.applicant_id || "").trim();
-  const title = [department && `部门：${department}`, applicantId && `钉钉用户 ID：${applicantId}`].filter(Boolean).join("\n") || undefined;
-  return (
-    <span className={name ? "request-applicant" : "request-applicant empty"} title={title}>
-      <span>{name || "—"}</span>
-      {department && <small>{department}</small>}
-    </span>
-  );
+  const isManual = request.applicant !== undefined && request.applicant !== null;
+  if (isManual) return department ? `人工填写 · ${department}` : "人工填写";
+  return department ? `钉钉同步 · ${department}` : "钉钉同步";
+}
+
+function requestApplicantTitle(request: Partial<PaymentRequest>) {
+  const source = request.raw_extra?.external_source;
+  const parts = [requestApplicantMeta(request)];
+  if (source?.applicant_id) parts.push(`钉钉用户 ID：${source.applicant_id}`);
+  if (source?.applicant) parts.push(`钉钉姓名：${source.applicant}`);
+  return parts.join("\n");
 }
 
 function ExternalApprovalBadge({

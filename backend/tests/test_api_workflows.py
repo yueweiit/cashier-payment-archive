@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 
 from backend.app.db import connect, now_iso
-from backend.app.external_expenses import ExternalExpenseError, _preview_conditions, applicant_name_from_title, map_external_expense
+from backend.app.external_expenses import ExternalExpenseError, _preview_conditions, applicant_name_from_title, map_external_expense, valid_applicant_name
 from backend.app.excel_io import export_workbook
 from backend.app import main as main_module
 from backend.app.main import app
@@ -1264,6 +1264,32 @@ def test_external_expense_applicant_title_patterns():
     assert applicant_name_from_title("Expense submitted by John Smith") == "John Smith"
     assert applicant_name_from_title("Jane Doe's Purchase Expense") == "Jane Doe"
     assert applicant_name_from_title("无法识别的标题") == ""
+    assert not valid_applicant_name("unknown")
+    assert not valid_applicant_name("未识别人员")
+    assert valid_applicant_name("王道伦")
+
+    fallback = map_external_expense(
+        {
+            "source_type": "operation",
+            "source_id": "title-fallback",
+            "effective_date": date(2026, 7, 15),
+            "approval_no": "TITLE-FALLBACK",
+            "creator_name": "user-with-placeholder",
+            "applicant_department": "财务部",
+            "approval_title": "王道伦提交的运营支出",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "中国China",
+            "beneficiary": "测试收款人",
+            "expense_type": "管理费用",
+            "summary": "测试摘要",
+            "base_currency_amount": Decimal("100"),
+            "raw_data": {},
+        },
+        {"user-with-placeholder": "unknown"},
+    )
+    assert fallback["applicant"] == "王道伦"
+    assert fallback["request_data"]["raw_extra"]["external_source"]["applicant_name_source"] == "approval_title"
 
 
 def test_external_expense_exact_approval_number_ignores_dates():
@@ -1525,6 +1551,13 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             assert response.status_code == 200
             request_ids.append(response.json()["request"]["id"])
 
+        manual_applicant = client.patch(
+            f"/api/batches/{batch_id}/requests/{request_ids[0]}",
+            json={"applicant": "外部供应商申请人"},
+        )
+        assert manual_applicant.status_code == 200
+        assert manual_applicant.json()["request"]["applicant"] == "外部供应商申请人"
+
         synced = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
         assert synced.status_code == 200
         assert synced.json() == {
@@ -1543,6 +1576,7 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         assert matched_source["approval_status"] == "RUNNING"
         assert matched_source["applicant"] == "同步申请人"
         assert matched_source["applicant_department"] == "产品与采购部"
+        assert by_id[request_ids[0]]["applicant"] == "外部供应商申请人"
         assert by_id[request_ids[0]]["amount"] == 100
         assert by_id[request_ids[0]]["source_sheet"] == "用户手动 Sheet"
         assert by_id[request_ids[2]]["raw_extra"]["external_source"]["lookup_status"] == "conflict"

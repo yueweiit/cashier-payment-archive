@@ -19,6 +19,7 @@ from openpyxl.utils import get_column_letter
 
 CORE_FIELDS = {
     "dingding_id": "钉钉申请单号",
+    "applicant": "申请人",
     "payment_account": "付款账户",
     "expense_type": "费用性质",
     "summary": "摘要",
@@ -69,6 +70,7 @@ IMAGE_FORMATS = {
 
 KNOWN_HEADER_ALIASES = {
     "dingding_id": ["钉钉申请单号", "审批编号", "审批单号", "申请单号", "流程编号"],
+    "applicant": ["申请人", "请款人", "提交人", "申请人姓名"],
     "payment_account": ["付款账户", "付款账号类型"],
     "expense_type": ["费用性质", "费用类型", "款项类型"],
     "summary": ["摘要", "支付节点明细", "事由", "付款事由", "申请内容", "明细"],
@@ -105,6 +107,10 @@ SHEET_HEADERS = {
     "reimburse": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "开票情况", "收款账户", "项目归属", "备注", "财务审批", "财务付款时间", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
     "growth": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "收款账户", "备注", "财务审批", "财务付款时间", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
 }
+
+for _headers in SHEET_HEADERS.values():
+    if "申请人" not in _headers:
+        _headers.insert(_headers.index("钉钉申请单号") + 1, "申请人")
 
 PAYMENT_DETAIL_SHEET = "付款明细"
 PAYMENT_DETAIL_HEADERS = [
@@ -471,6 +477,7 @@ def row_from_sheet(
         manager_approval = None
     row: Dict[str, Any] = {
         "dingding_id": stringify(first_value(values_by_header, ["钉钉申请单号"])),
+        "applicant": stringify(first_value(values_by_header, ["申请人", "请款人", "提交人"])),
         "payment_account": stringify(first_value(values_by_header, ["付款账户"])),
         "expense_type": stringify(first_value(values_by_header, ["费用性质"])),
         "summary": stringify(first_value(values_by_header, ["摘要", "支付节点明细"])),
@@ -1007,6 +1014,10 @@ def values_for_headers(headers: List[str], record: Dict[str, Any]) -> List[Any]:
             values.append(None)
         elif header == "钉钉申请单号":
             values.append(record.get("dingding_id"))
+        elif header == "申请人":
+            manual_applicant = record.get("applicant")
+            external_source = (record.get("raw_extra") or {}).get("external_source") or {}
+            values.append(manual_applicant if manual_applicant is not None else external_source.get("applicant"))
         elif header == "付款账户":
             values.append(record.get("payment_account"))
         elif header == "费用性质":

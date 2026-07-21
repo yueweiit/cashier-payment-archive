@@ -109,9 +109,10 @@ def test_partial_payment_amounts_are_normalized_and_exported():
     workbook = load_workbook(io.BytesIO(content), data_only=False)
     worksheet = workbook.worksheets[0]
     headers = [cell.value for cell in worksheet[1]]
-    assert headers[4:7] == ["应付金额", "已支付金额", "待付款金额"]
-    assert [worksheet.cell(2, column).value for column in range(5, 8)] == [100, 35.5, 64.5]
-    assert all(str(worksheet.cell(3, column).value).startswith("=SUM(") for column in range(5, 8))
+    assert "申请人" in headers
+    amount_columns = [headers.index(header) + 1 for header in ("应付金额", "已支付金额", "待付款金额")]
+    assert [worksheet.cell(2, column).value for column in amount_columns] == [100, 35.5, 64.5]
+    assert all(str(worksheet.cell(3, column).value).startswith("=SUM(") for column in amount_columns)
 
 
 def test_weekly_excel_extracts_embedded_images():

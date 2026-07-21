@@ -93,6 +93,7 @@ def init_db() -> None:
                 batch_id INTEGER NOT NULL REFERENCES request_batches(id) ON DELETE CASCADE,
                 copied_from_request_id INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL,
                 dingding_id TEXT,
+                applicant TEXT,
                 payment_account TEXT,
                 expense_type TEXT,
                 summary TEXT,
@@ -260,6 +261,7 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "users", "deleted_by", "INTEGER REFERENCES users(id)")
     ensure_column(conn, "request_batches", "parent_batch_id", "INTEGER REFERENCES request_batches(id) ON DELETE SET NULL")
     ensure_column(conn, "payment_requests", "copied_from_request_id", "INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL")
+    ensure_column(conn, "payment_requests", "applicant", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_approval_date", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_opinion", "TEXT")
     migrate_payment_amounts(conn)

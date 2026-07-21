@@ -355,7 +355,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
 
     application_date = _date_text(row.get("effective_date"))
     applicant_id = _text(row.get("creator_name")) or ""
-    applicant = (user_names or {}).get(applicant_id, "")
+    snapshot_applicant = (user_names or {}).get(applicant_id, "")
+    applicant = snapshot_applicant if valid_applicant_name(snapshot_applicant) else ""
     applicant_name_source = "ding_user_snapshot" if applicant else ""
     if not applicant:
         applicant = applicant_name_from_title(row.get("approval_title"))
@@ -430,8 +431,29 @@ def applicant_name_from_title(value: Any) -> str:
     for pattern in patterns:
         match = pattern.search(title)
         if match:
-            return match.group(1).strip()
+            candidate = match.group(1).strip()
+            return candidate if valid_applicant_name(candidate) else ""
     return ""
+
+
+INVALID_APPLICANT_NAMES = {
+    "-",
+    "--",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "unknown",
+    "unknown user",
+    "未知",
+    "未识别",
+    "未识别人员",
+}
+
+
+def valid_applicant_name(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text.lower() not in INVALID_APPLICANT_NAMES
 
 
 def fetch_dingtalk_user_names(user_ids: Iterable[Any]) -> Dict[str, str]:
@@ -453,15 +475,16 @@ def fetch_dingtalk_user_names(user_ids: Iterable[Any]) -> Dict[str, str]:
                     WHERE BTRIM(user_id) = ANY(%s)
                       AND name IS NOT NULL
                       AND BTRIM(name) <> ''
+                      AND NOT (LOWER(BTRIM(name)) = ANY(%s))
                     ORDER BY BTRIM(user_id),
                              is_current DESC NULLS LAST,
                              valid_from DESC NULLS LAST,
                              updated_at DESC NULLS LAST,
                              id DESC
                     """,
-                    [chunk],
+                    [chunk, sorted(INVALID_APPLICANT_NAMES)],
                 ).fetchall()
-                names.update({str(row["user_id"]): str(row["name"]) for row in rows})
+                names.update({str(row["user_id"]): str(row["name"]) for row in rows if valid_applicant_name(row["name"])})
     except ExternalExpenseError:
         return {}
     return names
@@ -478,7 +501,8 @@ def _applicant_options(rows: Iterable[Dict[str, Any]], user_names: Optional[Dict
         if not applicant_id:
             continue
         count = int(row.get("count") or 0)
-        name = (user_names or {}).get(applicant_id) or applicant_name_from_title(row.get("approval_title")) or "未识别人员"
+        snapshot_name = (user_names or {}).get(applicant_id)
+        name = (snapshot_name if valid_applicant_name(snapshot_name) else "") or applicant_name_from_title(row.get("approval_title")) or "未识别人员"
         department = _text(row.get("applicant_department")) or "未归属部门"
         grouped[applicant_id]["count"] += count
         grouped[applicant_id]["names"][name] += count

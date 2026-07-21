@@ -26,6 +26,7 @@ export type PaymentRequest = {
   batch_id: number;
   copied_from_request_id?: number;
   dingding_id?: string;
+  applicant?: string | null;
   payment_account?: string;
   expense_type?: string;
   summary?: string;

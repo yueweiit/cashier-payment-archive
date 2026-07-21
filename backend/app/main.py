@@ -93,6 +93,7 @@ class RolloverIn(BaseModel):
 
 class RequestIn(BaseModel):
     dingding_id: Optional[str] = None
+    applicant: Optional[str] = None
     payment_account: Optional[str] = None
     expense_type: Optional[str] = None
     summary: Optional[str] = None
@@ -243,6 +244,7 @@ GENERAL_MANAGER_CONTROLLED_FIELDS = {
     "general_manager_opinion",
 }
 REQUEST_FIELD_LABELS = {
+    "applicant": "申请人",
     "paid_amount": "已支付金额",
     "pending_amount": "待付款金额",
     "finance_review": "财务审批",
@@ -257,6 +259,7 @@ REQUEST_FIELD_LABELS = {
 }
 REQUEST_WRITE_FIELDS = {
     "dingding_id",
+    "applicant",
     "payment_account",
     "expense_type",
     "summary",
