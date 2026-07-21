@@ -68,6 +68,13 @@ def test_sheet_order_is_saved_and_inherited_by_rollover():
         assert rollover.status_code == 200
         assert rollover.json()["batch"]["sheet_order"] == order
 
+        archived = client.post(f"/api/batches/{source['id']}/archive")
+        assert archived.status_code == 200
+        archived_order = list(reversed(order))
+        reordered = client.put(f"/api/batches/{source['id']}/sheet-order", json={"sheet_order": archived_order})
+        assert reordered.status_code == 200
+        assert reordered.json()["batch"]["sheet_order"] == archived_order
+
 
 def external_expense_test_row(
     approval_no: str,

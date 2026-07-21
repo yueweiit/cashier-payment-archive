@@ -761,8 +761,8 @@ def update_batch_sheet_order(
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         batch = require_batch(conn, batch_id)
-        if batch["status"] == "archived":
-            raise HTTPException(status_code=400, detail="归档批次不能调整 Sheet 顺序")
+        if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
+            raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理调整 Sheet 顺序")
         existing_names = {
             str(row["sheet_name"] or "").strip()
             for row in conn.execute(

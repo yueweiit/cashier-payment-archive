@@ -1070,7 +1070,7 @@ function Workspace({
   const canRestoreBatch = isPrivilegedRole(user.role);
   const canManageDraftState = selectedBatch?.status === "draft" && isPrivilegedRole(user.role);
   const canEditGrid = selectedBatch?.status !== "archived" || isPrivilegedRole(user.role);
-  const canReorderSheets = selectedBatch?.status === "draft" && !hasUnsavedChanges && !sheetOrderSaving;
+  const canReorderSheets = canEditGrid && !hasUnsavedChanges && !sheetOrderSaving;
   const batchPayableAmount = Number(selectedBatch?.total_amount) || 0;
   const batchPaidAmount = Number(selectedBatch?.total_paid_amount) || 0;
   const paymentProgress = batchPayableAmount > 0
