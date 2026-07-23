@@ -111,9 +111,12 @@ SHEET_HEADERS = {
 for _headers in SHEET_HEADERS.values():
     if "申请人" not in _headers:
         _headers.insert(_headers.index("钉钉申请单号") + 1, "申请人")
+    if "请款标识" not in _headers:
+        _headers.append("请款标识")
 
 PAYMENT_DETAIL_SHEET = "付款明细"
 PAYMENT_DETAIL_HEADERS = [
+    "付款标识",
     "请款标识",
     "钉钉单号",
     "来源 Sheet",
@@ -126,6 +129,8 @@ PAYMENT_DETAIL_HEADERS = [
     "来源标记",
     "凭证信息",
 ]
+SYSTEM_INFO_SHEET = "_系统信息"
+EXPORT_FORMAT_VERSION = 2
 
 
 def parse_batch_dates(filename: str) -> Tuple[Optional[str], Optional[str], str]:
@@ -476,6 +481,7 @@ def row_from_sheet(
     if strict_date_string(manager_approval_raw):
         manager_approval = None
     row: Dict[str, Any] = {
+        "_request_id": integer_value(first_value(values_by_header, ["请款标识"])),
         "dingding_id": stringify(first_value(values_by_header, ["钉钉申请单号"])),
         "applicant": stringify(first_value(values_by_header, ["申请人", "请款人", "提交人"])),
         "payment_account": stringify(first_value(values_by_header, ["付款账户"])),
@@ -506,6 +512,7 @@ def row_from_sheet(
         "source_sheet": source_sheet,
         "source_row": row_idx,
         "raw_extra_json": json.dumps(raw_extra, ensure_ascii=False, default=str),
+        "_present_fields": present_request_fields(header_columns),
     }
     formula_amount = raw_extra.get("应付金额__formula")
     if row["amount"] is None and formula_amount and re.match(r"^=[0-9\s+\-*/().]+$", formula_amount):
@@ -527,9 +534,9 @@ def merge_texts(values: Iterable[Any]) -> Optional[str]:
 
 
 def should_keep_row(row: Dict[str, Any], amount_formula: Optional[str]) -> bool:
-    if row.get("amount") is None:
+    if row.get("amount") is None and not row.get("_request_id"):
         return False
-    if not row.get("dingding_id") and not row.get("payment_account"):
+    if not row.get("_request_id") and not row.get("dingding_id") and not row.get("payment_account"):
         return False
     has_business_text = any(
         row.get(key)
@@ -542,6 +549,24 @@ def should_keep_row(row: Dict[str, Any], amount_formula: Optional[str]) -> bool:
     if not row.get("dingding_id") and amount_formula and re.match(r"^=[A-Z]+\$?\d+$", amount_formula):
         return False
     return True
+
+
+def integer_value(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def present_request_fields(header_columns: List[Tuple[int, str]]) -> List[str]:
+    normalized_headers = {normalize_header(header) for _, header in header_columns}
+    present: List[str] = []
+    for field, aliases in KNOWN_HEADER_ALIASES.items():
+        if any(normalize_header(alias) in normalized_headers for alias in aliases):
+            present.append(field)
+    return present
 
 
 def image_format_info(image: ExcelImage) -> Tuple[str, str]:
@@ -609,14 +634,21 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
     image_summary = {"found": 0, "attached": 0, "skipped": 0}
     payment_details: List[Dict[str, Any]] = []
     payment_detail_sheet_present = False
+    system_info = parse_system_info(wb_values)
+    sheet_name_map = system_info.get("sheet_name_map") or {}
+    workbook_sheet_order: List[str] = []
     for ws_values in wb_values.worksheets:
         ws_formulas = wb_formulas[ws_values.title]
+        if normalize_header(ws_values.title) == normalize_header(SYSTEM_INFO_SHEET):
+            continue
         if normalize_header(ws_values.title) == normalize_header(PAYMENT_DETAIL_SHEET):
             payment_detail_sheet_present = True
             parsed_details, detail_summary = parse_payment_detail_sheet(ws_values)
             payment_details.extend(parsed_details)
             sheet_summaries.append(detail_summary)
             continue
+        full_source_sheet = str(sheet_name_map.get(ws_values.title) or ws_values.title)
+        workbook_sheet_order.append(full_source_sheet)
         header_row = detect_header_row(ws_values)
         if not header_row:
             image_counts = collect_embedded_images(ws_values, {})
@@ -628,7 +660,7 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
         imported = 0
         rows_by_source_row: Dict[int, Dict[str, Any]] = {}
         for row_idx in range(header_row + 1, ws_values.max_row + 1):
-            parsed = row_from_sheet(ws_values, ws_formulas, row_idx, header_columns, ws_values.title)
+            parsed = row_from_sheet(ws_values, ws_formulas, row_idx, header_columns, full_source_sheet)
             if parsed:
                 imported += 1
                 rows_by_source_row[row_idx] = parsed
@@ -636,13 +668,44 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
         image_counts = collect_embedded_images(ws_values, rows_by_source_row)
         for key in image_summary:
             image_summary[key] += image_counts[key]
-        sheet_summaries.append({"sheet": ws_values.title, "imported": imported, "header_row": header_row, "images": image_counts})
+        sheet_summaries.append({"sheet": full_source_sheet, "workbook_sheet": ws_values.title, "imported": imported, "header_row": header_row, "images": image_counts})
     return rows, {
         "sheets": sheet_summaries,
         "images": image_summary,
         "payment_detail_sheet_present": payment_detail_sheet_present,
         "payment_details": payment_details,
+        "format_version": system_info.get("format_version"),
+        "export_batch_id": system_info.get("batch_id"),
+        "export_batch_updated_at": system_info.get("batch_updated_at"),
+        "exported_at": system_info.get("exported_at"),
+        "sheet_name_map": sheet_name_map,
+        "workbook_sheet_order": workbook_sheet_order,
     }
+
+
+def parse_system_info(workbook) -> Dict[str, Any]:
+    matching = next(
+        (
+            worksheet
+            for worksheet in workbook.worksheets
+            if normalize_header(worksheet.title) == normalize_header(SYSTEM_INFO_SHEET)
+        ),
+        None,
+    )
+    if matching is None:
+        return {}
+    info: Dict[str, Any] = {"sheet_name_map": {}}
+    for row_idx in range(1, matching.max_row + 1):
+        key = stringify(matching.cell(row_idx, 1).value)
+        value = stringify(matching.cell(row_idx, 2).value)
+        if key in {"format_version", "batch_id", "batch_updated_at", "exported_at"}:
+            info[key] = integer_value(value) if key in {"format_version", "batch_id"} else value
+        if key == "sheet_map":
+            workbook_name = stringify(matching.cell(row_idx, 2).value)
+            source_name = stringify(matching.cell(row_idx, 3).value)
+            if workbook_name and source_name:
+                info["sheet_name_map"][workbook_name] = source_name
+    return info
 
 
 def parse_payment_detail_sheet(ws) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -669,6 +732,7 @@ def parse_payment_detail_sheet(ws) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
     rows_by_source_row: Dict[int, Dict[str, Any]] = {}
     for row_idx in range(header_row + 1, ws.max_row + 1):
         raw_request_id = cell_value(row_idx, "请款标识")
+        raw_payment_id = cell_value(row_idx, "付款标识")
         raw_amount = cell_value(row_idx, "本次金额")
         raw_date = cell_value(row_idx, "付款日期")
         if all(value in (None, "") for value in (raw_request_id, raw_amount, raw_date, cell_value(row_idx, "钉钉单号"))):
@@ -678,6 +742,7 @@ def parse_payment_detail_sheet(ws) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
         except (TypeError, ValueError):
             request_id = None
         detail = {
+            "payment_id": integer_value(raw_payment_id),
             "request_id": request_id,
             "dingding_id": stringify(cell_value(row_idx, "钉钉单号")),
             "source_sheet": stringify(cell_value(row_idx, "来源 Sheet")),
@@ -690,6 +755,18 @@ def parse_payment_detail_sheet(ws) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
             "source_type": stringify(cell_value(row_idx, "来源标记")) or "excel_detail",
             "voucher_info": stringify(cell_value(row_idx, "凭证信息")),
             "source_row": row_idx,
+            "_present_fields": [
+                field
+                for field, header in (
+                    ("payment_date", "付款日期"),
+                    ("amount", "本次金额"),
+                    ("payer", "付款人"),
+                    ("payment_account", "付款账户"),
+                    ("bank_reference", "流水号"),
+                    ("remark", "备注"),
+                )
+                if normalize_header(header) in header_lookup
+            ],
         }
         details.append(detail)
         rows_by_source_row[row_idx] = detail
@@ -803,8 +880,6 @@ def export_workbook(
     groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for record in records:
         source = record.get("source_sheet") or "汇总"
-        if source.startswith("汇总") or source == "钉钉导入":
-            source = sheet_name_for_summary(batch.get("end_date"))
         groups[source].append(record)
     if not groups:
         groups[sheet_name_for_summary(batch.get("end_date"))] = []
@@ -819,8 +894,6 @@ def export_workbook(
     export_order: list[str] = []
     for item in raw_sheet_order:
         source = str(item or "").strip()
-        if source.startswith("汇总") or source == "钉钉导入":
-            source = sheet_name_for_summary(batch.get("end_date"))
         if source and source not in export_order:
             export_order.append(source)
     order_index = {name: index for index, name in enumerate(export_order)}
@@ -829,14 +902,18 @@ def export_workbook(
         key=lambda item: (order_index.get(item[0], len(order_index)), list(groups).index(item[0])),
     )
 
-    used_sheet_titles: set[str] = set()
+    used_sheet_titles: set[str] = {PAYMENT_DETAIL_SHEET, SYSTEM_INFO_SHEET}
+    sheet_name_map: Dict[str, str] = {}
     for sheet_name, sheet_records in ordered_groups:
         kind = sheet_kind(sheet_name)
-        ws = wb.create_sheet(safe_sheet_title(sheet_name, used_sheet_titles))
+        workbook_title = safe_sheet_title(sheet_name, used_sheet_titles)
+        ws = wb.create_sheet(workbook_title)
+        sheet_name_map[workbook_title] = sheet_name
         write_sheet(ws, kind, sheet_name, sheet_records, attachments)
 
-    payment_ws = wb.create_sheet(safe_sheet_title(PAYMENT_DETAIL_SHEET, used_sheet_titles))
+    payment_ws = wb.create_sheet(PAYMENT_DETAIL_SHEET)
     write_payment_detail_sheet(payment_ws, payments or [])
+    write_system_info_sheet(wb, batch, sheet_name_map)
 
     output = io.BytesIO()
     wb.save(output)
@@ -875,6 +952,7 @@ def write_payment_detail_sheet(ws, payments: List[Dict[str, Any]]) -> None:
             for voucher in vouchers
         )
         values = [
+            payment.get("id"),
             payment.get("request_id"),
             payment.get("dingding_id"),
             payment.get("request_source_sheet") or payment.get("source_sheet"),
@@ -891,9 +969,9 @@ def write_payment_detail_sheet(ws, payments: List[Dict[str, Any]]) -> None:
             cell = ws.cell(row_idx, col, value)
             cell.border = border
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-        ws.cell(row_idx, 5).number_format = '#,##0.00'
+        ws.cell(row_idx, PAYMENT_DETAIL_HEADERS.index("本次金额") + 1).number_format = '#,##0.00'
         if payment.get("payment_date"):
-            ws.cell(row_idx, 4).number_format = "yyyy-mm-dd"
+            ws.cell(row_idx, PAYMENT_DETAIL_HEADERS.index("付款日期") + 1).number_format = "yyyy-mm-dd"
         image_vouchers = [
             voucher
             for voucher in vouchers
@@ -916,13 +994,30 @@ def write_payment_detail_sheet(ws, payments: List[Dict[str, Any]]) -> None:
             image.width = int(image.width * scale)
             image.height = int(image.height * scale)
             ws.add_image(image, f"{get_column_letter(col)}{row_idx}")
-    widths = [14, 22, 22, 14, 14, 16, 18, 22, 30, 18, 42]
+    widths = [14, 14, 22, 22, 14, 14, 16, 18, 22, 30, 18, 42]
     for col, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
     for col in range(len(PAYMENT_DETAIL_HEADERS) + 1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col)].width = 18
     ws.freeze_panes = "A2"
     ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].hidden = True
+    ws.column_dimensions["B"].hidden = True
+
+
+def write_system_info_sheet(workbook, batch: Dict[str, Any], sheet_name_map: Dict[str, str]) -> None:
+    ws = workbook.create_sheet(SYSTEM_INFO_SHEET)
+    rows = [
+        ("format_version", EXPORT_FORMAT_VERSION, None),
+        ("batch_id", batch.get("id"), None),
+        ("batch_updated_at", batch.get("updated_at"), None),
+        ("exported_at", datetime.now().replace(microsecond=0).isoformat(), None),
+    ]
+    rows.extend(("sheet_map", workbook_name, source_name) for workbook_name, source_name in sheet_name_map.items())
+    for row_idx, values in enumerate(rows, start=1):
+        for col_idx, value in enumerate(values, start=1):
+            ws.cell(row_idx, col_idx, value)
+    ws.sheet_state = "veryHidden"
 
 
 def safe_sheet_title(title: str, used_titles: Optional[set[str]] = None) -> str:
@@ -1024,6 +1119,8 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
         ws.column_dimensions[get_column_letter(col)].width = width
     ws.freeze_panes = ws["A2"] if kind != "mold" else ws["A3"]
     ws.sheet_view.showGridLines = False
+    request_id_col = headers.index("请款标识") + 1
+    ws.column_dimensions[get_column_letter(request_id_col)].hidden = True
 
 
 def values_for_headers(headers: List[str], record: Dict[str, Any]) -> List[Any]:
@@ -1032,6 +1129,8 @@ def values_for_headers(headers: List[str], record: Dict[str, Any]) -> List[Any]:
     for header in headers:
         if header == "序号":
             values.append(None)
+        elif header == "请款标识":
+            values.append(record.get("id"))
         elif header == "钉钉申请单号":
             values.append(record.get("dingding_id"))
         elif header == "申请人":
@@ -1100,8 +1199,6 @@ def add_attachment_comment(ws, row_idx: int, headers: List[str], record: Dict[st
     target_header = "备注" if "备注" in headers else headers[-1]
     col = headers.index(target_header) + 1
     cell = ws.cell(row_idx, col)
-    existing = cell.value or ""
-    cell.value = (str(existing) + "\n" if existing else "") + comment_text
     cell.comment = Comment(comment_text, "System")
 
 

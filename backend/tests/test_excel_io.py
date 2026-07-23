@@ -184,4 +184,5 @@ def test_export_workbook_uses_saved_sheet_order():
     )
     workbook = load_workbook(io.BytesIO(content))
     assert workbook.sheetnames[:3] == ["供应商", "财务中心", "采购中心"]
-    assert workbook.sheetnames[-1] == "付款明细"
+    assert workbook.sheetnames[-2:] == ["付款明细", "_系统信息"]
+    assert workbook["_系统信息"].sheet_state == "veryHidden"

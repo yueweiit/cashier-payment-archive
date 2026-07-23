@@ -1933,6 +1933,168 @@ textarea {
   cursor: wait;
 }
 
+.weekly-merge-modal {
+  width: min(1380px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  grid-template-columns: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.weekly-merge-intro,
+.weekly-merge-filters,
+.weekly-merge-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.weekly-merge-intro {
+  color: #60717d;
+  font-size: 13px;
+}
+
+.weekly-merge-intro span + span {
+  padding-left: 8px;
+  border-left: 1px solid #dce5ea;
+}
+
+.weekly-merge-filters .danger {
+  color: #a84339;
+  background: #fff0ee;
+}
+
+.weekly-merge-table-wrap {
+  min-height: 260px;
+  max-height: min(55vh, 620px);
+  overflow: auto;
+  border: 1px solid #dce5ea;
+  border-radius: 8px;
+}
+
+.weekly-merge-table {
+  width: 100%;
+  min-width: 1180px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.weekly-merge-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 9px;
+  color: #38515d;
+  text-align: left;
+  background: #edf5f4;
+}
+
+.weekly-merge-table td {
+  padding: 9px;
+  vertical-align: top;
+  border-top: 1px solid #e5ebee;
+}
+
+.weekly-merge-table td strong,
+.weekly-merge-table td small {
+  display: block;
+}
+
+.weekly-merge-table td small {
+  margin-top: 3px;
+  color: #778b95;
+}
+
+.merge-conflict-row td {
+  background: #fff4f2;
+}
+
+.merge-warning-row td {
+  background: #fffaf0;
+}
+
+.merge-action-badge {
+  display: inline-flex;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: #526873;
+  background: #e8eef1;
+}
+
+.merge-action-badge.create,
+.merge-action-badge.update {
+  color: #176b4d;
+  background: #dff4e8;
+}
+
+.merge-action-badge.conflict {
+  color: #943c34;
+  background: #fce8e5;
+}
+
+.merge-change-list {
+  display: grid;
+  gap: 3px;
+  max-width: 320px;
+}
+
+.merge-change-list span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-error-text {
+  color: #a23e34;
+}
+
+.merge-warning-text {
+  color: #8a620d;
+}
+
+.merge-payment-date {
+  display: grid;
+  gap: 4px;
+  margin-top: 7px;
+  color: #4c616d;
+}
+
+.merge-payment-date input {
+  min-height: 34px;
+}
+
+.merge-sheet-order-note,
+.merge-confirm-summary {
+  padding: 10px 12px;
+  border: 1px solid #cfe2de;
+  border-radius: 7px;
+  color: #315b57;
+  background: #f2faf8;
+}
+
+.merge-confirm-summary {
+  display: grid;
+  gap: 4px;
+}
+
+.merge-archive-reason {
+  display: grid;
+  gap: 6px;
+  color: #4c616d;
+}
+
+.merge-archive-reason textarea {
+  min-height: 70px;
+}
+
+.weekly-merge-actions {
+  justify-content: flex-end;
+}
+
+.weekly-merge-actions > .muted {
+  margin-right: auto;
+}
+
 .external-preview-table-wrap {
   min-height: 180px;
   max-height: min(48vh, 510px);
@@ -2835,6 +2997,26 @@ textarea {
     max-height: calc(100dvh - 20px);
     overflow: auto;
     padding: 14px;
+  }
+
+  .weekly-merge-modal {
+    width: calc(100vw - 20px);
+    max-height: calc(100dvh - 20px);
+    padding: 14px;
+  }
+
+  .weekly-merge-intro {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .weekly-merge-intro span + span {
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .weekly-merge-table-wrap {
+    max-height: 48dvh;
   }
 
   .external-expense-filters {

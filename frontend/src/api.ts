@@ -169,6 +169,76 @@ export type ExternalMetadataSyncResult = {
   updated_requests: number;
 };
 
+export type WeeklyMergeCandidate = {
+  id: number;
+  dingding_id?: string;
+  applicant?: string;
+  source_sheet?: string;
+  amount?: number;
+  summary?: string;
+};
+
+export type WeeklyMergeRow = {
+  row_id: string;
+  action: "create" | "update" | "unchanged" | "conflict" | "skip";
+  request_id?: number;
+  incoming_request_id?: number;
+  dingding_id?: string;
+  applicant?: string;
+  source_sheet?: string;
+  amount?: number;
+  old_paid_amount: number;
+  new_paid_amount: number;
+  changes: Array<{ field: string; label: string; old?: unknown; new?: unknown }>;
+  payment_change: boolean;
+  attachment_change: boolean;
+  payment_changes: Array<{
+    key: string;
+    action: string;
+    payment_id?: number;
+    old_amount?: number;
+    new_amount?: number;
+    delta?: number;
+  }>;
+  payment_date_keys: string[];
+  candidates: WeeklyMergeCandidate[];
+  errors: string[];
+  warnings: string[];
+};
+
+export type WeeklyMergePreview = {
+  job_id: number;
+  batch_id: number;
+  format_version: number;
+  summary: {
+    create: number;
+    update: number;
+    payment: number;
+    unchanged: number;
+    conflict: number;
+    warning: number;
+  };
+  rows: WeeklyMergeRow[];
+  sheet_order: { old: string[]; new: string[]; changed: boolean };
+  can_apply: boolean;
+  expires_at: string;
+};
+
+export type WeeklyMergeResolution = {
+  row_id: string;
+  action: "update" | "create" | "skip";
+  request_id?: number;
+};
+
+export type WeeklyMergeApplyResult = {
+  status: string;
+  job_id: number;
+  batch_id: number;
+  operation_id: string;
+  summary: WeeklyMergePreview["summary"];
+  sheet_order: string[];
+};
+
 export type PaymentVoucher = {
   id: number;
   payment_id: number;
@@ -399,6 +469,24 @@ export const api = {
     if (batchId) body.append("batch_id", String(batchId));
     return request<Record<string, unknown>>("/api/import/weekly-excel", { method: "POST", body });
   },
+  previewWeeklyMerge: (file: File, batchId: number) => {
+    const body = new FormData();
+    body.append("file", file);
+    body.append("batch_id", String(batchId));
+    return request<WeeklyMergePreview>("/api/import/weekly-excel/merge-preview", { method: "POST", body });
+  },
+  applyWeeklyMerge: (
+    jobId: number,
+    payload: {
+      resolutions: WeeklyMergeResolution[];
+      payment_dates: Record<string, string>;
+      reason?: string;
+    },
+  ) =>
+    request<WeeklyMergeApplyResult>(`/api/import-jobs/${jobId}/apply-merge`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
   uploadDingTalk: (file: File, batchId?: number, mapping?: Record<string, string>) => {
     const body = new FormData();
     body.append("file", file);
@@ -432,6 +520,8 @@ export const api = {
       deleted_payments: number;
       deleted_payment_vouchers: number;
       removed_files: number;
+      restored_requests?: number;
+      restored_payments?: number;
     }>(
       `/api/batches/${batchId}/imports/latest/rollback`,
       { method: "POST" },

@@ -44,6 +44,10 @@ import {
   RolloverCopyMode,
   User,
   UserRole,
+  WeeklyMergeApplyResult,
+  WeeklyMergePreview,
+  WeeklyMergeResolution,
+  WeeklyMergeRow,
 } from "./api";
 
 type Tab = "workspace" | "archive" | "admin";
@@ -479,7 +483,8 @@ function TopbarImportActions({
   const [headers, setHeaders] = useState<string[]>([]);
   const [mappingOpen, setMappingOpen] = useState(false);
   const [externalImportOpen, setExternalImportOpen] = useState(false);
-  const [busyAction, setBusyAction] = useState<"weekly" | "dingtalk" | "sync-metadata" | "rollback" | null>(null);
+  const [mergePreview, setMergePreview] = useState<WeeklyMergePreview | null>(null);
+  const [busyAction, setBusyAction] = useState<"weekly" | "weekly-merge" | "dingtalk" | "sync-metadata" | "rollback" | null>(null);
   const [weeklyInputKey, setWeeklyInputKey] = useState(0);
   const [dingtalkInputKey, setDingtalkInputKey] = useState(0);
 
@@ -497,6 +502,20 @@ function TopbarImportActions({
       setWeeklyFile(null);
       setWeeklyInputKey((value) => value + 1);
       await refreshAfterImport("周报 Excel 已导入");
+    } catch (err) {
+      setMessage((err as Error).message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function previewWeeklyMerge() {
+    if (!weeklyFile || !selectedBatch || hasUnsavedChanges) return;
+    setBusyAction("weekly-merge");
+    setMessage("");
+    try {
+      const preview = await api.previewWeeklyMerge(weeklyFile, selectedBatch.id);
+      setMergePreview(preview);
     } catch (err) {
       setMessage((err as Error).message);
     } finally {
@@ -585,7 +604,17 @@ function TopbarImportActions({
             <span className="compact-file-name" title={weeklyFile?.name || ""}>{weeklyFile?.name || "未选择"}</span>
             <button className="primary-button compact-import-button" type="button" onClick={uploadWeekly} disabled={!weeklyFile || busyAction !== null}>
               <Upload size={15} />
-              {busyAction === "weekly" ? "导入中" : "导入"}
+              {busyAction === "weekly" ? "导入中" : "新增导入"}
+            </button>
+            <button
+              className="ghost-button compact-import-button"
+              type="button"
+              onClick={previewWeeklyMerge}
+              disabled={!weeklyFile || !selectedBatch || hasUnsavedChanges || busyAction !== null}
+              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : "合并系统导出后人工维护的 Excel"}
+            >
+              <RefreshCcw size={15} />
+              {busyAction === "weekly-merge" ? "解析中" : "合并更新"}
             </button>
           </div>
           <div className="topbar-import-group">
@@ -673,7 +702,280 @@ function TopbarImportActions({
           setMessage={setMessage}
         />
       )}
+      {mergePreview && selectedBatch && (
+        <WeeklyMergeDialog
+          batch={selectedBatch}
+          preview={mergePreview}
+          onClose={() => setMergePreview(null)}
+          onApplied={async (result) => {
+            setMergePreview(null);
+            setWeeklyFile(null);
+            setWeeklyInputKey((value) => value + 1);
+            await reloadBatches();
+            onImported();
+            setMessage(
+              `合并完成：新增 ${result.summary.create} 条、更新 ${result.summary.update} 条、付款变化 ${result.summary.payment} 条`,
+            );
+          }}
+        />
+      )}
     </>
+  );
+}
+
+type WeeklyMergeFilter = "all" | "create" | "update" | "payment" | "unchanged" | "conflict" | "warning";
+
+function mergeActionLabel(action: WeeklyMergeRow["action"]) {
+  return {
+    create: "新增",
+    update: "更新",
+    unchanged: "无变化",
+    conflict: "冲突",
+    skip: "跳过",
+  }[action];
+}
+
+function mergeDisplayValue(value: unknown) {
+  if (value === null || value === undefined || value === "") return "空";
+  if (typeof value === "number") return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+  return String(value);
+}
+
+function WeeklyMergeDialog({
+  batch,
+  preview,
+  onClose,
+  onApplied,
+}: {
+  batch: Batch;
+  preview: WeeklyMergePreview;
+  onClose: () => void;
+  onApplied: (result: WeeklyMergeApplyResult) => Promise<void>;
+}) {
+  const [filter, setFilter] = useState<WeeklyMergeFilter>("all");
+  const [resolutions, setResolutions] = useState<Record<string, WeeklyMergeResolution>>({});
+  const [paymentDates, setPaymentDates] = useState<Record<string, string>>({});
+  const [reason, setReason] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  const filteredRows = useMemo(
+    () =>
+      preview.rows.filter((row) => {
+        if (filter === "all") return true;
+        if (filter === "payment") return row.payment_change;
+        if (filter === "warning") return row.warnings.length > 0;
+        if (filter === "unchanged") return row.action === "unchanged" || row.action === "skip";
+        return row.action === filter;
+      }),
+    [filter, preview.rows],
+  );
+  const conflictRows = preview.rows.filter((row) => row.action === "conflict");
+  const hardConflicts = conflictRows.filter((row) => row.candidates.length === 0);
+  const unresolvedChoices = conflictRows.filter((row) => row.candidates.length > 0 && !resolutions[row.row_id]);
+  const requiredDateKeys = Array.from(new Set(preview.rows.flatMap((row) => row.payment_date_keys)));
+  const missingDateKeys = requiredDateKeys.filter((key) => !paymentDates[key]);
+  const archivedReasonMissing = batch.status === "archived" && !reason.trim();
+  const canContinue =
+    hardConflicts.length === 0
+    && unresolvedChoices.length === 0
+    && missingDateKeys.length === 0
+    && !archivedReasonMissing;
+
+  function changeResolution(row: WeeklyMergeRow, value: string) {
+    setConfirming(false);
+    setResolutions((current) => {
+      const next = { ...current };
+      if (!value) {
+        delete next[row.row_id];
+      } else if (value === "create" || value === "skip") {
+        next[row.row_id] = { row_id: row.row_id, action: value };
+      } else {
+        next[row.row_id] = { row_id: row.row_id, action: "update", request_id: Number(value) };
+      }
+      return next;
+    });
+  }
+
+  async function applyMerge() {
+    if (!canContinue || submitting) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const result = await api.applyWeeklyMerge(preview.job_id, {
+        resolutions: Object.values(resolutions),
+        payment_dates: paymentDates,
+        reason: reason.trim() || undefined,
+      });
+      await onApplied(result);
+    } catch (err) {
+      setError((err as Error).message);
+      setConfirming(false);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const filters: Array<{ key: WeeklyMergeFilter; label: string; count: number }> = [
+    { key: "all", label: "全部", count: preview.rows.length },
+    { key: "create", label: "新增", count: preview.summary.create },
+    { key: "update", label: "更新", count: preview.summary.update },
+    { key: "payment", label: "付款变化", count: preview.summary.payment },
+    { key: "unchanged", label: "无变化", count: preview.summary.unchanged },
+    { key: "conflict", label: "冲突", count: preview.summary.conflict },
+    { key: "warning", label: "警告", count: preview.summary.warning },
+  ];
+
+  return (
+    <Modal title="Excel 合并更新预览" onClose={() => { if (!submitting) onClose(); }} className="weekly-merge-modal">
+      <div className="weekly-merge-intro">
+        <span>批次：{batch.name}</span>
+        <span>格式：{preview.format_version >= 2 ? "新版精确标识" : "旧版兼容匹配"}</span>
+        <span>Excel 未出现的系统记录、附件和付款凭证会保留。</span>
+      </div>
+      <div className="weekly-merge-filters" role="group" aria-label="合并结果筛选">
+        {filters.map((item) => (
+          <button
+            key={item.key}
+            className={`external-preview-filter${filter === item.key ? " active" : ""}${item.key === "conflict" && item.count ? " danger" : ""}`}
+            type="button"
+            onClick={() => setFilter(item.key)}
+          >
+            {item.label} {item.count}
+          </button>
+        ))}
+      </div>
+      {error && <div className="form-error">{error}</div>}
+      <div className="weekly-merge-table-wrap">
+        <table className="weekly-merge-table">
+          <thead>
+            <tr>
+              <th>处理</th>
+              <th>请款标识 / 钉钉号</th>
+              <th>申请人 / 来源 Sheet</th>
+              <th>应付 / 已付变化</th>
+              <th>字段差异</th>
+              <th>校验与处理</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredRows.map((row) => (
+              <tr key={row.row_id} className={row.action === "conflict" ? "merge-conflict-row" : row.warnings.length ? "merge-warning-row" : ""}>
+                <td>
+                  <span className={`merge-action-badge ${row.action}`}>{mergeActionLabel(row.action)}</span>
+                  {row.payment_change && <small>付款变化</small>}
+                  {row.attachment_change && <small>新增附件</small>}
+                </td>
+                <td>
+                  <strong>{row.incoming_request_id || row.request_id || "新增"}</strong>
+                  <small>{row.dingding_id || "无钉钉号"}</small>
+                </td>
+                <td>
+                  <strong>{row.applicant || "未填写"}</strong>
+                  <small>{row.source_sheet || "未分 Sheet"}</small>
+                </td>
+                <td>
+                  <span>应付 ¥{Number(row.amount || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</span>
+                  <small>
+                    已付 ¥{row.old_paid_amount.toLocaleString("zh-CN", { minimumFractionDigits: 2 })}
+                    {row.old_paid_amount !== row.new_paid_amount && ` → ¥${row.new_paid_amount.toLocaleString("zh-CN", { minimumFractionDigits: 2 })}`}
+                  </small>
+                </td>
+                <td>
+                  {row.changes.length === 0 ? (
+                    <span className="muted">无字段变化</span>
+                  ) : (
+                    <div className="merge-change-list">
+                      {row.changes.slice(0, 5).map((change) => (
+                        <span key={change.field} title={`${mergeDisplayValue(change.old)} → ${mergeDisplayValue(change.new)}`}>
+                          {change.label}：{mergeDisplayValue(change.old)} → {mergeDisplayValue(change.new)}
+                        </span>
+                      ))}
+                      {row.changes.length > 5 && <span>另有 {row.changes.length - 5} 项</span>}
+                    </div>
+                  )}
+                </td>
+                <td>
+                  {row.errors.map((message) => <div className="merge-error-text" key={message}>{message}</div>)}
+                  {row.warnings.map((message) => <div className="merge-warning-text" key={message}>{message}</div>)}
+                  {row.candidates.length > 0 && row.action === "conflict" && (
+                    <select
+                      value={resolutions[row.row_id]?.action === "update" ? String(resolutions[row.row_id]?.request_id) : resolutions[row.row_id]?.action || ""}
+                      onChange={(event) => changeResolution(row, event.target.value)}
+                    >
+                      <option value="">请选择处理方式</option>
+                      {row.candidates.map((candidate) => (
+                        <option value={candidate.id} key={candidate.id}>
+                          关联 #{candidate.id} · {candidate.applicant || candidate.dingding_id || "未命名"} · ¥{Number(candidate.amount || 0).toLocaleString()}
+                        </option>
+                      ))}
+                      <option value="create">作为新增</option>
+                      <option value="skip">跳过此行</option>
+                    </select>
+                  )}
+                  {row.payment_date_keys.map((key) => (
+                    <label className="merge-payment-date" key={key}>
+                      补充付款日期
+                      <input
+                        type="date"
+                        value={paymentDates[key] || ""}
+                        onChange={(event) => {
+                          setConfirming(false);
+                          setPaymentDates((current) => ({ ...current, [key]: event.target.value }));
+                        }}
+                      />
+                    </label>
+                  ))}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {preview.sheet_order.changed && (
+        <div className="merge-sheet-order-note">
+          Sheet 顺序将按 Excel 更新；系统中独有的 Sheet 会保留并追加在末尾。
+        </div>
+      )}
+      {batch.status === "archived" && (
+        <label className="merge-archive-reason">
+          归档更正原因
+          <textarea value={reason} onChange={(event) => { setReason(event.target.value); setConfirming(false); }} placeholder="归档批次提交合并时必填" />
+        </label>
+      )}
+      {confirming && (
+        <div className="merge-confirm-summary">
+          <strong>确认本次合并</strong>
+          <span>
+            将新增 {preview.summary.create} 条、更新 {preview.summary.update} 条、处理 {preview.summary.payment} 条付款变化；
+            无变化及 Excel 缺失的系统记录均保留。
+          </span>
+        </div>
+      )}
+      <div className="drawer-actions weekly-merge-actions">
+        <span className="muted">
+          {hardConflicts.length > 0
+            ? `仍有 ${hardConflicts.length} 个不可提交冲突`
+            : unresolvedChoices.length > 0
+              ? `仍有 ${unresolvedChoices.length} 项需要选择`
+              : missingDateKeys.length > 0
+                ? `仍缺 ${missingDateKeys.length} 个付款日期`
+                : "校验已通过"}
+        </span>
+        <button className="ghost-button" type="button" onClick={onClose} disabled={submitting}>取消</button>
+        {!confirming ? (
+          <button className="primary-button" type="button" onClick={() => setConfirming(true)} disabled={!canContinue || submitting}>
+            核对并继续
+          </button>
+        ) : (
+          <button className="primary-button" type="button" onClick={applyMerge} disabled={!canContinue || submitting}>
+            <Save size={16} />
+            {submitting ? "合并中" : "确认合并"}
+          </button>
+        )}
+      </div>
+    </Modal>
   );
 }
 

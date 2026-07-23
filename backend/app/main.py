@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import mimetypes
 import shutil
 import uuid
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import quote
@@ -30,6 +31,8 @@ from .db import (
     write_audit,
 )
 from .excel_io import (
+    CORE_FIELDS,
+    EXPORT_FORMAT_VERSION,
     TARGET_FIELDS,
     content_hash,
     detect_table_headers,
@@ -165,6 +168,18 @@ class ExternalExpenseKey(BaseModel):
 
 class ExternalExpenseImportIn(BaseModel):
     items: list[ExternalExpenseKey] = Field(default_factory=list)
+
+
+class WeeklyMergeResolution(BaseModel):
+    row_id: str
+    action: str
+    request_id: Optional[int] = None
+
+
+class WeeklyMergeApplyIn(BaseModel):
+    resolutions: list[WeeklyMergeResolution] = Field(default_factory=list)
+    payment_dates: Dict[str, str] = Field(default_factory=dict)
+    reason: Optional[str] = None
 
 
 class UserIn(BaseModel):
@@ -1618,6 +1633,1141 @@ def get_attachment_file(attachment_id: int, user: Dict[str, Any] = Depends(curre
     )
 
 
+MERGE_REQUEST_FIELDS = {
+    "dingding_id",
+    "applicant",
+    "payment_account",
+    "expense_type",
+    "summary",
+    "style_name",
+    "amount",
+    "currency",
+    "project",
+    "bu",
+    "payee_account",
+    "payee_name",
+    "bank_name",
+    "invoice_status",
+    "needed_payment_date",
+    "owner_confirmation",
+    "finance_manager_approval",
+    "general_manager_approval",
+    "general_manager_approval_date",
+    "general_manager_opinion",
+    "remark",
+    "overdue_status",
+}
+MERGE_PAYMENT_FIELDS = ("amount", "payment_date", "payer", "payment_account", "bank_reference", "remark")
+
+
+def weekly_merge_row_id(row: Dict[str, Any]) -> str:
+    return f"request:{row.get('source_sheet') or ''}:{int(row.get('source_row') or 0)}"
+
+
+def weekly_merge_payment_key(detail: Dict[str, Any]) -> str:
+    return f"payment:{int(detail.get('source_row') or 0)}"
+
+
+def merge_request_payload(row: Dict[str, Any], *, creating: bool) -> Dict[str, Any]:
+    present = set(row.get("_present_fields") or [])
+    payload = {
+        field: row.get(field)
+        for field in MERGE_REQUEST_FIELDS
+        if creating or field in present
+    }
+    payload["source_sheet"] = str(row.get("source_sheet") or "").strip() or "未分 Sheet"
+    payload["source_row"] = row.get("source_row")
+    if creating:
+        try:
+            payload["raw_extra"] = json.loads(row.get("raw_extra_json") or "{}")
+        except json.JSONDecodeError:
+            payload["raw_extra"] = {}
+    return payload
+
+
+def merge_field_changes(existing: Dict[str, Any], payload: Dict[str, Any]) -> list[Dict[str, Any]]:
+    changes = []
+    for field, value in payload.items():
+        if field in {"raw_extra", "source_row"}:
+            continue
+        if not request_values_equal(existing.get(field), value):
+            changes.append(
+                {
+                    "field": field,
+                    "label": CORE_FIELDS.get(field, {"source_sheet": "来源 Sheet"}.get(field, field)),
+                    "old": existing.get(field),
+                    "new": value,
+                }
+            )
+    return changes
+
+
+def merge_payment_changes(existing: Dict[str, Any], detail: Dict[str, Any]) -> list[Dict[str, Any]]:
+    present = set(detail.get("_present_fields") or [])
+    changes = []
+    for field in MERGE_PAYMENT_FIELDS:
+        if field not in present:
+            continue
+        value = detail.get(field)
+        if field == "amount":
+            equal = request_values_equal(float(existing.get(field) or 0), float(value or 0))
+        else:
+            equal = request_values_equal(existing.get(field), value)
+        if not equal:
+            changes.append({"field": field, "old": existing.get(field), "new": value})
+    return changes
+
+
+def merge_request_lookup(conn, batch_id: int) -> tuple[Dict[int, Dict[str, Any]], Dict[tuple[str, str], list[Dict[str, Any]]]]:
+    records = rows_to_dicts(
+        conn.execute("SELECT * FROM payment_requests WHERE batch_id = ? ORDER BY id", (batch_id,)).fetchall()
+    )
+    by_id = {int(record["id"]): record for record in records}
+    by_legacy: Dict[tuple[str, str], list[Dict[str, Any]]] = {}
+    for record in records:
+        key = (
+            str(record.get("dingding_id") or "").strip(),
+            str(record.get("source_sheet") or "").strip(),
+        )
+        if key[0]:
+            by_legacy.setdefault(key, []).append(record)
+    return by_id, by_legacy
+
+
+def build_weekly_merge_plan(
+    conn,
+    batch_id: int,
+    rows: list[Dict[str, Any]],
+    meta: Dict[str, Any],
+    resolutions: Optional[Dict[str, Dict[str, Any]]] = None,
+    payment_dates: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    resolutions = resolutions or {}
+    payment_dates = payment_dates or {}
+    by_id, by_legacy = merge_request_lookup(conn, batch_id)
+    format_version = int(meta.get("format_version") or 0)
+    export_batch_id = meta.get("export_batch_id")
+    duplicate_ids = Counter(
+        int(row["_request_id"])
+        for row in rows
+        if row.get("_request_id")
+    )
+    request_plans: list[Dict[str, Any]] = []
+    plan_by_row_id: Dict[str, Dict[str, Any]] = {}
+    plan_by_request_id: Dict[int, Dict[str, Any]] = {}
+
+    for row in rows:
+        row_id = weekly_merge_row_id(row)
+        request_id = int(row["_request_id"]) if row.get("_request_id") else None
+        resolution = resolutions.get(row_id) or {}
+        action = ""
+        existing: Optional[Dict[str, Any]] = None
+        candidates: list[Dict[str, Any]] = []
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        if resolution.get("action") == "skip":
+            action = "skip"
+        elif request_id:
+            if duplicate_ids[request_id] > 1:
+                action = "conflict"
+                errors.append("同一请款标识在 Excel 中出现多次")
+            elif request_id not in by_id:
+                other = conn.execute("SELECT batch_id FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+                action = "conflict"
+                errors.append("请款标识属于其他批次" if other else "请款标识对应的记录已不存在")
+            else:
+                existing = by_id[request_id]
+                action = "update"
+        elif format_version >= EXPORT_FORMAT_VERSION:
+            action = "create"
+        else:
+            key = (
+                str(row.get("dingding_id") or "").strip(),
+                str(row.get("source_sheet") or "").strip(),
+            )
+            matches = by_legacy.get(key, []) if key[0] else []
+            candidates = [
+                {
+                    "id": item["id"],
+                    "dingding_id": item.get("dingding_id"),
+                    "applicant": item.get("applicant"),
+                    "source_sheet": item.get("source_sheet"),
+                    "amount": item.get("amount"),
+                    "summary": item.get("summary"),
+                }
+                for item in matches
+            ]
+            if len(matches) == 1:
+                existing = matches[0]
+                action = "update"
+            elif resolution.get("action") == "create":
+                action = "create"
+            elif (
+                resolution.get("action") == "update"
+                and resolution.get("request_id") in {int(item["id"]) for item in matches}
+            ):
+                existing = by_id[int(resolution["request_id"])]
+                action = "update"
+                request_id = int(existing["id"])
+            elif len(matches) == 0:
+                action = "create"
+            else:
+                action = "conflict"
+                errors.append("旧版文件匹配到多条请款，请选择关联记录、作为新增或跳过")
+
+        if format_version >= EXPORT_FORMAT_VERSION and export_batch_id and int(export_batch_id) != batch_id:
+            action = "conflict"
+            errors.append("该文件由其他批次导出，不能直接合并到当前批次")
+
+        payload = merge_request_payload(row, creating=action == "create")
+        if existing and "applicant" in payload and existing.get("applicant") is None:
+            external_source = (existing.get("raw_extra") or {}).get("external_source") or {}
+            if request_values_equal(payload.get("applicant"), external_source.get("applicant")):
+                payload.pop("applicant", None)
+        if "amount" in payload and payload.get("amount") is None:
+            action = "conflict"
+            errors.append("应付金额不能为空")
+        if payload.get("amount") is not None and float(payload["amount"]) < 0:
+            action = "conflict"
+            errors.append("应付金额不能为负数")
+
+        changes = merge_field_changes(existing, payload) if existing else []
+        attachment_change = bool(row.get("_embedded_images"))
+        if existing and attachment_change:
+            existing_hashes = existing_binary_hashes(conn, "attachment_links", "request_id", int(existing["id"]))
+            attachment_change = any(
+                isinstance(image.get("data"), bytes)
+                and hashlib.sha256(image["data"]).hexdigest() not in existing_hashes
+                for image in row.get("_embedded_images", []) or []
+            )
+        if action == "update" and not changes:
+            action = "unchanged"
+        if action == "unchanged" and attachment_change:
+            action = "update"
+        if action == "create":
+            dingding_id = str(row.get("dingding_id") or "").strip()
+            if dingding_id:
+                duplicates = rows_to_dicts(
+                    conn.execute(
+                        """
+                        SELECT payment_requests.id, payment_requests.batch_id, request_batches.name AS batch_name
+                        FROM payment_requests
+                        JOIN request_batches ON request_batches.id = payment_requests.batch_id
+                        WHERE TRIM(COALESCE(payment_requests.dingding_id, '')) = ?
+                        ORDER BY payment_requests.id
+                        """,
+                        (dingding_id,),
+                    ).fetchall()
+                )
+                if duplicates:
+                    warnings.append(f"钉钉单号已存在 {len(duplicates)} 条记录；确认后仍可作为拆分请款新增")
+
+        plan = {
+            "row_id": row_id,
+            "action": action,
+            "request_id": int(existing["id"]) if existing else None,
+            "incoming_request_id": request_id,
+            "row": row,
+            "payload": payload,
+            "existing": existing,
+            "changes": changes,
+            "candidates": candidates,
+            "errors": errors,
+            "warnings": warnings,
+            "payment_change": False,
+            "attachment_change": attachment_change,
+            "payment_changes": [],
+            "payment_date_keys": [],
+            "old_paid_amount": round(float(existing.get("paid_amount") or 0), 2) if existing else 0.0,
+            "new_paid_amount": round(float(row.get("paid_amount") or 0), 2),
+        }
+        request_plans.append(plan)
+        plan_by_row_id[row_id] = plan
+        if existing:
+            plan_by_request_id[int(existing["id"])] = plan
+        if request_id:
+            plan_by_request_id[request_id] = plan
+
+    payment_details = list(meta.get("payment_details") or [])
+    payment_actions: list[Dict[str, Any]] = []
+    detail_changed_by_plan: Dict[str, bool] = {}
+    simulated_additions: Dict[str, float] = {}
+    simulated_replacements: Dict[str, Dict[int, float]] = {}
+
+    def preserved_request_plan(request: Dict[str, Any]) -> Dict[str, Any]:
+        request_id = int(request["id"])
+        existing_plan = plan_by_request_id.get(request_id)
+        if existing_plan:
+            return existing_plan
+        row_id = f"preserved:{request_id}"
+        preserved_row = {
+            **request,
+            "_request_id": request_id,
+            "_present_fields": [],
+            "source_row": request.get("source_row"),
+        }
+        preserved = {
+            "row_id": row_id,
+            "action": "unchanged",
+            "request_id": request_id,
+            "incoming_request_id": None,
+            "row": preserved_row,
+            "payload": {},
+            "existing": request,
+            "changes": [],
+            "candidates": [],
+            "errors": [],
+            "warnings": ["该请款未出现在主表中，系统记录将保留"],
+            "payment_change": False,
+            "attachment_change": False,
+            "payment_changes": [],
+            "payment_date_keys": [],
+            "old_paid_amount": round(float(request.get("paid_amount") or 0), 2),
+            "new_paid_amount": round(float(request.get("paid_amount") or 0), 2),
+        }
+        request_plans.append(preserved)
+        plan_by_row_id[row_id] = preserved
+        plan_by_request_id[request_id] = preserved
+        return preserved
+
+    def payment_target_plan(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if detail.get("request_id"):
+            request_id = int(detail["request_id"])
+            if request_id in plan_by_request_id:
+                return plan_by_request_id[request_id]
+            if request_id in by_id:
+                return preserved_request_plan(by_id[request_id])
+        dingding_id = str(detail.get("dingding_id") or "").strip()
+        source_sheet = str(detail.get("source_sheet") or "").strip()
+        matches = [
+            item
+            for item in request_plans
+            if str(item["row"].get("dingding_id") or "").strip() == dingding_id
+            and str(item["row"].get("source_sheet") or "").strip() == source_sheet
+            and item["action"] != "skip"
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    seen_payment_ids = Counter(
+        int(detail["payment_id"])
+        for detail in payment_details
+        if detail.get("payment_id")
+    )
+    for detail in payment_details:
+        key = weekly_merge_payment_key(detail)
+        target = payment_target_plan(detail)
+        errors: list[str] = []
+        warnings: list[str] = []
+        changes: list[Dict[str, Any]] = []
+        existing_payment: Optional[Dict[str, Any]] = None
+        action = "unchanged"
+        if target is None:
+            errors.append("无法唯一匹配付款明细所属请款")
+            action = "conflict"
+        payment_id = int(detail["payment_id"]) if detail.get("payment_id") else None
+        if target and target["action"] == "skip":
+            payment_actions.append(
+                {
+                    "key": key,
+                    "action": "unchanged",
+                    "target_row_id": target["row_id"],
+                    "request_id": target.get("request_id") or target.get("incoming_request_id"),
+                    "payment_id": payment_id,
+                    "detail": detail,
+                    "existing": None,
+                    "changes": [],
+                    "errors": [],
+                    "warnings": [],
+                }
+            )
+            continue
+        if payment_id:
+            if seen_payment_ids[payment_id] > 1:
+                errors.append("同一付款标识在 Excel 中出现多次")
+                action = "conflict"
+            payment_row = conn.execute(
+                """
+                SELECT payment_records.* FROM payment_records
+                JOIN payment_requests ON payment_requests.id = payment_records.request_id
+                WHERE payment_records.id = ? AND payment_requests.batch_id = ?
+                """,
+                (payment_id, batch_id),
+            ).fetchone()
+            if not payment_row:
+                errors.append("付款标识对应的记录不存在或属于其他批次")
+                action = "conflict"
+            else:
+                existing_payment = row_to_dict(payment_row)
+                if target and int(existing_payment["request_id"]) != int(target.get("request_id") or detail.get("request_id") or 0):
+                    errors.append("付款标识与所属请款不一致")
+                    action = "conflict"
+                elif payment_record_is_inherited(existing_payment):
+                    changes = merge_payment_changes(existing_payment, detail)
+                    if changes:
+                        errors.append("结转继承付款只读，不能通过 Excel 修改")
+                        action = "conflict"
+                    else:
+                        changes = []
+                else:
+                    changes = merge_payment_changes(existing_payment, detail)
+                    action = "update" if changes else "unchanged"
+        else:
+            changes = []
+            action = "create" if target else "conflict"
+
+        voucher_change = bool(detail.get("_embedded_images"))
+        if existing_payment and voucher_change:
+            voucher_hashes = existing_binary_hashes(conn, "payment_vouchers", "payment_id", int(existing_payment["id"]))
+            voucher_change = any(
+                isinstance(image.get("data"), bytes)
+                and hashlib.sha256(image["data"]).hexdigest() not in voucher_hashes
+                for image in detail.get("_embedded_images", []) or []
+            )
+        if action == "unchanged" and voucher_change:
+            action = "update"
+
+        if action in {"create", "update"}:
+            amount = detail.get("amount")
+            if amount is None or float(amount) <= 0:
+                errors.append("本次付款金额必须大于 0")
+                action = "conflict"
+            payment_date = detail.get("payment_date") or payment_dates.get(key)
+            if not payment_date:
+                if target:
+                    target["payment_date_keys"].append(key)
+            else:
+                try:
+                    date.fromisoformat(str(payment_date))
+                except (TypeError, ValueError):
+                    errors.append("付款日期格式无效")
+                    action = "conflict"
+            detail["payment_date"] = payment_date
+            if target and action != "conflict":
+                detail_changed_by_plan[target["row_id"]] = True
+                target["payment_change"] = True
+                target["payment_changes"].append(
+                    {
+                        "key": key,
+                        "action": action,
+                        "payment_id": payment_id,
+                        "old_amount": existing_payment.get("amount") if existing_payment else None,
+                        "new_amount": amount,
+                        "voucher_change": voucher_change,
+                    }
+                )
+                if action == "create":
+                    simulated_additions[target["row_id"]] = simulated_additions.get(target["row_id"], 0.0) + float(amount)
+                elif existing_payment:
+                    simulated_replacements.setdefault(target["row_id"], {})[payment_id] = float(amount)
+        payment_actions.append(
+            {
+                "key": key,
+                "action": action,
+                "target_row_id": target["row_id"] if target else None,
+                "request_id": target.get("request_id") if target else None,
+                "payment_id": payment_id,
+                "detail": detail,
+                "existing": existing_payment,
+                "changes": changes,
+                "errors": errors,
+                "warnings": warnings,
+            }
+        )
+
+    for plan in request_plans:
+        if plan["action"] in {"skip", "conflict"}:
+            continue
+        existing = plan.get("existing")
+        current_total = round(float(existing.get("paid_amount") or 0), 2) if existing else 0.0
+        target_paid = round(float(plan["row"].get("paid_amount") or 0), 2)
+        detail_changed = bool(detail_changed_by_plan.get(plan["row_id"]))
+        simulated_total = current_total
+        for payment_id, replacement in simulated_replacements.get(plan["row_id"], {}).items():
+            old_payment = conn.execute("SELECT amount FROM payment_records WHERE id = ?", (payment_id,)).fetchone()
+            simulated_total += replacement - float(old_payment["amount"] or 0)
+        simulated_total += simulated_additions.get(plan["row_id"], 0.0)
+        simulated_total = round(simulated_total, 2)
+        payable = plan["payload"].get("amount")
+        if payable is None and existing:
+            payable = existing.get("amount")
+        if detail_changed:
+            if abs(target_paid - current_total) > 0.000001 and abs(target_paid - simulated_total) > 0.000001:
+                plan["action"] = "conflict"
+                plan["errors"].append(
+                    f"主表累计已付 {target_paid:.2f} 与修改后的付款明细合计 {simulated_total:.2f} 不一致"
+                )
+            elif abs(target_paid - current_total) <= 0.000001 and abs(simulated_total - current_total) > 0.000001:
+                plan["warnings"].append(f"主表累计已付未同步，提交后将按付款明细更新为 {simulated_total:.2f}")
+            plan["new_paid_amount"] = simulated_total
+        elif target_paid < current_total - 0.000001:
+            plan["action"] = "conflict"
+            plan["errors"].append("累计已付不能通过主表减少，请在付款明细 Sheet 中处理")
+        elif target_paid > current_total + 0.000001:
+            key = f"summary:{plan['row_id']}"
+            payment_date = payment_dates.get(key)
+            plan["payment_change"] = True
+            plan["payment_date_keys"].append(key) if not payment_date else None
+            delta = round(target_paid - current_total, 2)
+            plan["payment_changes"].append(
+                {"key": key, "action": "create_summary", "old_amount": current_total, "new_amount": target_paid, "delta": delta}
+            )
+            payment_actions.append(
+                {
+                    "key": key,
+                    "action": "create_summary",
+                    "target_row_id": plan["row_id"],
+                    "request_id": plan.get("request_id"),
+                    "payment_id": None,
+                    "detail": {
+                        "amount": delta,
+                        "payment_date": payment_date,
+                        "payer": plan["row"].get("payer"),
+                        "payment_account": plan["row"].get("payment_account"),
+                        "bank_reference": None,
+                        "remark": "由 Excel 主表累计已付差额生成",
+                    },
+                    "existing": None,
+                    "changes": [],
+                    "errors": [],
+                    "warnings": [],
+                }
+            )
+        final_paid = simulated_total if detail_changed else target_paid
+        if payable is not None and final_paid > float(payable) + 0.000001:
+            plan["action"] = "conflict"
+            plan["errors"].append(f"付款合计 {final_paid:.2f} 超过应付金额 {float(payable):.2f}")
+        if plan["action"] == "unchanged" and plan["payment_change"]:
+            plan["action"] = "update"
+
+    incoming_order = [
+        str(name).strip()
+        for name in meta.get("workbook_sheet_order") or []
+        if str(name).strip()
+    ]
+    old_order = batch_sheet_order(row_to_dict(require_batch(conn, batch_id)))
+    existing_sheets = [
+        str(row["source_sheet"] or "未分 Sheet").strip() or "未分 Sheet"
+        for row in conn.execute(
+            "SELECT DISTINCT source_sheet FROM payment_requests WHERE batch_id = ? ORDER BY id",
+            (batch_id,),
+        ).fetchall()
+    ]
+    final_order: list[str] = []
+    for name in [*incoming_order, *old_order, *existing_sheets]:
+        if name and name not in final_order:
+            final_order.append(name)
+
+    summary = {
+        "create": sum(1 for item in request_plans if item["action"] == "create"),
+        "update": sum(1 for item in request_plans if item["action"] == "update"),
+        "payment": sum(1 for item in request_plans if item["payment_change"]),
+        "unchanged": sum(1 for item in request_plans if item["action"] in {"unchanged", "skip"}),
+        "conflict": sum(1 for item in request_plans if item["action"] == "conflict")
+        + sum(1 for item in payment_actions if item["action"] == "conflict"),
+        "warning": sum(1 for item in request_plans if item["warnings"])
+        + sum(1 for item in payment_actions if item["warnings"]),
+    }
+    public_rows = [
+        {
+            "row_id": item["row_id"],
+            "action": item["action"],
+            "request_id": item.get("request_id"),
+            "incoming_request_id": item.get("incoming_request_id"),
+            "dingding_id": item["row"].get("dingding_id"),
+            "applicant": item["row"].get("applicant"),
+            "source_sheet": item["row"].get("source_sheet"),
+            "amount": item["row"].get("amount"),
+            "old_paid_amount": item["old_paid_amount"],
+            "new_paid_amount": item["new_paid_amount"],
+            "changes": item["changes"],
+            "payment_change": item["payment_change"],
+            "attachment_change": item["attachment_change"],
+            "payment_changes": item["payment_changes"],
+            "payment_date_keys": list(dict.fromkeys(item["payment_date_keys"])),
+            "candidates": item["candidates"],
+            "errors": item["errors"],
+            "warnings": item["warnings"],
+        }
+        for item in request_plans
+    ]
+    return {
+        "summary": summary,
+        "rows": public_rows,
+        "request_plans": request_plans,
+        "payment_actions": payment_actions,
+        "sheet_order": {"old": old_order, "new": final_order, "changed": old_order != final_order},
+        "can_apply": summary["conflict"] == 0
+        and not any(item["payment_date_keys"] for item in request_plans),
+    }
+
+
+def merge_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def merge_database_row_signature(row: Dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(row, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def merge_related_rows_signature(conn, table: str, owner_column: str, owner_id: int) -> str:
+    rows = rows_to_dicts(
+        conn.execute(
+            f"SELECT * FROM {table} WHERE {owner_column} = ? ORDER BY id",
+            (owner_id,),
+        ).fetchall()
+    )
+    return hashlib.sha256(
+        json.dumps(rows, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def cleanup_expired_weekly_merge_jobs(conn) -> None:
+    cutoff = (datetime.now() - timedelta(hours=24)).replace(microsecond=0).isoformat()
+    jobs = conn.execute(
+        """
+        SELECT id, mapping_json FROM import_jobs
+        WHERE kind = 'weekly-excel-merge' AND status = 'previewed' AND created_at < ?
+        """,
+        (cutoff,),
+    ).fetchall()
+    for job in jobs:
+        try:
+            mapping = json.loads(job["mapping_json"] or "{}")
+        except json.JSONDecodeError:
+            mapping = {}
+        source_copy = mapping.get("source_copy")
+        if source_copy:
+            path = resolve_data_file(source_copy)
+            if path.exists():
+                path.unlink()
+        conn.execute("UPDATE import_jobs SET status = 'expired' WHERE id = ?", (job["id"],))
+
+
+@app.post("/api/import/weekly-excel/merge-preview")
+async def preview_weekly_excel_merge(
+    file: UploadFile = File(...),
+    batch_id: int = Form(...),
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    saved_path = await save_upload(file)
+    try:
+        rows, meta = parse_weekly_excel(saved_path)
+    except Exception as exc:
+        saved_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Excel 解析失败：{exc}") from exc
+    with connect() as conn:
+        cleanup_expired_weekly_merge_jobs(conn)
+        batch = require_batch(conn, batch_id)
+        plan = build_weekly_merge_plan(conn, batch_id, rows, meta)
+        job_meta = {
+            "source_copy": str(saved_path.relative_to(DATA_DIR)),
+            "file_sha256": merge_file_sha256(saved_path),
+            "batch_updated_at": batch["updated_at"],
+            "format_version": meta.get("format_version"),
+            "export_batch_id": meta.get("export_batch_id"),
+            "preview_summary": plan["summary"],
+            "request_versions": {
+                str(item["request_id"]): item["existing"].get("updated_at")
+                for item in plan["request_plans"]
+                if item.get("request_id") and item.get("existing")
+            },
+            "request_signatures": {
+                str(item["request_id"]): merge_database_row_signature(item["existing"])
+                for item in plan["request_plans"]
+                if item.get("request_id") and item.get("existing")
+            },
+            "request_attachment_signatures": {
+                str(item["request_id"]): merge_related_rows_signature(
+                    conn, "attachment_links", "request_id", int(item["request_id"])
+                )
+                for item in plan["request_plans"]
+                if item.get("request_id") and item.get("existing")
+            },
+            "payment_versions": {
+                str(item["payment_id"]): item["existing"].get("updated_at")
+                for item in plan["payment_actions"]
+                if item.get("payment_id") and item.get("existing")
+            },
+            "payment_signatures": {
+                str(item["payment_id"]): merge_database_row_signature(item["existing"])
+                for item in plan["payment_actions"]
+                if item.get("payment_id") and item.get("existing")
+            },
+            "payment_voucher_signatures": {
+                str(item["payment_id"]): merge_related_rows_signature(
+                    conn, "payment_vouchers", "payment_id", int(item["payment_id"])
+                )
+                for item in plan["payment_actions"]
+                if item.get("payment_id") and item.get("existing")
+            },
+            "expires_at": (datetime.now() + timedelta(hours=24)).replace(microsecond=0).isoformat(),
+        }
+        job_id = write_import_job(
+            conn,
+            "weekly-excel-merge",
+            file.filename or saved_path.name,
+            "previewed",
+            batch_id,
+            rows,
+            [],
+            job_meta,
+            user["id"],
+        )
+        conn.execute("UPDATE import_jobs SET imported_rows = 0 WHERE id = ?", (job_id,))
+    return {
+        "job_id": job_id,
+        "batch_id": batch_id,
+        "format_version": meta.get("format_version") or 1,
+        "summary": plan["summary"],
+        "rows": plan["rows"],
+        "sheet_order": plan["sheet_order"],
+        "can_apply": plan["can_apply"],
+        "expires_at": job_meta["expires_at"],
+    }
+
+
+def existing_binary_hashes(conn, table: str, owner_column: str, owner_id: int) -> set[str]:
+    hashes: set[str] = set()
+    rows = conn.execute(
+        f"SELECT file_path FROM {table} WHERE {owner_column} = ? AND file_path IS NOT NULL",
+        (owner_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            path = resolve_data_file(row["file_path"])
+            if path.exists():
+                hashes.add(hashlib.sha256(path.read_bytes()).hexdigest())
+        except (HTTPException, OSError):
+            continue
+    return hashes
+
+
+def filter_new_embedded_images(row: Dict[str, Any], existing_hashes: set[str]) -> Dict[str, Any]:
+    filtered = dict(row)
+    images = []
+    for image in row.get("_embedded_images", []) or []:
+        data = image.get("data")
+        if not isinstance(data, bytes) or not data:
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in existing_hashes:
+            continue
+        existing_hashes.add(digest)
+        images.append(image)
+    filtered["_embedded_images"] = images
+    return filtered
+
+
+def update_payment_from_merge(
+    conn,
+    payment_id: int,
+    detail: Dict[str, Any],
+    user_id: int,
+) -> None:
+    existing = row_to_dict(conn.execute("SELECT * FROM payment_records WHERE id = ?", (payment_id,)).fetchone())
+    present = set(detail.get("_present_fields") or [])
+    payload = {field: detail.get(field) for field in MERGE_PAYMENT_FIELDS if field in present}
+    if "amount" in payload:
+        payload["amount"] = payment_record_amount(payload["amount"])
+    if "payment_date" in payload:
+        payload["payment_date"] = normalize_payment_date(payload["payment_date"], required=True)
+    merged = {**existing, **payload}
+    payload["content_hash"] = payment_record_hash(
+        int(existing["request_id"]),
+        merged.get("amount"),
+        merged.get("payment_date"),
+        merged.get("payer"),
+        merged.get("bank_reference"),
+    )
+    payload["updated_by"] = user_id
+    payload["updated_at"] = now_iso()
+    columns = list(payload)
+    conn.execute(
+        f"UPDATE payment_records SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",
+        [payload[column] for column in columns] + [payment_id],
+    )
+
+
+def table_row_snapshot(conn, table: str, row_id: int) -> Dict[str, Any]:
+    row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    return row_to_dict(row) if row else {}
+
+
+def request_payment_signature(conn, request_id: int) -> str:
+    rows = rows_to_dicts(
+        conn.execute(
+            """
+            SELECT id, amount, payment_date, payer, payment_account, bank_reference,
+                   remark, source_type, updated_at
+            FROM payment_records WHERE request_id = ? ORDER BY id
+            """,
+            (request_id,),
+        ).fetchall()
+    )
+    return hashlib.sha256(
+        json.dumps(rows, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+@app.post("/api/import-jobs/{job_id}/apply-merge")
+def apply_weekly_excel_merge(
+    job_id: int,
+    payload: WeeklyMergeApplyIn,
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    resolutions = {
+        item.row_id: {"action": item.action, "request_id": item.request_id}
+        for item in payload.resolutions
+    }
+    created_file_paths: set[str] = set()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        job = conn.execute(
+            "SELECT * FROM import_jobs WHERE id = ? AND kind = 'weekly-excel-merge'",
+            (job_id,),
+        ).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="合并预览任务不存在")
+        if job["status"] != "previewed":
+            raise HTTPException(status_code=409, detail="该预览任务已提交、撤回或过期")
+        if job["created_by"] != user["id"] and user["role"] != ROLE_ADMIN:
+            raise HTTPException(status_code=403, detail="只能提交自己创建的合并预览")
+        try:
+            job_meta = json.loads(job["mapping_json"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=409, detail="合并预览任务数据损坏，请重新预览") from exc
+        expires_at = job_meta.get("expires_at")
+        if expires_at and expires_at < now_iso():
+            conn.execute("UPDATE import_jobs SET status = 'expired' WHERE id = ?", (job_id,))
+            raise HTTPException(status_code=409, detail="合并预览已超过 24 小时，请重新上传预览")
+        source_copy = job_meta.get("source_copy")
+        if not source_copy:
+            raise HTTPException(status_code=409, detail="合并源文件不存在，请重新预览")
+        source_path = resolve_data_file(source_copy)
+        if not source_path.exists() or merge_file_sha256(source_path) != job_meta.get("file_sha256"):
+            raise HTTPException(status_code=409, detail="合并源文件已变化或丢失，请重新预览")
+        batch_id = int(job["batch_id"])
+        batch = require_batch(conn, batch_id)
+        ensure_bulk_editable(batch, user, payload.reason)
+        if batch["updated_at"] != job_meta.get("batch_updated_at"):
+            raise HTTPException(status_code=409, detail="预览后批次数据已被修改，请重新预览")
+        for request_id, expected in (job_meta.get("request_versions") or {}).items():
+            current = conn.execute(
+                "SELECT * FROM payment_requests WHERE id = ? AND batch_id = ?",
+                (int(request_id), batch_id),
+            ).fetchone()
+            if not current or current["updated_at"] != expected:
+                raise HTTPException(status_code=409, detail=f"预览后请款 {request_id} 已被修改，请重新预览")
+            if merge_database_row_signature(row_to_dict(current)) != (job_meta.get("request_signatures") or {}).get(request_id):
+                raise HTTPException(status_code=409, detail=f"预览后请款 {request_id} 已被修改，请重新预览")
+            if merge_related_rows_signature(conn, "attachment_links", "request_id", int(request_id)) != (
+                job_meta.get("request_attachment_signatures") or {}
+            ).get(request_id):
+                raise HTTPException(status_code=409, detail=f"预览后请款 {request_id} 的附件已变化，请重新预览")
+        for payment_id, expected in (job_meta.get("payment_versions") or {}).items():
+            current = conn.execute(
+                """
+                SELECT payment_records.* FROM payment_records
+                JOIN payment_requests ON payment_requests.id = payment_records.request_id
+                WHERE payment_records.id = ? AND payment_requests.batch_id = ?
+                """,
+                (int(payment_id), batch_id),
+            ).fetchone()
+            if not current or current["updated_at"] != expected:
+                raise HTTPException(status_code=409, detail=f"预览后付款 {payment_id} 已被修改，请重新预览")
+            if merge_database_row_signature(row_to_dict(current)) != (job_meta.get("payment_signatures") or {}).get(payment_id):
+                raise HTTPException(status_code=409, detail=f"预览后付款 {payment_id} 已被修改，请重新预览")
+            if merge_related_rows_signature(conn, "payment_vouchers", "payment_id", int(payment_id)) != (
+                job_meta.get("payment_voucher_signatures") or {}
+            ).get(payment_id):
+                raise HTTPException(status_code=409, detail=f"预览后付款 {payment_id} 的凭证已变化，请重新预览")
+        rows, meta = parse_weekly_excel(source_path)
+        plan = build_weekly_merge_plan(conn, batch_id, rows, meta, resolutions, payload.payment_dates)
+        if not plan["can_apply"]:
+            unresolved = [
+                *[
+                    message
+                    for item in plan["rows"]
+                    for message in item["errors"]
+                ],
+                *[
+                    f"{item['dingding_id'] or item['row_id']} 缺少付款日期"
+                    for item in plan["rows"]
+                    if item["payment_date_keys"]
+                ],
+            ]
+            raise HTTPException(status_code=400, detail="；".join(unresolved[:8]) or "仍有未解决的冲突")
+        if any(item["payment_change"] for item in plan["request_plans"]) and user["role"] not in FINANCE_FIELD_ROLES:
+            raise HTTPException(status_code=403, detail="包含付款变化的合并只能由财务、总经理或管理员提交")
+
+        operation_id = uuid.uuid4().hex
+        manifest: Dict[str, Any] = {
+            "operation_id": operation_id,
+            "created_requests": [],
+            "updated_requests": [],
+            "created_payments": [],
+            "updated_payments": [],
+            "created_attachments": [],
+            "created_vouchers": [],
+            "old_sheet_order": plan["sheet_order"]["old"],
+            "new_sheet_order": plan["sheet_order"]["new"],
+        }
+        request_ids_by_row: Dict[str, int] = {}
+        try:
+            for item in plan["request_plans"]:
+                if item["action"] in {"skip", "unchanged"} and not item["payment_change"] and not item["attachment_change"]:
+                    if item.get("request_id"):
+                        request_ids_by_row[item["row_id"]] = int(item["request_id"])
+                    continue
+                if item["action"] == "create":
+                    request_id = insert_request(
+                        conn,
+                        batch_id,
+                        item["payload"],
+                        user["id"],
+                        user["role"],
+                        create_summary_payment=False,
+                    )
+                    request_ids_by_row[item["row_id"]] = request_id
+                    manifest["created_requests"].append({"id": request_id})
+                    write_audit(
+                        conn,
+                        user["id"],
+                        "import.merge.request.create",
+                        "payment_request",
+                        request_id,
+                        batch_id,
+                        new_value=table_row_snapshot(conn, "payment_requests", request_id),
+                        reason=payload.reason,
+                        operation_id=operation_id,
+                    )
+                else:
+                    request_id = int(item["request_id"])
+                    request_ids_by_row[item["row_id"]] = request_id
+                    if item["changes"]:
+                        old = table_row_snapshot(conn, "payment_requests", request_id)
+                        changed = update_request_row(
+                            conn,
+                            request_id,
+                            item["payload"],
+                            user["id"],
+                            user["role"],
+                        )
+                        if changed:
+                            new = table_row_snapshot(conn, "payment_requests", request_id)
+                            manifest["updated_requests"].append({"id": request_id, "old": old})
+                            write_audit(
+                                conn,
+                                user["id"],
+                                "import.merge.request.update",
+                                "payment_request",
+                                request_id,
+                                batch_id,
+                                old_value=old,
+                                new_value=new,
+                                reason=payload.reason,
+                                operation_id=operation_id,
+                            )
+
+                request_id = request_ids_by_row[item["row_id"]]
+                hashes = existing_binary_hashes(conn, "attachment_links", "request_id", request_id)
+                filtered_row = filter_new_embedded_images(item["row"], hashes)
+                before_ids = {
+                    int(row["id"])
+                    for row in conn.execute(
+                        "SELECT id FROM attachment_links WHERE request_id = ?",
+                        (request_id,),
+                    ).fetchall()
+                }
+                save_embedded_image_attachments(conn, batch_id, request_id, filtered_row, user["id"])
+                new_rows = rows_to_dicts(
+                    conn.execute(
+                        "SELECT * FROM attachment_links WHERE request_id = ? ORDER BY id",
+                        (request_id,),
+                    ).fetchall()
+                )
+                for attachment in new_rows:
+                    if int(attachment["id"]) in before_ids:
+                        continue
+                    manifest["created_attachments"].append(
+                        {"id": int(attachment["id"]), "file_path": attachment.get("file_path")}
+                    )
+                    if attachment.get("file_path"):
+                        created_file_paths.add(str(attachment["file_path"]))
+
+            for action in sorted(
+                plan["payment_actions"],
+                key=lambda item: 0 if item["action"] == "update" and float(item["detail"].get("amount") or 0) < float((item.get("existing") or {}).get("amount") or 0) else 1,
+            ):
+                if action["action"] == "unchanged":
+                    continue
+                request_id = request_ids_by_row.get(action["target_row_id"]) or action.get("request_id")
+                if not request_id:
+                    raise HTTPException(status_code=400, detail="无法确定付款所属请款")
+                detail = action["detail"]
+                if action["action"] == "update":
+                    payment_id = int(action["payment_id"])
+                    old_payment = table_row_snapshot(conn, "payment_records", payment_id)
+                    update_payment_from_merge(conn, payment_id, detail, user["id"])
+                    manifest["updated_payments"].append({"id": payment_id, "old": old_payment})
+                    write_audit(
+                        conn,
+                        user["id"],
+                        "import.merge.payment.update",
+                        "payment_record",
+                        payment_id,
+                        batch_id,
+                        old_value=old_payment,
+                        new_value=table_row_snapshot(conn, "payment_records", payment_id),
+                        reason=payload.reason,
+                        operation_id=operation_id,
+                    )
+                else:
+                    payment_id = insert_payment_record_internal(
+                        conn,
+                        int(request_id),
+                        amount=detail.get("amount"),
+                        payment_date=detail.get("payment_date"),
+                        payer=detail.get("payer"),
+                        payment_account=detail.get("payment_account"),
+                        bank_reference=detail.get("bank_reference"),
+                        remark=detail.get("remark"),
+                        source_type="excel_summary" if action["action"] == "create_summary" else "excel_detail",
+                        user_id=user["id"],
+                    )
+                    manifest["created_payments"].append({"id": payment_id})
+                    write_audit(
+                        conn,
+                        user["id"],
+                        "import.merge.payment.create",
+                        "payment_record",
+                        payment_id,
+                        batch_id,
+                        new_value=table_row_snapshot(conn, "payment_records", payment_id),
+                        reason=payload.reason,
+                        operation_id=operation_id,
+                    )
+                hashes = existing_binary_hashes(conn, "payment_vouchers", "payment_id", payment_id)
+                filtered_detail = filter_new_embedded_images(detail, hashes)
+                before_ids = {
+                    int(row["id"])
+                    for row in conn.execute(
+                        "SELECT id FROM payment_vouchers WHERE payment_id = ?",
+                        (payment_id,),
+                    ).fetchall()
+                }
+                save_embedded_payment_vouchers(conn, batch_id, payment_id, filtered_detail, user["id"])
+                voucher_rows = rows_to_dicts(
+                    conn.execute(
+                        "SELECT * FROM payment_vouchers WHERE payment_id = ? ORDER BY id",
+                        (payment_id,),
+                    ).fetchall()
+                )
+                for voucher in voucher_rows:
+                    if int(voucher["id"]) in before_ids:
+                        continue
+                    manifest["created_vouchers"].append(
+                        {"id": int(voucher["id"]), "file_path": voucher.get("file_path")}
+                    )
+                    if voucher.get("file_path"):
+                        created_file_paths.add(str(voucher["file_path"]))
+                refresh_payment_summaries(conn, int(request_id))
+
+            timestamp = now_iso()
+            conn.execute(
+                "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(plan["sheet_order"]["new"], ensure_ascii=False), timestamp, batch_id),
+            )
+            touched_request_ids = {
+                *[int(item["id"]) for item in manifest["created_requests"]],
+                *[int(item["id"]) for item in manifest["updated_requests"]],
+                *[int(request_ids_by_row[item["row_id"]]) for item in plan["request_plans"] if item["payment_change"]],
+            }
+            manifest["request_post_versions"] = {
+                str(request_id): table_row_snapshot(conn, "payment_requests", request_id).get("updated_at")
+                for request_id in touched_request_ids
+            }
+            manifest["request_post_signatures"] = {
+                str(request_id): merge_database_row_signature(table_row_snapshot(conn, "payment_requests", request_id))
+                for request_id in touched_request_ids
+            }
+            touched_payment_ids = {
+                *[int(item["id"]) for item in manifest["created_payments"]],
+                *[int(item["id"]) for item in manifest["updated_payments"]],
+            }
+            manifest["payment_post_versions"] = {
+                str(payment_id): table_row_snapshot(conn, "payment_records", payment_id).get("updated_at")
+                for payment_id in touched_payment_ids
+            }
+            manifest["payment_post_signatures"] = {
+                str(payment_id): merge_database_row_signature(table_row_snapshot(conn, "payment_records", payment_id))
+                for payment_id in touched_payment_ids
+            }
+            manifest["request_payment_signatures"] = {
+                str(request_id): request_payment_signature(conn, request_id)
+                for request_id in touched_request_ids
+            }
+            manifest["request_attachment_signatures"] = {
+                str(request_id): merge_related_rows_signature(conn, "attachment_links", "request_id", request_id)
+                for request_id in touched_request_ids
+            }
+            manifest["payment_voucher_signatures"] = {
+                str(payment_id): merge_related_rows_signature(conn, "payment_vouchers", "payment_id", payment_id)
+                for payment_id in touched_payment_ids
+            }
+            manifest["batch_post_updated_at"] = timestamp
+            job_meta["rollback_manifest"] = manifest
+            job_meta["applied_summary"] = plan["summary"]
+            conn.execute(
+                """
+                UPDATE import_jobs
+                SET status = 'imported', imported_rows = ?, duplicate_rows = 0, mapping_json = ?
+                WHERE id = ?
+                """,
+                (
+                    plan["summary"]["create"] + plan["summary"]["update"],
+                    json.dumps(job_meta, ensure_ascii=False, default=str),
+                    job_id,
+                ),
+            )
+            write_audit(
+                conn,
+                user["id"],
+                "import.weekly_excel.merge",
+                "import_job",
+                job_id,
+                batch_id,
+                new_value={
+                    "summary": plan["summary"],
+                    "sheet_order_changed": plan["sheet_order"]["changed"],
+                },
+                reason=payload.reason,
+                operation_id=operation_id,
+            )
+        except Exception:
+            for file_path in created_file_paths:
+                try:
+                    resolve_data_file(file_path).unlink(missing_ok=True)
+                except (HTTPException, OSError):
+                    pass
+            raise
+    return {
+        "status": "imported",
+        "job_id": job_id,
+        "batch_id": batch_id,
+        "operation_id": operation_id,
+        "summary": plan["summary"],
+        "sheet_order": plan["sheet_order"]["new"],
+    }
+
+
 @app.post("/api/import/weekly-excel")
 async def import_weekly_excel(
     file: UploadFile = File(...),
@@ -2110,6 +3260,157 @@ def get_import_job(job_id: int, user: Dict[str, Any] = Depends(current_user)) ->
     return {"job": row_to_dict(row)}
 
 
+def restore_table_snapshot(conn, table: str, snapshot: Dict[str, Any]) -> None:
+    columns = [
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if row["name"] != "id"
+    ]
+    payload = {column: snapshot.get(column) for column in columns}
+    conn.execute(
+        f"UPDATE {table} SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",
+        [payload[column] for column in columns] + [snapshot["id"]],
+    )
+
+
+def rollback_weekly_merge_job(
+    conn,
+    batch,
+    job,
+    meta: Dict[str, Any],
+    user: Dict[str, Any],
+) -> Dict[str, Any]:
+    manifest = meta.get("rollback_manifest") or {}
+    if not manifest:
+        raise HTTPException(status_code=409, detail="该合并任务缺少撤回信息")
+    batch_id = int(job["batch_id"])
+    if batch["updated_at"] != manifest.get("batch_post_updated_at"):
+        raise HTTPException(status_code=409, detail="合并后批次又发生了修改，不能整次撤回")
+    if batch_sheet_order(row_to_dict(batch)) != (manifest.get("new_sheet_order") or []):
+        raise HTTPException(status_code=409, detail="合并后 Sheet 顺序又发生了修改，不能整次撤回")
+    for request_id, expected in (manifest.get("request_post_versions") or {}).items():
+        row = conn.execute(
+            "SELECT * FROM payment_requests WHERE id = ? AND batch_id = ?",
+            (int(request_id), batch_id),
+        ).fetchone()
+        if not row or row["updated_at"] != expected:
+            raise HTTPException(status_code=409, detail=f"请款 {request_id} 在合并后又被修改，不能撤回")
+        expected_signature = (manifest.get("request_post_signatures") or {}).get(request_id)
+        if expected_signature and merge_database_row_signature(row_to_dict(row)) != expected_signature:
+            raise HTTPException(status_code=409, detail=f"请款 {request_id} 在合并后又被修改，不能撤回")
+    for payment_id, expected in (manifest.get("payment_post_versions") or {}).items():
+        row = conn.execute("SELECT * FROM payment_records WHERE id = ?", (int(payment_id),)).fetchone()
+        if not row or row["updated_at"] != expected:
+            raise HTTPException(status_code=409, detail=f"付款 {payment_id} 在合并后又被修改，不能撤回")
+        expected_signature = (manifest.get("payment_post_signatures") or {}).get(payment_id)
+        if expected_signature and merge_database_row_signature(row_to_dict(row)) != expected_signature:
+            raise HTTPException(status_code=409, detail=f"付款 {payment_id} 在合并后又被修改，不能撤回")
+    for request_id, expected in (manifest.get("request_payment_signatures") or {}).items():
+        if request_payment_signature(conn, int(request_id)) != expected:
+            raise HTTPException(status_code=409, detail=f"请款 {request_id} 的付款明细在合并后又发生变化，不能撤回")
+    for request_id, expected in (manifest.get("request_attachment_signatures") or {}).items():
+        if merge_related_rows_signature(conn, "attachment_links", "request_id", int(request_id)) != expected:
+            raise HTTPException(status_code=409, detail=f"请款 {request_id} 的附件在合并后又发生变化，不能撤回")
+    for payment_id, expected in (manifest.get("payment_voucher_signatures") or {}).items():
+        if merge_related_rows_signature(conn, "payment_vouchers", "payment_id", int(payment_id)) != expected:
+            raise HTTPException(status_code=409, detail=f"付款 {payment_id} 的凭证在合并后又发生变化，不能撤回")
+
+    created_request_ids = [int(item["id"]) for item in manifest.get("created_requests", [])]
+    created_payment_ids = [int(item["id"]) for item in manifest.get("created_payments", [])]
+    created_attachment_ids = [int(item["id"]) for item in manifest.get("created_attachments", [])]
+    created_voucher_ids = [int(item["id"]) for item in manifest.get("created_vouchers", [])]
+    file_paths = {
+        str(item["file_path"])
+        for item in [*manifest.get("created_attachments", []), *manifest.get("created_vouchers", [])]
+        if item.get("file_path")
+    }
+    for table, ids in (
+        ("attachment_links", created_attachment_ids),
+        ("payment_vouchers", created_voucher_ids),
+        ("payment_records", created_payment_ids),
+    ):
+        if ids:
+            placeholders = ", ".join("?" for _ in ids)
+            conn.execute(f"DELETE FROM {table} WHERE id IN ({placeholders})", ids)
+    if created_request_ids:
+        placeholders = ", ".join("?" for _ in created_request_ids)
+        conn.execute(
+            f"DELETE FROM payment_requests WHERE batch_id = ? AND id IN ({placeholders})",
+            [batch_id, *created_request_ids],
+        )
+
+    restored_request_ids: set[int] = set()
+    for item in manifest.get("updated_requests", []):
+        old = item.get("old") or {}
+        if old:
+            restore_table_snapshot(conn, "payment_requests", old)
+            restored_request_ids.add(int(old["id"]))
+    for item in manifest.get("updated_payments", []):
+        old = item.get("old") or {}
+        if old:
+            restore_table_snapshot(conn, "payment_records", old)
+            restored_request_ids.add(int(old["request_id"]))
+    for request_id in restored_request_ids:
+        refresh_payment_summaries(conn, request_id)
+        current = table_row_snapshot(conn, "payment_requests", request_id)
+        conn.execute(
+            "UPDATE payment_requests SET content_hash = ? WHERE id = ?",
+            (content_hash(current), request_id),
+        )
+
+    timestamp = now_iso()
+    conn.execute(
+        "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(manifest.get("old_sheet_order") or [], ensure_ascii=False), timestamp, batch_id),
+    )
+    conn.execute(
+        "UPDATE import_jobs SET status = 'rolled_back', imported_rows = 0 WHERE id = ?",
+        (job["id"],),
+    )
+    removed_files = 0
+    for file_path in file_paths:
+        path = resolve_data_file(file_path)
+        delete_file_if_unreferenced(conn, file_path)
+        if not path.exists():
+            removed_files += 1
+    source_copy = meta.get("source_copy")
+    if source_copy:
+        path = resolve_data_file(source_copy)
+        if path.exists():
+            path.unlink()
+            removed_files += 1
+    write_audit(
+        conn,
+        user["id"],
+        "import.merge.rollback",
+        "import_job",
+        job["id"],
+        batch_id,
+        old_value={"job_id": job["id"], "summary": meta.get("applied_summary")},
+        new_value={
+            "deleted_requests": len(created_request_ids),
+            "restored_requests": len(manifest.get("updated_requests", [])),
+            "deleted_payments": len(created_payment_ids),
+            "restored_payments": len(manifest.get("updated_payments", [])),
+            "removed_files": removed_files,
+        },
+        reason="撤回最近合并更新",
+        operation_id=manifest.get("operation_id"),
+    )
+    return {
+        "status": "rolled_back",
+        "job_id": int(job["id"]),
+        "batch_id": batch_id,
+        "deleted_requests": len(created_request_ids),
+        "restored_requests": len(manifest.get("updated_requests", [])),
+        "deleted_attachments": len(created_attachment_ids),
+        "deleted_payments": len(created_payment_ids),
+        "restored_payments": len(manifest.get("updated_payments", [])),
+        "deleted_payment_vouchers": len(created_voucher_ids),
+        "removed_files": removed_files,
+    }
+
+
 @app.post("/api/batches/{batch_id}/imports/latest/rollback")
 def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES))) -> Dict[str, Any]:
     with connect() as conn:
@@ -2121,7 +3422,7 @@ def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require
             SELECT * FROM import_jobs
             WHERE batch_id = ?
               AND status = 'imported'
-              AND kind IN ('weekly-excel', 'dingtalk', 'external-expenses')
+              AND kind IN ('weekly-excel', 'weekly-excel-merge', 'dingtalk', 'external-expenses')
             ORDER BY created_at DESC, id DESC
             LIMIT 1
             """,
@@ -2133,6 +3434,8 @@ def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require
             meta = json.loads(job["mapping_json"] or "{}")
         except json.JSONDecodeError:
             meta = {}
+        if job["kind"] == "weekly-excel-merge":
+            return rollback_weekly_merge_job(conn, batch, job, meta, user)
         raw_payment_ids = [
             int(value)
             for value in (meta.get("payment_details") or {}).get("payment_ids", [])

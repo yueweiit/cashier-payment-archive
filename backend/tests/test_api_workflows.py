@@ -17,7 +17,7 @@ os.environ["PAYMENT_APP_DATA_DIR"] = str(TEST_DIR / "data")
 os.environ["PAYMENT_APP_DB"] = str(TEST_DIR / "app.db")
 
 from fastapi.testclient import TestClient
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from backend.app.db import connect, now_iso
 from backend.app.external_expenses import ExternalExpenseError, _preview_conditions, applicant_name_from_title, map_external_expense, valid_applicant_name
@@ -974,8 +974,8 @@ def test_excel_payment_detail_import_export_duplicate_and_rollback(tmp_path):
         exported_workbook = load_workbook(io.BytesIO(exported.content))
         payment_sheet = exported_workbook["付款明细"]
         headers = [cell.value for cell in payment_sheet[1]]
-        assert headers[:11] == ["请款标识", "钉钉单号", "来源 Sheet", "付款日期", "本次金额", "付款人", "付款账户", "流水号", "备注", "来源标记", "凭证信息"]
-        assert payment_sheet.cell(2, 5).value == 30
+        assert headers[:12] == ["付款标识", "请款标识", "钉钉单号", "来源 Sheet", "付款日期", "本次金额", "付款人", "付款账户", "流水号", "备注", "来源标记", "凭证信息"]
+        assert payment_sheet.cell(2, 6).value == 30
         assert len(payment_sheet._images) == 1
 
         rolled_back = client.post(f"/api/batches/{batch_id}/imports/latest/rollback")
@@ -1655,6 +1655,246 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         unchanged = client.get(f"/api/batches/{failure_batch['id']}/requests").json()["requests"][0]
         assert unchanged["id"] == created["id"]
         assert unchanged["raw_extra"] == {"kept": True}
+
+
+def visible_data_sheet(workbook):
+    return next(
+        sheet
+        for sheet in workbook.worksheets
+        if sheet.title not in {"付款明细", "_系统信息"}
+    )
+
+
+def header_lookup(sheet):
+    header_row = 2 if sheet.cell(2, 1).value == "序号" else 1
+    return header_row, {
+        str(sheet.cell(header_row, column).value): column
+        for column in range(1, sheet.max_column + 1)
+        if sheet.cell(header_row, column).value
+    }
+
+
+def test_weekly_merge_roundtrip_update_add_payment_and_rollback():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "merge-roundtrip", "start_date": "2026-07-16", "end_date": "2026-07-23"},
+        ).json()["batch"]
+        created = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={
+                "dingding_id": "MERGE-001",
+                "applicant": "原申请人",
+                "payment_account": "私户",
+                "summary": "原摘要",
+                "amount": 100,
+                "source_sheet": "原部门",
+            },
+        ).json()["request"]
+        exported = client.get(f"/api/batches/{batch['id']}/export.xlsx")
+        assert exported.status_code == 200
+        workbook = load_workbook(io.BytesIO(exported.content))
+        assert workbook["_系统信息"].sheet_state == "veryHidden"
+        sheet = visible_data_sheet(workbook)
+        header_row, headers = header_lookup(sheet)
+        assert sheet.column_dimensions[sheet.cell(header_row, headers["请款标识"]).column_letter].hidden
+        assert sheet.cell(header_row + 1, headers["请款标识"]).value == created["id"]
+        payment_sheet = workbook["付款明细"]
+        assert payment_sheet.column_dimensions["A"].hidden
+        assert payment_sheet.cell(1, 1).value == "付款标识"
+
+        unchanged_bytes = io.BytesIO()
+        workbook.save(unchanged_bytes)
+        unchanged_bytes.seek(0)
+        unchanged_preview = client.post(
+            "/api/import/weekly-excel/merge-preview",
+            data={"batch_id": str(batch["id"])},
+            files={"file": ("roundtrip.xlsx", unchanged_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+        assert unchanged_preview.status_code == 200
+        assert unchanged_preview.json()["summary"]["unchanged"] == 1
+        assert unchanged_preview.json()["summary"]["conflict"] == 0
+
+        sheet.title = "新部门"
+        header_row, headers = header_lookup(sheet)
+        sheet.cell(header_row + 1, headers["摘要"], "更新后的摘要")
+        sheet.cell(header_row + 1, headers["已支付金额"], 20)
+        new_row = header_row + 2
+        sheet.cell(new_row, headers["请款标识"], None)
+        sheet.cell(new_row, headers["钉钉申请单号"], "MERGE-002")
+        sheet.cell(new_row, headers["申请人"], "新增申请人")
+        sheet.cell(new_row, headers["付款账户"], "公户")
+        sheet.cell(new_row, headers["摘要"], "新增摘要")
+        sheet.cell(new_row, headers["应付金额"], 50)
+        sheet.cell(new_row, headers["已支付金额"], 0)
+        sheet.cell(new_row, headers["待付款金额"], 50)
+        modified = io.BytesIO()
+        workbook.save(modified)
+        modified.seek(0)
+
+        preview_response = client.post(
+            "/api/import/weekly-excel/merge-preview",
+            data={"batch_id": str(batch["id"])},
+            files={"file": ("modified.xlsx", modified, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+        assert preview_response.status_code == 200
+        preview = preview_response.json()
+        assert preview["summary"]["create"] == 1
+        assert preview["summary"]["update"] == 1
+        assert preview["summary"]["payment"] == 1
+        payment_key = next(
+            key
+            for row in preview["rows"]
+            if row["dingding_id"] == "MERGE-001"
+            for key in row["payment_date_keys"]
+        )
+        applied = client.post(
+            f"/api/import-jobs/{preview['job_id']}/apply-merge",
+            json={
+                "resolutions": [],
+                "payment_dates": {payment_key: "2026-07-23"},
+            },
+        )
+        assert applied.status_code == 200, applied.text
+        rows = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+        assert len(rows) == 2
+        by_ding = {row["dingding_id"]: row for row in rows}
+        assert by_ding["MERGE-001"]["summary"] == "更新后的摘要"
+        assert by_ding["MERGE-001"]["source_sheet"] == "新部门"
+        assert by_ding["MERGE-001"]["paid_amount"] == 20
+        assert by_ding["MERGE-002"]["summary"] == "新增摘要"
+        assert client.get(f"/api/batches/{batch['id']}").json()["batch"]["sheet_order"][0] == "新部门"
+
+        rolled_back = client.post(f"/api/batches/{batch['id']}/imports/latest/rollback")
+        assert rolled_back.status_code == 200, rolled_back.text
+        assert rolled_back.json()["restored_requests"] == 1
+        restored_rows = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+        assert len(restored_rows) == 1
+        assert restored_rows[0]["summary"] == "原摘要"
+        assert restored_rows[0]["source_sheet"] == "原部门"
+        assert restored_rows[0]["paid_amount"] == 0
+
+
+def test_weekly_merge_legacy_ambiguity_and_concurrent_change():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "merge-legacy"}).json()["batch"]
+        existing_ids = []
+        for amount in (100, 200):
+            response = client.post(
+                f"/api/batches/{batch['id']}/requests",
+                json={
+                    "dingding_id": "LEGACY-DUP",
+                    "payment_account": "私户",
+                    "summary": f"原记录 {amount}",
+                    "amount": amount,
+                    "source_sheet": "旧版 Sheet",
+                },
+            )
+            existing_ids.append(response.json()["request"]["id"])
+
+        legacy = Workbook()
+        sheet = legacy.active
+        sheet.title = "旧版 Sheet"
+        sheet.append(["钉钉申请单号", "申请人", "付款账户", "摘要", "应付金额", "已支付金额", "待付款金额"])
+        sheet.append(["LEGACY-DUP", "旧版申请人", "私户", "旧版修改", 180, 0, 180])
+        payload = io.BytesIO()
+        legacy.save(payload)
+        payload.seek(0)
+        preview_response = client.post(
+            "/api/import/weekly-excel/merge-preview",
+            data={"batch_id": str(batch["id"])},
+            files={"file": ("legacy.xlsx", payload, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+        assert preview_response.status_code == 200
+        preview = preview_response.json()
+        row = preview["rows"][0]
+        assert row["action"] == "conflict"
+        assert {candidate["id"] for candidate in row["candidates"]} == set(existing_ids)
+
+        applied = client.post(
+            f"/api/import-jobs/{preview['job_id']}/apply-merge",
+            json={
+                "resolutions": [{"row_id": row["row_id"], "action": "update", "request_id": existing_ids[0]}],
+                "payment_dates": {},
+            },
+        )
+        assert applied.status_code == 200, applied.text
+        selected = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+        assert next(item for item in selected if item["id"] == existing_ids[0])["summary"] == "旧版修改"
+
+        exported = client.get(f"/api/batches/{batch['id']}/export.xlsx")
+        concurrent_preview = client.post(
+            "/api/import/weekly-excel/merge-preview",
+            data={"batch_id": str(batch["id"])},
+            files={"file": ("concurrent.xlsx", io.BytesIO(exported.content), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        ).json()
+        changed = client.patch(
+            f"/api/batches/{batch['id']}/requests/{existing_ids[1]}",
+            json={"remark": "预览后修改"},
+        )
+        assert changed.status_code == 200
+        rejected = client.post(
+            f"/api/import-jobs/{concurrent_preview['job_id']}/apply-merge",
+            json={"resolutions": [], "payment_dates": {}},
+        )
+        assert rejected.status_code == 409
+
+
+def test_weekly_merge_payment_detail_is_authoritative_and_missing_main_row_is_preserved():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "merge-payment-detail"}).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": "MERGE-PAY", "payment_account": "公户", "amount": 100, "source_sheet": "付款测试"},
+        ).json()["request"]
+        payment = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/payments",
+            json={"amount": 30, "payment_date": "2026-07-20", "payer": "测试出纳"},
+        ).json()["payment"]
+        exported = client.get(f"/api/batches/{batch['id']}/export.xlsx")
+        workbook = load_workbook(io.BytesIO(exported.content))
+        main_sheet = visible_data_sheet(workbook)
+        main_header_row, _ = header_lookup(main_sheet)
+        main_sheet.delete_rows(main_header_row + 1, 1)
+        payment_sheet = workbook["付款明细"]
+        payment_headers = {cell.value: cell.column for cell in payment_sheet[1] if cell.value}
+        assert payment_sheet.cell(2, payment_headers["付款标识"]).value == payment["id"]
+        payment_sheet.cell(2, payment_headers["本次金额"], 40)
+        modified = io.BytesIO()
+        workbook.save(modified)
+        modified.seek(0)
+        preview_response = client.post(
+            "/api/import/weekly-excel/merge-preview",
+            data={"batch_id": str(batch["id"])},
+            files={"file": ("payment-update.xlsx", modified, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+        assert preview_response.status_code == 200
+        preview = preview_response.json()
+        assert preview["summary"]["conflict"] == 0
+        assert preview["summary"]["payment"] == 1
+        preserved = next(row for row in preview["rows"] if row["request_id"] == request["id"])
+        assert preserved["payment_change"]
+        assert any("系统记录将保留" in warning for warning in preserved["warnings"])
+        applied = client.post(
+            f"/api/import-jobs/{preview['job_id']}/apply-merge",
+            json={"resolutions": [], "payment_dates": {}},
+        )
+        assert applied.status_code == 200, applied.text
+        updated = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"][0]
+        assert updated["id"] == request["id"]
+        assert updated["paid_amount"] == 40
+
+        rolled_back = client.post(f"/api/batches/{batch['id']}/imports/latest/rollback")
+        assert rolled_back.status_code == 200, rolled_back.text
+        restored = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"][0]
+        assert restored["paid_amount"] == 30
+        restored_payment = client.get(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/payments"
+        ).json()["payments"][0]
+        assert restored_payment["amount"] == 30
 
 
 def teardown_module():
