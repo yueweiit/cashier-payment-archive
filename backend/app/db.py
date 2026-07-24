@@ -490,7 +490,13 @@ def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int
             """
             UPDATE payment_requests
             SET paid_amount = ?, pending_amount = ?, finance_review = ?,
-                payment_status = ?, actual_payment_date = ?, payer = ?
+                payment_status = ?, actual_payment_date = ?, payer = ?,
+                general_manager_approval = CASE
+                    WHEN ? = '已付款'
+                         AND COALESCE(NULLIF(TRIM(general_manager_approval), ''), '') = ''
+                    THEN '同意付款'
+                    ELSE general_manager_approval
+                END
             WHERE id = ?
             """,
             (
@@ -500,6 +506,7 @@ def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int
                 finance_review,
                 latest["payment_date"] if latest else None,
                 latest["payer"] if latest else None,
+                finance_review,
                 request["id"],
             ),
         )

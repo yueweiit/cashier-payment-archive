@@ -350,6 +350,7 @@ def test_partial_payment_amounts_are_calculated_and_summarized():
             assert updated_row["paid_amount"] == expected_paid
             assert updated_row["pending_amount"] == 100 - expected_paid
             assert updated_row["finance_review"] == ("已付款" if index == 3 else "部分付款")
+            assert updated_row["general_manager_approval"] == ("同意付款" if index == 3 else None)
 
         detail = client.get(f"/api/batches/{batch_id}/requests/{row['id']}/payments").json()
         assert detail["summary"]["payment_count"] == 3
@@ -1185,7 +1186,7 @@ def test_normalize_payment_data_repairs_saved_rows_and_dictionary():
             dispute_row = conn.execute("SELECT * FROM payment_requests WHERE dingding_id = 'FIX-4'").fetchone()
             partial_row = conn.execute("SELECT * FROM payment_requests WHERE dingding_id = 'FIX-5'").fetchone()
             assert paid_row["finance_review"] == "已付款"
-            assert paid_row["general_manager_approval"] is None
+            assert paid_row["general_manager_approval"] == "同意付款"
             assert paid_row["payment_status"] == "已付款"
             assert conn.execute("SELECT COUNT(*) AS count FROM payment_records WHERE request_id = ?", (paid_row["id"],)).fetchone()["count"] == 1
             assert "已经支付14500元" in paid_row["remark"]
