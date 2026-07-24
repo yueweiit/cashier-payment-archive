@@ -64,6 +64,7 @@ const emptyRequest: Partial<PaymentRequest> = {
 
 const financeApprovalOptions = ["未付款", "部分付款", "已付款"];
 const generalManagerApprovalOptions = ["同意付款", "延缓批付", "存在争议"];
+const generalManagerApprovalFilterOptions = [...generalManagerApprovalOptions, "无需审批"];
 const GENERAL_MANAGER_EMPTY_FILTER = "__empty_general_manager_approval__";
 const selectOptionsByField: Partial<Record<keyof PaymentRequest, string[]>> = {
   finance_review: financeApprovalOptions,
@@ -1985,7 +1986,7 @@ function Workspace({
           <select value={filters.general_manager_approval} onChange={(event) => setFilters({ ...filters, general_manager_approval: event.target.value })} aria-label="总经理审批">
             <option value="">全部总经理审批</option>
             <option value={GENERAL_MANAGER_EMPTY_FILTER}>未选择</option>
-            {generalManagerApprovalOptions.map((option) => (
+            {generalManagerApprovalFilterOptions.map((option) => (
               <option key={option} value={option}>{option}</option>
             ))}
           </select>
@@ -2686,12 +2687,13 @@ function EditablePaymentGrid({
 	                  const cellValue = cellDisplayValue(row, column);
 	                  const selectOptions = selectOptionsForField(column.key, cellValue);
 	                  const shouldWrap = wrapText && wrappableColumnKeys.has(column.key) && column.type !== "number" && column.type !== "date";
-	                  const cellReadOnly = readOnly || row.__deleted || !canEditField(column.key);
+	                  const terminatedManagerField = requestDingTalkTerminated(row) && generalManagerControlledFields.has(column.key);
+	                  const cellReadOnly = readOnly || row.__deleted || !canEditField(column.key) || terminatedManagerField;
 	                  const fieldClass = [
 	                    column.key === "dingding_id" ? "mono" : "",
 	                    moneyFields.has(column.key) ? "amount-input" : "",
 	                    shouldWrap ? "wrap-field" : "",
-	                    !canEditField(column.key) ? "readonly-field" : "",
+	                    cellReadOnly ? "readonly-field" : "",
 	                  ].filter(Boolean).join(" ");
                   return (
                     <td key={column.key} className={`${dirty ? "dirty-cell " : ""}${column.key === "applicant" ? "applicant-edit-cell" : ""}`.trim()} style={{ width: column.width, minWidth: column.width, maxWidth: column.width }}>
@@ -2928,7 +2930,7 @@ function RequestEditor({
   }
 
   function renderField(field: keyof PaymentRequest, options: { span?: boolean } = {}) {
-    const fieldEditable = canEditField(field);
+    const fieldEditable = canEditField(field) && !(requestDingTalkTerminated(form) && generalManagerControlledFields.has(field));
     const className = options.span ? "editor-field span-2" : "editor-field";
     const label = fieldLabels[field] || field;
     const value = field === "applicant" ? requestApplicantName(form) : form[field];
@@ -3897,8 +3899,11 @@ function selectOptionsForField(field: keyof PaymentRequest, currentValue: string
   const baseOptions = selectOptionsByField[field];
   if (!baseOptions) return null;
   const options = ["", ...baseOptions];
-  if (strictSelectFields.has(field)) return options;
   const value = currentValue.trim();
+  if (strictSelectFields.has(field)) {
+    if (field === "general_manager_approval" && value === "无需审批") options.push(value);
+    return options;
+  }
   if (value && !options.includes(value)) options.push(value);
   return options;
 }
@@ -4109,6 +4114,10 @@ function requestApplicantName(request: Partial<PaymentRequest>) {
 
 function requestApplicantDepartment(request: Partial<PaymentRequest>) {
   return String(request.raw_extra?.external_source?.applicant_department || "").trim();
+}
+
+function requestDingTalkTerminated(request: Partial<PaymentRequest>) {
+  return String(request.raw_extra?.external_source?.approval_status || "").trim().toUpperCase() === "TERMINATED";
 }
 
 function requestApplicantMeta(request: Partial<PaymentRequest>) {

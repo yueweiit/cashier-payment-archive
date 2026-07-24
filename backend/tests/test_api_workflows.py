@@ -1571,6 +1571,13 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             "source_id": "903",
             "approval_status": "TERMINATED",
         },
+        {
+            "approval_no": "SYNC-TERMINATED",
+            "source_type": "purchase",
+            "source_label": "采购支出",
+            "source_id": "904",
+            "approval_status": "TERMINATED",
+        },
     ]
     monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda approval_nos: metadata)
 
@@ -1584,6 +1591,7 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             ("SYNC-MATCH", 101, "用户手动 Sheet"),
             ("SYNC-CONFLICT", 200, "冲突 Sheet"),
             ("SYNC-MISSING", 300, "未匹配 Sheet"),
+            ("SYNC-TERMINATED", 400, "终止 Sheet"),
         ):
             response = client.post(
                 f"/api/batches/{batch_id}/requests",
@@ -1604,11 +1612,11 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         assert synced.json() == {
             "status": "synced",
             "batch_id": batch_id,
-            "unique_approval_nos": 3,
-            "matched": 1,
+            "unique_approval_nos": 4,
+            "matched": 2,
             "unmatched": 1,
             "conflicts": 1,
-            "updated_requests": 4,
+            "updated_requests": 5,
         }
         rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
         by_id = {row["id"]: row for row in rows}
@@ -1622,6 +1630,8 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         assert by_id[request_ids[0]]["source_sheet"] == "用户手动 Sheet"
         assert by_id[request_ids[2]]["raw_extra"]["external_source"]["lookup_status"] == "conflict"
         assert by_id[request_ids[3]]["raw_extra"]["external_source"]["lookup_status"] == "unmatched"
+        assert by_id[request_ids[4]]["raw_extra"]["external_source"]["approval_status"] == "TERMINATED"
+        assert by_id[request_ids[4]]["general_manager_approval"] == "无需审批"
         with connect() as conn:
             audit_row = conn.execute(
                 "SELECT new_value_json FROM audit_logs WHERE batch_id = ? AND action = 'external_expenses.metadata_sync'",
@@ -1629,12 +1639,26 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             ).fetchone()
             assert audit_row is not None
             assert json.loads(audit_row["new_value_json"]) == {
-                "unique_approval_nos": 3,
-                "matched": 1,
+                "unique_approval_nos": 4,
+                "matched": 2,
                 "unmatched": 1,
                 "conflicts": 1,
-                "updated_requests": 4,
+                "updated_requests": 5,
             }
+
+        refreshed_metadata = [
+            {**item, "approval_status": "RUNNING"}
+            if item["approval_no"] == "SYNC-TERMINATED"
+            else item
+            for item in metadata
+        ]
+        monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda approval_nos: refreshed_metadata)
+        resynced = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
+        assert resynced.status_code == 200
+        rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        by_id = {row["id"]: row for row in rows}
+        assert by_id[request_ids[4]]["raw_extra"]["external_source"]["approval_status"] == "RUNNING"
+        assert by_id[request_ids[4]]["general_manager_approval"] is None
 
         archived = client.post(f"/api/batches/{batch_id}/archive")
         assert archived.status_code == 200

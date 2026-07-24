@@ -3230,6 +3230,7 @@ def sync_external_expense_metadata(
                 """,
                 (json.dumps(raw_extra, ensure_ascii=False, default=str), user["id"], timestamp, request_id, batch_id),
             )
+            refresh_payment_summaries(conn, request_id)
             updated_requests += 1
 
         summary = {

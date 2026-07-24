@@ -459,9 +459,22 @@ def migrate_payment_summaries_to_details(conn: sqlite3.Connection) -> None:
 
 def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int] = None) -> None:
     if request_id is None:
-        requests = conn.execute("SELECT id, amount FROM payment_requests ORDER BY id").fetchall()
+        requests = conn.execute(
+            """
+            SELECT id, amount, general_manager_approval, raw_extra_json
+            FROM payment_requests
+            ORDER BY id
+            """
+        ).fetchall()
     else:
-        requests = conn.execute("SELECT id, amount FROM payment_requests WHERE id = ?", (request_id,)).fetchall()
+        requests = conn.execute(
+            """
+            SELECT id, amount, general_manager_approval, raw_extra_json
+            FROM payment_requests
+            WHERE id = ?
+            """,
+            (request_id,),
+        ).fetchall()
     for request in requests:
         aggregate = conn.execute(
             "SELECT COALESCE(SUM(amount), 0) AS paid_amount, COUNT(*) AS payment_count FROM payment_records WHERE request_id = ?",
@@ -486,17 +499,26 @@ def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int
             finance_review = "已付款"
         else:
             finance_review = "部分付款"
+        try:
+            raw_extra = json.loads(request["raw_extra_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw_extra = {}
+        external_source = raw_extra.get("external_source") if isinstance(raw_extra, dict) else {}
+        external_status = str((external_source or {}).get("approval_status") or "").strip().upper()
+        manager_approval = str(request["general_manager_approval"] or "").strip() or None
+        if external_status == "TERMINATED":
+            manager_approval = "无需审批"
+        else:
+            if manager_approval == "无需审批":
+                manager_approval = None
+            if finance_review == "已付款" and not manager_approval:
+                manager_approval = "同意付款"
         conn.execute(
             """
             UPDATE payment_requests
             SET paid_amount = ?, pending_amount = ?, finance_review = ?,
                 payment_status = ?, actual_payment_date = ?, payer = ?,
-                general_manager_approval = CASE
-                    WHEN ? = '已付款'
-                         AND COALESCE(NULLIF(TRIM(general_manager_approval), ''), '') = ''
-                    THEN '同意付款'
-                    ELSE general_manager_approval
-                END
+                general_manager_approval = ?
             WHERE id = ?
             """,
             (
@@ -506,7 +528,7 @@ def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int
                 finance_review,
                 latest["payment_date"] if latest else None,
                 latest["payer"] if latest else None,
-                finance_review,
+                manager_approval,
                 request["id"],
             ),
         )

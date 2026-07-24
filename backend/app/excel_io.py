@@ -56,7 +56,7 @@ FINANCE_REVIEW_OPTIONS = {"未付款", "部分付款", "已付款"}
 UNPAID_REVIEW_VALUES = {"未选择", "待批付", "待付款", "未支付", "未付款"}
 PAID_REVIEW_VALUES = {"已支付", "已付款", "已付", "付讫"}
 PARTIAL_REVIEW_VALUES = {"部分付款", "部分支付", "部分已付", "已部分付款", "已部分支付"}
-GENERAL_MANAGER_APPROVAL_OPTIONS = {"同意付款", "延缓批付", "存在争议"}
+GENERAL_MANAGER_APPROVAL_OPTIONS = {"同意付款", "延缓批付", "存在争议", "无需审批"}
 NON_FINANCE_PAYMENT_RE = re.compile(r"(垫付|Tiffany|T总|总经理|个人|老板|代付)")
 IMAGE_FORMATS = {
     "png": (".png", "image/png"),
