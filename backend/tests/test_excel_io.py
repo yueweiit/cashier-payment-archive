@@ -107,12 +107,12 @@ def test_partial_payment_amounts_are_normalized_and_exported():
         {},
     )
     workbook = load_workbook(io.BytesIO(content), data_only=False)
-    worksheet = workbook.worksheets[0]
-    headers = [cell.value for cell in worksheet[1]]
+    worksheet = workbook["全部"]
+    headers = [cell.value for cell in worksheet[2]]
     assert "申请人" in headers
     amount_columns = [headers.index(header) + 1 for header in ("应付金额", "已支付金额", "待付款金额")]
-    assert [worksheet.cell(2, column).value for column in amount_columns] == [100, 35.5, 64.5]
-    assert all(str(worksheet.cell(3, column).value).startswith("=SUM(") for column in amount_columns)
+    assert [worksheet.cell(3, column).value for column in amount_columns] == [100, 35.5, 64.5]
+    assert all(str(worksheet.cell(4, column).value).startswith("=SUM(") for column in amount_columns)
 
 
 def test_weekly_excel_extracts_embedded_images():
@@ -183,6 +183,35 @@ def test_export_workbook_uses_saved_sheet_order():
         {},
     )
     workbook = load_workbook(io.BytesIO(content))
-    assert workbook.sheetnames[:3] == ["供应商", "财务中心", "采购中心"]
+    assert workbook.sheetnames[:4] == ["全部", "供应商", "财务中心", "采购中心"]
     assert workbook.sheetnames[-2:] == ["付款明细", "_系统信息"]
     assert workbook["_系统信息"].sheet_state == "veryHidden"
+
+
+def test_all_sheet_is_first_and_skipped_during_roundtrip_parse(tmp_path):
+    records = [
+        {"id": 1, "dingding_id": "DD-1", "source_sheet": "采购中心", "amount": 100, "summary": "采购"},
+        {"id": 2, "dingding_id": "DD-2", "source_sheet": "财务中心", "amount": 200, "summary": "财务"},
+    ]
+    content = export_workbook(
+        {
+            "id": 7,
+            "name": "全部 Sheet 测试",
+            "end_date": "2026-07-21",
+            "sheet_order": ["财务中心", "采购中心"],
+        },
+        records,
+        {},
+    )
+    exported = tmp_path / "all-sheet-roundtrip.xlsx"
+    exported.write_bytes(content)
+
+    workbook = load_workbook(exported, data_only=False)
+    assert workbook.sheetnames[:3] == ["全部", "财务中心", "采购中心"]
+    assert workbook["全部"]["A1"].value.startswith("全部记录汇总视图")
+
+    rows, meta = parse_weekly_excel(exported)
+    assert len(rows) == len(records)
+    assert {row["_request_id"] for row in rows} == {1, 2}
+    assert meta["workbook_sheet_order"] == ["财务中心", "采购中心"]
+    assert any(item.get("sheet") == "全部" and item.get("skipped") == "view_sheet" for item in meta["sheets"])

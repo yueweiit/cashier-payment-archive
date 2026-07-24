@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -59,7 +60,7 @@ def test_sheet_order_is_saved_and_inherited_by_rollover():
         exported = client.get(f"/api/batches/{source['id']}/export.xlsx")
         assert exported.status_code == 200
         workbook = load_workbook(io.BytesIO(exported.content))
-        assert workbook.sheetnames[:3] == order
+        assert workbook.sheetnames[:4] == ["全部", *order]
 
         rollover = client.post(
             f"/api/batches/{source['id']}/rollover",
@@ -74,6 +75,81 @@ def test_sheet_order_is_saved_and_inherited_by_rollover():
         reordered = client.put(f"/api/batches/{source['id']}/sheet-order", json={"sheet_order": archived_order})
         assert reordered.status_code == 200
         assert reordered.json()["batch"]["sheet_order"] == archived_order
+
+
+def test_filtered_export_matches_workspace_filters_and_keeps_all_sheet():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "筛选导出测试", "start_date": "2026-07-16", "end_date": "2026-07-23"},
+        ).json()["batch"]
+
+        def create(sheet: str, applicant: str, manager_approval: str, amount: float) -> dict:
+            response = client.post(
+                f"/api/batches/{batch['id']}/requests",
+                json={
+                    "source_sheet": sheet,
+                    "applicant": applicant,
+                    "summary": f"{applicant}的请款",
+                    "amount": amount,
+                    "general_manager_approval": manager_approval,
+                },
+            )
+            assert response.status_code == 200
+            return response.json()["request"]
+
+        expected_a = create("采购中心", "张三", "同意付款", 100)
+        create("采购中心", "李四", "存在争议", 200)
+        expected_b = create("财务中心", "王五", "同意付款", 300)
+        paid = create("财务中心", "赵六", "同意付款", 400)
+        payment = client.post(
+            f"/api/batches/{batch['id']}/requests/{paid['id']}/payments",
+            json={"amount": 400, "payment_date": "2026-07-23"},
+        )
+        assert payment.status_code == 200
+        order = client.put(
+            f"/api/batches/{batch['id']}/sheet-order",
+            json={"sheet_order": ["采购中心", "财务中心"]},
+        )
+        assert order.status_code == 200
+
+        exported = client.get(
+            f"/api/batches/{batch['id']}/export.xlsx",
+            params={
+                "filtered": "true",
+                "finance_review": "未付款",
+                "general_manager_approval": "同意付款",
+            },
+        )
+        assert exported.status_code == 200
+        assert "筛选结果" in unquote(exported.headers["content-disposition"])
+        workbook = load_workbook(io.BytesIO(exported.content), data_only=False)
+        assert workbook.sheetnames[:3] == ["全部", "采购中心", "财务中心"]
+
+        all_sheet = workbook["全部"]
+        headers = [cell.value for cell in all_sheet[2]]
+        request_id_column = headers.index("请款标识") + 1
+        exported_request_ids = {
+            all_sheet.cell(row, request_id_column).value
+            for row in range(3, all_sheet.max_row + 1)
+            if all_sheet.cell(row, request_id_column).value
+        }
+        assert exported_request_ids == {expected_a["id"], expected_b["id"]}
+        assert workbook["付款明细"].max_row == 1
+
+        sheet_filtered = client.get(
+            f"/api/batches/{batch['id']}/export.xlsx",
+            params={
+                "filtered": "true",
+                "finance_review": "未付款",
+                "general_manager_approval": "同意付款",
+                "source_sheet": "采购中心",
+            },
+        )
+        sheet_workbook = load_workbook(io.BytesIO(sheet_filtered.content), data_only=False)
+        assert sheet_workbook.sheetnames[:2] == ["全部", "采购中心"]
+        assert "财务中心" not in sheet_workbook.sheetnames
 
 
 def external_expense_test_row(
@@ -715,7 +791,7 @@ def test_image_attachment_upload_and_export():
         exported = client.get(f"/api/batches/{batch_id}/export.xlsx")
         assert exported.status_code == 200
         workbook = load_workbook(io.BytesIO(exported.content))
-        worksheet = workbook[workbook.sheetnames[0]]
+        worksheet = workbook["图片测试"]
         headers = [cell.value for cell in next(worksheet.iter_rows(max_row=1))]
         assert "图片附件" in headers
         assert "财务付款时间" in headers
@@ -1686,7 +1762,7 @@ def visible_data_sheet(workbook):
     return next(
         sheet
         for sheet in workbook.worksheets
-        if sheet.title not in {"付款明细", "_系统信息"}
+        if sheet.title not in {"全部", "付款明细", "_系统信息"}
     )
 
 

@@ -955,6 +955,60 @@ def correct_archived_request(
     return {"request": row_to_dict(new_row)}
 
 
+def payment_request_filter_parts(
+    batch_id: int,
+    q: str = "",
+    payment_account: str = "",
+    invoice_status: str = "",
+    finance_review: str = "",
+    general_manager_approval: str = "",
+    payment_status: str = "",
+    source_sheet: str = "",
+) -> tuple[list[str], list[Any]]:
+    q = q.strip()
+    payment_account = payment_account.strip()
+    invoice_status = invoice_status.strip()
+    finance_review = finance_review.strip()
+    general_manager_approval = general_manager_approval.strip()
+    payment_status = payment_status.strip()
+    source_sheet = source_sheet.strip()
+    conditions = ["batch_id = ?"]
+    params: list[Any] = [batch_id]
+    if q:
+        conditions.append(
+            """
+            (
+                dingding_id LIKE ?
+                OR COALESCE(applicant, '') LIKE ?
+                OR COALESCE(raw_extra_json, '') LIKE ?
+                OR summary LIKE ? OR payee_name LIKE ? OR payee_account LIKE ?
+                OR project LIKE ? OR expense_type LIKE ? OR general_manager_opinion LIKE ? OR remark LIKE ?
+            )
+            """
+        )
+        needle = f"%{q}%"
+        params.extend([needle] * 10)
+    if payment_account:
+        conditions.append("payment_account LIKE ?")
+        params.append(f"%{payment_account}%")
+    if invoice_status:
+        conditions.append("invoice_status LIKE ?")
+        params.append(f"%{invoice_status}%")
+    normalized_finance_review = finance_review or {"未支付": "未付款", "已支付": "已付款"}.get(payment_status, payment_status)
+    if normalized_finance_review:
+        conditions.append("finance_review = ?")
+        params.append(normalized_finance_review)
+    if general_manager_approval == "__empty_general_manager_approval__":
+        conditions.append("(general_manager_approval IS NULL OR TRIM(general_manager_approval) = '')")
+    elif general_manager_approval:
+        conditions.append("general_manager_approval = ?")
+        params.append(general_manager_approval)
+    if source_sheet:
+        conditions.append("source_sheet = ?")
+        params.append(source_sheet)
+    return conditions, params
+
+
 @app.get("/api/batches/{batch_id}/requests")
 def list_requests(
     batch_id: int,
@@ -967,35 +1021,16 @@ def list_requests(
     source_sheet: str = "",
     user: Dict[str, Any] = Depends(current_user),
 ) -> Dict[str, Any]:
-    conditions = ["batch_id = ?"]
-    params: list[Any] = [batch_id]
-    if q:
-        conditions.append(
-            """
-            (
-                dingding_id LIKE ? OR summary LIKE ? OR payee_name LIKE ? OR payee_account LIKE ?
-                OR project LIKE ? OR expense_type LIKE ? OR general_manager_opinion LIKE ? OR remark LIKE ?
-            )
-            """
-        )
-        needle = f"%{q}%"
-        params.extend([needle] * 8)
-    for column, value in [
-        ("payment_account", payment_account),
-        ("invoice_status", invoice_status),
-        ("finance_review", finance_review or {"未支付": "未付款", "已支付": "已付款"}.get(payment_status, payment_status)),
-    ]:
-        if value:
-            conditions.append(f"{column} = ?")
-            params.append(value)
-    if general_manager_approval == "__empty_general_manager_approval__":
-        conditions.append("(general_manager_approval IS NULL OR TRIM(general_manager_approval) = '')")
-    elif general_manager_approval:
-        conditions.append("general_manager_approval = ?")
-        params.append(general_manager_approval)
-    if source_sheet:
-        conditions.append("source_sheet = ?")
-        params.append(source_sheet)
+    conditions, params = payment_request_filter_parts(
+        batch_id,
+        q=q,
+        payment_account=payment_account,
+        invoice_status=invoice_status,
+        finance_review=finance_review,
+        general_manager_approval=general_manager_approval,
+        payment_status=payment_status,
+        source_sheet=source_sheet,
+    )
     with connect() as conn:
         require_batch(conn, batch_id)
         rows = conn.execute(
@@ -3567,10 +3602,42 @@ def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require
 
 
 @app.get("/api/batches/{batch_id}/export.xlsx")
-def export_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> StreamingResponse:
+def export_batch(
+    batch_id: int,
+    filtered: bool = False,
+    q: str = "",
+    payment_account: str = "",
+    invoice_status: str = "",
+    finance_review: str = "",
+    general_manager_approval: str = "",
+    source_sheet: str = "",
+    user: Dict[str, Any] = Depends(current_user),
+) -> StreamingResponse:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
-        records = rows_to_dicts(conn.execute("SELECT * FROM payment_requests WHERE batch_id = ? ORDER BY source_sheet, source_row, id", (batch_id,)).fetchall())
+        if filtered:
+            conditions, params = payment_request_filter_parts(
+                batch_id,
+                q=q,
+                payment_account=payment_account,
+                invoice_status=invoice_status,
+                finance_review=finance_review,
+                general_manager_approval=general_manager_approval,
+                source_sheet=source_sheet,
+            )
+        else:
+            conditions, params = ["batch_id = ?"], [batch_id]
+        records = rows_to_dicts(
+            conn.execute(
+                f"""
+                SELECT * FROM payment_requests
+                WHERE {' AND '.join(conditions)}
+                ORDER BY source_sheet, source_row, id
+                """,
+                params,
+            ).fetchall()
+        )
+        record_ids = {int(record["id"]) for record in records}
         links = rows_to_dicts(
             conn.execute(
                 """
@@ -3583,6 +3650,8 @@ def export_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) ->
         )
         attachments: Dict[int, list[Dict[str, Any]]] = {}
         for link in links:
+            if int(link["request_id"]) not in record_ids:
+                continue
             if link.get("file_path"):
                 link["absolute_path"] = str(resolve_data_file(link["file_path"]))
             attachments.setdefault(link["request_id"], []).append(link)
@@ -3599,6 +3668,8 @@ def export_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) ->
                 (batch_id,),
             ).fetchall()
         )
+        payments = [payment for payment in payments if int(payment["request_id"]) in record_ids]
+        payment_ids = {int(payment["id"]) for payment in payments}
         voucher_rows = rows_to_dicts(
             conn.execute(
                 """
@@ -3613,6 +3684,8 @@ def export_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) ->
         )
         vouchers_by_payment: Dict[int, list[Dict[str, Any]]] = {}
         for voucher in voucher_rows:
+            if int(voucher["payment_id"]) not in payment_ids:
+                continue
             voucher["file_url"] = f"/api/payment-vouchers/{voucher['id']}/file"
             if str(voucher.get("mime_type") or "").startswith("image/") and voucher.get("file_path"):
                 voucher["absolute_path"] = str(resolve_data_file(voucher["file_path"]))
@@ -3620,7 +3693,8 @@ def export_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) ->
         for payment in payments:
             payment["vouchers"] = vouchers_by_payment.get(int(payment["id"]), [])
         content = export_workbook(row_to_dict(batch), records, attachments, payments)
-    filename = f"{batch['name']}.xlsx".replace("/", "_")
+    suffix = "_筛选结果" if filtered else ""
+    filename = f"{batch['name']}{suffix}.xlsx".replace("/", "_")
     return StreamingResponse(
         iter([content]),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

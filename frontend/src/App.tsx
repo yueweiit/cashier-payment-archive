@@ -1347,6 +1347,7 @@ function Workspace({
   const sheetTabs = useMemo(() => getSheetTabs(gridRows, sheetOrder), [gridRows, sheetOrder]);
   const visibleRows = useMemo(() => gridRows.filter((row) => rowMatchesFilters(row, filters, activeSheet)), [gridRows, filters, activeSheet]);
   const visibleActiveRows = useMemo(() => visibleRows.filter((row) => !row.__deleted), [visibleRows]);
+  const hasActiveExportFilter = activeSheet !== ALL_SHEET || Object.values(filters).some((value) => value.trim());
   const activeSheetRows = useMemo(
     () => (activeSheet === ALL_SHEET ? [] : gridRows.filter((row) => normalizeSheetName(row.source_sheet) === activeSheet)),
     [activeSheet, gridRows],
@@ -1594,6 +1595,35 @@ function Workspace({
     setSheetOrder(selectedBatch?.sheet_order || []);
     await loadRequests();
     setMessage("未保存修改已放弃");
+  }
+
+  function exportCurrentResults() {
+    if (!selectedBatch) return;
+    if (hasUnsavedChanges || editorDirty) {
+      setMessage("请先保存或放弃未保存修改，再导出");
+      return;
+    }
+    if (visibleActiveRows.length === 0) {
+      setMessage("当前筛选没有可导出的记录");
+      return;
+    }
+    if (!hasActiveExportFilter) {
+      window.open(`/api/batches/${selectedBatch.id}/export.xlsx`, "_blank");
+      return;
+    }
+    const params = new URLSearchParams({ filtered: "true" });
+    const exportFilters = {
+      q: filters.q.trim(),
+      payment_account: filters.payment_account.trim(),
+      invoice_status: filters.invoice_status.trim(),
+      finance_review: filters.finance_review.trim(),
+      general_manager_approval: filters.general_manager_approval.trim(),
+    };
+    Object.entries(exportFilters).forEach(([key, value]) => {
+      if (value) params.set(key, value);
+    });
+    if (activeSheet !== ALL_SHEET) params.set("source_sheet", activeSheet);
+    window.open(`/api/batches/${selectedBatch.id}/export.xlsx?${params.toString()}`, "_blank");
   }
 
   async function restoreInitialDraftState() {
@@ -1993,6 +2023,23 @@ function Workspace({
           <button className="ghost-button" onClick={() => setMessage("筛选已应用")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setMessage("筛选已应用"))}>
             <Filter size={16} />
             筛选
+          </button>
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={exportCurrentResults}
+            onKeyDown={(event) => activateButtonByKeyboard(event, exportCurrentResults)}
+            disabled={hasUnsavedChanges || editorDirty || visibleActiveRows.length === 0}
+            title={
+              hasUnsavedChanges || editorDirty
+                ? "请先保存或放弃未保存修改"
+                : hasActiveExportFilter
+                  ? `导出当前筛选的 ${visibleActiveRows.length} 条记录`
+                  : `导出全部 ${visibleActiveRows.length} 条记录`
+            }
+          >
+            <Download size={16} />
+            {hasActiveExportFilter ? "导出筛选结果" : "导出全部"}
           </button>
           <button className="primary-button" onClick={() => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet })} onKeyDown={(event) => activateButtonByKeyboard(event, () => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet }))}>
             <Plus size={16} />

@@ -99,6 +99,35 @@ KNOWN_HEADER_ALIASES = {
 
 
 SHEET_HEADERS = {
+    "all": [
+        "钉钉申请单号",
+        "申请人",
+        "付款账户",
+        "费用性质",
+        "摘要",
+        "应付金额",
+        "已支付金额",
+        "待付款金额",
+        "项目归属",
+        "BU归属",
+        "收款信息",
+        "账户名",
+        "开户行",
+        "开票情况",
+        "需求付款日期",
+        "负责人确认",
+        "财务审批",
+        "财务付款时间",
+        "财务主管审批",
+        "总经理审批",
+        "总经理审批时间",
+        "总经理意见",
+        "备注",
+        "逾期情况",
+        "付款人",
+        "来源 Sheet",
+        "请款标识",
+    ],
     "main": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "项目归属", "收款信息", "开票情况", "需求付款日期", "财务审批", "财务付款时间", "总经理审批", "总经理审批时间", "总经理意见", "备注"],
     "mold": ["序号", "钉钉申请单号", "付款账户", "款式", "支付节点明细", "应付金额", "已支付金额", "待付款金额", "账户名", "需求付款日期", "财务审批", "财务付款时间", "备注", "财务主管审批", "总经理审批", "总经理审批时间", "总经理意见"],
     "yuewei": ["钉钉申请单号", "付款账户", "费用性质", "摘要", "应付金额", "已支付金额", "待付款金额", "项目归属", "账号", "账户名", "开户行", "开票情况", "需求付款日期", "负责人确认", "财务审批", "财务付款时间", "备注", "逾期情况", "总经理审批", "总经理审批时间", "总经理意见", "备注", "付款人"],
@@ -115,6 +144,7 @@ for _headers in SHEET_HEADERS.values():
         _headers.append("请款标识")
 
 PAYMENT_DETAIL_SHEET = "付款明细"
+ALL_EXPORT_SHEET = "全部"
 PAYMENT_DETAIL_HEADERS = [
     "付款标识",
     "请款标识",
@@ -636,6 +666,7 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
     payment_detail_sheet_present = False
     system_info = parse_system_info(wb_values)
     sheet_name_map = system_info.get("sheet_name_map") or {}
+    view_sheets = set(system_info.get("view_sheets") or [])
     workbook_sheet_order: List[str] = []
     for ws_values in wb_values.worksheets:
         ws_formulas = wb_formulas[ws_values.title]
@@ -646,6 +677,9 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
             parsed_details, detail_summary = parse_payment_detail_sheet(ws_values)
             payment_details.extend(parsed_details)
             sheet_summaries.append(detail_summary)
+            continue
+        if ws_values.title in view_sheets:
+            sheet_summaries.append({"sheet": ws_values.title, "imported": 0, "skipped": "view_sheet"})
             continue
         full_source_sheet = str(sheet_name_map.get(ws_values.title) or ws_values.title)
         workbook_sheet_order.append(full_source_sheet)
@@ -694,7 +728,7 @@ def parse_system_info(workbook) -> Dict[str, Any]:
     )
     if matching is None:
         return {}
-    info: Dict[str, Any] = {"sheet_name_map": {}}
+    info: Dict[str, Any] = {"sheet_name_map": {}, "view_sheets": []}
     for row_idx in range(1, matching.max_row + 1):
         key = stringify(matching.cell(row_idx, 1).value)
         value = stringify(matching.cell(row_idx, 2).value)
@@ -705,6 +739,8 @@ def parse_system_info(workbook) -> Dict[str, Any]:
             source_name = stringify(matching.cell(row_idx, 3).value)
             if workbook_name and source_name:
                 info["sheet_name_map"][workbook_name] = source_name
+        if key == "view_sheet" and value:
+            info["view_sheets"].append(value)
     return info
 
 
@@ -903,6 +939,10 @@ def export_workbook(
     )
 
     used_sheet_titles: set[str] = {PAYMENT_DETAIL_SHEET, SYSTEM_INFO_SHEET}
+    all_sheet_title = safe_sheet_title(ALL_EXPORT_SHEET, used_sheet_titles)
+    all_ws = wb.create_sheet(all_sheet_title)
+    write_sheet(all_ws, "all", ALL_EXPORT_SHEET, records, {})
+
     sheet_name_map: Dict[str, str] = {}
     for sheet_name, sheet_records in ordered_groups:
         kind = sheet_kind(sheet_name)
@@ -913,7 +953,7 @@ def export_workbook(
 
     payment_ws = wb.create_sheet(PAYMENT_DETAIL_SHEET)
     write_payment_detail_sheet(payment_ws, payments or [])
-    write_system_info_sheet(wb, batch, sheet_name_map)
+    write_system_info_sheet(wb, batch, sheet_name_map, [all_sheet_title])
 
     output = io.BytesIO()
     wb.save(output)
@@ -1005,7 +1045,12 @@ def write_payment_detail_sheet(ws, payments: List[Dict[str, Any]]) -> None:
     ws.column_dimensions["B"].hidden = True
 
 
-def write_system_info_sheet(workbook, batch: Dict[str, Any], sheet_name_map: Dict[str, str]) -> None:
+def write_system_info_sheet(
+    workbook,
+    batch: Dict[str, Any],
+    sheet_name_map: Dict[str, str],
+    view_sheet_titles: Optional[List[str]] = None,
+) -> None:
     ws = workbook.create_sheet(SYSTEM_INFO_SHEET)
     rows = [
         ("format_version", EXPORT_FORMAT_VERSION, None),
@@ -1013,6 +1058,7 @@ def write_system_info_sheet(workbook, batch: Dict[str, Any], sheet_name_map: Dic
         ("batch_updated_at", batch.get("updated_at"), None),
         ("exported_at", datetime.now().replace(microsecond=0).isoformat(), None),
     ]
+    rows.extend(("view_sheet", sheet_title, "read_only_summary") for sheet_title in (view_sheet_titles or []))
     rows.extend(("sheet_map", workbook_name, source_name) for workbook_name, source_name in sheet_name_map.items())
     for row_idx, values in enumerate(rows, start=1):
         for col_idx, value in enumerate(values, start=1):
@@ -1060,6 +1106,15 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
             amount_col = headers.index(header) + 1
             ws.cell(1, amount_col, value=f"=SUM({get_column_letter(amount_col)}3:{get_column_letter(amount_col)}{last_row})")
             ws.cell(1, amount_col).number_format = '#,##0.00'
+        header_row = 2
+        data_start = 3
+    elif kind == "all":
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(export_headers))
+        note = ws.cell(1, 1, value="全部记录汇总视图；如需重新导入并合并更新，请在对应部门 Sheet 中修改。")
+        note.fill = title_fill
+        note.font = Font(bold=True, color="5A4500")
+        note.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[1].height = 24
         header_row = 2
         data_start = 3
     else:
@@ -1117,7 +1172,7 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
         elif header.startswith("图片附件"):
             width = 18
         ws.column_dimensions[get_column_letter(col)].width = width
-    ws.freeze_panes = ws["A2"] if kind != "mold" else ws["A3"]
+    ws.freeze_panes = ws["A3"] if kind in {"mold", "all"} else ws["A2"]
     ws.sheet_view.showGridLines = False
     request_id_col = headers.index("请款标识") + 1
     ws.column_dimensions[get_column_letter(request_id_col)].hidden = True
@@ -1186,6 +1241,8 @@ def values_for_headers(headers: List[str], record: Dict[str, Any]) -> List[Any]:
             values.append(record.get("overdue_status"))
         elif header == "付款人":
             values.append(record.get("payer"))
+        elif header == "来源 Sheet":
+            values.append(record.get("source_sheet"))
         else:
             values.append(None)
     return values
