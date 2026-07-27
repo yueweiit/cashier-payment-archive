@@ -39,6 +39,7 @@ PAYMENT_AMOUNT_RE = re.compile(
     r"(?:[¥￥]\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(万|千)?|"
     r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*(万|千)?\s*元)"
 )
+GENERIC_COMMENT_STAGE_RE = re.compile(r"^(评论|备注|comment|remark|comentario)$", re.IGNORECASE)
 
 
 class ExternalExpenseError(RuntimeError):
@@ -324,6 +325,79 @@ def _workflow_event_key(process_instance_id: str, operation: Dict[str, Any]) -> 
     return hashlib.sha256("|".join(stable_parts).encode("utf-8")).hexdigest()
 
 
+def _parse_workflow_events(
+    process_instance_id: str,
+    operations: list[Dict[str, Any]],
+    current_activity_ids: set[str],
+    user_names: Dict[str, str],
+) -> list[Dict[str, Any]]:
+    stage_by_activity: Dict[str, str] = {}
+    normalized_operations: list[tuple[Dict[str, Any], Optional[str]]] = []
+    finance_agree_times: Dict[str, list[str]] = {}
+    for operation in operations:
+        activity_id = _text(operation.get("activityId")) or ""
+        stage_name = _text(operation.get("showName")) or ""
+        event_type = (_text(operation.get("type")) or "").upper()
+        result = (_text(operation.get("result")) or "").upper()
+        event_time = _workflow_event_time(operation.get("date"))
+        normalized_operations.append((operation, event_time))
+        if activity_id and stage_name and not GENERIC_COMMENT_STAGE_RE.fullmatch(stage_name):
+            stage_by_activity.setdefault(activity_id, stage_name)
+        operator_id = _text(operation.get("userId")) or ""
+        if (
+            operator_id
+            and event_type == "EXECUTE_TASK_NORMAL"
+            and result == "AGREE"
+            and FINANCE_STAGE_RE.search(stage_name)
+            and event_time
+        ):
+            finance_agree_times.setdefault(operator_id, []).append(event_time)
+
+    events: list[Dict[str, Any]] = []
+    for operation, event_time in normalized_operations:
+        operator_id = _text(operation.get("userId")) or ""
+        activity_id = _text(operation.get("activityId")) or ""
+        raw_stage_name = _text(operation.get("showName")) or ""
+        stage_name = (
+            stage_by_activity.get(activity_id)
+            if activity_id and GENERIC_COMMENT_STAGE_RE.fullmatch(raw_stage_name)
+            else raw_stage_name
+        ) or stage_by_activity.get(activity_id) or "流程操作"
+        event_type = (_text(operation.get("type")) or "").upper()
+        result = (_text(operation.get("result")) or "").upper()
+        is_finance_agree = bool(
+            operator_id
+            and event_type == "EXECUTE_TASK_NORMAL"
+            and result == "AGREE"
+            and FINANCE_STAGE_RE.search(stage_name)
+        )
+        trusted_after_finance_agree = bool(
+            operator_id
+            and event_time
+            and any(
+                approval_time <= event_time
+                for approval_time in finance_agree_times.get(operator_id, [])
+            )
+        )
+        events.append({
+            "event_key": _workflow_event_key(process_instance_id, operation),
+            "process_instance_id": process_instance_id,
+            "activity_id": activity_id or None,
+            "event_type": event_type,
+            "stage_name": stage_name,
+            "result": result or None,
+            "operator_id": operator_id,
+            "operator_name": user_names.get(operator_id) or "未识别人员",
+            "event_time": event_time,
+            "comment": _text(operation.get("remark")),
+            "images": _json_list(operation.get("images")),
+            "attachments": _json_list(operation.get("attachments")),
+            "trusted_finance": bool(is_finance_agree or trusted_after_finance_agree),
+            "current": bool(activity_id and activity_id in current_activity_ids),
+        })
+    return sorted(events, key=lambda event: (event.get("event_time") or "", event["event_key"]))
+
+
 def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]]:
     normalized = sorted({str(value or "").strip() for value in approval_nos if str(value or "").strip()})
     if not normalized:
@@ -401,35 +475,12 @@ def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]
             and (_text(task.get("status")) or "").upper() in {"RUNNING", "PROCESSING"}
             and _text(task.get("activityId"))
         }
-        trusted_finance_users = {
-            _text(operation.get("userId")) or ""
-            for operation in operations
-            if (_text(operation.get("type")) or "").upper() == "EXECUTE_TASK_NORMAL"
-            and (_text(operation.get("result")) or "").upper() == "AGREE"
-            and FINANCE_STAGE_RE.search(_text(operation.get("showName")) or "")
-        }
-        events: list[Dict[str, Any]] = []
-        for operation in operations:
-            operator_id = _text(operation.get("userId")) or ""
-            events.append({
-                "event_key": _workflow_event_key(process_instance_id, operation),
-                "process_instance_id": process_instance_id,
-                "activity_id": _text(operation.get("activityId")),
-                "event_type": (_text(operation.get("type")) or "").upper(),
-                "stage_name": _text(operation.get("showName")) or "流程操作",
-                "result": (_text(operation.get("result")) or "").upper() or None,
-                "operator_id": operator_id,
-                "operator_name": user_names.get(operator_id) or "未识别人员",
-                "event_time": _workflow_event_time(operation.get("date")),
-                "comment": _text(operation.get("remark")),
-                "images": _json_list(operation.get("images")),
-                "attachments": _json_list(operation.get("attachments")),
-                "trusted_finance": bool(operator_id and operator_id in trusted_finance_users),
-                "current": bool(
-                    _text(operation.get("activityId"))
-                    and _text(operation.get("activityId")) in current_activity_ids
-                ),
-            })
+        events = _parse_workflow_events(
+            process_instance_id,
+            operations,
+            current_activity_ids,
+            user_names,
+        )
         workflows.append({
             "approval_no": _text(instance.get("approval_no")) or "",
             "process_instance_id": process_instance_id,
@@ -437,7 +488,7 @@ def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]
             "result": (_text(instance.get("result")) or "").lower(),
             "title": _text(instance.get("title")),
             "updated_at": _workflow_event_time(instance.get("updated_at")),
-            "events": sorted(events, key=lambda event: (event.get("event_time") or "", event["event_key"])),
+            "events": events,
         })
     return workflows
 

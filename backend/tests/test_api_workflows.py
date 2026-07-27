@@ -23,6 +23,7 @@ from openpyxl import Workbook, load_workbook
 from backend.app.db import connect, now_iso
 from backend.app.external_expenses import (
     ExternalExpenseError,
+    _parse_workflow_events,
     _preview_conditions,
     applicant_name_from_title,
     classify_dingtalk_payment_event,
@@ -1812,6 +1813,47 @@ def test_dingtalk_payment_comment_classifier_is_strict():
         workflow_status="RUNNING",
         workflow_result="agree",
     )[0] == "ignored"
+
+
+def test_dingtalk_workflow_events_respect_stage_and_finance_approval_order():
+    operations = [
+        {
+            "userId": "finance-user",
+            "date": "2026-07-27T01:00:00Z",
+            "type": "ADD_REMARK",
+            "activityId": "finance-node",
+            "showName": "评论",
+            "remark": "已支付",
+        },
+        {
+            "userId": "finance-user",
+            "date": "2026-07-27T02:00:00Z",
+            "type": "EXECUTE_TASK_NORMAL",
+            "activityId": "finance-node",
+            "showName": "财务审批",
+            "result": "AGREE",
+        },
+        {
+            "userId": "finance-user",
+            "date": "2026-07-27T03:00:00Z",
+            "type": "ADD_REMARK",
+            "activityId": "finance-node",
+            "showName": "评论",
+            "remark": "付款完成",
+        },
+    ]
+    events = _parse_workflow_events(
+        "process-order",
+        operations,
+        {"finance-node"},
+        {"finance-user": "测试财务"},
+    )
+    assert [event["comment"] for event in events] == ["已支付", None, "付款完成"]
+    assert [event["stage_name"] for event in events] == ["财务审批", "财务审批", "财务审批"]
+    assert events[0]["trusted_finance"] is False
+    assert events[1]["trusted_finance"] is True
+    assert events[2]["trusted_finance"] is True
+    assert all(event["current"] for event in events)
 
 
 def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch):
