@@ -1877,6 +1877,21 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
             "attachments": [],
             "trusted_finance": True,
         },
+        {
+            "event_key": "second-paid-comment",
+            "process_instance_id": "process-1",
+            "activity_id": "finance-node",
+            "event_type": "ADD_REMARK",
+            "stage_name": "评论",
+            "result": None,
+            "operator_id": "finance-user",
+            "operator_name": "测试财务",
+            "event_time": "2026-07-27T18:02:00+08:00",
+            "comment": "付款完成",
+            "images": [],
+            "attachments": [],
+            "trusted_finance": True,
+        },
     ]
     monkeypatch.setattr(
         main_module,
@@ -1907,7 +1922,7 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
         synced = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
         assert synced.status_code == 200
         result = synced.json()
-        assert result["workflow_events"] == 3
+        assert result["workflow_events"] == 4
         assert result["payment_candidates"] == 1
         assert result["auto_payments"] == 1
         assert result["review_required"] == 1
@@ -1928,8 +1943,8 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
         assert workflow.status_code == 200
         workflow_payload = workflow.json()
         assert workflow_payload["summary"] == {
-            "total": 3,
-            "active": 3,
+            "total": 4,
+            "active": 4,
             "applied": 1,
             "review_required": 1,
         }
@@ -1940,7 +1955,7 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
         repeated = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
         assert repeated.status_code == 200
         assert repeated.json()["auto_payments"] == 0
-        assert repeated.json()["already_applied"] == 1
+        assert repeated.json()["already_applied"] == 2
         repeated_payments = client.get(
             f"/api/batches/{batch['id']}/requests/{request['id']}/payments"
         ).json()["payments"]

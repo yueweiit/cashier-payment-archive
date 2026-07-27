@@ -3315,6 +3315,7 @@ def sync_external_expense_metadata(
     review_required = 0
     already_applied = 0
     skipped = 0
+    candidate_request_ids: set[int] = set()
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         batch = require_batch(conn, batch_id)
@@ -3429,12 +3430,17 @@ def sync_external_expense_metadata(
                         classification_reason = "该流程证据已生成付款"
                         already_applied += 1
                     elif classification == "eligible":
-                        payment_candidates += 1
                         if pending_amount <= 0 or request_amount <= 0:
                             classification = "already_applied"
                             classification_reason = "请款已无待付款金额"
                             already_applied += 1
+                        elif request_id in candidate_request_ids:
+                            classification = "ignored"
+                            classification_reason = "同一请款已有更早的付款候选"
+                            skipped += 1
                         elif auto_payment_mode == "apply":
+                            candidate_request_ids.add(request_id)
+                            payment_candidates += 1
                             payment_date = str(event.get("event_time") or "")[:10] or None
                             comment = str(event.get("comment") or "").strip()
                             linked_payment_id = insert_payment_record_internal(
@@ -3473,6 +3479,8 @@ def sync_external_expense_metadata(
                             )
                             pending_amount = 0
                         elif auto_payment_mode == "preview":
+                            candidate_request_ids.add(request_id)
+                            payment_candidates += 1
                             classification = "preview_candidate"
                             classification_reason = "预览模式：核对后切换 apply 可自动生成付款"
                         else:
