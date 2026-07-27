@@ -36,7 +36,8 @@ PAYMENT_EXCLUSION_RE = re.compile(
 )
 APPROVAL_REFERENCE_RE = re.compile(r"(?<!\d)\d{15,}(?!\d)")
 PAYMENT_AMOUNT_RE = re.compile(
-    r"(?:[¥￥]\s*([0-9][0-9,]*(?:\.\d{1,2})?)|([0-9][0-9,]*(?:\.\d{1,2})?)\s*元)"
+    r"(?:[¥￥]\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(万|千)?|"
+    r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*(万|千)?\s*元)"
 )
 
 
@@ -467,11 +468,14 @@ def classify_dingtalk_payment_event(
     }
     if referenced_approval_nos:
         return "review_required", "评论引用了其他钉钉审批单号"
-    amounts = {
-        round(float((left or right).replace(",", "")), 2)
-        for left, right in PAYMENT_AMOUNT_RE.findall(comment)
-        if left or right
-    }
+    amounts = set()
+    for symbol_amount, symbol_unit, yuan_amount, yuan_unit in PAYMENT_AMOUNT_RE.findall(comment):
+        raw_amount = symbol_amount or yuan_amount
+        if not raw_amount:
+            continue
+        unit = symbol_unit or yuan_unit
+        multiplier = 10000 if unit == "万" else 1000 if unit == "千" else 1
+        amounts.add(round(float(raw_amount.replace(",", "")) * multiplier, 2))
     if len(amounts) > 1:
         return "review_required", "评论包含多笔付款金额"
     if amounts and abs(next(iter(amounts)) - round(float(pending_amount), 2)) > 0.01:

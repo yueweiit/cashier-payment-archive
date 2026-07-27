@@ -1792,6 +1792,7 @@ def test_dingtalk_payment_comment_classifier_is_strict():
     for comment in (
         "客户已付款",
         "已支付 40 元，剩余 20 元未支付",
+        "已支付5千元",
         "两张审批单合并付款，已支付",
         "审批已支付该笔，无需再次支付",
         "202607270000000002 已付款",
