@@ -1665,6 +1665,7 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
     ]
     monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda approval_nos: metadata)
     monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda approval_nos: [])
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda approval_nos: [])
 
     with TestClient(app) as client:
         login(client)
@@ -1709,6 +1710,11 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             "already_applied": 0,
             "skipped": 0,
             "auto_payment_mode": "preview",
+            "attachment_downloaded": 0,
+            "attachment_synced": 0,
+            "attachment_existing": 0,
+            "attachment_failed": 0,
+            "attachment_errors": [],
         }
         rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
         by_id = {row["id"]: row for row in rows}
@@ -1743,6 +1749,11 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
                 "already_applied": 0,
                 "skipped": 0,
                 "auto_payment_mode": "preview",
+                "attachment_downloaded": 0,
+                "attachment_synced": 0,
+                "attachment_existing": 0,
+                "attachment_failed": 0,
+                "attachment_errors": [],
             }
 
         refreshed_metadata = [
@@ -1823,6 +1834,106 @@ def test_dingtalk_payment_comment_classifier_is_strict():
     )
     assert classification == "review_required"
     assert "累计已付" in reason
+
+
+def test_dingtalk_metadata_sync_adds_only_unsynced_request_attachments(monkeypatch):
+    approval_no = "SYNC-ATTACHMENT"
+    content = b"%PDF-1.4\nsynced attachment\n"
+    metadata = [{
+        "approval_no": approval_no,
+        "source_type": "operation",
+        "source_label": "运营支出",
+        "source_id": "1201",
+        "approval_status": "RUNNING",
+        "approval_result": "agree",
+        "applicant_id": "user-1201",
+        "applicant": "附件申请人",
+        "applicant_department": "财务中心",
+    }]
+    source_attachments = [{
+        "source_type": "operation",
+        "source_id": "1201",
+        "approval_no": approval_no,
+        "attachment_id": "501",
+        "row_no": 1,
+        "file_id": "file-501",
+        "file_name": "付款凭证.pdf",
+        "file_type": "pdf",
+        "file_size": len(content),
+        "created_at": "2026-07-27T10:00:00",
+    }]
+    workflows = [{
+        "approval_no": approval_no,
+        "process_instance_id": "process-attachment",
+        "status": "RUNNING",
+        "result": "agree",
+        "title": "附件同步测试",
+        "events": [],
+    }]
+    download_calls = []
+
+    class FakeAttachmentClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def download(self, process_instance_id, file_id):
+            download_calls.append((process_instance_id, file_id))
+            return content, "application/pdf"
+
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda approval_nos: metadata)
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda approval_nos: workflows)
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda approval_nos: source_attachments)
+    monkeypatch.setattr(main_module, "DingtalkAttachmentClient", FakeAttachmentClient)
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "attachment-sync"}).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": approval_no, "amount": 100},
+        ).json()["request"]
+
+        first = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+        assert first.status_code == 200
+        assert first.json()["attachment_downloaded"] == 1
+        assert first.json()["attachment_synced"] == 1
+        assert first.json()["attachment_existing"] == 0
+        assert first.json()["attachment_failed"] == 0
+        assert download_calls == [("process-attachment", "file-501")]
+
+        attachments = client.get(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/attachments"
+        ).json()["attachments"]
+        assert len(attachments) == 1
+        attachment = attachments[0]
+        assert attachment["source_system"] == "dingtalk_expense_database"
+        assert attachment["source_attachment_id"] == "501"
+        assert attachment["attachment_type"] == "file"
+        assert attachment["original_filename"] == "付款凭证.pdf"
+        downloaded = client.get(attachment["file_url"])
+        assert downloaded.status_code == 200
+        assert downloaded.content == content
+        assert downloaded.headers["content-type"].startswith("application/pdf")
+
+        rejected_delete = client.delete(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/attachments/{attachment['id']}"
+        )
+        assert rejected_delete.status_code == 400
+
+        second = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+        assert second.status_code == 200
+        assert second.json()["attachment_downloaded"] == 0
+        assert second.json()["attachment_synced"] == 0
+        assert second.json()["attachment_existing"] == 1
+        assert download_calls == [("process-attachment", "file-501")]
+        assert len(
+            client.get(
+                f"/api/batches/{batch['id']}/requests/{request['id']}/attachments"
+            ).json()["attachments"]
+        ) == 1
 
 
 def test_dingtalk_workflow_events_respect_stage_and_finance_approval_order():
@@ -1959,6 +2070,7 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
             "events": events,
         }],
     )
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda approval_nos: [])
 
     with TestClient(app) as client:
         login(client)

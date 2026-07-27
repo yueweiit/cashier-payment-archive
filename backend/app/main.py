@@ -45,10 +45,12 @@ from .excel_io import (
 )
 from .external_expenses import (
     ALLOWED_SOURCE_TYPES,
+    DingtalkAttachmentClient,
     ExternalExpenseError,
     classify_dingtalk_payment_event,
     dingtalk_auto_payment_mode,
     fetch_dingtalk_workflows,
+    fetch_external_expense_attachments,
     fetch_external_expense_metadata,
     fetch_external_expenses,
     preview_external_expenses,
@@ -234,6 +236,7 @@ class PaymentRecordPatch(BaseModel):
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 PAYMENT_VOUCHER_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
+DINGTALK_ATTACHMENT_SOURCE = "dingtalk_expense_database"
 DEFAULT_RESET_PASSWORD = "123456"
 ROLE_BUSINESS = "business"
 ROLE_FINANCE = "finance"
@@ -328,7 +331,7 @@ def user_public(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def attachment_public(row: Dict[str, Any]) -> Dict[str, Any]:
     data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
-    if data.get("attachment_type") == "image":
+    if data.get("file_path"):
         data["file_url"] = f"/api/attachments/{data['id']}/file"
     return data
 
@@ -1706,6 +1709,8 @@ def delete_attachment(
         ).fetchone()
         if not old:
             raise HTTPException(status_code=404, detail="附件链接不存在")
+        if old["source_system"] == DINGTALK_ATTACHMENT_SOURCE:
+            raise HTTPException(status_code=400, detail="钉钉同步附件不能手动删除")
         conn.execute("DELETE FROM attachment_links WHERE id = ?", (attachment_id,))
         delete_attachment_file_if_unused(conn, row_to_dict(old))
         write_audit(conn, user["id"], "attachment.delete", "attachment", attachment_id, batch_id, row_to_dict(old), None, reason or None)
@@ -1719,7 +1724,7 @@ def get_attachment_file(attachment_id: int, user: Dict[str, Any] = Depends(curre
     if not row:
         raise HTTPException(status_code=404, detail="附件不存在")
     attachment = row_to_dict(row)
-    if attachment.get("attachment_type") != "image" or not attachment.get("file_path"):
+    if not attachment.get("file_path"):
         raise HTTPException(status_code=404, detail="附件文件不存在")
     path = resolve_data_file(attachment["file_path"])
     if not path.exists():
@@ -1728,7 +1733,12 @@ def get_attachment_file(attachment_id: int, user: Dict[str, Any] = Depends(curre
         path,
         media_type=attachment.get("mime_type") or "application/octet-stream",
         filename=attachment.get("original_filename") or path.name,
-        content_disposition_type="inline",
+        content_disposition_type=(
+            "inline"
+            if attachment.get("attachment_type") == "image"
+            or attachment.get("mime_type") == "application/pdf"
+            else "attachment"
+        ),
     )
 
 
@@ -3289,6 +3299,7 @@ def sync_external_expense_metadata(
     try:
         source_metadata = fetch_external_expense_metadata(approval_nos)
         source_workflows = fetch_dingtalk_workflows(approval_nos)
+        source_attachments = fetch_external_expense_attachments(approval_nos)
     except ExternalExpenseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -3307,6 +3318,117 @@ def sync_external_expense_metadata(
         if approval_no:
             workflows_by_approval.setdefault(approval_no, []).append(workflow)
 
+    attachments_by_approval: Dict[str, list[Dict[str, Any]]] = {}
+    for attachment in source_attachments:
+        approval_no = str(attachment.get("approval_no") or "").strip()
+        if approval_no:
+            attachments_by_approval.setdefault(approval_no, []).append(attachment)
+
+    with connect() as conn:
+        existing_source_attachments = {
+            (int(row["request_id"]), str(row["source_attachment_id"]))
+            for row in conn.execute(
+                """
+                SELECT attachment_links.request_id, attachment_links.source_attachment_id
+                FROM attachment_links
+                JOIN payment_requests ON payment_requests.id = attachment_links.request_id
+                WHERE payment_requests.batch_id = ?
+                  AND attachment_links.source_system = ?
+                  AND attachment_links.source_attachment_id IS NOT NULL
+                """,
+                (batch_id, DINGTALK_ATTACHMENT_SOURCE),
+            ).fetchall()
+        }
+
+    request_ids_by_approval: Dict[str, list[int]] = {}
+    for request_id, approval_no in initial_approval_by_request.items():
+        request_ids_by_approval.setdefault(approval_no, []).append(request_id)
+
+    attachment_existing = 0
+    attachment_failed = 0
+    attachment_errors: list[Dict[str, Any]] = []
+    attachment_candidates: list[Dict[str, Any]] = []
+    for approval_no in sorted(matched):
+        metadata = metadata_by_approval[approval_no][0]
+        matching_attachments = [
+            attachment
+            for attachment in attachments_by_approval.get(approval_no, [])
+            if str(attachment.get("source_type") or "") == str(metadata.get("source_type") or "")
+            and str(attachment.get("source_id") or "") == str(metadata.get("source_id") or "")
+        ]
+        if not matching_attachments:
+            continue
+        request_ids = request_ids_by_approval.get(approval_no, [])
+        request_workflows = workflows_by_approval.get(approval_no, [])
+        process_instance_id = (
+            str(request_workflows[0].get("process_instance_id") or "").strip()
+            if len(request_workflows) == 1
+            else ""
+        )
+        for attachment in matching_attachments:
+            source_attachment_id = str(attachment.get("attachment_id") or "").strip()
+            pending_request_ids = [
+                request_id
+                for request_id in request_ids
+                if (request_id, source_attachment_id) not in existing_source_attachments
+            ]
+            attachment_existing += len(request_ids) - len(pending_request_ids)
+            if not pending_request_ids:
+                continue
+            if not source_attachment_id or not attachment.get("file_id") or not process_instance_id:
+                attachment_failed += 1
+                attachment_errors.append(
+                    {
+                        "approval_no": approval_no,
+                        "attachment_id": source_attachment_id or None,
+                        "file_name": attachment.get("file_name"),
+                        "message": "附件缺少流程实例或文件标识",
+                    }
+                )
+                continue
+            attachment_candidates.append(
+                {
+                    **attachment,
+                    "approval_no": approval_no,
+                    "process_instance_id": process_instance_id,
+                    "request_ids": pending_request_ids,
+                }
+            )
+
+    downloaded_attachments: list[Dict[str, Any]] = []
+    if attachment_candidates:
+        try:
+            with DingtalkAttachmentClient() as downloader:
+                for attachment in attachment_candidates:
+                    try:
+                        content, content_type = downloader.download(
+                            str(attachment["process_instance_id"]),
+                            str(attachment["file_id"]),
+                        )
+                        saved = save_dingtalk_attachment_file(attachment, content, content_type)
+                        downloaded_attachments.append({**attachment, **saved})
+                    except ExternalExpenseError as exc:
+                        attachment_failed += 1
+                        attachment_errors.append(
+                            {
+                                "approval_no": attachment.get("approval_no"),
+                                "attachment_id": attachment.get("attachment_id"),
+                                "file_name": attachment.get("file_name"),
+                                "message": str(exc),
+                            }
+                        )
+        except ExternalExpenseError as exc:
+            attachment_failed += len(attachment_candidates)
+            attachment_errors.extend(
+                {
+                    "approval_no": attachment.get("approval_no"),
+                    "attachment_id": attachment.get("attachment_id"),
+                    "file_name": attachment.get("file_name"),
+                    "message": str(exc),
+                }
+                for attachment in attachment_candidates
+            )
+
     auto_payment_mode = dingtalk_auto_payment_mode()
     timestamp = now_iso()
     updated_requests = 0
@@ -3316,6 +3438,7 @@ def sync_external_expense_metadata(
     review_required = 0
     already_applied = 0
     skipped = 0
+    attachment_synced = 0
     candidate_request_ids: set[int] = set()
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -3564,6 +3687,33 @@ def sync_external_expense_metadata(
             refresh_payment_summaries(conn, request_id)
             updated_requests += 1
 
+        for attachment in downloaded_attachments:
+            for request_id in attachment["request_ids"]:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO attachment_links (
+                        request_id, label, url_path, attachment_type, file_path,
+                        original_filename, mime_type, file_size, source_system,
+                        source_attachment_id, created_by, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request_id,
+                        attachment["file_name"],
+                        attachment["relative_path"],
+                        attachment["attachment_type"],
+                        attachment["relative_path"],
+                        attachment["file_name"],
+                        attachment["mime_type"],
+                        attachment["file_size"],
+                        DINGTALK_ATTACHMENT_SOURCE,
+                        str(attachment["attachment_id"]),
+                        user["id"],
+                        timestamp,
+                    ),
+                )
+                attachment_synced += max(0, cursor.rowcount)
+
         summary = {
             "unique_approval_nos": len(approval_nos),
             "matched": len(matched),
@@ -3577,6 +3727,11 @@ def sync_external_expense_metadata(
             "already_applied": already_applied,
             "skipped": skipped,
             "auto_payment_mode": auto_payment_mode,
+            "attachment_downloaded": len(downloaded_attachments),
+            "attachment_synced": attachment_synced,
+            "attachment_existing": attachment_existing,
+            "attachment_failed": attachment_failed,
+            "attachment_errors": attachment_errors[:50],
         }
         write_audit(
             conn,
@@ -4348,7 +4503,8 @@ def ensure_bulk_editable(batch, user: Dict[str, Any], reason: Optional[str]) -> 
 def copy_attachment_links(conn, source_request_id: int, target_request_id: int, user_id: int) -> None:
     links = conn.execute(
         """
-        SELECT label, url_path, attachment_type, file_path, original_filename, mime_type, file_size
+        SELECT label, url_path, attachment_type, file_path, original_filename, mime_type,
+               file_size, source_system, source_attachment_id
         FROM attachment_links
         WHERE request_id = ?
         ORDER BY id
@@ -4360,9 +4516,10 @@ def copy_attachment_links(conn, source_request_id: int, target_request_id: int, 
             """
             INSERT INTO attachment_links (
                 request_id, label, url_path, attachment_type, file_path,
-                original_filename, mime_type, file_size, created_by, created_at
+                original_filename, mime_type, file_size, source_system,
+                source_attachment_id, created_by, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 target_request_id,
@@ -4373,6 +4530,8 @@ def copy_attachment_links(conn, source_request_id: int, target_request_id: int, 
                 link["original_filename"],
                 link["mime_type"],
                 link["file_size"],
+                link["source_system"],
+                link["source_attachment_id"],
                 user_id,
                 now_iso(),
             ),
@@ -4817,6 +4976,65 @@ async def save_image_upload(file: UploadFile, batch_id: int) -> tuple[Path, Path
     target = directory / f"{uuid.uuid4().hex}{suffix}"
     target.write_bytes(content)
     return target, target.relative_to(DATA_DIR), len(content)
+
+
+def save_dingtalk_attachment_file(
+    attachment: Dict[str, Any],
+    content: bytes,
+    response_content_type: Optional[str],
+) -> Dict[str, Any]:
+    expected_size = attachment.get("file_size")
+    if expected_size is not None and int(expected_size) > 0 and int(expected_size) != len(content):
+        raise ExternalExpenseError(
+            f"附件大小校验失败：来源 {int(expected_size)} 字节，实际 {len(content)} 字节"
+        )
+    original_name = Path(str(attachment.get("file_name") or "")).name.strip()
+    if not original_name:
+        original_name = f"钉钉附件-{attachment.get('attachment_id')}"
+    file_type = str(attachment.get("file_type") or "").strip().lower().lstrip(".")
+    if not Path(original_name).suffix and file_type:
+        original_name = f"{original_name}.{file_type}"
+    safe_name = "".join(
+        "_" if character in {'/', '\\'} or ord(character) < 32 else character
+        for character in original_name
+    ).strip(" .")
+    if not safe_name:
+        safe_name = f"钉钉附件-{attachment.get('attachment_id')}"
+    if len(safe_name) > 180:
+        suffix = Path(safe_name).suffix[:20]
+        safe_name = f"{Path(safe_name).stem[:150]}{suffix}"
+    source_type = "".join(
+        character for character in str(attachment.get("source_type") or "other") if character.isalnum() or character in {"-", "_"}
+    ) or "other"
+    source_attachment_id = "".join(
+        character for character in str(attachment.get("attachment_id") or "") if character.isalnum() or character in {"-", "_"}
+    )
+    if not source_attachment_id:
+        raise ExternalExpenseError("附件缺少来源标识")
+    directory = DATA_DIR / "uploads" / "dingtalk-attachments" / source_type
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{source_attachment_id}-{safe_name}"
+    temporary = directory / f".{target.name}.{uuid.uuid4().hex}.part"
+    try:
+        temporary.write_bytes(content)
+        temporary.replace(target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    suffix = Path(original_name).suffix.lower()
+    header_type = str(response_content_type or "").split(";", 1)[0].strip()
+    guessed_type = mimetypes.guess_type(original_name)[0]
+    mime_type = (
+        guessed_type
+        if not header_type or header_type == "application/octet-stream"
+        else header_type
+    ) or "application/octet-stream"
+    return {
+        "relative_path": str(target.relative_to(DATA_DIR)),
+        "file_size": len(content),
+        "mime_type": mime_type,
+        "attachment_type": "image" if suffix in IMAGE_EXTENSIONS or mime_type.startswith("image/") else "file",
+    }
 
 
 async def save_payment_voucher_upload(file: UploadFile, batch_id: int, payment_id: int) -> tuple[Path, Path, int, str]:

@@ -304,6 +304,15 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "attachment_links", "original_filename", "TEXT")
     ensure_column(conn, "attachment_links", "mime_type", "TEXT")
     ensure_column(conn, "attachment_links", "file_size", "INTEGER")
+    ensure_column(conn, "attachment_links", "source_system", "TEXT")
+    ensure_column(conn, "attachment_links", "source_attachment_id", "TEXT")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_attachment_links_external_source
+        ON attachment_links(request_id, source_system, source_attachment_id)
+        WHERE source_system IS NOT NULL AND source_attachment_id IS NOT NULL
+        """
+    )
     ensure_batch_snapshots_table(conn)
     migrate_approval_date_values(conn)
     ensure_payment_detail_tables(conn)

@@ -174,6 +174,16 @@ export type ExternalMetadataSyncResult = {
   already_applied: number;
   skipped: number;
   auto_payment_mode: "off" | "preview" | "apply" | string;
+  attachment_downloaded: number;
+  attachment_synced: number;
+  attachment_existing: number;
+  attachment_failed: number;
+  attachment_errors: Array<{
+    approval_no?: string;
+    attachment_id?: string;
+    file_name?: string;
+    message: string;
+  }>;
 };
 
 export type DingtalkWorkflowEvent = {
@@ -366,12 +376,14 @@ export type AttachmentLink = {
   request_id: number;
   label?: string;
   url_path: string;
-  attachment_type?: "link" | "image";
+  attachment_type?: "link" | "image" | "file";
   file_path?: string;
   original_filename?: string;
   mime_type?: string;
   file_size?: number;
   file_url?: string;
+  source_system?: string;
+  source_attachment_id?: string;
   created_at: string;
 };
 

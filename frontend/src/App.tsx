@@ -586,7 +586,8 @@ function TopbarImportActions({
         const detail = result.auto_payment_mode === "preview"
           ? `发现 ${result.payment_candidates} 条自动付款候选、${result.review_required} 条待核对`
           : `新增 ${result.auto_payments} 笔自动付款、${result.review_required} 条待核对`;
-        setMessage(`钉钉流程同步完成：${detail}`);
+        const attachmentDetail = `附件新增 ${result.attachment_synced || 0} 个、已存在 ${result.attachment_existing || 0} 个${result.attachment_failed ? `、失败 ${result.attachment_failed} 个` : ""}`;
+        setMessage(`钉钉流程同步完成：${detail}；${attachmentDetail}`);
         window.setTimeout(() => setMessage(""), 3000);
       }
     } catch (err) {
@@ -3325,11 +3326,22 @@ function RequestEditor({
                     )}
                     <div className="attachment-meta">
                       <strong>{attachmentTitle(item, "附件")}</strong>
-                      <span>{isImageAttachment(item) ? item.original_filename || item.url_path : item.url_path}</span>
+                      <span>
+                        {isDingtalkAttachment(item)
+                          ? `钉钉关键凭证${item.file_size ? ` · ${formatFileSize(item.file_size)}` : ""}`
+                          : isImageAttachment(item)
+                            ? item.original_filename || item.url_path
+                            : item.url_path}
+                      </span>
                     </div>
                     <div className="attachment-actions">
                       {isImageAttachment(item) && <button className="ghost-button" type="button" onClick={() => previewAttachment(item)}><ImageIcon size={14} />预览</button>}
-                      {canEditAttachments && <button type="button" onClick={() => removeAttachment(item.id)}>删除</button>}
+                      {!isImageAttachment(item) && item.file_url && (
+                        <a className="ghost-button" href={item.file_url} target="_blank" rel="noreferrer">
+                          <Download size={14} />{isPdfAttachment(item) ? "查看" : "下载"}
+                        </a>
+                      )}
+                      {canEditAttachments && !isDingtalkAttachment(item) && <button type="button" onClick={() => removeAttachment(item.id)}>删除</button>}
                     </div>
                   </div>
                 ))}
@@ -4386,12 +4398,27 @@ function isImageAttachment(attachment: AttachmentLink) {
   return attachment.attachment_type === "image";
 }
 
+function isPdfAttachment(attachment: AttachmentLink) {
+  return attachment.mime_type === "application/pdf"
+    || String(attachment.original_filename || "").toLowerCase().endsWith(".pdf");
+}
+
+function isDingtalkAttachment(attachment: AttachmentLink) {
+  return attachment.source_system === "dingtalk_expense_database";
+}
+
 function attachmentImageUrl(attachment: AttachmentLink) {
   return attachment.file_url || api.attachmentFileUrl(attachment.id);
 }
 
 function attachmentTitle(attachment: AttachmentLink, fallback: string) {
   return attachment.label || attachment.original_filename || fallback;
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function formatMoney(value: number) {

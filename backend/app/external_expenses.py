@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Optional
 from zoneinfo import ZoneInfo
 
+import httpx
 import psycopg
 from dotenv import dotenv_values
 from psycopg.rows import dict_row
@@ -40,6 +41,7 @@ PAYMENT_AMOUNT_RE = re.compile(
     r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*(万|千)?\s*元)"
 )
 GENERIC_COMMENT_STAGE_RE = re.compile(r"^(评论|备注|comment|remark|comentario)$", re.IGNORECASE)
+MAX_DINGTALK_ATTACHMENT_BYTES = 50 * 1024 * 1024
 
 
 class ExternalExpenseError(RuntimeError):
@@ -54,6 +56,86 @@ class SourceDatabaseConfig:
     user_dbname: str
     user: str
     password: str
+
+
+class DingtalkAttachmentClient:
+    def __init__(self) -> None:
+        values = _source_env_values()
+        app_key = values.get("DINGTALK_APPKEY")
+        app_secret = values.get("DINGTALK_APPSECRET")
+        if not app_key or not app_secret:
+            raise ExternalExpenseError("钉钉附件下载配置不完整")
+        self.client = httpx.Client(
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            follow_redirects=True,
+        )
+        try:
+            response = self.client.post(
+                "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+                json={"appKey": app_key, "appSecret": app_secret},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            self.access_token = str(payload.get("accessToken") or "").strip()
+            if not self.access_token:
+                raise ExternalExpenseError(
+                    str(payload.get("message") or payload.get("errmsg") or "无法获取钉钉访问凭证")
+                )
+        except ExternalExpenseError:
+            self.client.close()
+            raise
+        except Exception as exc:
+            self.client.close()
+            raise ExternalExpenseError("无法获取钉钉附件下载凭证") from exc
+
+    def __enter__(self) -> "DingtalkAttachmentClient":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.client.close()
+
+    def download(self, process_instance_id: str, file_id: str) -> tuple[bytes, Optional[str]]:
+        if not process_instance_id or not file_id:
+            raise ExternalExpenseError("附件缺少流程实例或文件标识")
+        try:
+            response = self.client.post(
+                "https://api.dingtalk.com/v1.0/workflow/processInstances/spaces/files/urls/download",
+                headers={
+                    "x-acs-dingtalk-access-token": self.access_token,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "processInstanceId": process_instance_id,
+                    "fileId": file_id,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            result = payload.get("result") or {}
+            download_uri = str(result.get("downloadUri") or "").strip()
+            if not payload.get("success") or not download_uri:
+                raise ExternalExpenseError(
+                    str(payload.get("message") or payload.get("errmsg") or "钉钉未返回附件下载地址")
+                )
+            content = bytearray()
+            content_type: Optional[str] = None
+            with self.client.stream("GET", download_uri) as file_response:
+                file_response.raise_for_status()
+                content_type = file_response.headers.get("content-type")
+                declared_size = file_response.headers.get("content-length")
+                if declared_size and int(declared_size) > MAX_DINGTALK_ATTACHMENT_BYTES:
+                    raise ExternalExpenseError("钉钉附件超过 50MB")
+                for chunk in file_response.iter_bytes():
+                    content.extend(chunk)
+                    if len(content) > MAX_DINGTALK_ATTACHMENT_BYTES:
+                        raise ExternalExpenseError("钉钉附件超过 50MB")
+            if not content:
+                raise ExternalExpenseError("钉钉附件内容为空")
+            return bytes(content), content_type
+        except ExternalExpenseError:
+            raise
+        except Exception as exc:
+            raise ExternalExpenseError("钉钉附件下载失败") from exc
 
 
 SOURCE_ROWS_CTE = """
@@ -136,6 +218,8 @@ def _source_env_values() -> Dict[str, str]:
         "DB_PASSWORD",
         "DINGTALK_USER_DB_NAME",
         "DINGTALK_AUTO_PAYMENT_MODE",
+        "DINGTALK_APPKEY",
+        "DINGTALK_APPSECRET",
     ):
         value = os.environ.get(key)
         if value is None:
@@ -285,6 +369,89 @@ def fetch_external_expense_metadata(approval_nos: Iterable[str]) -> list[Dict[st
             **external_source,
         })
     return metadata
+
+
+def fetch_external_expense_attachments(approval_nos: Iterable[str]) -> list[Dict[str, Any]]:
+    normalized = sorted({str(value or "").strip() for value in approval_nos if str(value or "").strip()})
+    if not normalized:
+        return []
+    rows: list[Dict[str, Any]] = []
+    with source_connection() as conn:
+        for start in range(0, len(normalized), 500):
+            chunk = normalized[start : start + 500]
+            rows.extend(
+                conn.execute(
+                    """
+                    WITH parents AS (
+                        SELECT 'operation'::text AS source_type,
+                               id::text AS source_id,
+                               id AS parent_id,
+                               BTRIM(approval_no) AS approval_no
+                        FROM public.approval_expense_operation
+
+                        UNION ALL
+
+                        SELECT 'purchase'::text AS source_type,
+                               id::text AS source_id,
+                               id AS parent_id,
+                               BTRIM(approval_no) AS approval_no
+                        FROM public.approval_expense_purchase
+                    )
+                    SELECT parents.source_type,
+                           parents.source_id,
+                           parents.approval_no,
+                           attachments.id::text AS attachment_id,
+                           attachments.row_no,
+                           attachments.attachment_type,
+                           attachments.file_name,
+                           attachments.raw_data,
+                           attachments.created_at
+                    FROM parents
+                    JOIN public.approval_expense_attachments AS attachments
+                      ON attachments.parent_type = parents.source_type
+                     AND attachments.parent_id = parents.parent_id
+                    WHERE parents.approval_no = ANY(%s)
+                    ORDER BY parents.approval_no,
+                             parents.source_type,
+                             parents.source_id,
+                             attachments.row_no,
+                             attachments.id
+                    """,
+                    [chunk],
+                ).fetchall()
+            )
+    attachments: list[Dict[str, Any]] = []
+    for row in rows:
+        raw_data = row.get("raw_data")
+        if isinstance(raw_data, str):
+            try:
+                raw_data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                raw_data = {}
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+        file_id = _text(raw_data.get("fileId"))
+        file_name = _text(row.get("file_name")) or _text(raw_data.get("fileName"))
+        file_type = (_text(row.get("attachment_type")) or _text(raw_data.get("fileType")) or "").lower()
+        try:
+            file_size = int(raw_data.get("fileSize")) if raw_data.get("fileSize") is not None else None
+        except (TypeError, ValueError):
+            file_size = None
+        attachments.append(
+            {
+                "source_type": _text(row.get("source_type")) or "",
+                "source_id": _text(row.get("source_id")) or "",
+                "approval_no": _text(row.get("approval_no")) or "",
+                "attachment_id": _text(row.get("attachment_id")) or "",
+                "row_no": row.get("row_no"),
+                "file_id": file_id or "",
+                "file_name": file_name or f"钉钉附件-{row.get('attachment_id')}",
+                "file_type": file_type,
+                "file_size": file_size,
+                "created_at": _datetime_text(row.get("created_at")),
+            }
+        )
+    return attachments
 
 
 def _workflow_event_time(value: Any) -> Optional[str]:
