@@ -332,15 +332,15 @@ def _parse_workflow_events(
     user_names: Dict[str, str],
 ) -> list[Dict[str, Any]]:
     stage_by_activity: Dict[str, str] = {}
-    normalized_operations: list[tuple[Dict[str, Any], Optional[str]]] = []
+    normalized_operations: list[tuple[int, Dict[str, Any], Optional[str]]] = []
     finance_agree_times: Dict[str, list[str]] = {}
-    for operation in operations:
+    for sequence_index, operation in enumerate(operations):
         activity_id = _text(operation.get("activityId")) or ""
         stage_name = _text(operation.get("showName")) or ""
         event_type = (_text(operation.get("type")) or "").upper()
         result = (_text(operation.get("result")) or "").upper()
         event_time = _workflow_event_time(operation.get("date"))
-        normalized_operations.append((operation, event_time))
+        normalized_operations.append((sequence_index, operation, event_time))
         if activity_id and stage_name and not GENERIC_COMMENT_STAGE_RE.fullmatch(stage_name):
             stage_by_activity.setdefault(activity_id, stage_name)
         operator_id = _text(operation.get("userId")) or ""
@@ -353,16 +353,49 @@ def _parse_workflow_events(
         ):
             finance_agree_times.setdefault(operator_id, []).append(event_time)
 
+    stage_contexts = sorted(
+        [
+            (event_time, sequence_index, _text(operation.get("showName")) or "")
+            for sequence_index, operation, event_time in normalized_operations
+            if event_time
+            and _text(operation.get("showName"))
+            and not GENERIC_COMMENT_STAGE_RE.fullmatch(_text(operation.get("showName")) or "")
+        ],
+        key=lambda item: (item[0], item[1]),
+    )
+
     events: list[Dict[str, Any]] = []
-    for operation, event_time in normalized_operations:
+    for sequence_index, operation, event_time in normalized_operations:
         operator_id = _text(operation.get("userId")) or ""
         activity_id = _text(operation.get("activityId")) or ""
         raw_stage_name = _text(operation.get("showName")) or ""
-        stage_name = (
+        is_generic_comment_stage = bool(GENERIC_COMMENT_STAGE_RE.fullmatch(raw_stage_name))
+        mapped_stage_name = (
             stage_by_activity.get(activity_id)
-            if activity_id and GENERIC_COMMENT_STAGE_RE.fullmatch(raw_stage_name)
+            if is_generic_comment_stage
             else raw_stage_name
-        ) or stage_by_activity.get(activity_id) or "流程操作"
+        ) or stage_by_activity.get(activity_id)
+        if is_generic_comment_stage and not mapped_stage_name and event_time:
+            position = (event_time, sequence_index)
+            previous_stage = next(
+                (stage for time, index, stage in reversed(stage_contexts) if (time, index) < position),
+                None,
+            )
+            next_stage = next(
+                (stage for time, index, stage in stage_contexts if (time, index) > position),
+                None,
+            )
+            if previous_stage and next_stage:
+                mapped_stage_name = (
+                    f"{previous_stage}节点评论"
+                    if previous_stage == next_stage
+                    else f"{previous_stage} → {next_stage} 之间的评论"
+                )
+            elif previous_stage:
+                mapped_stage_name = f"{previous_stage}后评论"
+            elif next_stage:
+                mapped_stage_name = f"{next_stage}前评论"
+        stage_name = mapped_stage_name or "流程评论"
         event_type = (_text(operation.get("type")) or "").upper()
         result = (_text(operation.get("result")) or "").upper()
         is_finance_agree = bool(
@@ -389,13 +422,21 @@ def _parse_workflow_events(
             "operator_id": operator_id,
             "operator_name": user_names.get(operator_id) or "未识别人员",
             "event_time": event_time,
+            "sequence_index": sequence_index,
             "comment": _text(operation.get("remark")),
             "images": _json_list(operation.get("images")),
             "attachments": _json_list(operation.get("attachments")),
             "trusted_finance": bool(is_finance_agree or trusted_after_finance_agree),
             "current": bool(activity_id and activity_id in current_activity_ids),
         })
-    return sorted(events, key=lambda event: (event.get("event_time") or "", event["event_key"]))
+    return sorted(
+        events,
+        key=lambda event: (
+            event.get("event_time") is None,
+            event.get("event_time") or "",
+            int(event.get("sequence_index") or 0),
+        ),
+    )
 
 
 def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]]:

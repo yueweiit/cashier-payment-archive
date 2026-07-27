@@ -1272,6 +1272,7 @@ def get_request_dingtalk_workflow(
             WHERE events.request_id = ?
             ORDER BY CASE WHEN events.event_time IS NULL THEN 1 ELSE 0 END,
                      events.event_time,
+                     events.sequence_index,
                      events.id
             """,
             (request_id,),
@@ -3496,10 +3497,10 @@ def sync_external_expense_metadata(
                         """
                         INSERT INTO dingtalk_workflow_events (
                             request_id, event_key, process_instance_id, activity_id, event_type,
-                            stage_name, result, operator_id, operator_name, event_time, comment,
+                            stage_name, result, operator_id, operator_name, event_time, sequence_index, comment,
                             images_json, attachments_json, trusted_finance, classification,
                             classification_reason, payment_record_id, is_current, active, synced_at, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                         ON CONFLICT(request_id, event_key) DO UPDATE SET
                             process_instance_id = excluded.process_instance_id,
                             activity_id = excluded.activity_id,
@@ -3509,6 +3510,7 @@ def sync_external_expense_metadata(
                             operator_id = excluded.operator_id,
                             operator_name = excluded.operator_name,
                             event_time = excluded.event_time,
+                            sequence_index = excluded.sequence_index,
                             comment = excluded.comment,
                             images_json = excluded.images_json,
                             attachments_json = excluded.attachments_json,
@@ -3532,6 +3534,7 @@ def sync_external_expense_metadata(
                             event.get("operator_id"),
                             event.get("operator_name"),
                             event.get("event_time"),
+                            int(event.get("sequence_index") or 0),
                             event.get("comment"),
                             json.dumps(event.get("images") or [], ensure_ascii=False, default=str),
                             json.dumps(event.get("attachments") or [], ensure_ascii=False, default=str),

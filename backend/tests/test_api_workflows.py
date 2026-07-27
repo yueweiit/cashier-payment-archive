@@ -1821,7 +1821,7 @@ def test_dingtalk_workflow_events_respect_stage_and_finance_approval_order():
             "userId": "finance-user",
             "date": "2026-07-27T01:00:00Z",
             "type": "ADD_REMARK",
-            "activityId": "finance-node",
+            "activityId": None,
             "showName": "评论",
             "remark": "已支付",
         },
@@ -1837,7 +1837,7 @@ def test_dingtalk_workflow_events_respect_stage_and_finance_approval_order():
             "userId": "finance-user",
             "date": "2026-07-27T03:00:00Z",
             "type": "ADD_REMARK",
-            "activityId": "finance-node",
+            "activityId": None,
             "showName": "评论",
             "remark": "付款完成",
         },
@@ -1849,11 +1849,12 @@ def test_dingtalk_workflow_events_respect_stage_and_finance_approval_order():
         {"finance-user": "测试财务"},
     )
     assert [event["comment"] for event in events] == ["已支付", None, "付款完成"]
-    assert [event["stage_name"] for event in events] == ["财务审批", "财务审批", "财务审批"]
+    assert [event["stage_name"] for event in events] == ["财务审批前评论", "财务审批", "财务审批后评论"]
+    assert [event["sequence_index"] for event in events] == [0, 1, 2]
     assert events[0]["trusted_finance"] is False
     assert events[1]["trusted_finance"] is True
     assert events[2]["trusted_finance"] is True
-    assert all(event["current"] for event in events)
+    assert [event["current"] for event in events] == [False, True, False]
 
 
 def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch):

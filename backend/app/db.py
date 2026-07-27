@@ -170,6 +170,7 @@ def init_db() -> None:
                 operator_id TEXT,
                 operator_name TEXT,
                 event_time TEXT,
+                sequence_index INTEGER NOT NULL DEFAULT 0,
                 comment TEXT,
                 images_json TEXT,
                 attachments_json TEXT,
@@ -450,6 +451,7 @@ def ensure_dingtalk_workflow_events_table(conn: sqlite3.Connection) -> None:
             operator_id TEXT,
             operator_name TEXT,
             event_time TEXT,
+            sequence_index INTEGER NOT NULL DEFAULT 0,
             comment TEXT,
             images_json TEXT,
             attachments_json TEXT,
@@ -470,6 +472,7 @@ def ensure_dingtalk_workflow_events_table(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_column(conn, "dingtalk_workflow_events", "is_current", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "dingtalk_workflow_events", "sequence_index", "INTEGER NOT NULL DEFAULT 0")
 
 
 def payment_record_hash(
