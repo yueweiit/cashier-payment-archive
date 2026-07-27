@@ -3385,7 +3385,8 @@ def sync_external_expense_metadata(
                     "SELECT COALESCE(SUM(amount), 0) AS total FROM payment_records WHERE request_id = ?",
                     (request_id,),
                 ).fetchone()
-                pending_amount = max(0.0, round(request_amount - float(paid_row["total"] or 0), 2))
+                paid_amount = round(float(paid_row["total"] or 0), 2)
+                pending_amount = max(0.0, round(request_amount - paid_amount, 2))
                 for event in workflow.get("events") or []:
                     workflow_events += 1
                     event_key = str(event.get("event_key") or "")
@@ -3422,6 +3423,7 @@ def sync_external_expense_metadata(
                         pending_amount=pending_amount,
                         workflow_status=str(workflow.get("status") or ""),
                         workflow_result=str(workflow.get("result") or ""),
+                        paid_amount=paid_amount,
                     )
                     if classification == "eligible" and request_counts_by_approval[approval_no] > 1:
                         classification = "review_required"

@@ -541,6 +541,7 @@ def classify_dingtalk_payment_event(
     pending_amount: float,
     workflow_status: str,
     workflow_result: str,
+    paid_amount: float = 0,
 ) -> tuple[str, str]:
     comment = _text(event.get("comment")) or ""
     if not comment:
@@ -570,8 +571,12 @@ def classify_dingtalk_payment_event(
         amounts.add(round(float(raw_amount.replace(",", "")) * multiplier, 2))
     if len(amounts) > 1:
         return "review_required", "评论包含多笔付款金额"
-    if amounts and abs(next(iter(amounts)) - round(float(pending_amount), 2)) > 0.01:
-        return "review_required", "评论金额与当前待付款金额不一致"
+    if amounts:
+        comment_amount = next(iter(amounts))
+        if float(paid_amount) > 0 and comment_amount <= round(float(paid_amount), 2) + 0.01:
+            return "review_required", "评论金额可能已包含在当前累计已付金额中"
+        if abs(comment_amount - round(float(pending_amount), 2)) > 0.01:
+            return "review_required", "评论金额与当前待付款金额不一致"
     return "eligible", "可信财务人员明确确认全额付款"
 
 

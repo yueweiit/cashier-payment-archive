@@ -1813,6 +1813,16 @@ def test_dingtalk_payment_comment_classifier_is_strict():
         workflow_status="RUNNING",
         workflow_result="agree",
     )[0] == "ignored"
+    classification, reason = classify_dingtalk_payment_event(
+        {"comment": "已支付20000元", "trusted_finance": True},
+        approval_no="202605061052000163127",
+        pending_amount=20000,
+        paid_amount=20000,
+        workflow_status="RUNNING",
+        workflow_result="agree",
+    )
+    assert classification == "review_required"
+    assert "累计已付" in reason
 
 
 def test_dingtalk_workflow_events_respect_stage_and_finance_approval_order():
