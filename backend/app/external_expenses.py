@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Optional
+from zoneinfo import ZoneInfo
 
 import psycopg
 from dotenv import dotenv_values
@@ -25,6 +27,17 @@ SOURCE_TABLES = {
     "operation": "approval_expense_operation",
     "purchase": "approval_expense_purchase",
 }
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+FINANCE_STAGE_RE = re.compile(r"(财务|出纳|会计|付款|financ|cajer|tesorer|contab)", re.IGNORECASE)
+PAID_PHRASE_RE = re.compile(r"(已支付|已经支付|已付款|已经付款|付款完成|支付完成|打款完成|款已付|款项已付)")
+PAYMENT_EXCLUSION_RE = re.compile(
+    r"(未支付|未付款|未付|待支付|待付款|待付|尚未|剩余|部分|合并|"
+    r"客户.{0,8}(?:已支付|已付款)|无需.{0,8}(?:再次)?支付|不需要.{0,8}支付)"
+)
+APPROVAL_REFERENCE_RE = re.compile(r"(?<!\d)\d{15,}(?!\d)")
+PAYMENT_AMOUNT_RE = re.compile(
+    r"(?:[¥￥]\s*([0-9][0-9,]*(?:\.\d{1,2})?)|([0-9][0-9,]*(?:\.\d{1,2})?)\s*元)"
+)
 
 
 class ExternalExpenseError(RuntimeError):
@@ -113,13 +126,26 @@ def _source_env_values() -> Dict[str, str]:
             }
             break
     values: Dict[str, str] = {}
-    for key in ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD", "DINGTALK_USER_DB_NAME"):
+    for key in (
+        "DB_HOST",
+        "DB_PORT",
+        "DB_NAME",
+        "DB_USER",
+        "DB_PASSWORD",
+        "DINGTALK_USER_DB_NAME",
+        "DINGTALK_AUTO_PAYMENT_MODE",
+    ):
         value = os.environ.get(key)
         if value is None:
             value = file_values.get(key)
         if value is not None:
             values[key] = value.strip()
     return values
+
+
+def dingtalk_auto_payment_mode() -> str:
+    mode = _source_env_values().get("DINGTALK_AUTO_PAYMENT_MODE", "preview").strip().lower()
+    return mode if mode in {"off", "preview", "apply"} else "preview"
 
 
 def source_database_config() -> SourceDatabaseConfig:
@@ -257,6 +283,200 @@ def fetch_external_expense_metadata(approval_nos: Iterable[str]) -> list[Dict[st
             **external_source,
         })
     return metadata
+
+
+def _workflow_event_time(value: Any) -> Optional[str]:
+    text = _text(value)
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(SHANGHAI_TZ).replace(microsecond=0).isoformat()
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _workflow_event_key(process_instance_id: str, operation: Dict[str, Any]) -> str:
+    stable_parts = [
+        process_instance_id,
+        _text(operation.get("userId")) or "",
+        _text(operation.get("date")) or "",
+        _text(operation.get("type")) or "",
+        _text(operation.get("showName")) or "",
+        _text(operation.get("remark")) or "",
+    ]
+    return hashlib.sha256("|".join(stable_parts).encode("utf-8")).hexdigest()
+
+
+def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]]:
+    normalized = sorted({str(value or "").strip() for value in approval_nos if str(value or "").strip()})
+    if not normalized:
+        return []
+    config = source_database_config()
+    instances: list[Dict[str, Any]] = []
+    with source_connection(config.user_dbname) as conn:
+        for start in range(0, len(normalized), 500):
+            chunk = normalized[start : start + 500]
+            instances.extend(
+                conn.execute(
+                    """
+                    SELECT process_instance_id,
+                           BTRIM(raw_payload->>'businessId') AS approval_no,
+                           status,
+                           result,
+                           title,
+                           raw_payload->'operationRecords' AS operation_records,
+                           raw_payload->'tasks' AS tasks,
+                           updated_at
+                    FROM public.ding_approval_instance
+                    WHERE deleted_at IS NULL
+                      AND BTRIM(raw_payload->>'businessId') = ANY(%s)
+                    ORDER BY BTRIM(raw_payload->>'businessId'),
+                             updated_at DESC NULLS LAST,
+                             id DESC
+                    """,
+                    [chunk],
+                ).fetchall()
+            )
+        user_ids = sorted({
+            str(operation.get("userId") or "").strip()
+            for instance in instances
+            for operation in _json_list(instance.get("operation_records"))
+            if isinstance(operation, dict) and str(operation.get("userId") or "").strip()
+        })
+        user_names: Dict[str, str] = {}
+        for start in range(0, len(user_ids), 500):
+            chunk = user_ids[start : start + 500]
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ON (BTRIM(user_id))
+                       BTRIM(user_id) AS user_id,
+                       BTRIM(name) AS name
+                FROM public.ding_user_snapshot
+                WHERE BTRIM(user_id) = ANY(%s)
+                  AND name IS NOT NULL
+                  AND BTRIM(name) <> ''
+                ORDER BY BTRIM(user_id),
+                         is_current DESC NULLS LAST,
+                         valid_from DESC NULLS LAST,
+                         updated_at DESC NULLS LAST,
+                         id DESC
+                """,
+                [chunk],
+            ).fetchall()
+            user_names.update({
+                str(row["user_id"]): str(row["name"])
+                for row in rows
+                if valid_applicant_name(row.get("name"))
+            })
+
+    workflows: list[Dict[str, Any]] = []
+    for instance in instances:
+        process_instance_id = _text(instance.get("process_instance_id")) or ""
+        operations = [
+            dict(operation)
+            for operation in _json_list(instance.get("operation_records"))
+            if isinstance(operation, dict)
+        ]
+        current_activity_ids = {
+            _text(task.get("activityId")) or ""
+            for task in _json_list(instance.get("tasks"))
+            if isinstance(task, dict)
+            and (_text(task.get("status")) or "").upper() in {"RUNNING", "PROCESSING"}
+            and _text(task.get("activityId"))
+        }
+        trusted_finance_users = {
+            _text(operation.get("userId")) or ""
+            for operation in operations
+            if (_text(operation.get("type")) or "").upper() == "EXECUTE_TASK_NORMAL"
+            and (_text(operation.get("result")) or "").upper() == "AGREE"
+            and FINANCE_STAGE_RE.search(_text(operation.get("showName")) or "")
+        }
+        events: list[Dict[str, Any]] = []
+        for operation in operations:
+            operator_id = _text(operation.get("userId")) or ""
+            events.append({
+                "event_key": _workflow_event_key(process_instance_id, operation),
+                "process_instance_id": process_instance_id,
+                "activity_id": _text(operation.get("activityId")),
+                "event_type": (_text(operation.get("type")) or "").upper(),
+                "stage_name": _text(operation.get("showName")) or "流程操作",
+                "result": (_text(operation.get("result")) or "").upper() or None,
+                "operator_id": operator_id,
+                "operator_name": user_names.get(operator_id) or "未识别人员",
+                "event_time": _workflow_event_time(operation.get("date")),
+                "comment": _text(operation.get("remark")),
+                "images": _json_list(operation.get("images")),
+                "attachments": _json_list(operation.get("attachments")),
+                "trusted_finance": bool(operator_id and operator_id in trusted_finance_users),
+                "current": bool(
+                    _text(operation.get("activityId"))
+                    and _text(operation.get("activityId")) in current_activity_ids
+                ),
+            })
+        workflows.append({
+            "approval_no": _text(instance.get("approval_no")) or "",
+            "process_instance_id": process_instance_id,
+            "status": (_text(instance.get("status")) or "").upper(),
+            "result": (_text(instance.get("result")) or "").lower(),
+            "title": _text(instance.get("title")),
+            "updated_at": _workflow_event_time(instance.get("updated_at")),
+            "events": sorted(events, key=lambda event: (event.get("event_time") or "", event["event_key"])),
+        })
+    return workflows
+
+
+def classify_dingtalk_payment_event(
+    event: Dict[str, Any],
+    *,
+    approval_no: str,
+    pending_amount: float,
+    workflow_status: str,
+    workflow_result: str,
+) -> tuple[str, str]:
+    comment = _text(event.get("comment")) or ""
+    if not comment:
+        return "ignored", "无评论"
+    if not event.get("trusted_finance"):
+        return "ignored", "评论人未通过财务节点可信校验"
+    if workflow_status.upper() not in ALLOWED_APPROVAL_STATUSES or workflow_result.lower() == "refuse":
+        return "review_required", "审批流程当前状态不允许自动付款"
+    if PAYMENT_EXCLUSION_RE.search(comment):
+        return "review_required", "评论包含部分、未付、合并或其他排除语义"
+    if not PAID_PHRASE_RE.search(comment):
+        return "ignored", "未识别到明确的付款完成语义"
+    referenced_approval_nos = {
+        match
+        for match in APPROVAL_REFERENCE_RE.findall(comment)
+        if match != str(approval_no or "").strip()
+    }
+    if referenced_approval_nos:
+        return "review_required", "评论引用了其他钉钉审批单号"
+    amounts = {
+        round(float((left or right).replace(",", "")), 2)
+        for left, right in PAYMENT_AMOUNT_RE.findall(comment)
+        if left or right
+    }
+    if len(amounts) > 1:
+        return "review_required", "评论包含多笔付款金额"
+    if amounts and abs(next(iter(amounts)) - round(float(pending_amount), 2)) > 0.01:
+        return "review_required", "评论金额与当前待付款金额不一致"
+    return "eligible", "可信财务人员明确确认全额付款"
 
 
 def fetch_external_expenses(items: Iterable[Dict[str, str]]) -> list[Dict[str, Any]]:

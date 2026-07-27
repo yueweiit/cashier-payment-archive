@@ -158,6 +158,36 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_payment_records_root ON payment_records(root_payment_id);
             CREATE INDEX IF NOT EXISTS idx_payment_records_hash ON payment_records(request_id, content_hash);
 
+            CREATE TABLE IF NOT EXISTS dingtalk_workflow_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL REFERENCES payment_requests(id) ON DELETE CASCADE,
+                event_key TEXT NOT NULL,
+                process_instance_id TEXT,
+                activity_id TEXT,
+                event_type TEXT,
+                stage_name TEXT,
+                result TEXT,
+                operator_id TEXT,
+                operator_name TEXT,
+                event_time TEXT,
+                comment TEXT,
+                images_json TEXT,
+                attachments_json TEXT,
+                trusted_finance INTEGER NOT NULL DEFAULT 0,
+                classification TEXT NOT NULL DEFAULT 'ignored',
+                classification_reason TEXT,
+                payment_record_id INTEGER REFERENCES payment_records(id) ON DELETE SET NULL,
+                is_current INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                synced_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(request_id, event_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dingtalk_workflow_request_time
+                ON dingtalk_workflow_events(request_id, event_time, id);
+
             CREATE TABLE IF NOT EXISTS payment_vouchers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 payment_id INTEGER NOT NULL REFERENCES payment_records(id) ON DELETE CASCADE,
@@ -276,6 +306,7 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_batch_snapshots_table(conn)
     migrate_approval_date_values(conn)
     ensure_payment_detail_tables(conn)
+    ensure_dingtalk_workflow_events_table(conn)
     migrate_payment_summaries_to_details(conn)
     refresh_payment_summaries(conn)
     migrate_role_dictionary(conn)
@@ -402,6 +433,43 @@ def ensure_payment_detail_tables(conn: sqlite3.Connection) -> None:
         );
         """
     )
+
+
+def ensure_dingtalk_workflow_events_table(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS dingtalk_workflow_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL REFERENCES payment_requests(id) ON DELETE CASCADE,
+            event_key TEXT NOT NULL,
+            process_instance_id TEXT,
+            activity_id TEXT,
+            event_type TEXT,
+            stage_name TEXT,
+            result TEXT,
+            operator_id TEXT,
+            operator_name TEXT,
+            event_time TEXT,
+            comment TEXT,
+            images_json TEXT,
+            attachments_json TEXT,
+            trusted_finance INTEGER NOT NULL DEFAULT 0,
+            classification TEXT NOT NULL DEFAULT 'ignored',
+            classification_reason TEXT,
+            payment_record_id INTEGER REFERENCES payment_records(id) ON DELETE SET NULL,
+            is_current INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            synced_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(request_id, event_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dingtalk_workflow_request_time
+            ON dingtalk_workflow_events(request_id, event_time, id);
+        """
+    )
+    ensure_column(conn, "dingtalk_workflow_events", "is_current", "INTEGER NOT NULL DEFAULT 0")
 
 
 def payment_record_hash(

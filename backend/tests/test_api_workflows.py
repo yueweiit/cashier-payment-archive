@@ -21,7 +21,14 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
 from backend.app.db import connect, now_iso
-from backend.app.external_expenses import ExternalExpenseError, _preview_conditions, applicant_name_from_title, map_external_expense, valid_applicant_name
+from backend.app.external_expenses import (
+    ExternalExpenseError,
+    _preview_conditions,
+    applicant_name_from_title,
+    classify_dingtalk_payment_event,
+    map_external_expense,
+    valid_applicant_name,
+)
 from backend.app.excel_io import export_workbook
 from backend.app import main as main_module
 from backend.app.main import app
@@ -1656,6 +1663,7 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         },
     ]
     monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda approval_nos: metadata)
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda approval_nos: [])
 
     with TestClient(app) as client:
         login(client)
@@ -1693,6 +1701,13 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             "unmatched": 1,
             "conflicts": 1,
             "updated_requests": 5,
+            "workflow_events": 0,
+            "payment_candidates": 0,
+            "auto_payments": 0,
+            "review_required": 0,
+            "already_applied": 0,
+            "skipped": 0,
+            "auto_payment_mode": "preview",
         }
         rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
         by_id = {row["id"]: row for row in rows}
@@ -1720,6 +1735,13 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
                 "unmatched": 1,
                 "conflicts": 1,
                 "updated_requests": 5,
+                "workflow_events": 0,
+                "payment_candidates": 0,
+                "auto_payments": 0,
+                "review_required": 0,
+                "already_applied": 0,
+                "skipped": 0,
+                "auto_payment_mode": "preview",
             }
 
         refreshed_metadata = [
@@ -1756,6 +1778,186 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         unchanged = client.get(f"/api/batches/{failure_batch['id']}/requests").json()["requests"][0]
         assert unchanged["id"] == created["id"]
         assert unchanged["raw_extra"] == {"kept": True}
+
+
+def test_dingtalk_payment_comment_classifier_is_strict():
+    trusted_event = {"comment": "该笔已支付，付款截图如上", "trusted_finance": True}
+    assert classify_dingtalk_payment_event(
+        trusted_event,
+        approval_no="202607270000000001",
+        pending_amount=60,
+        workflow_status="RUNNING",
+        workflow_result="agree",
+    )[0] == "eligible"
+    for comment in (
+        "客户已付款",
+        "已支付 40 元，剩余 20 元未支付",
+        "两张审批单合并付款，已支付",
+        "审批已支付该笔，无需再次支付",
+        "202607270000000002 已付款",
+    ):
+        classification, _ = classify_dingtalk_payment_event(
+            {"comment": comment, "trusted_finance": True},
+            approval_no="202607270000000001",
+            pending_amount=60,
+            workflow_status="RUNNING",
+            workflow_result="agree",
+        )
+        assert classification == "review_required"
+    assert classify_dingtalk_payment_event(
+        {"comment": "已支付", "trusted_finance": False},
+        approval_no="202607270000000001",
+        pending_amount=60,
+        workflow_status="RUNNING",
+        workflow_result="agree",
+    )[0] == "ignored"
+
+
+def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch):
+    approval_no = "202607270000000001"
+    monkeypatch.setenv("DINGTALK_AUTO_PAYMENT_MODE", "apply")
+    monkeypatch.setattr(
+        main_module,
+        "fetch_external_expense_metadata",
+        lambda approval_nos: [{
+            "approval_no": approval_no,
+            "source_type": "operation",
+            "source_label": "运营支出",
+            "source_id": "9901",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "applicant_id": "finance-user",
+            "applicant": "测试财务",
+            "applicant_department": "财务中心",
+        }],
+    )
+    events = [
+        {
+            "event_key": "finance-agree",
+            "process_instance_id": "process-1",
+            "activity_id": "finance-node",
+            "event_type": "EXECUTE_TASK_NORMAL",
+            "stage_name": "财务审批",
+            "result": "AGREE",
+            "operator_id": "finance-user",
+            "operator_name": "测试财务",
+            "event_time": "2026-07-27T17:58:00+08:00",
+            "comment": None,
+            "images": [],
+            "attachments": [],
+            "trusted_finance": True,
+        },
+        {
+            "event_key": "paid-comment",
+            "process_instance_id": "process-1",
+            "activity_id": "finance-node",
+            "event_type": "ADD_REMARK",
+            "stage_name": "评论",
+            "result": None,
+            "operator_id": "finance-user",
+            "operator_name": "测试财务",
+            "event_time": "2026-07-27T18:00:00+08:00",
+            "comment": "已支付，付款截图如上",
+            "images": [{"url": "https://example.invalid/proof.png"}],
+            "attachments": [],
+            "trusted_finance": True,
+        },
+        {
+            "event_key": "complex-comment",
+            "process_instance_id": "process-1",
+            "activity_id": "finance-node",
+            "event_type": "ADD_REMARK",
+            "stage_name": "评论",
+            "result": None,
+            "operator_id": "finance-user",
+            "operator_name": "测试财务",
+            "event_time": "2026-07-27T18:01:00+08:00",
+            "comment": "另一笔部分付款，剩余金额待付",
+            "images": [],
+            "attachments": [],
+            "trusted_finance": True,
+        },
+    ]
+    monkeypatch.setattr(
+        main_module,
+        "fetch_dingtalk_workflows",
+        lambda approval_nos: [{
+            "approval_no": approval_no,
+            "process_instance_id": "process-1",
+            "status": "RUNNING",
+            "result": "agree",
+            "title": "测试审批",
+            "events": events,
+        }],
+    )
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "workflow-auto-payment"}).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": approval_no, "amount": 100, "payment_account": "公户"},
+        ).json()["request"]
+        manual_payment = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/payments",
+            json={"amount": 40, "payment_date": "2026-07-26", "payer": "人工出纳"},
+        )
+        assert manual_payment.status_code == 200
+
+        synced = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+        assert synced.status_code == 200
+        result = synced.json()
+        assert result["workflow_events"] == 3
+        assert result["payment_candidates"] == 1
+        assert result["auto_payments"] == 1
+        assert result["review_required"] == 1
+        payments = client.get(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/payments"
+        ).json()
+        assert payments["summary"]["paid_amount"] == 100
+        assert payments["summary"]["pending_amount"] == 0
+        assert len(payments["payments"]) == 2
+        automatic = next(payment for payment in payments["payments"] if payment["source_type"] == "dingtalk_workflow")
+        assert automatic["amount"] == 60
+        assert automatic["payment_date"] == "2026-07-27"
+        assert automatic["payer"] == "测试财务"
+
+        workflow = client.get(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/dingtalk-workflow"
+        )
+        assert workflow.status_code == 200
+        workflow_payload = workflow.json()
+        assert workflow_payload["summary"] == {
+            "total": 3,
+            "active": 3,
+            "applied": 1,
+            "review_required": 1,
+        }
+        paid_event = next(event for event in workflow_payload["events"] if event["event_key"] == "paid-comment")
+        assert paid_event["payment_record_id"] == automatic["id"]
+        assert paid_event["images"] == [{"url": "https://example.invalid/proof.png"}]
+
+        repeated = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+        assert repeated.status_code == 200
+        assert repeated.json()["auto_payments"] == 0
+        assert repeated.json()["already_applied"] == 1
+        repeated_payments = client.get(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/payments"
+        ).json()["payments"]
+        assert len(repeated_payments) == 2
+
+        fresh = client.post(
+            f"/api/batches/{batch['id']}/external-expenses/sync-metadata",
+            params={"only_if_stale_seconds": 300},
+        )
+        assert fresh.status_code == 200
+        assert fresh.json()["status"] == "fresh"
+
+        with connect() as conn:
+            auto_audits = conn.execute(
+                "SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'payment.auto_create_from_dingtalk'",
+            ).fetchone()["count"]
+            assert auto_audits == 1
 
 
 def visible_data_sheet(workbook):

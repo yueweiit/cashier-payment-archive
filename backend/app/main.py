@@ -46,6 +46,9 @@ from .excel_io import (
 from .external_expenses import (
     ALLOWED_SOURCE_TYPES,
     ExternalExpenseError,
+    classify_dingtalk_payment_event,
+    dingtalk_auto_payment_mode,
+    fetch_dingtalk_workflows,
     fetch_external_expense_metadata,
     fetch_external_expenses,
     preview_external_expenses,
@@ -1248,6 +1251,66 @@ def list_request_payments(
             "payment_count": len(payments),
             "actual_payment_date": request_row["actual_payment_date"],
             "payer": request_row["payer"],
+        },
+    }
+
+
+@app.get("/api/batches/{batch_id}/requests/{request_id}/dingtalk-workflow")
+def get_request_dingtalk_workflow(
+    batch_id: int,
+    request_id: int,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        require_batch(conn, batch_id)
+        request_row = require_request(conn, batch_id, request_id)
+        event_rows = conn.execute(
+            """
+            SELECT events.*, payments.amount AS payment_amount, payments.payment_date
+            FROM dingtalk_workflow_events AS events
+            LEFT JOIN payment_records AS payments ON payments.id = events.payment_record_id
+            WHERE events.request_id = ?
+            ORDER BY CASE WHEN events.event_time IS NULL THEN 1 ELSE 0 END,
+                     events.event_time,
+                     events.id
+            """,
+            (request_id,),
+        ).fetchall()
+        events: list[Dict[str, Any]] = []
+        for row in event_rows:
+            item = dict(row)
+            for field in ("images_json", "attachments_json"):
+                try:
+                    item[field.removesuffix("_json")] = json.loads(item.get(field) or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    item[field.removesuffix("_json")] = []
+                item.pop(field, None)
+            item["trusted_finance"] = bool(item.get("trusted_finance"))
+            item["active"] = bool(item.get("active"))
+            item["current"] = bool(item.get("is_current"))
+            events.append(item)
+        if events and not any(item.get("current") for item in events):
+            active_ids = [int(item["id"]) for item in events if item.get("active")]
+            current_event_id = active_ids[-1] if active_ids else None
+            for item in events:
+                item["current"] = int(item["id"]) == current_event_id
+        external_source = (row_to_dict(request_row).get("raw_extra") or {}).get("external_source") or {}
+    return {
+        "request_id": request_id,
+        "approval_no": str(request_row["dingding_id"] or "").strip() or None,
+        "lookup_status": external_source.get("lookup_status"),
+        "approval_status": external_source.get("approval_status"),
+        "last_synced_at": max((item.get("synced_at") or "" for item in events), default="") or None,
+        "events": events,
+        "summary": {
+            "total": len(events),
+            "active": sum(1 for item in events if item.get("active")),
+            "applied": sum(1 for item in events if item.get("payment_record_id")),
+            "review_required": sum(
+                1
+                for item in events
+                if item.get("classification") in {"review_required", "source_missing"}
+            ),
         },
     }
 
@@ -3173,12 +3236,38 @@ def import_external_expense_rows(
 @app.post("/api/batches/{batch_id}/external-expenses/sync-metadata")
 def sync_external_expense_metadata(
     batch_id: int,
+    only_if_stale_seconds: int = Query(default=0, ge=0, le=86400),
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
         if batch["status"] != "draft":
-            raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉状态")
+            raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉流程")
+        if only_if_stale_seconds:
+            latest_sync = conn.execute(
+                """
+                SELECT new_value_json, created_at
+                FROM audit_logs
+                WHERE batch_id = ?
+                  AND action = 'external_expenses.metadata_sync'
+                  AND new_value_json LIKE '%"workflow_events"%'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (batch_id,),
+            ).fetchone()
+            if latest_sync:
+                try:
+                    synced_at = datetime.fromisoformat(str(latest_sync["created_at"]))
+                    if datetime.now() - synced_at < timedelta(seconds=only_if_stale_seconds):
+                        previous_summary = json.loads(latest_sync["new_value_json"] or "{}")
+                        return {
+                            "status": "fresh",
+                            "batch_id": batch_id,
+                            **previous_summary,
+                        }
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
         initial_rows = conn.execute(
             """
             SELECT id, dingding_id
@@ -3195,8 +3284,10 @@ def sync_external_expense_metadata(
         if str(row["dingding_id"] or "").strip()
     }
     approval_nos = sorted(set(initial_approval_by_request.values()))
+    request_counts_by_approval = Counter(initial_approval_by_request.values())
     try:
         source_metadata = fetch_external_expense_metadata(approval_nos)
+        source_workflows = fetch_dingtalk_workflows(approval_nos)
     except ExternalExpenseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -3209,8 +3300,21 @@ def sync_external_expense_metadata(
     matched = {approval_no for approval_no, values in metadata_by_approval.items() if len(values) == 1}
     conflicts = {approval_no for approval_no, values in metadata_by_approval.items() if len(values) > 1}
     unmatched = set(approval_nos) - matched - conflicts
+    workflows_by_approval: Dict[str, list[Dict[str, Any]]] = {}
+    for workflow in source_workflows:
+        approval_no = str(workflow.get("approval_no") or "").strip()
+        if approval_no:
+            workflows_by_approval.setdefault(approval_no, []).append(workflow)
+
+    auto_payment_mode = dingtalk_auto_payment_mode()
     timestamp = now_iso()
     updated_requests = 0
+    workflow_events = 0
+    payment_candidates = 0
+    auto_payments = 0
+    review_required = 0
+    already_applied = 0
+    skipped = 0
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         batch = require_batch(conn, batch_id)
@@ -3266,6 +3370,185 @@ def sync_external_expense_metadata(
                 (json.dumps(raw_extra, ensure_ascii=False, default=str), user["id"], timestamp, request_id, batch_id),
             )
             refresh_payment_summaries(conn, request_id)
+
+            conn.execute(
+                "UPDATE dingtalk_workflow_events SET active = 0, synced_at = ?, updated_at = ? WHERE request_id = ?",
+                (timestamp, timestamp, request_id),
+            )
+            request_workflows = workflows_by_approval.get(approval_no, [])
+            if len(request_workflows) == 1:
+                workflow = request_workflows[0]
+                request_amount = round(float(row["amount"] or 0), 2)
+                paid_row = conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) AS total FROM payment_records WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                pending_amount = max(0.0, round(request_amount - float(paid_row["total"] or 0), 2))
+                for event in workflow.get("events") or []:
+                    workflow_events += 1
+                    event_key = str(event.get("event_key") or "")
+                    evidence_reference = f"dingtalk_workflow:{event_key}"
+                    existing_event = conn.execute(
+                        """
+                        SELECT payment_record_id
+                        FROM dingtalk_workflow_events
+                        WHERE request_id = ? AND event_key = ?
+                        """,
+                        (request_id, event_key),
+                    ).fetchone()
+                    existing_payment = conn.execute(
+                        """
+                        SELECT id
+                        FROM payment_records
+                        WHERE request_id = ?
+                          AND source_type = 'dingtalk_workflow'
+                          AND bank_reference = ?
+                        LIMIT 1
+                        """,
+                        (request_id, evidence_reference),
+                    ).fetchone()
+                    linked_payment_id = (
+                        int(existing_payment["id"])
+                        if existing_payment
+                        else int(existing_event["payment_record_id"])
+                        if existing_event and existing_event["payment_record_id"]
+                        else None
+                    )
+                    classification, classification_reason = classify_dingtalk_payment_event(
+                        event,
+                        approval_no=approval_no,
+                        pending_amount=pending_amount,
+                        workflow_status=str(workflow.get("status") or ""),
+                        workflow_result=str(workflow.get("result") or ""),
+                    )
+                    if classification == "eligible" and request_counts_by_approval[approval_no] > 1:
+                        classification = "review_required"
+                        classification_reason = "同一钉钉单号关联多条请款，无法自动分配付款"
+                    if linked_payment_id:
+                        classification = "already_applied"
+                        classification_reason = "该流程证据已生成付款"
+                        already_applied += 1
+                    elif classification == "eligible":
+                        payment_candidates += 1
+                        if pending_amount <= 0 or request_amount <= 0:
+                            classification = "already_applied"
+                            classification_reason = "请款已无待付款金额"
+                            already_applied += 1
+                        elif auto_payment_mode == "apply":
+                            payment_date = str(event.get("event_time") or "")[:10] or None
+                            comment = str(event.get("comment") or "").strip()
+                            linked_payment_id = insert_payment_record_internal(
+                                conn,
+                                request_id,
+                                amount=pending_amount,
+                                payment_date=payment_date,
+                                payer=str(event.get("operator_name") or "").strip() or None,
+                                payment_account=row["payment_account"],
+                                bank_reference=evidence_reference,
+                                remark=(
+                                    f"钉钉流程自动识别｜{event.get('stage_name') or '流程评论'}｜"
+                                    f"{event.get('operator_name') or '未识别人员'}｜{comment[:160]}"
+                                ),
+                                source_type="dingtalk_workflow",
+                                user_id=None,
+                            )
+                            classification = "applied"
+                            classification_reason = "已按当前待付款金额自动生成付款"
+                            auto_payments += 1
+                            write_audit(
+                                conn,
+                                user["id"],
+                                "payment.auto_create_from_dingtalk",
+                                "payment_record",
+                                linked_payment_id,
+                                batch_id=batch_id,
+                                new_value={
+                                    "request_id": request_id,
+                                    "approval_no": approval_no,
+                                    "event_key": event_key,
+                                    "amount": pending_amount,
+                                    "payment_date": payment_date,
+                                    "operator": event.get("operator_name"),
+                                },
+                            )
+                            pending_amount = 0
+                        elif auto_payment_mode == "preview":
+                            classification = "preview_candidate"
+                            classification_reason = "预览模式：核对后切换 apply 可自动生成付款"
+                        else:
+                            classification = "ignored"
+                            classification_reason = "自动付款功能已关闭"
+                            skipped += 1
+                    elif classification == "review_required":
+                        review_required += 1
+                    else:
+                        skipped += 1
+
+                    conn.execute(
+                        """
+                        INSERT INTO dingtalk_workflow_events (
+                            request_id, event_key, process_instance_id, activity_id, event_type,
+                            stage_name, result, operator_id, operator_name, event_time, comment,
+                            images_json, attachments_json, trusted_finance, classification,
+                            classification_reason, payment_record_id, is_current, active, synced_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                        ON CONFLICT(request_id, event_key) DO UPDATE SET
+                            process_instance_id = excluded.process_instance_id,
+                            activity_id = excluded.activity_id,
+                            event_type = excluded.event_type,
+                            stage_name = excluded.stage_name,
+                            result = excluded.result,
+                            operator_id = excluded.operator_id,
+                            operator_name = excluded.operator_name,
+                            event_time = excluded.event_time,
+                            comment = excluded.comment,
+                            images_json = excluded.images_json,
+                            attachments_json = excluded.attachments_json,
+                            trusted_finance = excluded.trusted_finance,
+                            classification = excluded.classification,
+                            classification_reason = excluded.classification_reason,
+                            payment_record_id = COALESCE(excluded.payment_record_id, dingtalk_workflow_events.payment_record_id),
+                            is_current = excluded.is_current,
+                            active = 1,
+                            synced_at = excluded.synced_at,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            request_id,
+                            event_key,
+                            event.get("process_instance_id"),
+                            event.get("activity_id"),
+                            event.get("event_type"),
+                            event.get("stage_name"),
+                            event.get("result"),
+                            event.get("operator_id"),
+                            event.get("operator_name"),
+                            event.get("event_time"),
+                            event.get("comment"),
+                            json.dumps(event.get("images") or [], ensure_ascii=False, default=str),
+                            json.dumps(event.get("attachments") or [], ensure_ascii=False, default=str),
+                            1 if event.get("trusted_finance") else 0,
+                            classification,
+                            classification_reason,
+                            linked_payment_id,
+                            1 if event.get("current") else 0,
+                            timestamp,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+
+            conn.execute(
+                """
+                UPDATE dingtalk_workflow_events
+                SET classification = 'source_missing',
+                    classification_reason = '本次同步未再找到原流程事件，请人工核对',
+                    updated_at = ?
+                WHERE request_id = ? AND active = 0 AND payment_record_id IS NOT NULL
+                """,
+                (timestamp, request_id),
+            )
+            refresh_payment_summaries(conn, request_id)
             updated_requests += 1
 
         summary = {
@@ -3274,6 +3557,13 @@ def sync_external_expense_metadata(
             "unmatched": len(unmatched),
             "conflicts": len(conflicts),
             "updated_requests": updated_requests,
+            "workflow_events": workflow_events,
+            "payment_candidates": payment_candidates,
+            "auto_payments": auto_payments,
+            "review_required": review_required,
+            "already_applied": already_applied,
+            "skipped": skipped,
+            "auto_payment_mode": auto_payment_mode,
         }
         write_audit(
             conn,

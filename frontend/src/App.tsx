@@ -13,6 +13,7 @@ import {
   Image as ImageIcon,
   LogOut,
   MoreHorizontal,
+  MessageSquareText,
   Paperclip,
   Plus,
   RefreshCcw,
@@ -29,6 +30,7 @@ import {
   AttachmentLink,
   AuditLog,
   Batch,
+  DingtalkWorkflow,
   ExternalExpenseImportResult,
   ExternalExpensePreview,
   ExternalExpensePreviewFilter,
@@ -51,7 +53,7 @@ import {
 } from "./api";
 
 type Tab = "workspace" | "archive" | "admin";
-type RequestEditorTab = "request" | "approval" | "payments" | "attachments";
+type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
 type PendingEditorNavigation =
   | { kind: "close" }
   | { kind: "switch"; request: Partial<PaymentRequest>; initialTab: RequestEditorTab };
@@ -488,6 +490,7 @@ function TopbarImportActions({
   const [busyAction, setBusyAction] = useState<"weekly" | "weekly-merge" | "dingtalk" | "sync-metadata" | "rollback" | null>(null);
   const [weeklyInputKey, setWeeklyInputKey] = useState(0);
   const [dingtalkInputKey, setDingtalkInputKey] = useState(0);
+  const silentSyncBatchRef = useRef<number | null>(null);
 
   async function refreshAfterImport(message: string) {
     await reloadBatches();
@@ -568,20 +571,42 @@ function TopbarImportActions({
     }
   }
 
-  async function syncExternalMetadata() {
+  async function syncExternalMetadata(silent = false) {
     if (!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null) return;
-    setMessage("");
-    setBusyAction("sync-metadata");
+    if (!silent) {
+      setMessage("");
+      setBusyAction("sync-metadata");
+    }
     try {
-      await api.syncExternalExpenseMetadata(selectedBatch.id);
+      const result = await api.syncExternalExpenseMetadata(selectedBatch.id, silent ? 300 : 0);
+      if (result.status === "fresh") return;
       await reloadBatches();
       onImported();
+      if (!silent) {
+        const detail = result.auto_payment_mode === "preview"
+          ? `发现 ${result.payment_candidates} 条自动付款候选、${result.review_required} 条待核对`
+          : `新增 ${result.auto_payments} 笔自动付款、${result.review_required} 条待核对`;
+        setMessage(`钉钉流程同步完成：${detail}`);
+        window.setTimeout(() => setMessage(""), 3000);
+      }
     } catch (err) {
-      setMessage((err as Error).message);
+      if (!silent) setMessage((err as Error).message);
     } finally {
-      setBusyAction(null);
+      if (!silent) setBusyAction(null);
     }
   }
+
+  useEffect(() => {
+    if (
+      !selectedBatch
+      || selectedBatch.status !== "draft"
+      || hasUnsavedChanges
+      || busyAction !== null
+      || silentSyncBatchRef.current === selectedBatch.id
+    ) return;
+    silentSyncBatchRef.current = selectedBatch.id;
+    void syncExternalMetadata(true);
+  }, [selectedBatch?.id, selectedBatch?.status, hasUnsavedChanges]);
 
   return (
     <>
@@ -653,12 +678,12 @@ function TopbarImportActions({
             <button
               className="ghost-button compact-import-button"
               type="button"
-              onClick={syncExternalMetadata}
+              onClick={() => void syncExternalMetadata(false)}
               disabled={!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
-              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能同步草稿批次" : "按钉钉单号刷新审批状态、申请人和部门"}
+              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能同步草稿批次" : "刷新审批状态、流程评论和可信付款证据"}
             >
               <RefreshCcw size={15} />
-              {busyAction === "sync-metadata" ? "同步中" : "同步钉钉状态"}
+              {busyAction === "sync-metadata" ? "同步中" : "同步钉钉流程"}
             </button>
           </div>
           <div className="topbar-import-group rollback-import-group">
@@ -2852,6 +2877,9 @@ function RequestEditor({
   const [form, setForm] = useState<Partial<PaymentRequest>>(request);
   const [activeTab, setActiveTab] = useState<RequestEditorTab>(initialTab);
   const [attachments, setAttachments] = useState<AttachmentLink[]>([]);
+  const [workflow, setWorkflow] = useState<DingtalkWorkflow | null>(null);
+  const [workflowLoading, setWorkflowLoading] = useState(false);
+  const [workflowError, setWorkflowError] = useState("");
   const [attachmentForm, setAttachmentForm] = useState({ label: "", url_path: "" });
   const [imageLabel, setImageLabel] = useState("");
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -2894,6 +2922,8 @@ function RequestEditor({
   useEffect(() => {
     setForm(request);
     setAttachments([]);
+    setWorkflow(null);
+    setWorkflowError("");
     setAttachmentForm({ label: "", url_path: "" });
     setImageLabel("");
     setImageFile(null);
@@ -2903,7 +2933,7 @@ function RequestEditor({
   }, [request]);
 
   useEffect(() => {
-    setActiveTab(!request.id && (initialTab === "payments" || initialTab === "attachments") ? "request" : initialTab);
+    setActiveTab(!request.id && (initialTab === "payments" || initialTab === "workflow" || initialTab === "attachments") ? "request" : initialTab);
   }, [initialTab, request.id]);
 
   useEffect(() => {
@@ -2929,6 +2959,19 @@ function RequestEditor({
     }
     api.attachments(batch.id, request.id).then((res) => setAttachments(res.attachments)).catch(() => setAttachments([]));
   }, [batch.id, request.id]);
+
+  useEffect(() => {
+    if (!request.id || activeTab !== "workflow") return;
+    setWorkflowLoading(true);
+    setWorkflowError("");
+    api.dingtalkWorkflow(batch.id, request.id)
+      .then(setWorkflow)
+      .catch((error) => {
+        setWorkflow(null);
+        setWorkflowError((error as Error).message);
+      })
+      .finally(() => setWorkflowLoading(false));
+  }, [activeTab, batch.id, request.id]);
 
   useEffect(() => {
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -3044,6 +3087,7 @@ function RequestEditor({
     { key: "request", label: "请款信息" },
     { key: "approval", label: "审批信息" },
     { key: "payments", label: `付款明细 ${Number(form.payment_count || 0)}`, disabled: !form.id },
+    { key: "workflow", label: `钉钉流程 ${workflow?.summary.total ?? 0}`, disabled: !form.id },
     { key: "attachments", label: `附件 ${attachments.length}`, disabled: !form.id },
   ];
 
@@ -3159,6 +3203,83 @@ function RequestEditor({
             />
           </div>
         )}
+        {activeTab === "workflow" && form.id && (
+          <div className="editor-tab-panel">
+            <section className="editor-form-section dingtalk-workflow-panel">
+              <div className="editor-section-head workflow-section-head">
+                <div>
+                  <h3>钉钉审批流程</h3>
+                  <p>展示最近一次同步缓存；普通搜索、筛选和切换 Sheet 不会访问钉钉数据库</p>
+                </div>
+                {workflow?.last_synced_at && <small>同步于 {formatDateTime(workflow.last_synced_at)}</small>}
+              </div>
+              {workflowLoading && <div className="workflow-empty-state">正在读取本地流程缓存…</div>}
+              {!workflowLoading && workflowError && <div className="error-text">{workflowError}</div>}
+              {!workflowLoading && !workflowError && !form.dingding_id && (
+                <div className="workflow-empty-state">该请款尚未填写钉钉申请单号。</div>
+              )}
+              {!workflowLoading && !workflowError && form.dingding_id && workflow?.lookup_status === "conflict" && (
+                <div className="workflow-empty-state warning">同一钉钉单号存在多个来源，暂不展示错误的流程信息。</div>
+              )}
+              {!workflowLoading && !workflowError && form.dingding_id && workflow?.lookup_status === "unmatched" && workflow.events.length === 0 && (
+                <div className="workflow-empty-state">未在钉钉中间库匹配到该申请单号。</div>
+              )}
+              {!workflowLoading && !workflowError && form.dingding_id && workflow && workflow.events.length === 0 && workflow.lookup_status !== "unmatched" && workflow.lookup_status !== "conflict" && (
+                <div className="workflow-empty-state">尚无已缓存的流程记录，请点击“同步钉钉流程”。</div>
+              )}
+              {!!workflow?.events.length && (
+                <div className="workflow-timeline">
+                  {workflow.events.map((event) => {
+                    const mediaCount = event.images.length + event.attachments.length;
+                    const paymentApplied = Boolean(event.payment_record_id);
+                    const needsReview = event.classification === "review_required" || event.classification === "source_missing";
+                    const previewCandidate = event.classification === "preview_candidate";
+                    return (
+                      <article className={`workflow-event ${event.current ? "current" : ""} ${!event.active ? "inactive" : ""}`} key={event.id}>
+                        <div className="workflow-event-marker" aria-hidden="true" />
+                        <div className="workflow-event-card">
+                          <header>
+                            <div>
+                              <strong>{event.stage_name || "流程操作"}</strong>
+                              {event.current && <span className="workflow-state-badge current">当前节点</span>}
+                              {event.result && <span className={`workflow-state-badge ${event.result.toLowerCase()}`}>{workflowResultLabel(event.result)}</span>}
+                            </div>
+                            <time>{event.event_time ? formatDateTime(event.event_time) : "时间未知"}</time>
+                          </header>
+                          <div className="workflow-operator">
+                            <span>{event.operator_name || "未识别人员"}</span>
+                            {event.trusted_finance && <span className="workflow-finance-badge">可信财务节点</span>}
+                          </div>
+                          {event.comment && <p className="workflow-comment"><MessageSquareText size={15} />{event.comment}</p>}
+                          {mediaCount > 0 && <p className="workflow-media-note">包含 {event.images.length} 张图片、{event.attachments.length} 个附件</p>}
+                          {(paymentApplied || needsReview || previewCandidate) && (
+                            <div className={`workflow-decision ${paymentApplied ? "applied" : needsReview ? "review" : "preview"}`}>
+                              <div>
+                                <strong>
+                                  {paymentApplied
+                                    ? `已生成付款 ${formatMoney(Number(event.payment_amount || 0))}`
+                                    : needsReview
+                                      ? "付款待核对"
+                                      : "自动付款候选"}
+                                </strong>
+                                <span>{event.classification_reason}</span>
+                              </div>
+                              {needsReview && (
+                                <button className="ghost-button" type="button" onClick={() => setActiveTab("payments")}>
+                                  去付款明细
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
         {activeTab === "attachments" && form.id && (
           <div className="editor-tab-panel">
             <section className="editor-form-section attachment-manager">
@@ -3228,7 +3349,7 @@ function RequestEditor({
         <div className="request-editor-actions">
           <div className={isDirty ? "editor-save-state dirty" : "editor-save-state"}>
             <strong>{isDirty ? "有未保存修改" : "已保存"}</strong>
-            <span>{activeTab === "payments" || activeTab === "attachments" ? "付款和附件保存后立即生效" : "保存请款后继续留在当前抽屉"}</span>
+            <span>{activeTab === "payments" || activeTab === "workflow" || activeTab === "attachments" ? "付款、流程和附件单独同步生效" : "保存请款后继续留在当前抽屉"}</span>
           </div>
           <div>
             <button className="ghost-button" type="button" onClick={discardRequestChanges} disabled={!isDirty || saving}>放弃修改</button>
@@ -3738,7 +3859,8 @@ function ArchiveView({
 
 function auditActionLabel(action: string) {
   const labels: Record<string, string> = {
-    "external_expenses.metadata_sync": "同步钉钉状态",
+    "external_expenses.metadata_sync": "同步钉钉流程",
+    "payment.auto_create_from_dingtalk": "钉钉流程自动生成付款",
   };
   return labels[action] || action;
 }
@@ -3750,8 +3872,16 @@ function auditDetail(log: AuditLog) {
     unmatched: number;
     conflicts: number;
     updated_requests: number;
+    workflow_events: number;
+    payment_candidates: number;
+    auto_payments: number;
+    review_required: number;
+    auto_payment_mode: string;
   }>;
-  return `匹配 ${Number(value.matched || 0)} 个单号，未匹配 ${Number(value.unmatched || 0)} 个，来源冲突 ${Number(value.conflicts || 0)} 个，更新 ${Number(value.updated_requests || 0)} 条请款`;
+  const paymentText = value.auto_payment_mode === "preview"
+    ? `候选付款 ${Number(value.payment_candidates || 0)} 笔`
+    : `自动付款 ${Number(value.auto_payments || 0)} 笔`;
+  return `匹配 ${Number(value.matched || 0)} 个单号，未匹配 ${Number(value.unmatched || 0)} 个，来源冲突 ${Number(value.conflicts || 0)} 个，流程事件 ${Number(value.workflow_events || 0)} 条，${paymentText}，待核对 ${Number(value.review_required || 0)} 条，更新 ${Number(value.updated_requests || 0)} 条请款`;
 }
 
 function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
@@ -4044,6 +4174,7 @@ function paymentSourceLabel(sourceType: string) {
     snapshot_legacy: "历史快照",
     excel_summary: "Excel 汇总导入",
     excel_detail: "Excel 明细导入",
+    dingtalk_workflow: "钉钉流程自动识别",
   };
   return labels[sourceType] || sourceType || "系统记录";
 }
@@ -4222,7 +4353,7 @@ function ExternalApprovalBadge({
   const title = syncedAt
     ? `最近同步：${formatDateTime(syncedAt)}`
     : snapshot
-      ? "钉钉审批状态为导入时快照，可点击“同步钉钉状态”刷新"
+      ? "钉钉审批状态为导入时快照，可点击“同步钉钉流程”刷新"
       : undefined;
   return (
     <span className={`external-approval-badge ${state}`} title={title}>
@@ -4270,6 +4401,15 @@ function formatMoney(value: number) {
 function formatDateTime(value: string) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function workflowResultLabel(value: string) {
+  const normalized = String(value || "").toUpperCase();
+  return {
+    AGREE: "同意",
+    REFUSE: "拒绝",
+    NONE: "处理",
+  }[normalized] || value;
 }
 
 function formatDateRange(start?: string, end?: string) {

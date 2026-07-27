@@ -167,6 +167,60 @@ export type ExternalMetadataSyncResult = {
   unmatched: number;
   conflicts: number;
   updated_requests: number;
+  workflow_events: number;
+  payment_candidates: number;
+  auto_payments: number;
+  review_required: number;
+  already_applied: number;
+  skipped: number;
+  auto_payment_mode: "off" | "preview" | "apply" | string;
+};
+
+export type DingtalkWorkflowEvent = {
+  id: number;
+  event_key: string;
+  process_instance_id?: string;
+  activity_id?: string;
+  event_type?: string;
+  stage_name?: string;
+  result?: string;
+  operator_id?: string;
+  operator_name?: string;
+  event_time?: string;
+  comment?: string;
+  images: unknown[];
+  attachments: unknown[];
+  trusted_finance: boolean;
+  classification:
+    | "ignored"
+    | "preview_candidate"
+    | "review_required"
+    | "applied"
+    | "already_applied"
+    | "source_missing"
+    | string;
+  classification_reason?: string;
+  payment_record_id?: number;
+  payment_amount?: number;
+  payment_date?: string;
+  active: boolean;
+  current: boolean;
+  synced_at?: string;
+};
+
+export type DingtalkWorkflow = {
+  request_id: number;
+  approval_no?: string;
+  lookup_status?: "matched" | "unmatched" | "conflict" | string;
+  approval_status?: string;
+  last_synced_at?: string;
+  events: DingtalkWorkflowEvent[];
+  summary: {
+    total: number;
+    active: number;
+    applied: number;
+    review_required: number;
+  };
 };
 
 export type WeeklyMergeCandidate = {
@@ -507,10 +561,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ items }),
     }),
-  syncExternalExpenseMetadata: (batchId: number) =>
-    request<ExternalMetadataSyncResult>(`/api/batches/${batchId}/external-expenses/sync-metadata`, {
+  syncExternalExpenseMetadata: (batchId: number, onlyIfStaleSeconds = 0) =>
+    request<ExternalMetadataSyncResult>(`/api/batches/${batchId}/external-expenses/sync-metadata?only_if_stale_seconds=${onlyIfStaleSeconds}`, {
       method: "POST",
     }),
+  dingtalkWorkflow: (batchId: number, requestId: number) =>
+    request<DingtalkWorkflow>(`/api/batches/${batchId}/requests/${requestId}/dingtalk-workflow`),
   rollbackLatestImport: (batchId: number) =>
     request<{
       status: string;
