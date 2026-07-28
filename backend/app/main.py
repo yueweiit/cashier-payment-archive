@@ -193,6 +193,7 @@ class UserIn(BaseModel):
     role: str
     display_name: str
     active: bool = True
+    sheet_permissions: list[str] = Field(default_factory=list)
 
 
 class UserPatch(BaseModel):
@@ -200,6 +201,7 @@ class UserPatch(BaseModel):
     role: Optional[str] = None
     display_name: Optional[str] = None
     active: Optional[bool] = None
+    sheet_permissions: Optional[list[str]] = None
 
 
 class DictionaryIn(BaseModel):
@@ -319,14 +321,85 @@ REQUEST_WRITE_FIELDS = {
 }
 
 
-def user_public(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+def normalize_sheet_permission(value: Any) -> str:
+    return str(value or "").strip() or "未分 Sheet"
+
+
+def normalize_sheet_permissions(values: list[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        name = normalize_sheet_permission(value)
+        if name == "全部" or len(name) > 200 or name in seen:
+            continue
+        result.append(name)
+        seen.add(name)
+    if len(result) > 200:
+        raise HTTPException(status_code=400, detail="Sheet 权限数量不能超过 200 个")
+    return result
+
+
+def load_user_sheet_permissions(conn, user_id: int) -> list[str]:
+    return [
+        str(row["sheet_name"])
+        for row in conn.execute(
+            "SELECT sheet_name FROM user_sheet_permissions WHERE user_id = ? ORDER BY sheet_name",
+            (user_id,),
+        ).fetchall()
+    ]
+
+
+def replace_user_sheet_permissions(
+    conn,
+    user_id: int,
+    sheet_permissions: list[Any],
+    actor_id: int,
+) -> list[str]:
+    normalized = normalize_sheet_permissions(sheet_permissions)
+    conn.execute("DELETE FROM user_sheet_permissions WHERE user_id = ?", (user_id,))
+    timestamp = now_iso()
+    conn.executemany(
+        """
+        INSERT INTO user_sheet_permissions (user_id, sheet_name, created_by, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [(user_id, sheet_name, actor_id, timestamp) for sheet_name in normalized],
+    )
+    return normalized
+
+
+def user_public(
+    row: Dict[str, Any],
+    sheet_permissions: Optional[list[str]] = None,
+) -> Dict[str, Any]:
+    public = {
         "id": row["id"],
         "username": row["username"],
         "role": row["role"],
         "display_name": row["display_name"],
         "active": bool(row["active"]),
     }
+    if sheet_permissions is not None:
+        public["sheet_permissions"] = list(sheet_permissions)
+    return public
+
+
+def user_public_with_permissions(conn, row: Dict[str, Any]) -> Dict[str, Any]:
+    data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    return user_public(data, load_user_sheet_permissions(conn, int(data["id"])))
+
+
+def available_sheet_names(conn) -> list[str]:
+    return [
+        str(row["sheet_name"])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name
+            FROM payment_requests
+            ORDER BY sheet_name
+            """
+        ).fetchall()
+    ]
 
 
 def attachment_public(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -390,6 +463,75 @@ def current_user(request: Request) -> Dict[str, Any]:
     if not row:
         raise HTTPException(status_code=401, detail="登录已失效")
     return row_to_dict(row)
+
+
+def user_has_restricted_sheet_access(user: Dict[str, Any]) -> bool:
+    return user["role"] == ROLE_BUSINESS
+
+
+def sheet_access_filter(
+    conn,
+    user: Dict[str, Any],
+    column: str = "source_sheet",
+) -> tuple[str, list[Any]]:
+    if not user_has_restricted_sheet_access(user):
+        return "1 = 1", []
+    allowed = load_user_sheet_permissions(conn, int(user["id"]))
+    if not allowed:
+        return "0 = 1", []
+    placeholders = ", ".join("?" for _ in allowed)
+    return (
+        f"COALESCE(NULLIF(TRIM({column}), ''), '未分 Sheet') IN ({placeholders})",
+        allowed,
+    )
+
+
+def ensure_sheet_access(
+    conn,
+    user: Dict[str, Any],
+    source_sheet: Any,
+) -> None:
+    if not user_has_restricted_sheet_access(user):
+        return
+    allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
+    if normalize_sheet_permission(source_sheet) not in allowed:
+        raise HTTPException(status_code=403, detail="无权访问该 Sheet")
+
+
+def ensure_request_access(
+    conn,
+    user: Dict[str, Any],
+    request_row,
+) -> None:
+    ensure_sheet_access(conn, user, request_row["source_sheet"])
+
+
+def require_accessible_request(
+    conn,
+    batch_id: int,
+    request_id: int,
+    user: Dict[str, Any],
+):
+    row = require_request(conn, batch_id, request_id)
+    ensure_request_access(conn, user, row)
+    return row
+
+
+def batch_public_for_user(
+    conn,
+    row,
+    user: Dict[str, Any],
+) -> Dict[str, Any]:
+    data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    if not user_has_restricted_sheet_access(user):
+        return data
+    allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
+    data["sheet_order"] = [
+        sheet_name
+        for sheet_name in data.get("sheet_order", [])
+        if normalize_sheet_permission(sheet_name) in allowed
+    ]
+    return data
 
 
 def require_roles(*roles: str):
@@ -527,8 +669,9 @@ def login(payload: LoginIn, response: Response) -> Dict[str, Any]:
             (token, row["id"], now_iso()),
         )
         write_audit(conn, row["id"], "auth.login", "user", row["id"], new_value={"username": row["username"]})
+        public_user = user_public_with_permissions(conn, row)
     response.set_cookie("session", token, httponly=True, samesite="lax", max_age=60 * 60 * 12)
-    return {"user": user_public(row_to_dict(row))}
+    return {"user": public_user}
 
 
 @app.post("/api/auth/logout")
@@ -543,7 +686,8 @@ def logout(request: Request, response: Response) -> Dict[str, str]:
 
 @app.get("/api/me")
 def me(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
-    return {"user": user_public(user)}
+    with connect() as conn:
+        return {"user": user_public_with_permissions(conn, user)}
 
 
 @app.post("/api/auth/change-password")
@@ -601,23 +745,29 @@ def change_password(
 @app.get("/api/batches")
 def list_batches(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
     with connect() as conn:
+        access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
         rows = conn.execute(
-            """
+            f"""
             SELECT b.*, COUNT(p.id) AS request_count,
                    COALESCE(SUM(p.amount), 0) AS total_amount,
                    COALESCE(SUM(p.paid_amount), 0) AS total_paid_amount,
                    COALESCE(SUM(p.pending_amount), 0) AS total_pending_amount
             FROM request_batches b
-            LEFT JOIN payment_requests p ON p.batch_id = b.id
+            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql}
             GROUP BY b.id
             ORDER BY COALESCE(b.end_date, b.created_at) DESC, b.id DESC
-            """
+            """,
+            access_params,
         ).fetchall()
-    return {"batches": rows_to_dicts(rows)}
+        batches = [batch_public_for_user(conn, row, user) for row in rows]
+    return {"batches": batches}
 
 
 @app.post("/api/batches")
-def create_batch(payload: BatchIn, user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES))) -> Dict[str, Any]:
+def create_batch(
+    payload: BatchIn,
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
     timestamp = now_iso()
     with connect() as conn:
         cursor = conn.execute(
@@ -638,7 +788,7 @@ def create_batch(payload: BatchIn, user: Dict[str, Any] = Depends(require_roles(
 def rollover_batch(
     source_batch_id: int,
     payload: RolloverIn,
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     if not payload.name.strip():
         raise HTTPException(status_code=400, detail="新批次名称不能为空")
@@ -732,41 +882,44 @@ def rollover_batch(
 @app.get("/api/batches/{batch_id}")
 def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
     with connect() as conn:
+        access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
         row = conn.execute(
-            """
+            f"""
             SELECT b.*, COUNT(p.id) AS request_count,
                    COALESCE(SUM(p.amount), 0) AS total_amount,
                    COALESCE(SUM(p.paid_amount), 0) AS total_paid_amount,
                    COALESCE(SUM(p.pending_amount), 0) AS total_pending_amount
             FROM request_batches b
-            LEFT JOIN payment_requests p ON p.batch_id = b.id
+            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql}
             WHERE b.id = ?
             GROUP BY b.id
             """,
-            (batch_id,),
+            [*access_params, batch_id],
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="批次不存在")
+        stats_access_sql, stats_access_params = sheet_access_filter(conn, user, "source_sheet")
         stats = conn.execute(
-            """
+            f"""
             SELECT payment_account, invoice_status, project, COUNT(*) AS count,
                    COALESCE(SUM(amount), 0) AS amount,
                    COALESCE(SUM(paid_amount), 0) AS paid_amount,
                    COALESCE(SUM(pending_amount), 0) AS pending_amount
             FROM payment_requests
-            WHERE batch_id = ?
+            WHERE batch_id = ? AND {stats_access_sql}
             GROUP BY payment_account, invoice_status, project
             """,
-            (batch_id,),
+            [batch_id, *stats_access_params],
         ).fetchall()
-    return {"batch": row_to_dict(row), "stats": rows_to_dicts(stats)}
+        public_batch = batch_public_for_user(conn, row, user)
+    return {"batch": public_batch, "stats": rows_to_dicts(stats)}
 
 
 @app.put("/api/batches/{batch_id}/sheet-order")
 def update_batch_sheet_order(
     batch_id: int,
     payload: SheetOrderIn,
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     requested_order: list[str] = []
     seen: set[str] = set()
@@ -1039,6 +1192,9 @@ def list_requests(
     )
     with connect() as conn:
         require_batch(conn, batch_id)
+        access_sql, access_params = sheet_access_filter(conn, user)
+        conditions.append(access_sql)
+        params.extend(access_params)
         rows = conn.execute(
             f"""
             SELECT payment_requests.*,
@@ -1072,6 +1228,7 @@ def create_request(
         batch = require_batch(conn, batch_id)
         ensure_editable(batch, user)
         data = payload.dict(exclude_unset=True)
+        ensure_sheet_access(conn, user, data.get("source_sheet"))
         reject_direct_payment_summary_changes(data, creating=True)
         request_id = insert_request(conn, batch_id, data, user["id"], user["role"], create_summary_payment=False)
         row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
@@ -1093,6 +1250,7 @@ def bulk_save_requests(
         updated: list[int] = []
         deleted: list[int] = []
         for item in payload.creates:
+            ensure_sheet_access(conn, user, item.get("source_sheet"))
             reject_direct_payment_summary_changes(item, creating=True)
             request_id = insert_request(conn, batch_id, item, user["id"], user["role"], create_summary_payment=False)
             row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
@@ -1112,8 +1270,10 @@ def bulk_save_requests(
             request_id = item.get("id")
             if not request_id:
                 raise HTTPException(status_code=400, detail="批量更新缺少记录 id")
-            old_row = require_request(conn, batch_id, int(request_id))
+            old_row = require_accessible_request(conn, batch_id, int(request_id), user)
             changes = {key: value for key, value in item.items() if key != "id"}
+            if "source_sheet" in changes:
+                ensure_sheet_access(conn, user, changes.get("source_sheet"))
             if not changes:
                 continue
             if not update_request_row(conn, int(request_id), changes, user["id"], user["role"]):
@@ -1133,7 +1293,7 @@ def bulk_save_requests(
             )
             updated.append(int(request_id))
         for request_id in payload.deletes:
-            old_row = require_request(conn, batch_id, int(request_id))
+            old_row = require_accessible_request(conn, batch_id, int(request_id), user)
             ensure_can_delete_request_with_payments(conn, int(request_id), user)
             file_paths = request_owned_file_paths(conn, [int(request_id)])
             conn.execute("DELETE FROM payment_requests WHERE id = ?", (request_id,))
@@ -1171,15 +1331,15 @@ def update_request(
 ) -> Dict[str, Any]:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
-        old_row = conn.execute("SELECT * FROM payment_requests WHERE id = ? AND batch_id = ?", (request_id, batch_id)).fetchone()
-        if not old_row:
-            raise HTTPException(status_code=404, detail="请款记录不存在")
+        old_row = require_accessible_request(conn, batch_id, request_id, user)
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理更正")
         if batch["status"] == "archived" and not payload.reason:
             raise HTTPException(status_code=400, detail="归档后更正必须填写原因")
         data = payload.dict(exclude_unset=True)
         reason = data.pop("reason", None)
+        if "source_sheet" in data:
+            ensure_sheet_access(conn, user, data.get("source_sheet"))
         changed = update_request_row(conn, request_id, data, user["id"], user["role"])
         new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         if changed:
@@ -1206,9 +1366,7 @@ def delete_request(
 ) -> Dict[str, str]:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
-        old_row = conn.execute("SELECT * FROM payment_requests WHERE id = ? AND batch_id = ?", (request_id, batch_id)).fetchone()
-        if not old_row:
-            raise HTTPException(status_code=404, detail="请款记录不存在")
+        old_row = require_accessible_request(conn, batch_id, request_id, user)
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理更正")
         if batch["status"] == "archived" and not reason.strip():
@@ -1240,7 +1398,7 @@ def list_request_payments(
 ) -> Dict[str, Any]:
     with connect() as conn:
         require_batch(conn, batch_id)
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         refresh_payment_summaries(conn, request_id)
         request_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         payments = payment_records_public(conn, request_id)
@@ -1266,7 +1424,7 @@ def get_request_dingtalk_workflow(
 ) -> Dict[str, Any]:
     with connect() as conn:
         require_batch(conn, batch_id)
-        request_row = require_request(conn, batch_id, request_id)
+        request_row = require_accessible_request(conn, batch_id, request_id, user)
         event_rows = conn.execute(
             """
             SELECT events.*, payments.amount AS payment_amount, payments.payment_date
@@ -1330,7 +1488,7 @@ def create_request_payment(
         conn.execute("BEGIN IMMEDIATE")
         batch = require_batch(conn, batch_id)
         ensure_can_manage_payments(batch, user, payload.reason)
-        request_row = require_request(conn, batch_id, request_id)
+        request_row = require_accessible_request(conn, batch_id, request_id, user)
         payment_id = insert_payment_record_internal(
             conn,
             request_id,
@@ -1380,7 +1538,7 @@ def update_request_payment(
         data = payload.dict(exclude_unset=True)
         reason = data.pop("reason", None)
         ensure_can_manage_payments(batch, user, reason)
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         old = require_payment_record(conn, request_id, payment_id)
         if payment_record_is_inherited(row_to_dict(old)):
             raise HTTPException(status_code=400, detail="结转继承的付款明细只读")
@@ -1459,7 +1617,7 @@ def delete_request_payment(
         conn.execute("BEGIN IMMEDIATE")
         batch = require_batch(conn, batch_id)
         ensure_can_manage_payments(batch, user, reason)
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         old = require_payment_record(conn, request_id, payment_id)
         if payment_record_is_inherited(row_to_dict(old)):
             raise HTTPException(status_code=400, detail="结转继承的付款明细只读")
@@ -1495,7 +1653,7 @@ async def upload_payment_voucher(
     with connect() as conn:
         batch = require_batch(conn, batch_id)
         ensure_can_manage_payments(batch, user, reason)
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         payment = require_payment_record(conn, request_id, payment_id)
         if payment_record_is_inherited(row_to_dict(payment)):
             raise HTTPException(status_code=400, detail="结转继承的付款凭证只读")
@@ -1535,7 +1693,18 @@ async def upload_payment_voucher(
 @app.get("/api/payment-vouchers/{voucher_id}/file")
 def get_payment_voucher_file(voucher_id: int, user: Dict[str, Any] = Depends(current_user)) -> FileResponse:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM payment_vouchers WHERE id = ?", (voucher_id,)).fetchone()
+        row = conn.execute(
+            """
+            SELECT payment_vouchers.*, payment_requests.source_sheet
+            FROM payment_vouchers
+            JOIN payment_records ON payment_records.id = payment_vouchers.payment_id
+            JOIN payment_requests ON payment_requests.id = payment_records.request_id
+            WHERE payment_vouchers.id = ?
+            """,
+            (voucher_id,),
+        ).fetchone()
+        if row:
+            ensure_sheet_access(conn, user, row["source_sheet"])
     if not row:
         raise HTTPException(status_code=404, detail="付款凭证不存在")
     path = resolve_data_file(row["file_path"])
@@ -1561,7 +1730,7 @@ def delete_payment_voucher(
     with connect() as conn:
         batch = require_batch(conn, batch_id)
         ensure_can_manage_payments(batch, user, reason)
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         payment = require_payment_record(conn, request_id, payment_id)
         if payment_record_is_inherited(row_to_dict(payment)):
             raise HTTPException(status_code=400, detail="结转继承的付款凭证只读")
@@ -1587,14 +1756,15 @@ def delete_payment_voucher(
 def list_batch_attachments(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
     with connect() as conn:
         require_batch(conn, batch_id)
+        access_sql, access_params = sheet_access_filter(conn, user, "payment_requests.source_sheet")
         rows = conn.execute(
-            """
+            f"""
             SELECT attachment_links.* FROM attachment_links
             JOIN payment_requests ON payment_requests.id = attachment_links.request_id
-            WHERE payment_requests.batch_id = ?
+            WHERE payment_requests.batch_id = ? AND {access_sql}
             ORDER BY payment_requests.id, attachment_links.id
             """,
-            (batch_id,),
+            [batch_id, *access_params],
         ).fetchall()
     return {"attachments": attachments_public(rows)}
 
@@ -1607,7 +1777,7 @@ def list_attachments(
 ) -> Dict[str, Any]:
     with connect() as conn:
         require_batch(conn, batch_id)
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         rows = conn.execute(
             "SELECT * FROM attachment_links WHERE request_id = ? ORDER BY id",
             (request_id,),
@@ -1627,7 +1797,7 @@ def create_attachment(
     with connect() as conn:
         batch = require_batch(conn, batch_id)
         ensure_editable(batch, user)
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         cursor = conn.execute(
             """
             INSERT INTO attachment_links (request_id, label, url_path, created_by, created_at)
@@ -1652,7 +1822,7 @@ async def upload_image_attachment(
     with connect() as conn:
         batch = require_batch(conn, batch_id)
         ensure_bulk_editable(batch, user, reason)
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         saved_path, relative_path, file_size = await save_image_upload(file, batch_id)
         cursor = conn.execute(
             """
@@ -1702,7 +1872,7 @@ def delete_attachment(
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理更正")
         if batch["status"] == "archived" and not reason.strip():
             raise HTTPException(status_code=400, detail="归档后删除附件必须填写原因")
-        require_request(conn, batch_id, request_id)
+        require_accessible_request(conn, batch_id, request_id, user)
         old = conn.execute(
             "SELECT * FROM attachment_links WHERE id = ? AND request_id = ?",
             (attachment_id, request_id),
@@ -1720,7 +1890,17 @@ def delete_attachment(
 @app.get("/api/attachments/{attachment_id}/file")
 def get_attachment_file(attachment_id: int, user: Dict[str, Any] = Depends(current_user)) -> FileResponse:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM attachment_links WHERE id = ?", (attachment_id,)).fetchone()
+        row = conn.execute(
+            """
+            SELECT attachment_links.*, payment_requests.source_sheet
+            FROM attachment_links
+            JOIN payment_requests ON payment_requests.id = attachment_links.request_id
+            WHERE attachment_links.id = ?
+            """,
+            (attachment_id,),
+        ).fetchone()
+        if row:
+            ensure_sheet_access(conn, user, row["source_sheet"])
     if not row:
         raise HTTPException(status_code=404, detail="附件不存在")
     attachment = row_to_dict(row)
@@ -2363,7 +2543,7 @@ def cleanup_expired_weekly_merge_jobs(conn) -> None:
 async def preview_weekly_excel_merge(
     file: UploadFile = File(...),
     batch_id: int = Form(...),
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     try:
@@ -2529,7 +2709,7 @@ def request_payment_signature(conn, request_id: int) -> str:
 def apply_weekly_excel_merge(
     job_id: int,
     payload: WeeklyMergeApplyIn,
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     resolutions = {
         item.row_id: {"action": item.action, "request_id": item.request_id}
@@ -2881,7 +3061,7 @@ def apply_weekly_excel_merge(
 async def import_weekly_excel(
     file: UploadFile = File(...),
     batch_id: Optional[int] = Form(None),
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     rows, meta = parse_weekly_excel(saved_path)
@@ -2968,7 +3148,7 @@ async def import_dingtalk(
     file: UploadFile = File(...),
     batch_id: Optional[int] = Form(None),
     mapping_json: Optional[str] = Form(None),
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     if not mapping_json:
@@ -3027,7 +3207,7 @@ async def import_dingtalk(
 @app.post("/api/external-expenses/preview")
 def preview_external_expense_rows(
     payload: ExternalExpensePreviewIn,
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     date_from, date_to = validate_external_expense_filter(payload)
     with connect() as conn:
@@ -3101,7 +3281,7 @@ def preview_external_expense_rows(
 def import_external_expense_rows(
     batch_id: int,
     payload: ExternalExpenseImportIn,
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     if not payload.items:
         raise HTTPException(status_code=400, detail="请至少选择一条来源记录")
@@ -3248,7 +3428,7 @@ def import_external_expense_rows(
 def sync_external_expense_metadata(
     batch_id: int,
     only_if_stale_seconds: int = Query(default=0, ge=0, le=86400),
-    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
@@ -3746,7 +3926,10 @@ def sync_external_expense_metadata(
 
 
 @app.get("/api/import-jobs/{job_id}")
-def get_import_job(job_id: int, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+def get_import_job(
+    job_id: int,
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
         row = conn.execute("SELECT * FROM import_jobs WHERE id = ?", (job_id,)).fetchone()
         if not row:
@@ -4085,6 +4268,9 @@ def export_batch(
             )
         else:
             conditions, params = ["batch_id = ?"], [batch_id]
+        access_sql, access_params = sheet_access_filter(conn, user)
+        conditions.append(access_sql)
+        params.extend(access_params)
         records = rows_to_dicts(
             conn.execute(
                 f"""
@@ -4150,7 +4336,7 @@ def export_batch(
             vouchers_by_payment.setdefault(int(voucher["payment_id"]), []).append(voucher)
         for payment in payments:
             payment["vouchers"] = vouchers_by_payment.get(int(payment["id"]), [])
-        content = export_workbook(row_to_dict(batch), records, attachments, payments)
+        content = export_workbook(batch_public_for_user(conn, batch, user), records, attachments, payments)
     suffix = "_筛选结果" if filtered else ""
     filename = f"{batch['name']}{suffix}.xlsx".replace("/", "_")
     return StreamingResponse(
@@ -4161,7 +4347,10 @@ def export_batch(
 
 
 @app.get("/api/batches/{batch_id}/audit")
-def list_audit(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+def list_audit(
+    batch_id: int,
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
         rows = conn.execute(
             """
@@ -4181,7 +4370,9 @@ def list_audit(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> D
 def list_users(user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
     with connect() as conn:
         rows = conn.execute("SELECT * FROM users WHERE deleted_at IS NULL ORDER BY id").fetchall()
-    return {"users": [user_public(row_to_dict(row)) for row in rows]}
+        public_users = [user_public_with_permissions(conn, row) for row in rows]
+        sheets = available_sheet_names(conn)
+    return {"users": public_users, "available_sheets": sheets}
 
 
 @app.post("/api/admin/users")
@@ -4202,41 +4393,53 @@ def create_user(payload: UserIn, user: Dict[str, Any] = Depends(require_roles(*G
             if "UNIQUE" in str(exc).upper():
                 raise HTTPException(status_code=400, detail="账号已存在") from exc
             raise
+        sheet_permissions = replace_user_sheet_permissions(
+            conn,
+            int(cursor.lastrowid),
+            payload.sheet_permissions,
+            int(user["id"]),
+        )
         row = conn.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        write_audit(conn, user["id"], "user.create", "user", cursor.lastrowid, new_value=user_public(row_to_dict(row)))
-    return {"user": user_public(row_to_dict(row))}
+        public_user = user_public(row_to_dict(row), sheet_permissions)
+        write_audit(conn, user["id"], "user.create", "user", cursor.lastrowid, new_value=public_user)
+    return {"user": public_user}
 
 
 @app.patch("/api/admin/users/{user_id}")
 def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
     updates = payload.dict(exclude_unset=True)
+    sheet_permissions = updates.pop("sheet_permissions", None)
     if "password" in updates:
         password = updates.pop("password")
         if password:
             updates["password_hash"] = hash_password(password)
     if "active" in updates:
         updates["active"] = int(updates["active"])
-    if not updates:
+    if not updates and sheet_permissions is None:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
     allowed = {"password_hash", "role", "display_name", "active"}
     columns = [key for key in updates if key in allowed]
-    if not columns:
+    if not columns and sheet_permissions is None:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
     with connect() as conn:
         old = conn.execute("SELECT * FROM users WHERE id = ? AND deleted_at IS NULL", (user_id,)).fetchone()
         if not old:
             raise HTTPException(status_code=404, detail="用户不存在")
+        old_public = user_public_with_permissions(conn, old)
         ensure_can_change_user(conn, old, user, updates)
         if "display_name" in updates:
             updates["display_name"] = str(updates["display_name"]).strip()
-        conn.execute(
-            f"UPDATE users SET {', '.join(f'{col} = ?' for col in columns)} WHERE id = ?",
-            [updates[col] for col in columns] + [user_id],
-        )
+        if columns:
+            conn.execute(
+                f"UPDATE users SET {', '.join(f'{col} = ?' for col in columns)} WHERE id = ?",
+                [updates[col] for col in columns] + [user_id],
+            )
+        if sheet_permissions is not None:
+            replace_user_sheet_permissions(conn, user_id, sheet_permissions, int(user["id"]))
         if "active" in updates and updates["active"] == 0:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        audit_new_value = user_public(row_to_dict(row))
+        audit_new_value = user_public_with_permissions(conn, row)
         if "password_hash" in updates:
             audit_new_value["password_reset"] = True
         action = "user.update"
@@ -4244,8 +4447,8 @@ def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends
             action = "user.activate" if updates["active"] else "user.deactivate"
         elif "active" in updates and old["active"] != updates["active"]:
             action = "user.activate" if updates["active"] else "user.deactivate"
-        write_audit(conn, user["id"], action, "user", user_id, old_value=user_public(row_to_dict(old)), new_value=audit_new_value)
-    return {"user": user_public(row_to_dict(row))}
+        write_audit(conn, user["id"], action, "user", user_id, old_value=old_public, new_value=audit_new_value)
+    return {"user": audit_new_value}
 
 
 @app.post("/api/admin/users/{user_id}/reset-password")
@@ -4256,10 +4459,10 @@ def reset_user_password(user_id: int, user: Dict[str, Any] = Depends(require_rol
             raise HTTPException(status_code=404, detail="用户不存在")
         conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(DEFAULT_RESET_PASSWORD), user_id))
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        audit_new_value = user_public(row_to_dict(row))
+        audit_new_value = user_public_with_permissions(conn, row)
         audit_new_value["password_reset"] = True
         write_audit(conn, user["id"], "user.reset_password", "user", user_id, old_value=user_public(row_to_dict(old)), new_value=audit_new_value)
-    return {"user": user_public(row_to_dict(row)), "password": DEFAULT_RESET_PASSWORD}
+    return {"user": audit_new_value, "password": DEFAULT_RESET_PASSWORD}
 
 
 @app.delete("/api/admin/users/{user_id}")

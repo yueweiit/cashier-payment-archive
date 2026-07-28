@@ -3021,7 +3021,7 @@ textarea {
 }
 
 .admin-form {
-  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  grid-template-columns: repeat(6, minmax(120px, 1fr));
   margin-bottom: 12px;
 }
 
@@ -3035,6 +3035,64 @@ textarea {
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+}
+
+.sheet-permission-picker {
+  position: relative;
+  min-width: 190px;
+}
+
+.sheet-permission-picker > summary {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border: 1px solid #d7e1e5;
+  border-radius: 7px;
+  background: #fff;
+  color: #344b56;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.sheet-permission-options {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  left: 0;
+  width: min(420px, 70vw);
+  max-height: 320px;
+  overflow: auto;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid #ccdadd;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 12px 30px rgb(38 59 67 / 16%);
+}
+
+.sheet-permission-options label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.sheet-permission-options label:hover {
+  background: #eef7f5;
+}
+
+.sheet-permission-options input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.sheet-permission-options span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .table-actions {

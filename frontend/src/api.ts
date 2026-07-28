@@ -4,6 +4,7 @@ export type User = {
   display_name: string;
   role: "business" | "finance" | "general_manager" | "admin";
   active: boolean;
+  sheet_permissions: string[];
 };
 
 export type Batch = {
@@ -406,8 +407,9 @@ export type UserPayload = {
   role: UserRole;
   display_name: string;
   active: boolean;
+  sheet_permissions: string[];
 };
-export type UserUpdatePayload = Partial<Pick<User, "role" | "display_name" | "active">> & { password?: string };
+export type UserUpdatePayload = Partial<Pick<User, "role" | "display_name" | "active" | "sheet_permissions">> & { password?: string };
 export type ChangePasswordPayload = {
   current_password: string;
   new_password: string;
@@ -600,7 +602,7 @@ export const api = {
     request<{ dictionary: Dictionary }>("/api/admin/dictionaries", { method: "POST", body: JSON.stringify(payload) }),
   updateDictionary: (id: number, payload: Partial<Dictionary>) =>
     request<{ dictionary: Dictionary }>(`/api/admin/dictionaries/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
-  users: () => request<{ users: User[] }>("/api/admin/users"),
+  users: () => request<{ users: User[]; available_sheets: string[] }>("/api/admin/users"),
   createUser: (payload: UserPayload) =>
     request<{ user: User }>("/api/admin/users", { method: "POST", body: JSON.stringify(payload) }),
   updateUser: (id: number, payload: UserUpdatePayload) =>

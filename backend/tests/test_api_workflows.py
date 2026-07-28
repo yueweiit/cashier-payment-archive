@@ -622,7 +622,14 @@ def test_role_permissions_user_crud_and_audit_logs():
 
         business_user = admin_client.post(
             "/api/admin/users",
-            json={"username": "biz-user", "password": "biz123", "display_name": "业务", "role": "business", "active": True},
+            json={
+                "username": "biz-user",
+                "password": "biz123",
+                "display_name": "业务",
+                "role": "business",
+                "active": True,
+                "sheet_permissions": ["未分 Sheet"],
+            },
         )
         assert business_user.status_code == 200
         finance_user = admin_client.post(
@@ -758,6 +765,127 @@ def test_role_permissions_user_crud_and_audit_logs():
                 for row in conn.execute("SELECT action FROM audit_logs WHERE entity_type = 'user'").fetchall()
             }
         assert {"user.create", "user.update", "user.deactivate", "user.delete", "user.reset_password"} <= user_actions
+
+
+def test_business_users_are_strictly_isolated_by_sheet_permissions():
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2KpAAAAAASUVORK5CYII="
+    )
+    with TestClient(app) as admin_client, TestClient(app) as business_client:
+        login(admin_client)
+        batch = admin_client.post(
+            "/api/batches",
+            json={"name": "Sheet 权限隔离", "start_date": "2026-07-21", "end_date": "2026-07-28"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+
+        sheet_a = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"source_sheet": "部门 A", "summary": "A 请款", "amount": 100},
+        ).json()["request"]
+        sheet_b = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"source_sheet": "部门 B", "summary": "B 请款", "amount": 200},
+        ).json()["request"]
+        assert admin_client.put(
+            f"/api/batches/{batch_id}/sheet-order",
+            json={"sheet_order": ["部门 B", "部门 A"]},
+        ).status_code == 200
+
+        attachment_a = admin_client.post(
+            f"/api/batches/{batch_id}/requests/{sheet_a['id']}/attachments/image",
+            files={"file": ("a.png", io.BytesIO(png_bytes), "image/png")},
+        ).json()["attachment"]
+        attachment_b = admin_client.post(
+            f"/api/batches/{batch_id}/requests/{sheet_b['id']}/attachments/image",
+            files={"file": ("b.png", io.BytesIO(png_bytes), "image/png")},
+        ).json()["attachment"]
+        payment_b = admin_client.post(
+            f"/api/batches/{batch_id}/requests/{sheet_b['id']}/payments",
+            json={"amount": 50, "payment_date": "2026-07-28"},
+        ).json()["payment"]
+        voucher_b = admin_client.post(
+            f"/api/batches/{batch_id}/requests/{sheet_b['id']}/payments/{payment_b['id']}/vouchers",
+            files={"file": ("voucher.png", io.BytesIO(png_bytes), "image/png")},
+        ).json()["voucher"]
+
+        created_user = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": "sheet-a-user",
+                "password": "Yuewei123",
+                "display_name": "部门 A 负责人",
+                "role": "business",
+                "active": True,
+                "sheet_permissions": ["部门 A"],
+            },
+        )
+        assert created_user.status_code == 200
+        user_id = created_user.json()["user"]["id"]
+        assert created_user.json()["user"]["sheet_permissions"] == ["部门 A"]
+        login(business_client, "sheet-a-user", "Yuewei123")
+        assert business_client.get("/api/me").json()["user"]["sheet_permissions"] == ["部门 A"]
+
+        listed_batch = next(
+            item for item in business_client.get("/api/batches").json()["batches"]
+            if item["id"] == batch_id
+        )
+        assert listed_batch["request_count"] == 1
+        assert listed_batch["total_amount"] == 100
+        assert listed_batch["sheet_order"] == ["部门 A"]
+        batch_detail = business_client.get(f"/api/batches/{batch_id}").json()
+        assert batch_detail["batch"]["request_count"] == 1
+        assert batch_detail["batch"]["sheet_order"] == ["部门 A"]
+
+        requests = business_client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        assert [row["id"] for row in requests] == [sheet_a["id"]]
+        assert business_client.get(
+            f"/api/batches/{batch_id}/requests",
+            params={"source_sheet": "部门 B"},
+        ).json()["requests"] == []
+        attachments = business_client.get(f"/api/batches/{batch_id}/attachments").json()["attachments"]
+        assert [item["id"] for item in attachments] == [attachment_a["id"]]
+
+        assert business_client.get(
+            f"/api/batches/{batch_id}/requests/{sheet_b['id']}/payments"
+        ).status_code == 403
+        assert business_client.get(
+            f"/api/batches/{batch_id}/requests/{sheet_b['id']}/attachments"
+        ).status_code == 403
+        assert business_client.get(f"/api/attachments/{attachment_b['id']}/file").status_code == 403
+        assert business_client.get(f"/api/payment-vouchers/{voucher_b['id']}/file").status_code == 403
+        assert business_client.get(f"/api/batches/{batch_id}/audit").status_code == 403
+
+        exported = business_client.get(f"/api/batches/{batch_id}/export.xlsx")
+        assert exported.status_code == 200
+        workbook = load_workbook(io.BytesIO(exported.content), data_only=False)
+        assert workbook.sheetnames[:2] == ["全部", "部门 A"]
+        assert "部门 B" not in workbook.sheetnames
+
+        assert business_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"source_sheet": "部门 B", "summary": "越权新增", "amount": 1},
+        ).status_code == 403
+        allowed_create = business_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"source_sheet": "部门 A", "summary": "允许新增", "amount": 1},
+        )
+        assert allowed_create.status_code == 200
+        assert business_client.patch(
+            f"/api/batches/{batch_id}/requests/{sheet_a['id']}",
+            json={"source_sheet": "部门 B"},
+        ).status_code == 403
+
+        changed = admin_client.patch(
+            f"/api/admin/users/{user_id}",
+            json={"sheet_permissions": ["部门 B"]},
+        )
+        assert changed.status_code == 200
+        assert changed.json()["user"]["sheet_permissions"] == ["部门 B"]
+        switched_rows = business_client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        assert [row["id"] for row in switched_rows] == [sheet_b["id"]]
+        assert business_client.get(f"/api/attachments/{attachment_a['id']}/file").status_code == 403
+        assert business_client.get(f"/api/attachments/{attachment_b['id']}/file").status_code == 200
 
 
 def test_image_attachment_upload_and_export():

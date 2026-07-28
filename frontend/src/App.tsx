@@ -1395,12 +1395,18 @@ function Workspace({
     }),
     [visibleActiveRows],
   );
-  const defaultSourceSheet = activeSheet === ALL_SHEET ? "手工录入" : activeSheet;
+  const firstVisibleSheet = sheetTabs.find((tab) => tab.key !== ALL_SHEET)?.key || "";
+  const defaultSourceSheet = activeSheet === ALL_SHEET
+    ? (user.role === "business" ? firstVisibleSheet : "手工录入")
+    : activeSheet;
+  const canManageBatchOperations = user.role !== "business";
+  const canManageSheets = user.role !== "business";
   const canArchiveBatch = ["finance", "general_manager", "admin"].includes(user.role);
   const canRestoreBatch = isPrivilegedRole(user.role);
   const canManageDraftState = selectedBatch?.status === "draft" && isPrivilegedRole(user.role);
   const canEditGrid = selectedBatch?.status !== "archived" || isPrivilegedRole(user.role);
-  const canReorderSheets = canEditGrid && !hasUnsavedChanges && !sheetOrderSaving;
+  const canCreateRequests = canEditGrid && (user.role !== "business" || Boolean(firstVisibleSheet));
+  const canReorderSheets = canManageSheets && canEditGrid && !hasUnsavedChanges && !sheetOrderSaving;
   const batchPayableAmount = Number(selectedBatch?.total_amount) || 0;
   const batchPaidAmount = Number(selectedBatch?.total_paid_amount) || 0;
   const paymentProgress = batchPayableAmount > 0
@@ -1742,7 +1748,7 @@ function Workspace({
   }
 
   function beginCreateSheet() {
-    if (!canEditGrid) return;
+    if (!canManageSheets || !canEditGrid) return;
     setEditingSheet(null);
     setNewSheetName(nextSheetName(sheetTabs));
   }
@@ -1790,7 +1796,7 @@ function Workspace({
   }
 
   function beginRenameSheet(sheetKey: string) {
-    if (sheetKey === ALL_SHEET) return;
+    if (!canManageSheets || sheetKey === ALL_SHEET) return;
     const rowsInSheet = gridRows.filter((row) => normalizeSheetName(row.source_sheet) === sheetKey);
     if (rowsInSheet.length > 0 && rowsInSheet.every((row) => row.__deleted)) return;
     setNewSheetName(null);
@@ -1888,11 +1894,13 @@ function Workspace({
       <div className="workspace-grid empty-workspace">
         <section className="content-panel empty-state">
           <h2>还没有批次</h2>
-          <p>先创建一个本周草稿，再开始录入或从 Excel 导入。</p>
-          <button className="primary-button" onClick={() => setCreateDialogOpen(true)}>
-            <Plus size={16} />
-            新建批次
-          </button>
+          <p>{canManageBatchOperations ? "先创建一个本周草稿，再开始录入或从 Excel 导入。" : "当前还没有可查看的批次，请联系管理员。"}</p>
+          {canManageBatchOperations && (
+            <button className="primary-button" onClick={() => setCreateDialogOpen(true)}>
+              <Plus size={16} />
+              新建批次
+            </button>
+          )}
         </section>
         {createDialogOpen && (
           <Modal title="新建批次" onClose={() => setCreateDialogOpen(false)}>
@@ -1925,10 +1933,12 @@ function Workspace({
                 </select>
               </label>
             </div>
-            <button className="ghost-button batch-create-button" onClick={() => setCreateDialogOpen(true)}>
-              <Plus size={16} />
-              新建批次
-            </button>
+            {canManageBatchOperations && (
+              <button className="ghost-button batch-create-button" onClick={() => setCreateDialogOpen(true)}>
+                <Plus size={16} />
+                新建批次
+              </button>
+            )}
             <div className="batch-context-meta">
               <div className="batch-context-item">
                 <span>状态</span>
@@ -1941,10 +1951,12 @@ function Workspace({
             </div>
           </div>
           <div className="batch-primary-actions">
-            <button className="primary-button" onClick={() => setRolloverDialogOpen(true)}>
-              <Archive size={16} />
-              从上周生成本周
-            </button>
+            {canManageBatchOperations && (
+              <button className="primary-button" onClick={() => setRolloverDialogOpen(true)}>
+                <Archive size={16} />
+                从上周生成本周
+              </button>
+            )}
             {selectedBatch.status === "draft" && canArchiveBatch && (
               <button className="ghost-button" onClick={archiveCurrentBatch} type="button">
                 <Archive size={16} />
@@ -2018,13 +2030,15 @@ function Workspace({
           </div>
         </div>
       </section>
-      <TopbarImportActions
-        selectedBatch={selectedBatch}
-        hasUnsavedChanges={hasUnsavedChanges || editorDirty}
-        reloadBatches={reloadBatches}
-        onImported={onImported}
-        setMessage={setMessage}
-      />
+      {canManageBatchOperations && (
+        <TopbarImportActions
+          selectedBatch={selectedBatch}
+          hasUnsavedChanges={hasUnsavedChanges || editorDirty}
+          reloadBatches={reloadBatches}
+          onImported={onImported}
+          setMessage={setMessage}
+        />
+      )}
       <section className="content-panel">
         <div className="toolbar">
           <div className="search-box">
@@ -2067,14 +2081,18 @@ function Workspace({
             <Download size={16} />
             {hasActiveExportFilter ? "导出筛选结果" : "导出全部"}
           </button>
-          <button className="primary-button" onClick={() => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet })} onKeyDown={(event) => activateButtonByKeyboard(event, () => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet }))}>
-            <Plus size={16} />
-            新增
-          </button>
-          <button className="ghost-button" onClick={addBlankRow} onKeyDown={(event) => activateButtonByKeyboard(event, addBlankRow)}>
-            <Plus size={16} />
-            插入空行
-          </button>
+          {canCreateRequests && (
+            <>
+              <button className="primary-button" onClick={() => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet })} onKeyDown={(event) => activateButtonByKeyboard(event, () => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet }))}>
+                <Plus size={16} />
+                新增
+              </button>
+              <button className="ghost-button" onClick={addBlankRow} onKeyDown={(event) => activateButtonByKeyboard(event, addBlankRow)}>
+                <Plus size={16} />
+                插入空行
+              </button>
+            </>
+          )}
           <button
             className={wrapText ? "ghost-button active-toggle" : "ghost-button"}
             onClick={() => setWrapText(!wrapText)}
@@ -2136,7 +2154,7 @@ function Workspace({
                 onPointerDown={() => setActiveSheet(tab.key)}
                 onClick={() => setActiveSheet(tab.key)}
                 onFocus={() => setActiveSheet(tab.key)}
-                onDoubleClick={() => beginRenameSheet(tab.key)}
+                onDoubleClick={() => canManageSheets && beginRenameSheet(tab.key)}
                 onKeyDown={(event) => activateButtonByKeyboard(event, () => setActiveSheet(tab.key))}
                 draggable={canReorderSheets && tab.key !== ALL_SHEET}
                 onDragStart={(event) => handleSheetDragStart(event, tab.key)}
@@ -2168,7 +2186,7 @@ function Workspace({
               <small>0</small>
             </div>
           ) : (
-            canEditGrid && (
+            canManageSheets && canEditGrid && (
               <button
                 className="sheet-tab add-sheet-tab"
                 onClick={beginCreateSheet}
@@ -2182,7 +2200,7 @@ function Workspace({
             )
           )}
         </div>
-        {activeSheet !== ALL_SHEET && canEditGrid && (
+        {activeSheet !== ALL_SHEET && canManageSheets && canEditGrid && (
           <div className="sheet-actionbar">
             <span>
               当前 Sheet：{activeSheet}
@@ -3791,7 +3809,7 @@ function ArchiveView({
   }
 
   return (
-    <div className="two-column">
+    <div className={user.role === "business" ? "" : "two-column"}>
       <section className="content-panel">
         <div className="table-wrap">
           <table className="data-table">
@@ -3825,13 +3843,15 @@ function ArchiveView({
                       <Download size={15} />
                       导出
                     </button>
-                    <button className="ghost-button" onClick={(event) => {
-                      event.stopPropagation();
-                      loadLogs(batch.id);
-                    }}>
-                      <History size={15} />
-                      日志
-                    </button>
+                    {user.role !== "business" && (
+                      <button className="ghost-button" onClick={(event) => {
+                        event.stopPropagation();
+                        loadLogs(batch.id);
+                      }}>
+                        <History size={15} />
+                        日志
+                      </button>
+                    )}
                     {batch.status === "draft" && isPrivilegedRole(user.role) && (
                       <button className="danger-button" onClick={(event) => {
                         event.stopPropagation();
@@ -3848,23 +3868,25 @@ function ArchiveView({
           </table>
         </div>
       </section>
-      <section className="side-panel">
-        <button className="primary-button" onClick={archive} disabled={!selectedBatch || selectedBatch.status === "archived"}>
-          <Archive size={16} />
-          归档当前批次
-        </button>
-        <div className="section-title">操作日志</div>
-        <div className="audit-list">
-          {logs.map((log) => (
-            <div key={log.id} className="audit-item">
-              <strong>{auditActionLabel(log.action)}</strong>
-              <span>{log.actor_name || "系统"} · {log.created_at}</span>
-              {auditDetail(log) && <p>{auditDetail(log)}</p>}
-              {log.reason && <p>{log.reason}</p>}
-            </div>
-          ))}
-        </div>
-      </section>
+      {user.role !== "business" && (
+        <section className="side-panel">
+          <button className="primary-button" onClick={archive} disabled={!selectedBatch || selectedBatch.status === "archived"}>
+            <Archive size={16} />
+            归档当前批次
+          </button>
+          <div className="section-title">操作日志</div>
+          <div className="audit-list">
+            {logs.map((log) => (
+              <div key={log.id} className="audit-item">
+                <strong>{auditActionLabel(log.action)}</strong>
+                <span>{log.actor_name || "系统"} · {log.created_at}</span>
+                {auditDetail(log) && <p>{auditDetail(log)}</p>}
+                {log.reason && <p>{log.reason}</p>}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
@@ -3896,24 +3918,93 @@ function auditDetail(log: AuditLog) {
   return `匹配 ${Number(value.matched || 0)} 个单号，未匹配 ${Number(value.unmatched || 0)} 个，来源冲突 ${Number(value.conflicts || 0)} 个，流程事件 ${Number(value.workflow_events || 0)} 条，${paymentText}，待核对 ${Number(value.review_required || 0)} 条，更新 ${Number(value.updated_requests || 0)} 条请款`;
 }
 
+function SheetPermissionPicker({
+  value,
+  options,
+  onChange,
+  disabled = false,
+}: {
+  value: string[];
+  options: string[];
+  onChange: (value: string[]) => void;
+  disabled?: boolean;
+}) {
+  const allOptions = Array.from(new Set([...options, ...value])).sort((left, right) => left.localeCompare(right, "zh-CN"));
+  return (
+    <details className="sheet-permission-picker">
+      <summary>{disabled ? "角色可查看全部 Sheet" : `已授权 ${value.length} 个 Sheet`}</summary>
+      {!disabled && (
+        <div className="sheet-permission-options">
+          {allOptions.length === 0 && <span className="muted-text">暂无可授权的 Sheet</span>}
+          {allOptions.map((sheetName) => (
+            <label key={sheetName}>
+              <input
+                type="checkbox"
+                checked={value.includes(sheetName)}
+                onChange={(event) => {
+                  const next = event.target.checked
+                    ? [...value, sheetName]
+                    : value.filter((item) => item !== sheetName);
+                  onChange(Array.from(new Set(next)));
+                }}
+              />
+              <span title={sheetName}>{sheetName}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </details>
+  );
+}
+
 function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
+  type UserDraft = {
+    display_name: string;
+    role: UserRole;
+    active: boolean;
+    password: string;
+    sheet_permissions: string[];
+  };
   const [users, setUsers] = useState<User[]>([]);
-  const [userForm, setUserForm] = useState<{ username: string; password: string; role: UserRole; display_name: string; active: boolean }>({ username: "", password: "", role: "business", display_name: "", active: true });
-  const [userDrafts, setUserDrafts] = useState<Record<number, { display_name: string; role: UserRole; active: boolean; password: string }>>({});
+  const [availableSheets, setAvailableSheets] = useState<string[]>([]);
+  const [userForm, setUserForm] = useState<{
+    username: string;
+    password: string;
+    role: UserRole;
+    display_name: string;
+    active: boolean;
+    sheet_permissions: string[];
+  }>({
+    username: "",
+    password: "Yuewei123",
+    role: "business",
+    display_name: "",
+    active: true,
+    sheet_permissions: [],
+  });
+  const [userDrafts, setUserDrafts] = useState<Record<number, UserDraft>>({});
   const [userQuery, setUserQuery] = useState("");
   const visibleUsers = useMemo(() => {
     const query = userQuery.trim().toLowerCase();
     if (!query) return users;
     return users.filter((item) => {
       const roleLabel = roleLabels[item.role] || item.role;
-      return [item.username, item.display_name, item.role, roleLabel].some((value) => String(value || "").toLowerCase().includes(query));
+      return [item.username, item.display_name, item.role, roleLabel, ...(item.sheet_permissions || [])]
+        .some((value) => String(value || "").toLowerCase().includes(query));
     });
   }, [users, userQuery]);
 
   async function load() {
     const userRes = await api.users();
     setUsers(userRes.users);
-    setUserDrafts(Object.fromEntries(userRes.users.map((item) => [item.id, { display_name: item.display_name, role: item.role, active: item.active, password: "" }])));
+    setAvailableSheets(userRes.available_sheets);
+    setUserDrafts(Object.fromEntries(userRes.users.map((item) => [item.id, {
+      display_name: item.display_name,
+      role: item.role,
+      active: item.active,
+      password: "",
+      sheet_permissions: item.sheet_permissions || [],
+    }])));
   }
 
   useEffect(() => {
@@ -3922,12 +4013,19 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
 
   async function createUser() {
     await api.createUser(userForm);
-    setUserForm({ username: "", password: "", role: "business", display_name: "", active: true });
+    setUserForm({
+      username: "",
+      password: "Yuewei123",
+      role: "business",
+      display_name: "",
+      active: true,
+      sheet_permissions: [],
+    });
     await load();
     setMessage("用户已创建");
   }
 
-  function updateUserDraft(id: number, patch: Partial<{ display_name: string; role: UserRole; active: boolean; password: string }>) {
+  function updateUserDraft(id: number, patch: Partial<UserDraft>) {
     const current = userDrafts[id];
     if (!current) return;
     setUserDrafts({ ...userDrafts, [id]: { ...current, ...patch } });
@@ -3940,6 +4038,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
       display_name: draft.display_name,
       role: draft.role,
       active: draft.active,
+      sheet_permissions: draft.sheet_permissions,
       ...(draft.password ? { password: draft.password } : {}),
     });
     await load();
@@ -3979,6 +4078,12 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
           <select value={userForm.role} onChange={(event) => setUserForm({ ...userForm, role: event.target.value as UserRole })}>
             {Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
+          <SheetPermissionPicker
+            value={userForm.sheet_permissions}
+            options={availableSheets}
+            disabled={userForm.role !== "business"}
+            onChange={(sheet_permissions) => setUserForm({ ...userForm, sheet_permissions })}
+          />
           <button className="primary-button" onClick={createUser}><Plus size={16} />新增用户</button>
         </div>
         <div className="admin-user-tools">
@@ -3989,10 +4094,16 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
         </div>
         <div className="table-wrap">
           <table className="data-table">
-            <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>状态</th><th>修改密码</th><th>操作</th></tr></thead>
+            <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>Sheet 权限</th><th>状态</th><th>修改密码</th><th>操作</th></tr></thead>
             <tbody>
               {visibleUsers.map((item) => {
-                const draft = userDrafts[item.id] || { display_name: item.display_name, role: item.role, active: item.active, password: "" };
+                const draft = userDrafts[item.id] || {
+                  display_name: item.display_name,
+                  role: item.role,
+                  active: item.active,
+                  password: "",
+                  sheet_permissions: item.sheet_permissions || [],
+                };
                 return (
                   <tr key={item.id}>
                     <td>{item.username}</td>
@@ -4001,6 +4112,14 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
                       <select value={draft.role} onChange={(event) => updateUserDraft(item.id, { role: event.target.value as UserRole })}>
                         {Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                       </select>
+                    </td>
+                    <td>
+                      <SheetPermissionPicker
+                        value={draft.sheet_permissions}
+                        options={availableSheets}
+                        disabled={draft.role !== "business"}
+                        onChange={(sheet_permissions) => updateUserDraft(item.id, { sheet_permissions })}
+                      />
                     </td>
                     <td>
                       <label className="inline-check">

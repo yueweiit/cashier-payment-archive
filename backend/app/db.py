@@ -73,6 +73,17 @@ def init_db() -> None:
                 expires_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS user_sheet_permissions (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                sheet_name TEXT NOT NULL,
+                created_by INTEGER REFERENCES users(id),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, sheet_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_sheet_permissions_sheet
+            ON user_sheet_permissions(sheet_name, user_id);
+
             CREATE TABLE IF NOT EXISTS request_batches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 parent_batch_id INTEGER REFERENCES request_batches(id) ON DELETE SET NULL,
