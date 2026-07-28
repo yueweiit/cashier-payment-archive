@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from .db import DATA_DIR, now_iso, payment_record_hash, refresh_payment_summaries
+from .excel_io import content_hash
+from .sheet_names import canonical_sheet_name, canonical_sheet_order
 
 
 SNAPSHOT_BASELINE = "baseline"
@@ -162,6 +164,8 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
     for request in baseline_requests:
         request_id = int(request["id"])
         values = {column: request.get(column) for column in request_columns if column in request}
+        if "source_sheet" in values:
+            values["source_sheet"] = canonical_sheet_name(values["source_sheet"])
         if "paid_amount" in request_columns and "paid_amount" not in request:
             values["paid_amount"] = request.get("amount") if request.get("finance_review") == "已付款" else 0
         if "pending_amount" in request_columns and "pending_amount" not in request:
@@ -230,6 +234,14 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
 
     for request_id in baseline_request_ids:
         refresh_payment_summaries(conn, request_id)
+        request = conn.execute(
+            "SELECT * FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE payment_requests SET content_hash = ? WHERE id = ?",
+            (content_hash(dict(request)), request_id),
+        )
 
     restore_batch_fields(conn, batch_id, payload.get("batch", {}))
     for file_path in old_file_paths:
@@ -340,6 +352,22 @@ def restore_batch_fields(conn: sqlite3.Connection, batch_id: int, snapshot_batch
     values["archived_by"] = None
     values["archived_at"] = None
     values["updated_at"] = now_iso()
+    if "sheet_order_json" in values:
+        try:
+            restored_order = json.loads(values["sheet_order_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            restored_order = []
+        normalized_order = canonical_sheet_order(restored_order if isinstance(restored_order, list) else [])
+        registered = set(normalized_order)
+        for row in conn.execute(
+            "SELECT DISTINCT source_sheet FROM payment_requests WHERE batch_id = ? ORDER BY id",
+            (batch_id,),
+        ).fetchall():
+            sheet_name = canonical_sheet_name(row["source_sheet"])
+            if sheet_name not in registered:
+                normalized_order.append(sheet_name)
+                registered.add(sheet_name)
+        values["sheet_order_json"] = json.dumps(normalized_order, ensure_ascii=False)
     columns = [column for column in batch_columns if column in values and column != "id"]
     conn.execute(
         f"UPDATE request_batches SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",

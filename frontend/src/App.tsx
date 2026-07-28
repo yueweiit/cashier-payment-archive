@@ -1,4 +1,5 @@
 import { ClipboardEvent, DragEvent, FormEvent, Fragment, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   AlignLeft,
   AlertTriangle,
@@ -1315,6 +1316,7 @@ function Workspace({
   const [gridRows, setGridRows] = useState<GridRow[]>([]);
   const [dirtyCells, setDirtyCells] = useState<Set<string>>(new Set());
   const [deletedLocalIds, setDeletedLocalIds] = useState<Set<string>>(new Set());
+  const [deletedSheetNames, setDeletedSheetNames] = useState<Set<string>>(new Set());
   const [filters, setFilters] = useState({ q: "", payment_account: "", invoice_status: "", finance_review: "", general_manager_approval: "" });
   const [activeSheet, setActiveSheet] = useState(ALL_SHEET);
   const [editingSheet, setEditingSheet] = useState<{ key: string; value: string } | null>(null);
@@ -1337,7 +1339,7 @@ function Workspace({
   const [batchMenuOpen, setBatchMenuOpen] = useState(false);
   const batchMenuRef = useRef<HTMLDivElement | null>(null);
   const [reason, setReason] = useState("");
-  const hasUnsavedChanges = dirtyCells.size > 0 || deletedLocalIds.size > 0;
+  const hasUnsavedChanges = dirtyCells.size > 0 || deletedLocalIds.size > 0 || deletedSheetNames.size > 0;
 
   async function loadRequests() {
     if (!selectedBatch) return;
@@ -1347,6 +1349,7 @@ function Workspace({
     setAttachmentCounts(countAttachmentsByGroup(attachmentGroups));
     setDirtyCells(new Set());
     setDeletedLocalIds(new Set());
+    setDeletedSheetNames(new Set());
     setSelectedRows([]);
   }
 
@@ -1366,11 +1369,15 @@ function Workspace({
 
   useEffect(() => {
     setSheetOrder(selectedBatch?.sheet_order || []);
+    setDeletedSheetNames(new Set());
     setDraggedSheet(null);
     setSheetDropTarget(null);
   }, [selectedBatch?.id, selectedBatch?.sheet_order]);
 
-  const sheetTabs = useMemo(() => getSheetTabs(gridRows, sheetOrder), [gridRows, sheetOrder]);
+  const sheetTabs = useMemo(
+    () => getSheetTabs(gridRows, sheetOrder, deletedSheetNames),
+    [gridRows, sheetOrder, deletedSheetNames],
+  );
   const visibleRows = useMemo(() => gridRows.filter((row) => rowMatchesFilters(row, filters, activeSheet)), [gridRows, filters, activeSheet]);
   const visibleActiveRows = useMemo(() => visibleRows.filter((row) => !row.__deleted), [visibleRows]);
   const hasActiveExportFilter = activeSheet !== ALL_SHEET || Object.values(filters).some((value) => value.trim());
@@ -1413,8 +1420,11 @@ function Workspace({
     ? Math.min(100, Math.max(0, (batchPaidAmount / batchPayableAmount) * 100))
     : 0;
   const activeSheetPendingDeleteCount = activeSheetRows.filter((row) => row.__deleted).length;
-  const canDeleteActiveSheet = canEditGrid && activeSheet !== ALL_SHEET && activeSheetRows.some((row) => !row.__deleted);
-  const canRestoreActiveSheetDelete = canEditGrid && activeSheet !== ALL_SHEET && activeSheetRows.some((row) => row.__deleted);
+  const canDeleteActiveSheet = canEditGrid
+    && activeSheet !== ALL_SHEET
+    && sheetTabs.some((tab) => tab.key === activeSheet)
+    && !deletedSheetNames.has(activeSheet);
+  const canRestoreActiveSheetDelete = canEditGrid && activeSheet !== ALL_SHEET && deletedSheetNames.has(activeSheet);
 
   function handleSheetDragStart(event: DragEvent<HTMLButtonElement>, sheetKey: string) {
     if (!canReorderSheets || sheetKey === ALL_SHEET) {
@@ -1603,13 +1613,18 @@ function Workspace({
     const deletes = Array.from(deletedLocalIds)
       .map((localId) => gridRows.find((row) => row.__localId === localId)?.id)
       .filter((id): id is number => Boolean(id));
-    await api.bulkSaveRequests(selectedBatch.id, { creates, updates, deletes, reason });
-    const savedSheetOrder = getSheetTabs(gridRows, sheetOrder)
-      .filter((tab) => tab.key !== ALL_SHEET && !tab.pendingDelete)
+    if (creates.length || updates.length || deletes.length) {
+      await api.bulkSaveRequests(selectedBatch.id, { creates, updates, deletes, reason });
+    }
+    const savedSheetOrder = getSheetTabs(gridRows, sheetOrder, deletedSheetNames)
+      .filter((tab) => tab.key !== ALL_SHEET && !deletedSheetNames.has(tab.key))
       .map((tab) => tab.key);
-    await api.updateSheetOrder(selectedBatch.id, savedSheetOrder);
-    setSheetOrder(savedSheetOrder);
+    if (canManageSheets) {
+      await api.updateSheetOrder(selectedBatch.id, savedSheetOrder);
+      setSheetOrder(savedSheetOrder);
+    }
     setReason("");
+    setDeletedSheetNames(new Set());
     await loadRequests();
     await reloadBatches();
     setMessage("表格更改已保存");
@@ -1624,6 +1639,7 @@ function Workspace({
     setEditorDraft(null);
     setEditorDirty(false);
     setReason("");
+    setDeletedSheetNames(new Set());
     setSheetOrder(selectedBatch?.sheet_order || []);
     await loadRequests();
     setMessage("未保存修改已放弃");
@@ -1753,14 +1769,15 @@ function Workspace({
     setNewSheetName(nextSheetName(sheetTabs));
   }
 
-  function commitCreateSheet() {
+  async function commitCreateSheet() {
     if (newSheetName === null) return;
-    const name = newSheetName.trim();
-    if (!name) {
+    const rawName = newSheetName.trim();
+    if (!rawName) {
       setNewSheetName(null);
       setMessage("Sheet 名称不能为空，已取消新增");
       return;
     }
+    const name = normalizeSheetName(rawName);
     if (name === "全部") {
       setNewSheetName(null);
       setMessage("Sheet 名称不能叫“全部”，已取消新增");
@@ -1771,23 +1788,29 @@ function Workspace({
       setMessage("Sheet 名称已存在，已取消新增");
       return;
     }
-    const row = { ...emptyRequest, __localId: newLocalId(), __isNew: true, source_sheet: name };
-    setGridRows([...gridRows, row]);
-    const nextDirty = new Set(dirtyCells);
-    nextDirty.add(`${row.__localId}:source_sheet`);
-    setDirtyCells(nextDirty);
-    setSheetOrder((current) => current.includes(name) ? current : [...current, name]);
-    setFilters({ q: "", payment_account: "", invoice_status: "", finance_review: "", general_manager_approval: "" });
-    setActiveSheet(name);
     setNewSheetName(null);
-    setMessage(`已新增 Sheet：${name}，请保存更改`);
+    if (!selectedBatch) return;
+    const nextOrder = [...sheetTabs.filter((tab) => tab.key !== ALL_SHEET).map((tab) => tab.key), name];
+    setSheetOrderSaving(true);
+    try {
+      await api.updateSheetOrder(selectedBatch.id, nextOrder);
+      setSheetOrder(nextOrder);
+      setFilters({ q: "", payment_account: "", invoice_status: "", finance_review: "", general_manager_approval: "" });
+      setActiveSheet(name);
+      await reloadBatches();
+      setMessage(`已新增 Sheet：${name}`);
+    } catch (error) {
+      setMessage((error as Error).message);
+    } finally {
+      setSheetOrderSaving(false);
+    }
   }
 
   function handleCreateSheetKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     event.stopPropagation();
     if (event.key === "Enter") {
       event.preventDefault();
-      commitCreateSheet();
+      void commitCreateSheet();
     }
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1804,11 +1827,17 @@ function Workspace({
     setEditingSheet({ key: sheetKey, value: sheetKey });
   }
 
-  function commitRenameSheet() {
+  async function commitRenameSheet() {
     if (!editingSheet) return;
     const oldName = editingSheet.key;
-    const newName = editingSheet.value.trim();
-    if (!newName || newName === oldName) {
+    const rawNewName = editingSheet.value.trim();
+    if (!rawNewName) {
+      setMessage("Sheet 名称不能为空，已取消重命名");
+      setEditingSheet(null);
+      return;
+    }
+    const newName = normalizeSheetName(rawNewName);
+    if (newName === oldName) {
       setEditingSheet(null);
       return;
     }
@@ -1820,6 +1849,20 @@ function Workspace({
     const affectedRows = gridRows.filter((row) => normalizeSheetName(row.source_sheet) === oldName);
     if (affectedRows.length === 0) {
       setEditingSheet(null);
+      if (!selectedBatch) return;
+      const nextOrder = sheetOrder.map((name) => name === oldName ? newName : name);
+      setSheetOrderSaving(true);
+      try {
+        await api.updateSheetOrder(selectedBatch.id, nextOrder);
+        setSheetOrder(nextOrder);
+        setActiveSheet(newName);
+        await reloadBatches();
+        setMessage(`Sheet 已重命名为 ${newName}`);
+      } catch (error) {
+        setMessage((error as Error).message);
+      } finally {
+        setSheetOrderSaving(false);
+      }
       return;
     }
     const nextDirty = new Set(dirtyCells);
@@ -1839,7 +1882,7 @@ function Workspace({
     event.stopPropagation();
     if (event.key === "Enter") {
       event.preventDefault();
-      commitRenameSheet();
+      void commitRenameSheet();
     }
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1865,14 +1908,17 @@ function Workspace({
   function markDeleteActiveSheet() {
     if (!canDeleteActiveSheet) return;
     const targetRows = activeSheetRows.filter((row) => !row.__deleted);
-    if (!targetRows.length) return;
-    const confirmed = window.confirm(`确定删除 Sheet“${activeSheet}”吗？\n\n将把 ${targetRows.length} 行标记为待删除，点击“保存更改”后才会真正删除。`);
+    const detail = targetRows.length
+      ? `将把 ${targetRows.length} 行标记为待删除，并移除该 Sheet。`
+      : "该 Sheet 当前没有请款记录，将直接移除 Sheet。";
+    const confirmed = window.confirm(`确定删除 Sheet“${activeSheet}”吗？\n\n${detail}\n点击“保存更改”后生效。`);
     if (!confirmed) return;
     const targetLocalIds = new Set(targetRows.map((row) => row.__localId));
     const nextDeleted = new Set(deletedLocalIds);
     targetLocalIds.forEach((localId) => nextDeleted.add(localId));
     setGridRows(gridRows.map((row) => (targetLocalIds.has(row.__localId) ? { ...row, __deleted: true } : row)));
     setDeletedLocalIds(nextDeleted);
+    setDeletedSheetNames(new Set([...deletedSheetNames, activeSheet]));
     setSelectedRows([]);
     setEditingSheet(null);
     setNewSheetName(null);
@@ -1886,6 +1932,9 @@ function Workspace({
     targetLocalIds.forEach((localId) => nextDeleted.delete(localId));
     setGridRows(gridRows.map((row) => (targetLocalIds.has(row.__localId) ? { ...row, __deleted: false } : row)));
     setDeletedLocalIds(nextDeleted);
+    const nextDeletedSheets = new Set(deletedSheetNames);
+    nextDeletedSheets.delete(activeSheet);
+    setDeletedSheetNames(nextDeletedSheets);
     setMessage(`已撤回 Sheet“${activeSheet}”的删除标记`);
   }
 
@@ -2135,7 +2184,7 @@ function Workspace({
                   autoFocus
                   value={editingSheet.value}
                   onChange={(event) => setEditingSheet({ ...editingSheet, value: event.target.value })}
-                  onBlur={commitRenameSheet}
+                  onBlur={() => void commitRenameSheet()}
                   onKeyDown={handleSheetRenameKeyDown}
                   aria-label="Sheet 名称"
                 />
@@ -2179,7 +2228,7 @@ function Workspace({
                 autoFocus
                 value={newSheetName}
                 onChange={(event) => setNewSheetName(event.target.value)}
-                onBlur={commitCreateSheet}
+                onBlur={() => void commitCreateSheet()}
                 onKeyDown={handleCreateSheetKeyDown}
                 aria-label="新增 Sheet 名称"
               />
@@ -2219,6 +2268,7 @@ function Workspace({
         {hasUnsavedChanges && (
           <div className="dirty-banner">
             有 {dirtyCells.size} 个修改待保存单元格、{deletedLocalIds.size} 行待删除
+            {deletedSheetNames.size > 0 && `、${deletedSheetNames.size} 个 Sheet 待删除`}
             {selectedBatch.status === "archived" && <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="归档更正原因" />}
           </div>
         )}
@@ -2240,7 +2290,7 @@ function Workspace({
           selectedRows={selectedRows}
           setSelectedRows={setSelectedRows}
           readOnly={selectedBatch.status === "archived" && !isPrivilegedRole(user.role)}
-          canEditField={(field) => canEditGrid && canEditRequestField(user.role, field)}
+          canEditField={(field) => canEditGrid && canEditRequestField(user.role, field) && (user.role !== "business" || field !== "source_sheet")}
           onEdit={openRequestEditor}
           onOpenPayments={(request) => openRequestEditor(request, "payments")}
           onOpenAttachments={openAttachmentsFromGrid}
@@ -2297,7 +2347,7 @@ function Workspace({
             await reloadBatches();
           }}
           canEditAttachments={selectedBatch.status !== "archived" || isPrivilegedRole(user.role)}
-          canEditField={(field) => canEditGrid && canEditRequestField(user.role, field)}
+          canEditField={(field) => canEditGrid && canEditRequestField(user.role, field) && (user.role !== "business" || field !== "source_sheet")}
         />
       )}
       {pendingEditorNavigation && (
@@ -3929,12 +3979,84 @@ function SheetPermissionPicker({
   onChange: (value: string[]) => void;
   disabled?: boolean;
 }) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const [popoverPosition, setPopoverPosition] = useState({ top: 0, left: 0, width: 320, maxHeight: 320 });
   const allOptions = Array.from(new Set([...options, ...value])).sort((left, right) => left.localeCompare(right, "zh-CN"));
+
+  function updatePopoverPosition() {
+    const trigger = triggerRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const viewportPadding = 12;
+    const width = Math.min(420, Math.max(280, window.innerWidth - viewportPadding * 2));
+    const left = Math.min(
+      Math.max(viewportPadding, rect.left),
+      Math.max(viewportPadding, window.innerWidth - width - viewportPadding),
+    );
+    const spaceBelow = window.innerHeight - rect.bottom - viewportPadding;
+    const spaceAbove = rect.top - viewportPadding;
+    const openAbove = spaceBelow < 180 && spaceAbove > spaceBelow;
+    const maxHeight = Math.max(140, Math.min(320, openAbove ? spaceAbove - 6 : spaceBelow - 6));
+    const top = openAbove
+      ? Math.max(viewportPadding, rect.top - maxHeight - 4)
+      : rect.bottom + 4;
+    setPopoverPosition({ top, left, width, maxHeight });
+  }
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  useEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", updatePopoverPosition);
+    window.addEventListener("scroll", updatePopoverPosition, true);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", updatePopoverPosition);
+      window.removeEventListener("scroll", updatePopoverPosition, true);
+    };
+  }, [open]);
+
   return (
-    <details className="sheet-permission-picker">
-      <summary>{disabled ? "角色可查看全部 Sheet" : `已授权 ${value.length} 个 Sheet`}</summary>
-      {!disabled && (
-        <div className="sheet-permission-options">
+    <div className="sheet-permission-picker">
+      <button
+        ref={triggerRef}
+        className="sheet-permission-trigger"
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {disabled ? "角色可查看全部 Sheet" : `已授权 ${value.length} 个 Sheet`}
+      </button>
+      {!disabled && open && createPortal(
+        <div
+          ref={popoverRef}
+          className="sheet-permission-options"
+          role="dialog"
+          aria-label="选择可访问的 Sheet"
+          style={popoverPosition}
+        >
           {allOptions.length === 0 && <span className="muted-text">暂无可授权的 Sheet</span>}
           {allOptions.map((sheetName) => (
             <label key={sheetName}>
@@ -3951,9 +4073,10 @@ function SheetPermissionPicker({
               <span title={sheetName}>{sheetName}</span>
             </label>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
-    </details>
+    </div>
   );
 }
 
@@ -4155,8 +4278,18 @@ function activateButtonByKeyboard(event: KeyboardEvent<HTMLButtonElement>, actio
   action();
 }
 
-function getSheetTabs(rows: GridRow[], sheetOrder: string[] = []): SheetTab[] {
+function getSheetTabs(
+  rows: GridRow[],
+  sheetOrder: string[] = [],
+  deletedSheetNames: Set<string> = new Set(),
+): SheetTab[] {
   const counts = new Map<string, { active: number; deleted: number }>();
+  sheetOrder.forEach((sheetName) => {
+    const normalized = normalizeSheetName(sheetName);
+    if (normalized !== ALL_SHEET && !counts.has(normalized)) {
+      counts.set(normalized, { active: 0, deleted: 0 });
+    }
+  });
   rows.forEach((row) => {
     const sheetName = normalizeSheetName(row.source_sheet);
     const count = counts.get(sheetName) || { active: 0, deleted: 0 };
@@ -4167,7 +4300,7 @@ function getSheetTabs(rows: GridRow[], sheetOrder: string[] = []): SheetTab[] {
     }
     counts.set(sheetName, count);
   });
-  const orderIndex = new Map(sheetOrder.map((name, index) => [name, index]));
+  const orderIndex = new Map(sheetOrder.map((name, index) => [normalizeSheetName(name), index]));
   const sheetTabs = Array.from(counts.entries())
     .sort(([left], [right]) => {
       const leftIndex = orderIndex.get(left);
@@ -4184,7 +4317,7 @@ function getSheetTabs(rows: GridRow[], sheetOrder: string[] = []): SheetTab[] {
       label: sheetName,
       count: count.active,
       deletedCount: count.deleted,
-      pendingDelete: count.active === 0 && count.deleted > 0,
+      pendingDelete: deletedSheetNames.has(sheetName),
     }));
   return [{ key: ALL_SHEET, label: "全部", count: rows.filter((row) => !row.__deleted).length }, ...sheetTabs];
 }
@@ -4200,7 +4333,9 @@ function nextSheetName(tabs: Array<{ key: string }>) {
 
 function normalizeSheetName(sheetName?: string) {
   const normalized = String(sheetName || "").trim();
-  return normalized || "未分 Sheet";
+  if (!normalized) return "未分 Sheet";
+  const legacyMouldMatch = normalized.match(/^(赣瑞模具|志威模具)\s*(?:[（(]\s*7\s*月\s*(?:前|后)\s*[）)]|7\s*月\s*(?:前|后))$/);
+  return legacyMouldMatch?.[1] || normalized;
 }
 
 function selectOptionsForField(field: keyof PaymentRequest, currentValue: string) {

@@ -20,7 +20,7 @@ os.environ["PAYMENT_APP_DB"] = str(TEST_DIR / "app.db")
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
-from backend.app.db import connect, now_iso
+from backend.app.db import connect, migrate_sheet_registry_and_names, now_iso
 from backend.app.external_expenses import (
     ExternalExpenseError,
     _parse_workflow_events,
@@ -83,6 +83,174 @@ def test_sheet_order_is_saved_and_inherited_by_rollover():
         reordered = client.put(f"/api/batches/{source['id']}/sheet-order", json={"sheet_order": archived_order})
         assert reordered.status_code == 200
         assert reordered.json()["batch"]["sheet_order"] == archived_order
+
+
+def test_empty_sheet_registry_and_business_sheet_boundaries():
+    with TestClient(app) as admin_client, TestClient(app) as business_client:
+        login(admin_client)
+        batch = admin_client.post(
+            "/api/batches",
+            json={"name": "空 Sheet 与业务边界", "start_date": "2026-07-28", "end_date": "2026-08-03"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+        registered_order = ["部门 A", "部门 B", "空部门"]
+        registered = admin_client.put(
+            f"/api/batches/{batch_id}/sheet-order",
+            json={"sheet_order": registered_order},
+        )
+        assert registered.status_code == 200
+        assert registered.json()["batch"]["sheet_order"] == registered_order
+
+        existing = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"source_sheet": "部门 A", "summary": "已有请款", "amount": 100},
+        ).json()["request"]
+        created_user = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": "registered-sheet-user",
+                "password": "Yuewei123",
+                "display_name": "登记 Sheet 用户",
+                "role": "business",
+                "active": True,
+                "sheet_permissions": ["部门 A", "部门 B", "未登记部门"],
+            },
+        )
+        assert created_user.status_code == 200
+        login(business_client, "registered-sheet-user", "Yuewei123")
+
+        visible_batch = business_client.get(f"/api/batches/{batch_id}").json()["batch"]
+        assert visible_batch["sheet_order"] == ["部门 A", "部门 B"]
+        created_in_empty_sheet = business_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"source_sheet": "部门 B", "summary": "空 Sheet 中新增", "amount": 50},
+        )
+        assert created_in_empty_sheet.status_code == 200
+        created_request_id = created_in_empty_sheet.json()["request"]["id"]
+        assert business_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"source_sheet": "未登记部门", "summary": "越权创建 Sheet", "amount": 1},
+        ).status_code == 403
+        assert business_client.patch(
+            f"/api/batches/{batch_id}/requests/{existing['id']}",
+            json={"source_sheet": "部门 B"},
+        ).status_code == 403
+        assert business_client.patch(
+            f"/api/batches/{batch_id}/requests/bulk",
+            json={
+                "creates": [],
+                "updates": [{"id": existing["id"], "source_sheet": "部门 B", "summary": "不应保存"}],
+                "deletes": [],
+            },
+        ).status_code == 403
+        assert business_client.put(
+            f"/api/batches/{batch_id}/sheet-order",
+            json={"sheet_order": ["部门 B", "部门 A"]},
+        ).status_code == 403
+
+        deleted = business_client.patch(
+            f"/api/batches/{batch_id}/requests/bulk",
+            json={"creates": [], "updates": [], "deletes": [created_request_id]},
+        )
+        assert deleted.status_code == 200
+        assert admin_client.get(f"/api/batches/{batch_id}").json()["batch"]["sheet_order"] == registered_order
+
+        removed_empty_sheet = admin_client.put(
+            f"/api/batches/{batch_id}/sheet-order",
+            json={"sheet_order": ["部门 A", "空部门"]},
+        )
+        assert removed_empty_sheet.status_code == 200
+        assert removed_empty_sheet.json()["batch"]["sheet_order"] == ["部门 A", "空部门"]
+
+
+def test_legacy_mould_sheet_names_are_migrated_in_rows_order_and_permissions():
+    assert main_module.canonical_sheet_name("赣瑞模具 7 月 后") == "赣瑞模具"
+    assert main_module.canonical_sheet_name("志威模具 ( 7 月 前 )") == "志威模具"
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "模具 Sheet 归一", "start_date": "2026-07-28", "end_date": "2026-08-03"},
+        ).json()["batch"]
+        user = client.post(
+            "/api/admin/users",
+            json={
+                "username": "legacy-mould-user",
+                "password": "Yuewei123",
+                "display_name": "模具负责人",
+                "role": "business",
+                "active": True,
+                "sheet_permissions": ["其他部门"],
+            },
+        ).json()["user"]
+
+        with connect() as conn:
+            timestamp = now_iso()
+            for index, sheet_name in enumerate(
+                ("赣瑞模具（7月前）", "赣瑞模具（7月后）", "志威模具 (7月前)", "志威模具（7月后）"),
+                start=1,
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO payment_requests (
+                        batch_id, source_sheet, summary, amount, paid_amount, pending_amount,
+                        currency, raw_extra_json, created_by, updated_by, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 0, ?, 'CNY', '{}', 1, 1, ?, ?)
+                    """,
+                    (batch["id"], sheet_name, f"迁移记录 {index}", index * 100, index * 100, timestamp, timestamp),
+                )
+            conn.execute(
+                "UPDATE request_batches SET sheet_order_json = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        ["其他部门", "志威模具（7月后）", "赣瑞模具（7月前）", "志威模具 (7月前)", "赣瑞模具（7月后）"],
+                        ensure_ascii=False,
+                    ),
+                    batch["id"],
+                ),
+            )
+            conn.execute("DELETE FROM user_sheet_permissions WHERE user_id = ?", (user["id"],))
+            for sheet_name in ("赣瑞模具（7月前）", "赣瑞模具（7月后）", "志威模具（7月前）", "志威模具（7月后）"):
+                conn.execute(
+                    """
+                    INSERT INTO user_sheet_permissions (user_id, sheet_name, created_by, created_at)
+                    VALUES (?, ?, 1, ?)
+                    """,
+                    (user["id"], sheet_name, timestamp),
+                )
+            conn.execute(
+                "DELETE FROM schema_migrations WHERE key = 'sheet_registry_and_mould_names_v1'"
+            )
+            migrate_sheet_registry_and_names(conn)
+
+            row_names = {
+                row["source_sheet"]
+                for row in conn.execute(
+                    "SELECT source_sheet FROM payment_requests WHERE batch_id = ?",
+                    (batch["id"],),
+                ).fetchall()
+            }
+            assert row_names == {"赣瑞模具", "志威模具"}
+            migrated_batch = conn.execute(
+                "SELECT sheet_order_json FROM request_batches WHERE id = ?",
+                (batch["id"],),
+            ).fetchone()
+            assert json.loads(migrated_batch["sheet_order_json"]) == ["其他部门", "志威模具", "赣瑞模具"]
+            permissions = {
+                row["sheet_name"]
+                for row in conn.execute(
+                    "SELECT sheet_name FROM user_sheet_permissions WHERE user_id = ?",
+                    (user["id"],),
+                ).fetchall()
+            }
+            assert permissions == {"赣瑞模具", "志威模具"}
+
+        future = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "赣瑞模具 (7月后)", "summary": "未来旧名称输入", "amount": 500},
+        )
+        assert future.status_code == 200
+        assert future.json()["request"]["source_sheet"] == "赣瑞模具"
 
 
 def test_filtered_export_matches_workspace_filters_and_keeps_all_sheet():

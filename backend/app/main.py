@@ -56,6 +56,7 @@ from .external_expenses import (
     preview_external_expenses,
 )
 from .security import new_session_token, verify_password, hash_password
+from .sheet_names import canonical_sheet_name, canonical_sheet_order
 from .snapshots import (
     cleanup_batch_snapshot_files,
     create_batch_snapshot,
@@ -322,7 +323,7 @@ REQUEST_WRITE_FIELDS = {
 
 
 def normalize_sheet_permission(value: Any) -> str:
-    return str(value or "").strip() or "未分 Sheet"
+    return canonical_sheet_name(value)
 
 
 def normalize_sheet_permissions(values: list[Any]) -> list[str]:
@@ -390,16 +391,23 @@ def user_public_with_permissions(conn, row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def available_sheet_names(conn) -> list[str]:
-    return [
-        str(row["sheet_name"])
+    names = {
+        canonical_sheet_name(row["sheet_name"])
         for row in conn.execute(
             """
             SELECT DISTINCT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name
             FROM payment_requests
-            ORDER BY sheet_name
             """
         ).fetchall()
-    ]
+    }
+    for batch in conn.execute("SELECT sheet_order_json FROM request_batches").fetchall():
+        try:
+            stored_order = json.loads(batch["sheet_order_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            stored_order = []
+        if isinstance(stored_order, list):
+            names.update(canonical_sheet_order(stored_order))
+    return sorted(names, key=lambda value: value)
 
 
 def attachment_public(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -498,6 +506,65 @@ def ensure_sheet_access(
         raise HTTPException(status_code=403, detail="无权访问该 Sheet")
 
 
+def batch_registered_sheet_names(conn, batch_id: int) -> list[str]:
+    batch = require_batch(conn, batch_id)
+    names = batch_sheet_order(row_to_dict(batch))
+    seen = set(names)
+    rows = conn.execute(
+        """
+        SELECT DISTINCT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name
+        FROM payment_requests
+        WHERE batch_id = ?
+        ORDER BY id
+        """,
+        (batch_id,),
+    ).fetchall()
+    for row in rows:
+        sheet_name = canonical_sheet_name(row["sheet_name"])
+        if sheet_name not in seen:
+            names.append(sheet_name)
+            seen.add(sheet_name)
+    return names
+
+
+def register_batch_sheet(conn, batch_id: int, source_sheet: Any) -> None:
+    sheet_name = canonical_sheet_name(source_sheet)
+    batch = require_batch(conn, batch_id)
+    order = batch_sheet_order(row_to_dict(batch))
+    if sheet_name in order:
+        return
+    order.append(sheet_name)
+    conn.execute(
+        "UPDATE request_batches SET sheet_order_json = ? WHERE id = ?",
+        (json.dumps(order, ensure_ascii=False), batch_id),
+    )
+
+
+def ensure_business_can_create_in_sheet(
+    conn,
+    user: Dict[str, Any],
+    batch_id: int,
+    source_sheet: Any,
+) -> None:
+    ensure_sheet_access(conn, user, source_sheet)
+    if not user_has_restricted_sheet_access(user):
+        return
+    sheet_name = canonical_sheet_name(source_sheet)
+    if sheet_name not in set(batch_registered_sheet_names(conn, batch_id)):
+        raise HTTPException(status_code=403, detail="业务人员只能在当前批次已存在的授权 Sheet 中新增请款")
+
+
+def ensure_business_sheet_unchanged(
+    user: Dict[str, Any],
+    existing: Dict[str, Any],
+    changes: Dict[str, Any],
+) -> None:
+    if not user_has_restricted_sheet_access(user) or "source_sheet" not in changes:
+        return
+    if canonical_sheet_name(changes.get("source_sheet")) != canonical_sheet_name(existing.get("source_sheet")):
+        raise HTTPException(status_code=403, detail="业务人员不能修改请款所属 Sheet")
+
+
 def ensure_request_access(
     conn,
     user: Dict[str, Any],
@@ -523,6 +590,7 @@ def batch_public_for_user(
     user: Dict[str, Any],
 ) -> Dict[str, Any]:
     data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    data["sheet_order"] = batch_sheet_order(data)
     if not user_has_restricted_sheet_access(user):
         return data
     allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
@@ -798,6 +866,7 @@ def rollover_batch(
     timestamp = now_iso()
     with connect() as conn:
         source = require_batch(conn, source_batch_id)
+        source_sheet_order = canonical_sheet_order(batch_sheet_order(row_to_dict(source)))
         cursor = conn.execute(
             """
             INSERT INTO request_batches (
@@ -811,7 +880,7 @@ def rollover_batch(
                 payload.start_date,
                 payload.end_date,
                 f"rollover:{source['name']}",
-                source["sheet_order_json"],
+                json.dumps(source_sheet_order, ensure_ascii=False),
                 user["id"],
                 timestamp,
                 timestamp,
@@ -921,14 +990,9 @@ def update_batch_sheet_order(
     payload: SheetOrderIn,
     user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
-    requested_order: list[str] = []
-    seen: set[str] = set()
-    for value in payload.sheet_order:
-        name = str(value or "").strip()
-        if not name or name == "全部" or len(name) > 200 or name in seen:
-            continue
-        requested_order.append(name)
-        seen.add(name)
+    requested_order = canonical_sheet_order(payload.sheet_order)
+    if any(len(name) > 200 for name in requested_order):
+        raise HTTPException(status_code=400, detail="Sheet 名称不能超过 200 个字符")
     if len(requested_order) > 200:
         raise HTTPException(status_code=400, detail="Sheet 数量不能超过 200 个")
 
@@ -937,8 +1001,8 @@ def update_batch_sheet_order(
         batch = require_batch(conn, batch_id)
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理调整 Sheet 顺序")
-        existing_names = {
-            str(row["sheet_name"] or "").strip()
+        row_backed_names = {
+            canonical_sheet_name(row["sheet_name"])
             for row in conn.execute(
                 """
                 SELECT DISTINCT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name
@@ -948,8 +1012,8 @@ def update_batch_sheet_order(
                 (batch_id,),
             ).fetchall()
         }
-        final_order = [name for name in requested_order if name in existing_names]
-        final_order.extend(sorted(existing_names - set(final_order)))
+        final_order = list(requested_order)
+        final_order.extend(sorted(row_backed_names - set(final_order)))
         old_order = batch_sheet_order(row_to_dict(batch))
         timestamp = now_iso()
         conn.execute(
@@ -1130,7 +1194,7 @@ def payment_request_filter_parts(
     finance_review = finance_review.strip()
     general_manager_approval = general_manager_approval.strip()
     payment_status = payment_status.strip()
-    source_sheet = source_sheet.strip()
+    source_sheet = canonical_sheet_name(source_sheet) if source_sheet.strip() else ""
     conditions = ["batch_id = ?"]
     params: list[Any] = [batch_id]
     if q:
@@ -1228,7 +1292,7 @@ def create_request(
         batch = require_batch(conn, batch_id)
         ensure_editable(batch, user)
         data = payload.dict(exclude_unset=True)
-        ensure_sheet_access(conn, user, data.get("source_sheet"))
+        ensure_business_can_create_in_sheet(conn, user, batch_id, data.get("source_sheet"))
         reject_direct_payment_summary_changes(data, creating=True)
         request_id = insert_request(conn, batch_id, data, user["id"], user["role"], create_summary_payment=False)
         row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
@@ -1250,7 +1314,7 @@ def bulk_save_requests(
         updated: list[int] = []
         deleted: list[int] = []
         for item in payload.creates:
-            ensure_sheet_access(conn, user, item.get("source_sheet"))
+            ensure_business_can_create_in_sheet(conn, user, batch_id, item.get("source_sheet"))
             reject_direct_payment_summary_changes(item, creating=True)
             request_id = insert_request(conn, batch_id, item, user["id"], user["role"], create_summary_payment=False)
             row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
@@ -1272,6 +1336,7 @@ def bulk_save_requests(
                 raise HTTPException(status_code=400, detail="批量更新缺少记录 id")
             old_row = require_accessible_request(conn, batch_id, int(request_id), user)
             changes = {key: value for key, value in item.items() if key != "id"}
+            ensure_business_sheet_unchanged(user, row_to_dict(old_row), changes)
             if "source_sheet" in changes:
                 ensure_sheet_access(conn, user, changes.get("source_sheet"))
             if not changes:
@@ -1338,6 +1403,7 @@ def update_request(
             raise HTTPException(status_code=400, detail="归档后更正必须填写原因")
         data = payload.dict(exclude_unset=True)
         reason = data.pop("reason", None)
+        ensure_business_sheet_unchanged(user, row_to_dict(old_row), data)
         if "source_sheet" in data:
             ensure_sheet_access(conn, user, data.get("source_sheet"))
         changed = update_request_row(conn, request_id, data, user["id"], user["role"])
@@ -1950,7 +2016,7 @@ MERGE_PAYMENT_FIELDS = ("amount", "payment_date", "payer", "payment_account", "b
 
 
 def weekly_merge_row_id(row: Dict[str, Any]) -> str:
-    return f"request:{row.get('source_sheet') or ''}:{int(row.get('source_row') or 0)}"
+    return f"request:{canonical_sheet_name(row.get('source_sheet'))}:{int(row.get('source_row') or 0)}"
 
 
 def weekly_merge_payment_key(detail: Dict[str, Any]) -> str:
@@ -1964,7 +2030,7 @@ def merge_request_payload(row: Dict[str, Any], *, creating: bool) -> Dict[str, A
         for field in MERGE_REQUEST_FIELDS
         if creating or field in present
     }
-    payload["source_sheet"] = str(row.get("source_sheet") or "").strip() or "未分 Sheet"
+    payload["source_sheet"] = canonical_sheet_name(row.get("source_sheet"))
     payload["source_row"] = row.get("source_row")
     if creating:
         try:
@@ -2016,7 +2082,7 @@ def merge_request_lookup(conn, batch_id: int) -> tuple[Dict[int, Dict[str, Any]]
     for record in records:
         key = (
             str(record.get("dingding_id") or "").strip(),
-            str(record.get("source_sheet") or "").strip(),
+            canonical_sheet_name(record.get("source_sheet")),
         )
         if key[0]:
             by_legacy.setdefault(key, []).append(record)
@@ -2073,7 +2139,7 @@ def build_weekly_merge_plan(
         else:
             key = (
                 str(row.get("dingding_id") or "").strip(),
-                str(row.get("source_sheet") or "").strip(),
+                canonical_sheet_name(row.get("source_sheet")),
             )
             matches = by_legacy.get(key, []) if key[0] else []
             candidates = [
@@ -2429,14 +2495,10 @@ def build_weekly_merge_plan(
         if plan["action"] == "unchanged" and plan["payment_change"]:
             plan["action"] = "update"
 
-    incoming_order = [
-        str(name).strip()
-        for name in meta.get("workbook_sheet_order") or []
-        if str(name).strip()
-    ]
+    incoming_order = canonical_sheet_order(meta.get("workbook_sheet_order") or [])
     old_order = batch_sheet_order(row_to_dict(require_batch(conn, batch_id)))
     existing_sheets = [
-        str(row["source_sheet"] or "未分 Sheet").strip() or "未分 Sheet"
+        canonical_sheet_name(row["source_sheet"])
         for row in conn.execute(
             "SELECT DISTINCT source_sheet FROM payment_requests WHERE batch_id = ? ORDER BY id",
             (batch_id,),
@@ -2539,6 +2601,16 @@ def cleanup_expired_weekly_merge_jobs(conn) -> None:
         conn.execute("UPDATE import_jobs SET status = 'expired' WHERE id = ?", (job["id"],))
 
 
+def canonicalize_import_sheet_names(rows: list[Dict[str, Any]], meta: Dict[str, Any]) -> None:
+    for row in rows:
+        row["source_sheet"] = canonical_sheet_name(row.get("source_sheet"))
+        row["content_hash"] = content_hash(row)
+    for detail in meta.get("payment_details") or []:
+        detail["source_sheet"] = canonical_sheet_name(detail.get("source_sheet"))
+    if "workbook_sheet_order" in meta:
+        meta["workbook_sheet_order"] = canonical_sheet_order(meta.get("workbook_sheet_order") or [])
+
+
 @app.post("/api/import/weekly-excel/merge-preview")
 async def preview_weekly_excel_merge(
     file: UploadFile = File(...),
@@ -2548,6 +2620,7 @@ async def preview_weekly_excel_merge(
     saved_path = await save_upload(file)
     try:
         rows, meta = parse_weekly_excel(saved_path)
+        canonicalize_import_sheet_names(rows, meta)
     except Exception as exc:
         saved_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Excel 解析失败：{exc}") from exc
@@ -2778,6 +2851,7 @@ def apply_weekly_excel_merge(
             ).get(payment_id):
                 raise HTTPException(status_code=409, detail=f"预览后付款 {payment_id} 的凭证已变化，请重新预览")
         rows, meta = parse_weekly_excel(source_path)
+        canonicalize_import_sheet_names(rows, meta)
         plan = build_weekly_merge_plan(conn, batch_id, rows, meta, resolutions, payload.payment_dates)
         if not plan["can_apply"]:
             unresolved = [
@@ -2970,9 +3044,10 @@ def apply_weekly_excel_merge(
                 refresh_payment_summaries(conn, int(request_id))
 
             timestamp = now_iso()
+            next_sheet_order = canonical_sheet_order(plan["sheet_order"]["new"])
             conn.execute(
                 "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(plan["sheet_order"]["new"], ensure_ascii=False), timestamp, batch_id),
+                (json.dumps(next_sheet_order, ensure_ascii=False), timestamp, batch_id),
             )
             touched_request_ids = {
                 *[int(item["id"]) for item in manifest["created_requests"]],
@@ -3065,6 +3140,7 @@ async def import_weekly_excel(
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     rows, meta = parse_weekly_excel(saved_path)
+    canonicalize_import_sheet_names(rows, meta)
     payment_details = meta.pop("payment_details", [])
     payment_detail_sheet_present = bool(meta.get("payment_detail_sheet_present"))
     if (payment_detail_sheet_present or any(float(row.get("paid_amount") or 0) > 0 for row in rows)) and user["role"] not in FINANCE_FIELD_ROLES:
@@ -3162,6 +3238,7 @@ async def import_dingtalk(
         }
     mapping = json.loads(mapping_json)
     rows, meta = parse_dingtalk_file(saved_path, mapping)
+    canonicalize_import_sheet_names(rows, meta)
     if any(float(row.get("paid_amount") or 0) > 0 for row in rows) and user["role"] not in FINANCE_FIELD_ROLES:
         raise HTTPException(status_code=403, detail="包含付款数据的文件只能由财务、总经理或管理员导入")
     meta["source_copy"] = str(saved_path.relative_to(DATA_DIR))
@@ -3944,6 +4021,8 @@ def restore_table_snapshot(conn, table: str, snapshot: Dict[str, Any]) -> None:
         if row["name"] != "id"
     ]
     payload = {column: snapshot.get(column) for column in columns}
+    if table == "payment_requests" and "source_sheet" in payload:
+        payload["source_sheet"] = canonical_sheet_name(payload["source_sheet"])
     conn.execute(
         f"UPDATE {table} SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",
         [payload[column] for column in columns] + [snapshot["id"]],
@@ -3963,7 +4042,7 @@ def rollback_weekly_merge_job(
     batch_id = int(job["batch_id"])
     if batch["updated_at"] != manifest.get("batch_post_updated_at"):
         raise HTTPException(status_code=409, detail="合并后批次又发生了修改，不能整次撤回")
-    if batch_sheet_order(row_to_dict(batch)) != (manifest.get("new_sheet_order") or []):
+    if batch_sheet_order(row_to_dict(batch)) != canonical_sheet_order(manifest.get("new_sheet_order") or []):
         raise HTTPException(status_code=409, detail="合并后 Sheet 顺序又发生了修改，不能整次撤回")
     for request_id, expected in (manifest.get("request_post_versions") or {}).items():
         row = conn.execute(
@@ -4036,9 +4115,10 @@ def rollback_weekly_merge_job(
         )
 
     timestamp = now_iso()
+    restored_sheet_order = canonical_sheet_order(manifest.get("old_sheet_order") or [])
     conn.execute(
         "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(manifest.get("old_sheet_order") or [], ensure_ascii=False), timestamp, batch_id),
+        (json.dumps(restored_sheet_order, ensure_ascii=False), timestamp, batch_id),
     )
     conn.execute(
         "UPDATE import_jobs SET status = 'rolled_back', imported_rows = 0 WHERE id = ?",
@@ -4531,14 +4611,7 @@ def batch_sheet_order(batch: Dict[str, Any]) -> list[str]:
             value = []
     if not isinstance(value, list):
         return []
-    order: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        name = str(item or "").strip()
-        if name and name not in seen:
-            order.append(name)
-            seen.add(name)
-    return order
+    return canonical_sheet_order(value)
 
 
 def validate_external_expense_filter(payload: ExternalExpensePreviewIn) -> tuple[Optional[date], Optional[date]]:
@@ -4875,6 +4948,7 @@ def insert_request(
     placeholders = ", ".join(["?"] * len(columns))
     cursor = conn.execute(f"INSERT INTO payment_requests ({', '.join(columns)}) VALUES ({placeholders})", values)
     request_id = int(cursor.lastrowid)
+    register_batch_sheet(conn, batch_id, payload.get("source_sheet"))
     if create_summary_payment and summary_paid_amount not in (None, "") and float(summary_paid_amount or 0) > 0:
         insert_payment_record_internal(
             conn,
@@ -4897,6 +4971,8 @@ def insert_request(
 
 def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     payload = {key: value for key, value in data.items() if key in REQUEST_WRITE_FIELDS}
+    if "source_sheet" in payload:
+        payload["source_sheet"] = canonical_sheet_name(payload["source_sheet"])
     if "raw_extra" in data and "raw_extra_json" not in payload:
         payload["raw_extra_json"] = json.dumps(data["raw_extra"], ensure_ascii=False, default=str)
     if "raw_extra_json" not in payload:
@@ -4912,6 +4988,8 @@ def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
 def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int, user_role: str = ROLE_GENERAL_MANAGER) -> bool:
     allowed = REQUEST_WRITE_FIELDS - {"content_hash"}
     payload = {key: value for key, value in data.items() if key in allowed}
+    if "source_sheet" in payload:
+        payload["source_sheet"] = canonical_sheet_name(payload["source_sheet"])
     if "raw_extra" in data:
         payload["raw_extra_json"] = json.dumps(data["raw_extra"], ensure_ascii=False, default=str)
     elif "raw_extra_json" in data:
@@ -4964,6 +5042,8 @@ def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int
         f"UPDATE payment_requests SET {', '.join(f'{col} = ?' for col in columns)} WHERE id = ?",
         [changed_payload[col] for col in columns] + [request_id],
     )
+    if "source_sheet" in changed_payload:
+        register_batch_sheet(conn, int(existing["batch_id"]), changed_payload["source_sheet"])
     refresh_payment_summaries(conn, request_id)
     row = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
     conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(row), request_id))
@@ -4994,7 +5074,7 @@ def import_excel_payment_details(
             ).fetchone()
         if request is None:
             dingding_id = str(detail.get("dingding_id") or "").strip()
-            source_sheet = str(detail.get("source_sheet") or "").strip()
+            source_sheet = canonical_sheet_name(detail.get("source_sheet"))
             if not dingding_id or not source_sheet:
                 errors.append({"row": source_row, "message": "无法匹配请款：请款标识无效，且缺少钉钉单号或来源 Sheet"})
                 continue

@@ -3042,27 +3042,32 @@ textarea {
   min-width: 190px;
 }
 
-.sheet-permission-picker > summary {
+.sheet-permission-trigger {
+  width: 100%;
   min-height: 42px;
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   padding: 8px 12px;
   border: 1px solid #d7e1e5;
   border-radius: 7px;
   background: #fff;
   color: #344b56;
   cursor: pointer;
-  list-style-position: inside;
+  font: inherit;
+  text-align: left;
+}
+
+.sheet-permission-trigger:disabled {
+  cursor: default;
+  opacity: 1;
 }
 
 .sheet-permission-options {
-  position: absolute;
-  z-index: 40;
-  top: calc(100% + 4px);
-  left: 0;
-  width: min(420px, 70vw);
-  max-height: 320px;
-  overflow: auto;
+  position: fixed;
+  z-index: 1200;
+  overflow-x: hidden;
+  overflow-y: auto;
   display: grid;
   gap: 6px;
   padding: 10px;
@@ -3086,7 +3091,11 @@ textarea {
 }
 
 .sheet-permission-options input {
+  appearance: auto;
+  width: 16px;
+  height: 16px;
   flex: 0 0 auto;
+  padding: 0;
   margin-top: 2px;
 }
 

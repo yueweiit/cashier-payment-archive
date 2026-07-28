@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from .security import hash_password
+from .sheet_names import canonical_sheet_name, canonical_sheet_order
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -332,6 +333,99 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     refresh_payment_summaries(conn)
     migrate_role_dictionary(conn)
     migrate_external_department_sheets(conn)
+    migrate_sheet_registry_and_names(conn)
+
+
+def migrate_sheet_registry_and_names(conn: sqlite3.Connection) -> None:
+    migration_key = "sheet_registry_and_mould_names_v1"
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE key = ?", (migration_key,)).fetchone():
+        return
+
+    changed_request_ids: list[int] = []
+    request_rows = conn.execute("SELECT id, source_sheet FROM payment_requests ORDER BY id").fetchall()
+    for row in request_rows:
+        current_name = str(row["source_sheet"] or "").strip()
+        canonical_name = canonical_sheet_name(current_name)
+        if current_name and canonical_name != current_name:
+            conn.execute(
+                "UPDATE payment_requests SET source_sheet = ? WHERE id = ?",
+                (canonical_name, row["id"]),
+            )
+            changed_request_ids.append(int(row["id"]))
+
+    if changed_request_ids:
+        from .excel_io import content_hash
+
+        for request_id in changed_request_ids:
+            request = conn.execute(
+                "SELECT * FROM payment_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE payment_requests SET content_hash = ? WHERE id = ?",
+                (content_hash(dict(request)), request_id),
+            )
+
+    batches = conn.execute(
+        "SELECT id, sheet_order_json FROM request_batches ORDER BY id"
+    ).fetchall()
+    for batch in batches:
+        try:
+            stored_order = json.loads(batch["sheet_order_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            stored_order = []
+        if not isinstance(stored_order, list):
+            stored_order = []
+        normalized_order = canonical_sheet_order(stored_order)
+        registered = set(normalized_order)
+        row_sheets = conn.execute(
+            """
+            SELECT source_sheet, MIN(id) AS first_id
+            FROM payment_requests
+            WHERE batch_id = ?
+            GROUP BY source_sheet
+            ORDER BY first_id
+            """,
+            (batch["id"],),
+        ).fetchall()
+        for row in row_sheets:
+            sheet_name = canonical_sheet_name(row["source_sheet"])
+            if sheet_name not in registered:
+                normalized_order.append(sheet_name)
+                registered.add(sheet_name)
+        conn.execute(
+            "UPDATE request_batches SET sheet_order_json = ? WHERE id = ?",
+            (json.dumps(normalized_order, ensure_ascii=False), batch["id"]),
+        )
+
+    permissions = conn.execute(
+        """
+        SELECT user_id, sheet_name, created_by, created_at
+        FROM user_sheet_permissions
+        ORDER BY user_id, sheet_name
+        """
+    ).fetchall()
+    for row in permissions:
+        canonical_name = canonical_sheet_name(row["sheet_name"])
+        if canonical_name == row["sheet_name"]:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO user_sheet_permissions
+                (user_id, sheet_name, created_by, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (row["user_id"], canonical_name, row["created_by"], row["created_at"]),
+        )
+        conn.execute(
+            "DELETE FROM user_sheet_permissions WHERE user_id = ? AND sheet_name = ?",
+            (row["user_id"], row["sheet_name"]),
+        )
+
+    conn.execute(
+        "INSERT INTO schema_migrations (key, applied_at) VALUES (?, ?)",
+        (migration_key, now_iso()),
+    )
 
 
 def migrate_external_department_sheets(conn: sqlite3.Connection) -> None:
