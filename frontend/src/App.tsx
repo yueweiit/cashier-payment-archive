@@ -225,15 +225,19 @@ export function App() {
 }
 
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("admin123");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     setError("");
+    if (!username.trim() || !password) {
+      setError("请输入账号和密码");
+      return;
+    }
     try {
-      const res = await api.login(username, password);
+      const res = await api.login(username.trim(), password);
       onLogin(res.user);
     } catch (err) {
       setError((err as Error).message);
@@ -242,7 +246,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
 
   return (
     <main className="login-shell">
-      <form className="login-panel" onSubmit={submit}>
+      <form className="login-panel" onSubmit={submit} autoComplete="off">
         <div className="brand-row">
           <FileSpreadsheet size={28} />
           <div>
@@ -252,11 +256,23 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
         </div>
         <label>
           账号
-          <input value={username} onChange={(event) => setUsername(event.target.value)} />
+          <input
+            value={username}
+            name="cashier-username"
+            autoComplete="off"
+            autoFocus
+            onChange={(event) => setUsername(event.target.value)}
+          />
         </label>
         <label>
           密码
-          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+          <input
+            type="password"
+            value={password}
+            name="cashier-password"
+            autoComplete="new-password"
+            onChange={(event) => setPassword(event.target.value)}
+          />
         </label>
         {error && <p className="error-text">{error}</p>}
         <button className="primary-button" type="submit">
