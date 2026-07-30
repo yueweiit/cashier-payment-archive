@@ -3029,14 +3029,40 @@ textarea {
   font-size: 12px;
 }
 
-.admin-form {
-  grid-template-columns: repeat(6, minmax(120px, 1fr));
-  margin-bottom: 12px;
+.admin-users-header {
+  margin-bottom: 14px;
 }
 
 .admin-user-tools {
   margin-bottom: 12px;
   max-width: 360px;
+}
+
+.create-user-modal {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.create-user-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.create-user-form label small {
+  color: #60717d;
+  line-height: 1.5;
+}
+
+.create-user-active {
+  justify-self: start;
+  font-size: 14px;
+}
+
+.create-user-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 2px;
 }
 
 .inline-check {
@@ -3466,10 +3492,14 @@ textarea {
   }
 
   .mapping-table,
-  .admin-form,
+  .create-user-form,
   .attachment-form,
   .payment-entry-form {
     grid-template-columns: 1fr;
+  }
+
+  .create-user-form .span-2 {
+    grid-column: auto;
   }
 
   .payment-summary-grid {

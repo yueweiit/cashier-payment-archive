@@ -4148,6 +4148,14 @@ function SheetPermissionPicker({
 }
 
 function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
+  type UserForm = {
+    username: string;
+    password: string;
+    role: UserRole;
+    display_name: string;
+    active: boolean;
+    sheet_permissions: string[];
+  };
   type UserDraft = {
     display_name: string;
     role: UserRole;
@@ -4157,14 +4165,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
   };
   const [users, setUsers] = useState<User[]>([]);
   const [availableSheets, setAvailableSheets] = useState<string[]>([]);
-  const [userForm, setUserForm] = useState<{
-    username: string;
-    password: string;
-    role: UserRole;
-    display_name: string;
-    active: boolean;
-    sheet_permissions: string[];
-  }>({
+  const emptyUserForm = (): UserForm => ({
     username: "",
     password: "Yuewei123",
     role: "business",
@@ -4172,6 +4173,10 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
     active: true,
     sheet_permissions: [],
   });
+  const [userForm, setUserForm] = useState<UserForm>(emptyUserForm);
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
+  const [creatingUser, setCreatingUser] = useState(false);
+  const [createUserError, setCreateUserError] = useState("");
   const [userDrafts, setUserDrafts] = useState<Record<number, UserDraft>>({});
   const [userQuery, setUserQuery] = useState("");
   const visibleUsers = useMemo(() => {
@@ -4201,18 +4206,52 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
     load().catch((err) => setMessage((err as Error).message));
   }, []);
 
-  async function createUser() {
-    await api.createUser(userForm);
-    setUserForm({
-      username: "",
-      password: "Yuewei123",
-      role: "business",
-      display_name: "",
-      active: true,
-      sheet_permissions: [],
-    });
-    await load();
-    setMessage("用户已创建");
+  function openCreateUserDialog() {
+    setUserForm(emptyUserForm());
+    setCreateUserError("");
+    setCreateDialogOpen(true);
+  }
+
+  function closeCreateUserDialog() {
+    if (creatingUser) return;
+    setCreateDialogOpen(false);
+    setCreateUserError("");
+  }
+
+  async function createUser(event: FormEvent) {
+    event.preventDefault();
+    const username = userForm.username.trim();
+    const displayName = userForm.display_name.trim();
+    if (!username) {
+      setCreateUserError("请输入账号");
+      return;
+    }
+    if (!displayName) {
+      setCreateUserError("请输入姓名");
+      return;
+    }
+    if (userForm.password.length < 6) {
+      setCreateUserError("初始密码至少需要 6 位");
+      return;
+    }
+    setCreatingUser(true);
+    setCreateUserError("");
+    try {
+      await api.createUser({
+        ...userForm,
+        username,
+        display_name: displayName,
+        sheet_permissions: userForm.role === "business" ? userForm.sheet_permissions : [],
+      });
+      await load();
+      setCreateDialogOpen(false);
+      setUserForm(emptyUserForm());
+      setMessage("用户已创建");
+    } catch (err) {
+      setCreateUserError((err as Error).message);
+    } finally {
+      setCreatingUser(false);
+    }
   }
 
   function updateUserDraft(id: number, patch: Partial<UserDraft>) {
@@ -4260,21 +4299,14 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
   return (
     <div className="admin-page">
       <section className="content-panel">
-        <div className="section-title">用户</div>
-        <div className="admin-form">
-          <input placeholder="账号" value={userForm.username} onChange={(event) => setUserForm({ ...userForm, username: event.target.value })} />
-          <input placeholder="姓名" value={userForm.display_name} onChange={(event) => setUserForm({ ...userForm, display_name: event.target.value })} />
-          <input placeholder="初始密码" value={userForm.password} onChange={(event) => setUserForm({ ...userForm, password: event.target.value })} />
-          <select value={userForm.role} onChange={(event) => setUserForm({ ...userForm, role: event.target.value as UserRole })}>
-            {Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-          </select>
-          <SheetPermissionPicker
-            value={userForm.sheet_permissions}
-            options={availableSheets}
-            disabled={userForm.role !== "business"}
-            onChange={(sheet_permissions) => setUserForm({ ...userForm, sheet_permissions })}
-          />
-          <button className="primary-button" onClick={createUser}><Plus size={16} />新增用户</button>
+        <div className="section-title-row admin-users-header">
+          <div>
+            <div className="section-title">用户</div>
+            <small>共 {users.length} 个用户，在列表中维护已有账号</small>
+          </div>
+          <button className="primary-button" type="button" onClick={openCreateUserDialog}>
+            <Plus size={16} />新增用户
+          </button>
         </div>
         <div className="admin-user-tools">
           <div className="search-box">
@@ -4331,6 +4363,94 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
           </table>
         </div>
       </section>
+      {createDialogOpen && (
+        <Modal title="新增用户" onClose={closeCreateUserDialog} className="create-user-modal">
+          <form className="create-user-form" onSubmit={createUser}>
+            <p className="form-hint span-2">创建登录账号并设置角色。业务人员只能查看已授权的 Sheet。</p>
+            <label>
+              账号
+              <input
+                autoFocus
+                autoComplete="off"
+                placeholder="请输入登录账号"
+                value={userForm.username}
+                onChange={(event) => setUserForm({ ...userForm, username: event.target.value })}
+                disabled={creatingUser}
+              />
+            </label>
+            <label>
+              姓名
+              <input
+                autoComplete="off"
+                placeholder="请输入用户姓名"
+                value={userForm.display_name}
+                onChange={(event) => setUserForm({ ...userForm, display_name: event.target.value })}
+                disabled={creatingUser}
+              />
+            </label>
+            <label>
+              初始密码
+              <input
+                type="password"
+                autoComplete="new-password"
+                placeholder="至少 6 位"
+                value={userForm.password}
+                onChange={(event) => setUserForm({ ...userForm, password: event.target.value })}
+                disabled={creatingUser}
+              />
+              <small>默认密码为 Yuewei123，用户登录后可以自行修改。</small>
+            </label>
+            <label>
+              角色
+              <select
+                value={userForm.role}
+                onChange={(event) => {
+                  const role = event.target.value as UserRole;
+                  setUserForm({
+                    ...userForm,
+                    role,
+                    sheet_permissions: role === "business" ? userForm.sheet_permissions : [],
+                  });
+                }}
+                disabled={creatingUser}
+              >
+                {Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </label>
+            <label className="span-2">
+              Sheet 权限
+              <SheetPermissionPicker
+                value={userForm.sheet_permissions}
+                options={availableSheets}
+                disabled={userForm.role !== "business"}
+                onChange={(sheet_permissions) => setUserForm({ ...userForm, sheet_permissions })}
+              />
+              <small>
+                {userForm.role === "business"
+                  ? "未选择时，该用户登录后看不到任何 Sheet。"
+                  : "该角色按照系统权限查看全部 Sheet，无需单独授权。"}
+              </small>
+            </label>
+            <label className="inline-check create-user-active span-2">
+              <input
+                type="checkbox"
+                checked={userForm.active}
+                onChange={(event) => setUserForm({ ...userForm, active: event.target.checked })}
+                disabled={creatingUser}
+              />
+              创建后立即启用账号
+            </label>
+            {createUserError && <p className="error-text span-2" role="alert">{createUserError}</p>}
+            <div className="create-user-actions span-2">
+              <button className="ghost-button" type="button" onClick={closeCreateUserDialog} disabled={creatingUser}>取消</button>
+              <button className="primary-button" type="submit" disabled={creatingUser}>
+                <Plus size={16} />
+                {creatingUser ? "创建中" : "创建用户"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
     </div>
   );
 }
