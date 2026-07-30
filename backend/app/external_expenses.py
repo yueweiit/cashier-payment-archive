@@ -31,8 +31,13 @@ SOURCE_TABLES = {
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 FINANCE_STAGE_RE = re.compile(r"(财务|出纳|会计|付款|financ|cajer|tesorer|contab)", re.IGNORECASE)
 PAID_PHRASE_RE = re.compile(r"(已支付|已经支付|已付款|已经付款|付款完成|支付完成|打款完成|款已付|款项已付)")
+YUEWEI_PAYMENT_CONFIRM_RE = re.compile(
+    r"(?:^|[\s,，。；;：:])悦为支付(?:$|[\s,，。；;！!])",
+    re.IGNORECASE,
+)
 PAYMENT_EXCLUSION_RE = re.compile(
     r"(未支付|未付款|未付|待支付|待付款|待付|尚未|剩余|部分|合并|"
+    r"(?:待|请|将|计划|预计|需要|需由).{0,8}悦为.{0,4}(?:支付|付款)|"
     r"客户.{0,8}(?:已支付|已付款)|无需.{0,8}(?:再次)?支付|不需要.{0,8}支付)"
 )
 APPROVAL_REFERENCE_RE = re.compile(r"(?<!\d)\d{15,}(?!\d)")
@@ -719,7 +724,9 @@ def classify_dingtalk_payment_event(
         return "review_required", "审批流程当前状态不允许自动付款"
     if PAYMENT_EXCLUSION_RE.search(comment):
         return "review_required", "评论包含部分、未付、合并或其他排除语义"
-    if not PAID_PHRASE_RE.search(comment):
+    explicit_paid_phrase = bool(PAID_PHRASE_RE.search(comment))
+    yuewei_payment_confirmation = bool(YUEWEI_PAYMENT_CONFIRM_RE.search(comment))
+    if not explicit_paid_phrase and not yuewei_payment_confirmation:
         return "ignored", "未识别到明确的付款完成语义"
     referenced_approval_nos = {
         match
@@ -738,6 +745,8 @@ def classify_dingtalk_payment_event(
         amounts.add(round(float(raw_amount.replace(",", "")) * multiplier, 2))
     if len(amounts) > 1:
         return "review_required", "评论包含多笔付款金额"
+    if yuewei_payment_confirmation and not amounts:
+        return "review_required", "“悦为支付”评论缺少可核对的明确金额"
     if amounts:
         comment_amount = next(iter(amounts))
         if float(paid_amount) > 0 and comment_amount <= round(float(paid_amount), 2) + 0.01:

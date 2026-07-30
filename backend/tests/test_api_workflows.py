@@ -2097,6 +2097,36 @@ def test_dingtalk_payment_comment_classifier_is_strict():
         workflow_status="RUNNING",
         workflow_result="agree",
     )[0] == "eligible"
+    classification, _ = classify_dingtalk_payment_event(
+        {"comment": "发票金额100元，悦为支付", "trusted_finance": True},
+        approval_no="202607270943000076977",
+        pending_amount=100,
+        workflow_status="RUNNING",
+        workflow_result="agree",
+    )
+    assert classification == "eligible"
+    for comment in (
+        "悦为支付",
+        "发票金额100元，待悦为支付",
+        "发票金额100元，请悦为支付",
+        "发票金额100元，将由悦为支付",
+    ):
+        classification, _ = classify_dingtalk_payment_event(
+            {"comment": comment, "trusted_finance": True},
+            approval_no="202607270943000076977",
+            pending_amount=100,
+            workflow_status="RUNNING",
+            workflow_result="agree",
+        )
+        assert classification == "review_required"
+    classification, _ = classify_dingtalk_payment_event(
+        {"comment": "发票金额80元，悦为支付", "trusted_finance": True},
+        approval_no="202607270943000076977",
+        pending_amount=100,
+        workflow_status="RUNNING",
+        workflow_result="agree",
+    )
+    assert classification == "review_required"
     for comment in (
         "客户已付款",
         "已支付 40 元，剩余 20 元未支付",
@@ -2318,7 +2348,7 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
             "operator_id": "finance-user",
             "operator_name": "测试财务",
             "event_time": "2026-07-27T18:00:00+08:00",
-            "comment": "已支付，付款截图如上",
+            "comment": "发票金额60元，悦为支付",
             "images": [{"url": "https://example.invalid/proof.png"}],
             "attachments": [],
             "trusted_finance": True,
