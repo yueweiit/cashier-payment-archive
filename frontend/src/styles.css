@@ -894,6 +894,7 @@ textarea {
 
 .bulk-bar {
   justify-content: flex-start;
+  flex-wrap: wrap;
   padding: 10px;
   margin-bottom: 12px;
   border-radius: 8px;
@@ -901,8 +902,16 @@ textarea {
   border: 1px solid #f4d99a;
 }
 
-.bulk-bar input {
-  width: 180px;
+.bulk-move-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.bulk-move-controls select {
+  width: min(360px, 42vw);
+  min-width: 220px;
 }
 
 .dirty-banner {
@@ -3428,6 +3437,17 @@ textarea {
     width: 100%;
     flex-wrap: wrap;
     justify-content: flex-start;
+  }
+
+  .bulk-move-controls {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .bulk-move-controls select {
+    width: auto;
+    min-width: 0;
+    flex: 1 1 220px;
   }
 
   .workspace-grid .side-panel,

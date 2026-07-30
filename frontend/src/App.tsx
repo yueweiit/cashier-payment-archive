@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import {
   AlignLeft,
   AlertTriangle,
+  ArrowRight,
   Archive,
   ChevronLeft,
   ChevronRight,
@@ -1349,6 +1350,7 @@ function Workspace({
   const [editorDirty, setEditorDirty] = useState(false);
   const [attachmentCounts, setAttachmentCounts] = useState<Record<number, number>>({});
   const [selectedRows, setSelectedRows] = useState<number[]>([]);
+  const [bulkMoveTargetSheet, setBulkMoveTargetSheet] = useState("");
   const [editorInitialTab, setEditorInitialTab] = useState<RequestEditorTab>("request");
   const [pendingEditorNavigation, setPendingEditorNavigation] = useState<PendingEditorNavigation | null>(null);
   const [editorNavigationBusy, setEditorNavigationBusy] = useState(false);
@@ -1367,6 +1369,7 @@ function Workspace({
     setDeletedLocalIds(new Set());
     setDeletedSheetNames(new Set());
     setSelectedRows([]);
+    setBulkMoveTargetSheet("");
   }
 
   async function refreshAttachmentCounts() {
@@ -1907,6 +1910,7 @@ function Workspace({
   }
 
   function markDeleteSelected() {
+    if (!canEditGrid) return;
     const selected = new Set(selectedRows);
     const nextDeleted = new Set(deletedLocalIds);
     const nextRows = gridRows.map((row) => {
@@ -1919,6 +1923,31 @@ function Workspace({
     setGridRows(nextRows);
     setDeletedLocalIds(nextDeleted);
     setSelectedRows([]);
+  }
+
+  function markMoveSelected() {
+    if (!canManageSheets || !canEditGrid || !bulkMoveTargetSheet) return;
+    const targetSheet = normalizeSheetName(bulkMoveTargetSheet);
+    const selected = new Set(selectedRows);
+    const nextDirty = new Set(dirtyCells);
+    let changedCount = 0;
+    const nextRows = gridRows.map((row) => {
+      if (!row.id || !selected.has(row.id) || row.__deleted || normalizeSheetName(row.source_sheet) === targetSheet) {
+        return row;
+      }
+      nextDirty.add(`${row.__localId}:source_sheet`);
+      changedCount += 1;
+      return { ...row, source_sheet: targetSheet };
+    });
+    if (changedCount === 0) {
+      setMessage(`所选记录已经位于 Sheet“${targetSheet}”`);
+      return;
+    }
+    setGridRows(nextRows);
+    setDirtyCells(nextDirty);
+    setSelectedRows([]);
+    setBulkMoveTargetSheet("");
+    setMessage(`已将 ${changedCount} 条记录标记移动到 Sheet“${targetSheet}”，请点击“保存更改”`);
   }
 
   function markDeleteActiveSheet() {
@@ -2291,7 +2320,29 @@ function Workspace({
         {selectedRows.length > 0 && (
           <div className="bulk-bar">
             <span>已选 {selectedRows.length} 条</span>
-            <button className="ghost-button" onClick={markDeleteSelected}>
+            {canManageSheets && canEditGrid && (
+              <div className="bulk-move-controls">
+                <select
+                  value={bulkMoveTargetSheet}
+                  onChange={(event) => setBulkMoveTargetSheet(event.target.value)}
+                  aria-label="选择目标 Sheet"
+                >
+                  <option value="">选择目标 Sheet</option>
+                  {sheetTabs
+                    .filter((tab) => tab.key !== ALL_SHEET && !tab.pendingDelete)
+                    .map((tab) => (
+                      <option key={tab.key} value={tab.key}>
+                        {tab.label}（{tab.count} 条）
+                      </option>
+                    ))}
+                </select>
+                <button className="ghost-button" type="button" onClick={markMoveSelected} disabled={!bulkMoveTargetSheet}>
+                  <ArrowRight size={16} />
+                  移动所选行
+                </button>
+              </div>
+            )}
+            <button className="ghost-button" onClick={markDeleteSelected} disabled={!canEditGrid}>
               <Trash2 size={16} />
               删除所选行
             </button>
