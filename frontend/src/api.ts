@@ -80,6 +80,8 @@ export type ExternalSourceSnapshot = {
   applicant?: string;
   applicant_name_source?: "ding_user_snapshot" | "approval_title" | "unresolved" | string;
   applicant_department?: string;
+  applicant_department_level2?: string;
+  sheet_assignment_source?: string;
   application_date?: string;
   source_created_at?: string;
   source_updated_at?: string;
@@ -99,6 +101,7 @@ export type ExternalExpensePreviewRow = {
   applicant_id: string;
   applicant: string;
   applicant_department?: string;
+  original_applicant_department?: string;
   approval_status: "COMPLETED" | "RUNNING" | string;
   approval_result?: string;
   summary: string;
@@ -158,6 +161,26 @@ export type ExternalExpenseImportResult = {
   warnings: number;
   duplicates: unknown[];
   errors: Array<{ source_type: string; source_id: string; messages: string[] }>;
+};
+
+export type EmployeeDepartmentImportResult = {
+  status: string;
+  batch_id: number;
+  mapping_rows: number;
+  employee_rows: number;
+  skipped_employee_no_name: number;
+  skipped_employee_no_department: number;
+  ambiguous_employee_names: string[];
+  departments: string[];
+  matched_requests: number;
+  moved_requests: number;
+  unchanged_requests: number;
+  missing_applicant: number;
+  unmatched_applicant: number;
+  ambiguous_applicant: number;
+  removed_empty_sheets: string[];
+  sheet_order: string[];
+  permissions_unchanged: boolean;
 };
 
 export type ExternalMetadataSyncResult = {
@@ -575,6 +598,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ items }),
     }),
+  importEmployeeDepartments: (batchId: number, file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    return request<EmployeeDepartmentImportResult>(`/api/batches/${batchId}/employee-departments/import`, {
+      method: "POST",
+      body,
+    });
+  },
   syncExternalExpenseMetadata: (batchId: number, onlyIfStaleSeconds = 0) =>
     request<ExternalMetadataSyncResult>(`/api/batches/${batchId}/external-expenses/sync-metadata?only_if_stale_seconds=${onlyIfStaleSeconds}`, {
       method: "POST",

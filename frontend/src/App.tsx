@@ -13,6 +13,8 @@ import {
   Filter,
   History,
   Image as ImageIcon,
+  LayoutList,
+  Languages,
   LogOut,
   MoreHorizontal,
   MessageSquareText,
@@ -22,6 +24,8 @@ import {
   Save,
   Search,
   Shield,
+  SlidersHorizontal,
+  Table2,
   Trash2,
   Upload,
   Undo2,
@@ -33,6 +37,7 @@ import {
   AuditLog,
   Batch,
   DingtalkWorkflow,
+  EmployeeDepartmentImportResult,
   ExternalExpenseImportResult,
   ExternalExpensePreview,
   ExternalExpensePreviewFilter,
@@ -153,35 +158,32 @@ type GridRow = Partial<PaymentRequest> & {
   __deleted?: boolean;
 };
 
+type GridHeaderLanguage = "zh" | "es";
+type MobileQuickFilter = "all" | "pending_approval" | "unpaid" | "partial" | "paid";
+type MobileViewOverride = "cards" | "table" | null;
+
 type GridColumn = {
   key: keyof PaymentRequest;
-  label: string;
+  labelZh: string;
+  labelEs: string;
   width: number;
   type?: "number" | "date";
 };
 
 const gridColumns: GridColumn[] = [
-  { key: "dingding_id", label: "钉钉申请单号", width: 190 },
-  { key: "applicant", label: "申请人", width: 190 },
-  { key: "payment_account", label: "付款账户", width: 110 },
-  { key: "expense_type", label: "费用性质", width: 120 },
-  { key: "summary", label: "摘要", width: 360 },
-  { key: "amount", label: "应付金额", width: 120, type: "number" },
-  { key: "paid_amount", label: "已支付金额", width: 120, type: "number" },
-  { key: "pending_amount", label: "待付款金额", width: 120, type: "number" },
-  { key: "project", label: "项目归属", width: 160 },
-  { key: "payee_account", label: "收款信息/账号", width: 210 },
-  { key: "payee_name", label: "账户名", width: 140 },
-  { key: "bank_name", label: "开户行", width: 180 },
-  { key: "invoice_status", label: "开票情况", width: 110 },
-  { key: "needed_payment_date", label: "需求付款日期", width: 140, type: "date" },
-  { key: "finance_review", label: "财务审批", width: 130 },
-  { key: "actual_payment_date", label: "财务付款时间", width: 140, type: "date" },
-  { key: "general_manager_approval", label: "总经理审批", width: 130 },
-  { key: "general_manager_approval_date", label: "总经理审批时间", width: 150, type: "date" },
-  { key: "general_manager_opinion", label: "总经理意见", width: 260 },
-  { key: "remark", label: "备注", width: 220 },
-  { key: "source_sheet", label: "来源 Sheet", width: 150 },
+  { key: "dingding_id", labelZh: "钉钉申请单号", labelEs: "Número de solicitud en DingTalk", width: 220 },
+  { key: "source_sheet", labelZh: "应付款公司", labelEs: "Empresa a pagar", width: 220 },
+  { key: "payment_account", labelZh: "账户性质", labelEs: "Tipo de cuenta", width: 150 },
+  { key: "summary", labelZh: "摘要", labelEs: "Resumen / Concepto", width: 360 },
+  { key: "amount", labelZh: "应付金额", labelEs: "Monto a pagar", width: 140, type: "number" },
+  { key: "paid_amount", labelZh: "已支付金额", labelEs: "Monto pagado", width: 140, type: "number" },
+  { key: "pending_amount", labelZh: "待付款金额", labelEs: "Monto pendiente de pago", width: 180, type: "number" },
+  { key: "currency", labelZh: "货币类型", labelEs: "Tipo de moneda", width: 140 },
+  { key: "project", labelZh: "项目归属", labelEs: "Proyecto al que pertenece", width: 210 },
+  { key: "payee_name", labelZh: "收款人名称", labelEs: "Nombre del beneficiario", width: 200 },
+  { key: "needed_payment_date", labelZh: "需求付款日期", labelEs: "Fecha de pago requerida", width: 190, type: "date" },
+  { key: "remark", labelZh: "备注", labelEs: "Observaciones", width: 240 },
+  { key: "overdue_status", labelZh: "逾期情况", labelEs: "Estado de vencimiento", width: 180 },
 ];
 
 const ALL_SHEET = "__all__";
@@ -195,16 +197,31 @@ type SheetTab = {
 const wrappableColumnKeys = new Set<keyof PaymentRequest>([
   "payment_account",
   "expense_type",
+  "style_name",
   "summary",
   "project",
   "payee_account",
   "payee_name",
   "bank_name",
   "invoice_status",
-  "general_manager_opinion",
   "remark",
+  "overdue_status",
   "source_sheet",
 ]);
+
+function useSmallScreen() {
+  const [isSmallScreen, setIsSmallScreen] = useState(() => window.matchMedia("(max-width: 980px)").matches);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 980px)");
+    const update = () => setIsSmallScreen(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  return isSmallScreen;
+}
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -382,7 +399,20 @@ function Shell({
             setMessage={setMessage}
           />
         )}
-        {tab === "archive" && <ArchiveView user={user} batches={batches} selectedBatch={selectedBatch} setSelectedBatchId={setSelectedBatchId} reloadBatches={loadBatches} setMessage={setMessage} />}
+        {tab === "archive" && (
+          <ArchiveView
+            user={user}
+            batches={batches}
+            selectedBatch={selectedBatch}
+            setSelectedBatchId={setSelectedBatchId}
+            onOpenBatch={(batchId) => {
+              setSelectedBatchId(batchId);
+              setTab("workspace");
+            }}
+            reloadBatches={loadBatches}
+            setMessage={setMessage}
+          />
+        )}
         {tab === "admin" && <AdminView setMessage={setMessage} />}
       </main>
       {passwordDialogOpen && (
@@ -500,14 +530,16 @@ function TopbarImportActions({
 }) {
   const [weeklyFile, setWeeklyFile] = useState<File | null>(null);
   const [dingtalkFile, setDingtalkFile] = useState<File | null>(null);
+  const [employeeFile, setEmployeeFile] = useState<File | null>(null);
   const [mapping, setMapping] = useState<Record<string, string> | null>(null);
   const [headers, setHeaders] = useState<string[]>([]);
   const [mappingOpen, setMappingOpen] = useState(false);
   const [externalImportOpen, setExternalImportOpen] = useState(false);
   const [mergePreview, setMergePreview] = useState<WeeklyMergePreview | null>(null);
-  const [busyAction, setBusyAction] = useState<"weekly" | "weekly-merge" | "dingtalk" | "sync-metadata" | "rollback" | null>(null);
+  const [busyAction, setBusyAction] = useState<"weekly" | "weekly-merge" | "dingtalk" | "employee-departments" | "sync-metadata" | "rollback" | null>(null);
   const [weeklyInputKey, setWeeklyInputKey] = useState(0);
   const [dingtalkInputKey, setDingtalkInputKey] = useState(0);
+  const [employeeInputKey, setEmployeeInputKey] = useState(0);
   const silentSyncBatchRef = useRef<number | null>(null);
 
   async function refreshAfterImport(message: string) {
@@ -563,6 +595,25 @@ function TopbarImportActions({
       setHeaders([]);
       setMappingOpen(false);
       await refreshAfterImport("钉钉导出表已导入");
+    } catch (err) {
+      setMessage((err as Error).message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function importEmployeeDepartments() {
+    if (!employeeFile || !selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges) return;
+    setBusyAction("employee-departments");
+    setMessage("");
+    try {
+      const result: EmployeeDepartmentImportResult = await api.importEmployeeDepartments(selectedBatch.id, employeeFile);
+      setEmployeeFile(null);
+      setEmployeeInputKey((value) => value + 1);
+      const retained = result.missing_applicant + result.unmatched_applicant + result.ambiguous_applicant;
+      await refreshAfterImport(
+        `2级部门归组完成：导入 ${result.mapping_rows} 名员工，匹配 ${result.matched_requests} 条、移动 ${result.moved_requests} 条；${retained} 条未匹配请款保留原 Sheet`,
+      );
     } catch (err) {
       setMessage((err as Error).message);
     } finally {
@@ -703,6 +754,29 @@ function TopbarImportActions({
             >
               <RefreshCcw size={15} />
               {busyAction === "sync-metadata" ? "同步中" : "同步钉钉流程"}
+            </button>
+          </div>
+          <div className="topbar-import-group employee-department-import-group">
+            <label className="compact-file-button">
+              <Users size={15} />
+              员工部门表
+              <input
+                key={employeeInputKey}
+                type="file"
+                accept=".xls,.xlsx"
+                onChange={(event) => setEmployeeFile(event.target.files?.[0] || null)}
+              />
+            </label>
+            <span className="compact-file-name" title={employeeFile?.name || ""}>{employeeFile?.name || "未选择"}</span>
+            <button
+              className="ghost-button compact-import-button"
+              type="button"
+              onClick={importEmployeeDepartments}
+              disabled={!employeeFile || !selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
+              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能调整草稿批次" : "按员工表的2级部门重新归组当前批次"}
+            >
+              <Users size={15} />
+              {busyAction === "employee-departments" ? "归组中" : "按2级部门归组"}
             </button>
           </div>
           <div className="topbar-import-group rollback-import-group">
@@ -1330,11 +1404,20 @@ function Workspace({
   onImported: () => void;
   setMessage: (message: string) => void;
 }) {
+  const isSmallScreen = useSmallScreen();
   const [gridRows, setGridRows] = useState<GridRow[]>([]);
   const [dirtyCells, setDirtyCells] = useState<Set<string>>(new Set());
   const [deletedLocalIds, setDeletedLocalIds] = useState<Set<string>>(new Set());
   const [deletedSheetNames, setDeletedSheetNames] = useState<Set<string>>(new Set());
-  const [filters, setFilters] = useState({ q: "", payment_account: "", invoice_status: "", finance_review: "", general_manager_approval: "" });
+  const [filters, setFilters] = useState({
+    q: "",
+    payment_account: "",
+    invoice_status: "",
+    pending_amount_min: "",
+    pending_amount_max: "",
+    finance_review: "",
+    general_manager_approval: "",
+  });
   const [activeSheet, setActiveSheet] = useState(ALL_SHEET);
   const [editingSheet, setEditingSheet] = useState<{ key: string; value: string } | null>(null);
   const [newSheetName, setNewSheetName] = useState<string | null>(null);
@@ -1343,6 +1426,9 @@ function Workspace({
   const [sheetDropTarget, setSheetDropTarget] = useState<{ key: string; position: "before" | "after" } | null>(null);
   const [sheetOrderSaving, setSheetOrderSaving] = useState(false);
   const [wrapText, setWrapText] = useState(false);
+  const [gridHeaderLanguage, setGridHeaderLanguage] = useState<GridHeaderLanguage>(() =>
+    window.localStorage.getItem("payment-grid-header-language") === "es" ? "es" : "zh",
+  );
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [rolloverDialogOpen, setRolloverDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Partial<PaymentRequest> | null>(null);
@@ -1355,9 +1441,29 @@ function Workspace({
   const [pendingEditorNavigation, setPendingEditorNavigation] = useState<PendingEditorNavigation | null>(null);
   const [editorNavigationBusy, setEditorNavigationBusy] = useState(false);
   const [batchMenuOpen, setBatchMenuOpen] = useState(false);
+  const [mobileViewOverride, setMobileViewOverride] = useState<MobileViewOverride>(null);
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+  const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
   const batchMenuRef = useRef<HTMLDivElement | null>(null);
   const [reason, setReason] = useState("");
   const hasUnsavedChanges = dirtyCells.size > 0 || deletedLocalIds.size > 0 || deletedSheetNames.size > 0;
+  const showMobileCards = isSmallScreen && mobileViewOverride !== "table";
+
+  useEffect(() => {
+    window.localStorage.setItem("payment-grid-header-language", gridHeaderLanguage);
+  }, [gridHeaderLanguage]);
+
+  useEffect(() => {
+    if (isSmallScreen) return;
+    setMobileViewOverride(null);
+    setMobileFiltersOpen(false);
+    setMobileToolsOpen(false);
+  }, [isSmallScreen]);
+
+  useEffect(() => {
+    setMobileFiltersOpen(false);
+    setMobileToolsOpen(false);
+  }, [selectedBatch?.id]);
 
   async function loadRequests() {
     if (!selectedBatch) return;
@@ -1421,6 +1527,15 @@ function Workspace({
     }),
     [visibleActiveRows],
   );
+  const mobileQuickFilter: MobileQuickFilter = filters.general_manager_approval === GENERAL_MANAGER_EMPTY_FILTER
+    ? "pending_approval"
+    : filters.finance_review === "未付款"
+      ? "unpaid"
+      : filters.finance_review === "部分付款"
+        ? "partial"
+        : filters.finance_review === "已付款"
+          ? "paid"
+          : "all";
   const firstVisibleSheet = sheetTabs.find((tab) => tab.key !== ALL_SHEET)?.key || "";
   const defaultSourceSheet = activeSheet === ALL_SHEET
     ? (user.role === "business" ? firstVisibleSheet : "手工录入")
@@ -1585,8 +1700,18 @@ function Workspace({
     activateRequestEditor(request, initialTab);
   }
 
-  function openAttachmentsFromGrid(request: PaymentRequest) {
-    openRequestEditor(request, "attachments");
+  function applyMobileQuickFilter(filter: MobileQuickFilter) {
+    setFilters((current) => ({
+      ...current,
+      finance_review: filter === "unpaid"
+        ? "未付款"
+        : filter === "partial"
+          ? "部分付款"
+          : filter === "paid"
+            ? "已付款"
+            : "",
+      general_manager_approval: filter === "pending_approval" ? GENERAL_MANAGER_EMPTY_FILTER : "",
+    }));
   }
 
   function closeRequestEditor() {
@@ -1683,6 +1808,8 @@ function Workspace({
       q: filters.q.trim(),
       payment_account: filters.payment_account.trim(),
       invoice_status: filters.invoice_status.trim(),
+      pending_amount_min: filters.pending_amount_min.trim(),
+      pending_amount_max: filters.pending_amount_max.trim(),
       finance_review: filters.finance_review.trim(),
       general_manager_approval: filters.general_manager_approval.trim(),
     };
@@ -1814,7 +1941,15 @@ function Workspace({
     try {
       await api.updateSheetOrder(selectedBatch.id, nextOrder);
       setSheetOrder(nextOrder);
-      setFilters({ q: "", payment_account: "", invoice_status: "", finance_review: "", general_manager_approval: "" });
+      setFilters({
+        q: "",
+        payment_account: "",
+        invoice_status: "",
+        pending_amount_min: "",
+        pending_amount_max: "",
+        finance_review: "",
+        general_manager_approval: "",
+      });
       setActiveSheet(name);
       await reloadBatches();
       setMessage(`已新增 Sheet：${name}`);
@@ -2044,7 +2179,7 @@ function Workspace({
               </div>
             </div>
           </div>
-          <div className="batch-primary-actions">
+          <div className={`batch-primary-actions${isSmallScreen && !mobileToolsOpen ? " mobile-tools-collapsed" : ""}`}>
             {canManageBatchOperations && (
               <button className="primary-button" onClick={() => setRolloverDialogOpen(true)}>
                 <Archive size={16} />
@@ -2124,23 +2259,136 @@ function Workspace({
           </div>
         </div>
       </section>
+      {isSmallScreen && canManageBatchOperations && (
+        <button
+          className={mobileToolsOpen ? "ghost-button mobile-tools-toggle active-toggle" : "ghost-button mobile-tools-toggle"}
+          type="button"
+          aria-expanded={mobileToolsOpen}
+          onClick={() => setMobileToolsOpen((open) => !open)}
+        >
+          <MoreHorizontal size={16} />
+          {mobileToolsOpen ? "收起工具" : "更多工具"}
+        </button>
+      )}
       {canManageBatchOperations && (
-        <TopbarImportActions
-          selectedBatch={selectedBatch}
-          hasUnsavedChanges={hasUnsavedChanges || editorDirty}
-          reloadBatches={reloadBatches}
-          onImported={onImported}
-          setMessage={setMessage}
-        />
+        <div className={isSmallScreen && !mobileToolsOpen ? "mobile-import-tools-collapsed" : ""}>
+          <TopbarImportActions
+            selectedBatch={selectedBatch}
+            hasUnsavedChanges={hasUnsavedChanges || editorDirty}
+            reloadBatches={reloadBatches}
+            onImported={onImported}
+            setMessage={setMessage}
+          />
+        </div>
       )}
       <section className="content-panel">
-        <div className="toolbar">
-          <div className="search-box">
+        {isSmallScreen && (
+          <div className="mobile-workspace-controls">
+            <div className="mobile-search-row">
+              <div className="search-box">
+                <Search size={16} />
+                <input
+                  value={filters.q}
+                  onChange={(event) => setFilters({ ...filters, q: event.target.value })}
+                  placeholder={gridHeaderLanguage === "es" ? "Buscar solicitud, solicitante o resumen" : "搜索单号、申请人或摘要"}
+                />
+              </div>
+              <button
+                className={mobileFiltersOpen ? "ghost-button active-toggle" : "ghost-button"}
+                type="button"
+                aria-expanded={mobileFiltersOpen}
+                onClick={() => setMobileFiltersOpen(true)}
+              >
+                <SlidersHorizontal size={16} />
+                筛选
+              </button>
+            </div>
+            <div className="mobile-view-actions" aria-label="手机显示模式">
+              <div className="mobile-view-switcher">
+                <button
+                  className={showMobileCards ? "active" : ""}
+                  type="button"
+                  aria-pressed={showMobileCards}
+                  onClick={() => setMobileViewOverride("cards")}
+                >
+                  <LayoutList size={15} />卡片
+                </button>
+                <button
+                  className={!showMobileCards ? "active" : ""}
+                  type="button"
+                  aria-pressed={!showMobileCards}
+                  onClick={() => setMobileViewOverride("table")}
+                >
+                  <Table2 size={15} />完整表格
+                </button>
+              </div>
+              <button
+                className="ghost-button mobile-language-button"
+                type="button"
+                onClick={() => setGridHeaderLanguage((language) => (language === "zh" ? "es" : "zh"))}
+              >
+                <Languages size={15} />{gridHeaderLanguage === "zh" ? "Español" : "中文"}
+              </button>
+            </div>
+            <div className="mobile-quick-filters" aria-label="快捷筛选">
+              {([
+                ["all", gridHeaderLanguage === "es" ? "Todos" : "全部"],
+                ["pending_approval", gridHeaderLanguage === "es" ? "Pendientes de mi aprobación" : "待我审批"],
+                ["unpaid", gridHeaderLanguage === "es" ? "No pagado" : "未付款"],
+                ["partial", gridHeaderLanguage === "es" ? "Pago parcial" : "部分付款"],
+                ["paid", gridHeaderLanguage === "es" ? "Pagado" : "已付款"],
+              ] as Array<[MobileQuickFilter, string]>).map(([value, label]) => (
+                <button
+                  key={value}
+                  className={mobileQuickFilter === value ? "active" : ""}
+                  type="button"
+                  aria-pressed={mobileQuickFilter === value}
+                  onClick={() => applyMobileQuickFilter(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {showMobileCards && mobileFiltersOpen && (
+          <button className="mobile-filter-backdrop" type="button" aria-label="关闭筛选" onClick={() => setMobileFiltersOpen(false)} />
+        )}
+        <div className={`toolbar workspace-toolbar${showMobileCards ? " mobile-card-filter-panel" : ""}${mobileFiltersOpen ? " open" : ""}`}>
+          {showMobileCards && (
+            <div className="mobile-filter-panel-head">
+              <div><strong>筛选与操作</strong><span>调整完整筛选条件或执行其他操作</span></div>
+              <button className="ghost-button" type="button" onClick={() => setMobileFiltersOpen(false)}>关闭</button>
+            </div>
+          )}
+          <div className="search-box desktop-toolbar-search">
             <Search size={16} />
             <input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} placeholder="搜索单号、申请人、摘要、收款方、项目" />
           </div>
           <input value={filters.payment_account} onChange={(event) => setFilters({ ...filters, payment_account: event.target.value })} placeholder="付款账户" />
           <input value={filters.invoice_status} onChange={(event) => setFilters({ ...filters, invoice_status: event.target.value })} placeholder="开票情况" />
+          <div className="pending-amount-filter" aria-label="待付金额区间">
+            <span>待付金额</span>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={filters.pending_amount_min}
+              onChange={(event) => setFilters({ ...filters, pending_amount_min: event.target.value })}
+              placeholder="最低"
+              aria-label="最低待付金额"
+            />
+            <span>—</span>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={filters.pending_amount_max}
+              onChange={(event) => setFilters({ ...filters, pending_amount_max: event.target.value })}
+              placeholder="最高"
+              aria-label="最高待付金额"
+            />
+          </div>
           <select value={filters.finance_review} onChange={(event) => setFilters({ ...filters, finance_review: event.target.value })} aria-label="财务审批">
             <option value="">全部财务审批</option>
             {financeApprovalOptions.map((option) => (
@@ -2154,7 +2402,7 @@ function Workspace({
               <option key={option} value={option}>{option}</option>
             ))}
           </select>
-          <button className="ghost-button" onClick={() => setMessage("筛选已应用")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setMessage("筛选已应用"))}>
+          <button className="ghost-button" onClick={() => { setMessage("筛选已应用"); setMobileFiltersOpen(false); }} onKeyDown={(event) => activateButtonByKeyboard(event, () => { setMessage("筛选已应用"); setMobileFiltersOpen(false); })}>
             <Filter size={16} />
             筛选
           </button>
@@ -2195,6 +2443,17 @@ function Workspace({
           >
             <AlignLeft size={16} />
             {wrapText ? "取消换行" : "换行"}
+          </button>
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={() => setGridHeaderLanguage((language) => (language === "zh" ? "es" : "zh"))}
+            onKeyDown={(event) => activateButtonByKeyboard(event, () => setGridHeaderLanguage((language) => (language === "zh" ? "es" : "zh")))}
+            aria-label={gridHeaderLanguage === "zh" ? "切换为西班牙语表头" : "Cambiar encabezados a chino"}
+            title={gridHeaderLanguage === "zh" ? "切换为西班牙语表头" : "Cambiar encabezados a chino"}
+          >
+            <Languages size={16} />
+            {gridHeaderLanguage === "zh" ? "Español" : "中文"}
           </button>
           <button className="primary-button" onClick={saveGridChanges} onKeyDown={(event) => activateButtonByKeyboard(event, saveGridChanges)} disabled={!hasUnsavedChanges}>
             <Save size={16} />
@@ -2348,24 +2607,32 @@ function Workspace({
             </button>
           </div>
         )}
-        <EditablePaymentGrid
-          rows={visibleRows}
-          onRowsChange={mergeVisibleRows}
-          dirtyCells={dirtyCells}
-          setDirtyCells={setDirtyCells}
-          deletedLocalIds={deletedLocalIds}
-          selectedRows={selectedRows}
-          setSelectedRows={setSelectedRows}
-          readOnly={selectedBatch.status === "archived" && !isPrivilegedRole(user.role)}
-          canEditField={(field) => canEditGrid && canEditRequestField(user.role, field) && (user.role !== "business" || field !== "source_sheet")}
-          onEdit={openRequestEditor}
-          onOpenPayments={(request) => openRequestEditor(request, "payments")}
-          onOpenAttachments={openAttachmentsFromGrid}
-          attachmentCounts={attachmentCounts}
-          onSave={saveGridChanges}
-          defaultSourceSheet={defaultSourceSheet}
-          wrapText={wrapText}
-        />
+        {showMobileCards ? (
+          <MobileRequestCardList
+            rows={visibleActiveRows}
+            user={user}
+            headerLanguage={gridHeaderLanguage}
+            attachmentCounts={attachmentCounts}
+            onOpen={(request, tab) => openRequestEditor(request, tab)}
+          />
+        ) : (
+          <EditablePaymentGrid
+            rows={visibleRows}
+            onRowsChange={mergeVisibleRows}
+            dirtyCells={dirtyCells}
+            setDirtyCells={setDirtyCells}
+            deletedLocalIds={deletedLocalIds}
+            selectedRows={selectedRows}
+            setSelectedRows={setSelectedRows}
+            readOnly={selectedBatch.status === "archived" && !isPrivilegedRole(user.role)}
+            canEditField={(field) => canEditGrid && canEditRequestField(user.role, field) && (user.role !== "business" || field !== "source_sheet")}
+            onEdit={openRequestEditor}
+            onSave={saveGridChanges}
+            defaultSourceSheet={defaultSourceSheet}
+            wrapText={wrapText}
+            headerLanguage={gridHeaderLanguage}
+          />
+        )}
       </section>
       {createDialogOpen && (
         <Modal title="新建批次" onClose={() => setCreateDialogOpen(false)}>
@@ -2642,6 +2909,106 @@ function RolloverPanel({
   );
 }
 
+function MobileRequestCardList({
+  rows,
+  user,
+  headerLanguage,
+  attachmentCounts,
+  onOpen,
+}: {
+  rows: GridRow[];
+  user: User;
+  headerLanguage: GridHeaderLanguage;
+  attachmentCounts: Record<number, number>;
+  onOpen: (request: PaymentRequest, tab: RequestEditorTab) => void;
+}) {
+  const isSpanish = headerLanguage === "es";
+  const labels = isSpanish ? {
+    empty: "No hay solicitudes que coincidan con los filtros.",
+    company: "Empresa a pagar",
+    applicant: "Solicitante",
+    payable: "Monto a pagar",
+    paid: "Monto pagado",
+    pending: "Monto pendiente",
+    neededDate: "Fecha requerida",
+    managerApproval: "Aprobación del director general",
+    pendingApproval: "Pendiente",
+    attachments: "Adjuntos",
+    payments: "Pagos",
+    details: "Ver detalles",
+    approve: "Ver / Aprobar",
+    unsaved: "Solicitud sin guardar",
+  } : {
+    empty: "没有符合当前筛选条件的请款。",
+    company: "应付款公司",
+    applicant: "申请人",
+    payable: "应付金额",
+    paid: "已支付",
+    pending: "待付款",
+    neededDate: "需求付款日期",
+    managerApproval: "总经理审批",
+    pendingApproval: "待审批",
+    attachments: "附件",
+    payments: "付款",
+    details: "查看详情",
+    approve: "查看 / 审批",
+    unsaved: "尚未保存的请款",
+  };
+
+  if (rows.length === 0) return <div className="mobile-request-empty">{labels.empty}</div>;
+
+  return (
+    <div className="mobile-request-list" aria-label={isSpanish ? "Lista de solicitudes" : "请款卡片列表"}>
+      {rows.map((row) => {
+        const source = row.raw_extra?.external_source;
+        const applicant = requestApplicantName(row) || (isSpanish ? "Sin completar" : "未填写");
+        const attachmentCount = row.id ? Number(attachmentCounts[row.id] || 0) : 0;
+        const canApprove = user.role === "general_manager" && Boolean(row.id) && !requestDingTalkTerminated(row);
+        return (
+          <article className="mobile-request-card" key={row.__localId}>
+            <header className="mobile-request-card-head">
+              <StatusPill value={String(row.finance_review || "未付款")} />
+              {source ? <ExternalApprovalBadge source={source} snapshot /> : <span className="external-status-empty">—</span>}
+            </header>
+            <div className="mobile-request-card-title">
+              <strong>{row.summary || labels.unsaved}</strong>
+              {row.dingding_id && <small className="mono">{row.dingding_id}</small>}
+            </div>
+            <dl className="mobile-request-context">
+              <div><dt>{labels.company}</dt><dd>{row.source_sheet || "—"}</dd></div>
+              <div><dt>{labels.applicant}</dt><dd>{applicant}</dd></div>
+            </dl>
+            <div className="mobile-request-amounts">
+              <div><span>{labels.payable}</span><strong>{formatMoney(Number(row.amount || 0))}</strong></div>
+              <div><span>{labels.paid}</span><strong>{formatMoney(Number(row.paid_amount || 0))}</strong></div>
+              <div className="pending"><span>{labels.pending}</span><strong>{formatMoney(Number(row.pending_amount || 0))}</strong></div>
+            </div>
+            <dl className="mobile-request-meta">
+              <div><dt>{labels.neededDate}</dt><dd>{row.needed_payment_date || "—"}</dd></div>
+              <div><dt>{labels.managerApproval}</dt><dd>{row.general_manager_approval || labels.pendingApproval}</dd></div>
+            </dl>
+            <footer className="mobile-request-card-actions">
+              <div className="mobile-request-counts">
+                <span>{labels.payments} {Number(row.payment_count || 0)}</span>
+                <span>{labels.attachments} {attachmentCount}</span>
+              </div>
+              {row.id && (
+                <button
+                  className={canApprove ? "primary-button" : "ghost-button"}
+                  type="button"
+                  onClick={() => onOpen(row as PaymentRequest, canApprove ? "approval" : "request")}
+                >
+                  {canApprove ? labels.approve : labels.details}
+                </button>
+              )}
+            </footer>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
 function EditablePaymentGrid({
   rows,
   onRowsChange,
@@ -2652,12 +3019,10 @@ function EditablePaymentGrid({
   setSelectedRows,
   readOnly,
   onEdit,
-  onOpenPayments,
-  onOpenAttachments,
-  attachmentCounts,
   onSave,
   defaultSourceSheet,
   wrapText,
+  headerLanguage,
   canEditField,
 }: {
   rows: GridRow[];
@@ -2668,13 +3033,11 @@ function EditablePaymentGrid({
   selectedRows: number[];
   setSelectedRows: (ids: number[]) => void;
   onEdit: (request: PaymentRequest) => void;
-  onOpenPayments: (request: PaymentRequest) => void;
-  onOpenAttachments: (request: PaymentRequest) => void;
-  attachmentCounts: Record<number, number>;
   readOnly: boolean;
   onSave: () => void;
   defaultSourceSheet: string;
   wrapText: boolean;
+  headerLanguage: GridHeaderLanguage;
   canEditField: (field: keyof PaymentRequest) => boolean;
 }) {
   const [activeCell, setActiveCell] = useState<{ row: number; col: number }>({ row: 0, col: 0 });
@@ -2838,11 +3201,10 @@ function EditablePaymentGrid({
           <thead>
             <tr>
               <th className="checkbox-col" style={{ width: 52, minWidth: 52 }}></th>
-              <th className="payment-detail-col" style={{ width: 120, minWidth: 120 }}>付款明细</th>
-              <th className="attachment-col" style={{ width: 112, minWidth: 112 }}>附件</th>
-              <th className="external-status-col">钉钉状态</th>
               {gridColumns.map((column) => (
-                <th key={column.key} style={{ width: column.width, minWidth: column.width }}>{column.label}</th>
+                <th key={column.key} style={{ width: column.width, minWidth: column.width }}>
+                  {headerLanguage === "es" ? column.labelEs : column.labelZh}
+                </th>
               ))}
             </tr>
           </thead>
@@ -2852,44 +3214,6 @@ function EditablePaymentGrid({
                 <td className="checkbox-col">
                   {row.id && <input type="checkbox" checked={selectedRows.includes(row.id)} onChange={() => toggle(row.id!)} />}
                 </td>
-                <td className="payment-detail-col">
-                  {row.id ? (
-                    <button
-                      className={row.payment_count ? "payment-detail-chip has-payments" : "payment-detail-chip"}
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onOpenPayments(row as PaymentRequest);
-                      }}
-                    >
-                      {row.payment_count ? `付款 ${row.payment_count} 笔` : "未付款"}
-                    </button>
-                  ) : (
-                    <span className="muted-chip">先保存</span>
-                  )}
-                </td>
-                <td className="attachment-col">
-                  {row.id ? (
-                    <button
-                      className={attachmentCounts[row.id] ? "attachment-chip has-attachments" : "attachment-chip"}
-                      type="button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onOpenAttachments(row as PaymentRequest);
-                      }}
-                    >
-                      <Paperclip size={14} />
-                      {attachmentCounts[row.id] ? `附件 ${attachmentCounts[row.id]}` : "上传"}
-                    </button>
-                  ) : (
-                    <span className="muted-chip">先保存</span>
-                  )}
-                </td>
-	                <td className="external-status-col">
-	                  {row.raw_extra?.external_source
-	                    ? <ExternalApprovalBadge source={row.raw_extra.external_source} snapshot />
-	                    : <span className="external-status-empty">—</span>}
-	                </td>
 	                {gridColumns.map((column, colIndex) => {
 	                  const dirty = dirtyCells.has(`${row.__localId}:${column.key}`);
 	                  const cellValue = cellDisplayValue(row, column);
@@ -2966,8 +3290,8 @@ function EditablePaymentGrid({
                           />
                         )}
                       </td>
-                  );
-                })}
+	                  );
+	                })}
               </tr>
             ))}
           </tbody>
@@ -3893,6 +4217,7 @@ function ArchiveView({
   batches,
   selectedBatch,
   setSelectedBatchId,
+  onOpenBatch,
   reloadBatches,
   setMessage,
 }: {
@@ -3900,10 +4225,13 @@ function ArchiveView({
   batches: Batch[];
   selectedBatch: Batch | null;
   setSelectedBatchId: (id: number) => void;
+  onOpenBatch: (id: number) => void;
   reloadBatches: () => Promise<void>;
   setMessage: (message: string) => void;
 }) {
+  const isSmallScreen = useSmallScreen();
   const [logs, setLogs] = useState<AuditLog[]>([]);
+  const [mobileLogBatch, setMobileLogBatch] = useState<Batch | null>(null);
 
   async function archive() {
     if (!selectedBatch) return;
@@ -3911,9 +4239,11 @@ function ArchiveView({
     setMessage("批次已归档");
   }
 
-  async function loadLogs(batchId: number) {
-    const res = await api.audit(batchId);
+  async function loadLogs(batch: Batch, openMobile = false) {
+    const res = await api.audit(batch.id);
     setLogs(res.logs);
+    setSelectedBatchId(batch.id);
+    if (openMobile) setMobileLogBatch(batch);
   }
 
   async function deleteDraft(batch: Batch) {
@@ -3928,6 +4258,35 @@ function ArchiveView({
   return (
     <div className={user.role === "business" ? "" : "two-column"}>
       <section className="content-panel">
+        {isSmallScreen ? (
+          <div className="mobile-archive-list" aria-label="历史批次">
+            {batches.map((batch) => (
+              <article className="mobile-archive-card" key={batch.id}>
+                <header>
+                  <div><strong>{batch.name}</strong><span>{formatDateRange(batch.start_date, batch.end_date)}</span></div>
+                  <StatusPill value={batch.status === "archived" ? "已归档" : "草稿"} />
+                </header>
+                <div className="mobile-archive-metrics">
+                  <div><span>记录</span><strong>{batch.request_count || 0} 条</strong></div>
+                  <div><span>应付</span><strong>{formatMoney(batch.total_amount || 0)}</strong></div>
+                  <div><span>已付</span><strong>{formatMoney(batch.total_paid_amount || 0)}</strong></div>
+                  <div><span>待付</span><strong>{formatMoney(batch.total_pending_amount || 0)}</strong></div>
+                </div>
+                <footer>
+                  <button className="primary-button" type="button" onClick={() => onOpenBatch(batch.id)}>查看批次</button>
+                  <button className="ghost-button" type="button" onClick={() => window.open(`/api/batches/${batch.id}/export.xlsx`, "_blank")}>
+                    <Download size={15} />导出
+                  </button>
+                  {user.role !== "business" && (
+                    <button className="ghost-button" type="button" onClick={() => void loadLogs(batch, true)}>
+                      <History size={15} />日志
+                    </button>
+                  )}
+                </footer>
+              </article>
+            ))}
+          </div>
+        ) : (
         <div className="table-wrap">
           <table className="data-table">
             <thead>
@@ -3963,7 +4322,7 @@ function ArchiveView({
                     {user.role !== "business" && (
                       <button className="ghost-button" onClick={(event) => {
                         event.stopPropagation();
-                        loadLogs(batch.id);
+                        void loadLogs(batch);
                       }}>
                         <History size={15} />
                         日志
@@ -3984,8 +4343,9 @@ function ArchiveView({
             </tbody>
           </table>
         </div>
+        )}
       </section>
-      {user.role !== "business" && (
+      {user.role !== "business" && !isSmallScreen && (
         <section className="side-panel">
           <button className="primary-button" onClick={archive} disabled={!selectedBatch || selectedBatch.status === "archived"}>
             <Archive size={16} />
@@ -4003,6 +4363,21 @@ function ArchiveView({
             ))}
           </div>
         </section>
+      )}
+      {mobileLogBatch && (
+        <Modal title={`${mobileLogBatch.name} · 操作日志`} onClose={() => setMobileLogBatch(null)} className="mobile-audit-modal">
+          <div className="audit-list mobile-audit-list">
+            {logs.length === 0 && <div className="mobile-request-empty">该批次暂无操作日志。</div>}
+            {logs.map((log) => (
+              <div key={log.id} className="audit-item">
+                <strong>{auditActionLabel(log.action)}</strong>
+                <span>{log.actor_name || "系统"} · {log.created_at}</span>
+                {auditDetail(log) && <p>{auditDetail(log)}</p>}
+                {log.reason && <p>{log.reason}</p>}
+              </div>
+            ))}
+          </div>
+        </Modal>
       )}
     </div>
   );
@@ -4549,7 +4924,15 @@ function normalizeFormValue(value: unknown) {
 
 function rowMatchesFilters(
   row: GridRow,
-  filters: { q: string; payment_account: string; invoice_status: string; finance_review: string; general_manager_approval: string },
+  filters: {
+    q: string;
+    payment_account: string;
+    invoice_status: string;
+    pending_amount_min: string;
+    pending_amount_max: string;
+    finance_review: string;
+    general_manager_approval: string;
+  },
   activeSheet: string,
 ) {
   if (activeSheet !== ALL_SHEET && normalizeSheetName(row.source_sheet) !== activeSheet) return false;
@@ -4573,8 +4956,20 @@ function rowMatchesFilters(
   }
   if (filters.payment_account.trim() && !String(row.payment_account || "").includes(filters.payment_account.trim())) return false;
   if (filters.invoice_status.trim() && !String(row.invoice_status || "").includes(filters.invoice_status.trim())) return false;
+  const pendingAmount = Number(row.pending_amount) || 0;
+  const pendingAmountMin = optionalNumber(filters.pending_amount_min);
+  const pendingAmountMax = optionalNumber(filters.pending_amount_max);
+  if (pendingAmountMin !== undefined && pendingAmount < pendingAmountMin) return false;
+  if (pendingAmountMax !== undefined && pendingAmount > pendingAmountMax) return false;
   if (filters.finance_review.trim() && String(row.finance_review || "") !== filters.finance_review.trim()) return false;
-  if (filters.general_manager_approval === GENERAL_MANAGER_EMPTY_FILTER && String(row.general_manager_approval || "").trim()) return false;
+  if (filters.general_manager_approval === GENERAL_MANAGER_EMPTY_FILTER) {
+    if (String(row.general_manager_approval || "").trim()) return false;
+    const externalSource = row.raw_extra?.external_source;
+    const externalStatus = String(externalSource?.approval_status || "").trim().toUpperCase();
+    const externalResult = String(externalSource?.approval_result || "").trim().toLowerCase();
+    const fullyPaid = String(row.finance_review || "") === "已付款" || (Number(row.amount || 0) > 0 && pendingAmount <= 0);
+    if (fullyPaid || externalStatus === "TERMINATED" || externalResult === "refuse") return false;
+  }
   if (
     filters.general_manager_approval.trim()
     && filters.general_manager_approval !== GENERAL_MANAGER_EMPTY_FILTER
