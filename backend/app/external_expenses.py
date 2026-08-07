@@ -40,7 +40,12 @@ PAYMENT_EXCLUSION_RE = re.compile(
     r"(?:待|请|将|计划|预计|需要|需由).{0,8}悦为.{0,4}(?:支付|付款)|"
     r"客户.{0,8}(?:已支付|已付款)|无需.{0,8}(?:再次)?支付|不需要.{0,8}支付)"
 )
-APPROVAL_REFERENCE_RE = re.compile(r"(?<!\d)\d{15,}(?!\d)")
+# DingTalk approval business IDs begin with an application date (YYYYMMDD).
+# Do not treat numeric user IDs in mentions such as ``[name](275014...)`` as
+# references to another approval.
+APPROVAL_REFERENCE_RE = re.compile(
+    r"(?<!\d)20\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{10,}(?!\d)"
+)
 PAYMENT_AMOUNT_RE = re.compile(
     r"(?:[¥￥]\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(万|千)?|"
     r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*(万|千)?\s*元)"
