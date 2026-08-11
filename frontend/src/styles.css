@@ -4051,3 +4051,151 @@ textarea {
     padding: 14px;
   }
 }
+.currency-subtotals,
+.batch-currency-subtotals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  color: #71838d;
+  font-size: 12px;
+}
+
+.filtered-summary-bar .currency-subtotals {
+  flex-basis: 100%;
+  padding-top: 6px;
+  border-top: 1px dashed #dce5e8;
+}
+
+.batch-currency-subtotals {
+  margin-top: 8px;
+}
+
+.currency-conversion-modal {
+  width: min(720px, calc(100vw - 32px));
+}
+
+.currency-conversion-route {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 12px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  background: #f3f7f7;
+}
+
+.currency-rate-date {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.currency-rate-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.currency-rate-summary > div {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #dce5e8;
+  border-radius: 9px;
+}
+
+.currency-rate-summary span,
+.currency-anchor-note,
+.muted-text {
+  color: #71838d;
+}
+
+.currency-amount-comparison {
+  border: 1px solid #dce5e8;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.currency-amount-comparison > div {
+  display: grid;
+  grid-template-columns: 0.7fr 1fr 1fr;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #dce5e8;
+}
+
+.currency-amount-comparison > div:last-child {
+  border-bottom: 0;
+}
+
+.currency-comparison-head {
+  background: #f3f7f7;
+  font-weight: 700;
+}
+
+.currency-anchor-note {
+  margin: 10px 0 0;
+  font-size: 13px;
+}
+
+.historical-currency-modal {
+  width: min(900px, calc(100vw - 32px));
+}
+
+.history-currency-summary {
+  padding: 10px 12px;
+  margin: 10px 0;
+  border-radius: 8px;
+  background: #f3f7f7;
+}
+
+.history-currency-list {
+  max-height: 50vh;
+  overflow: auto;
+  border: 1px solid #dce5e8;
+  border-radius: 10px;
+}
+
+.history-currency-row {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1fr) minmax(240px, 1.2fr);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #dce5e8;
+}
+
+.history-currency-row:last-child {
+  border-bottom: 0;
+}
+
+.history-currency-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+}
+
+.history-currency-row > span {
+  display: grid;
+  gap: 3px;
+}
+
+.history-currency-row small,
+.history-currency-row.disabled {
+  color: #71838d;
+}
+
+@media (max-width: 700px) {
+  .currency-rate-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .history-currency-row {
+    grid-template-columns: auto 1fr;
+  }
+
+  .history-currency-row > span:last-child {
+    grid-column: 2;
+  }
+}

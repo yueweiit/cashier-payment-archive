@@ -20,6 +20,7 @@ export type Batch = {
   total_amount?: number;
   total_paid_amount?: number;
   total_pending_amount?: number;
+  currency_totals?: CurrencySubtotal[];
   archived_at?: string;
 };
 
@@ -37,6 +38,10 @@ export type PaymentRequest = {
   paid_amount?: number;
   pending_amount?: number;
   currency?: string;
+  base_amount_cny?: number;
+  fx_rate_cny_per_unit?: number;
+  fx_rate_date?: string;
+  fx_rate_actual_date?: string;
   project?: string;
   bu?: string;
   payee_account?: string;
@@ -58,6 +63,7 @@ export type PaymentRequest = {
   source_sheet?: string;
   source_row?: number;
   payment_count?: number;
+  updated_at?: string;
   raw_extra?: {
     external_source?: ExternalSourceSnapshot;
     [key: string]: unknown;
@@ -87,6 +93,7 @@ export type ExternalSourceSnapshot = {
   source_updated_at?: string;
   source_currency?: string;
   source_amount?: number;
+  base_currency_amount?: number;
 };
 
 export type ExternalExpenseSourceType = "operation" | "purchase";
@@ -106,6 +113,8 @@ export type ExternalExpensePreviewRow = {
   approval_result?: string;
   summary: string;
   amount?: number;
+  currency?: string;
+  base_amount_cny?: number;
   beneficiary: string;
   needed_payment_date?: string;
   warnings: string[];
@@ -345,6 +354,10 @@ export type PaymentRecord = {
   copied_from_payment_id?: number;
   root_payment_id?: number;
   amount: number;
+  base_amount_cny?: number;
+  fx_rate_cny_per_unit?: number;
+  fx_rate_date?: string;
+  fx_rate_actual_date?: string;
   payment_date?: string;
   payer?: string;
   payment_account?: string;
@@ -356,6 +369,52 @@ export type PaymentRecord = {
   updated_at: string;
   inherited: boolean;
   vouchers: PaymentVoucher[];
+};
+
+export type CurrencyCode = "CNY" | "USD" | "MXN";
+export type CurrencySubtotal = {
+  currency: CurrencyCode | string;
+  amount: number;
+  paid_amount: number;
+  pending_amount: number;
+  amount_cny: number;
+  paid_amount_cny: number;
+  pending_amount_cny: number;
+};
+
+export type CurrencyConversionPreview = {
+  request_id: number;
+  source_currency: CurrencyCode;
+  target_currency: CurrencyCode;
+  requested_rate_date: string;
+  actual_rate_date: string;
+  used_previous_rate: boolean;
+  source_rate?: number;
+  target_rate: number;
+  before: { amount: number; paid_amount: number; pending_amount: number };
+  after: { amount: number; paid_amount: number; pending_amount: number };
+  base_amount_cny: number;
+  payment_count: number;
+  request_updated_at?: string;
+};
+
+export type HistoricalCurrencyRestoreRow = {
+  request_id: number;
+  dingding_id?: string;
+  applicant?: string;
+  source_sheet?: string;
+  current_currency: string;
+  source_currency?: CurrencyCode;
+  source_amount?: number;
+  base_amount_cny?: number;
+  payment_count: number;
+  status: "recoverable" | "undetermined" | "amount_error" | "already_restored" | string;
+  reasons?: string[];
+};
+
+export type HistoricalCurrencyRestorePreview = {
+  rows: HistoricalCurrencyRestoreRow[];
+  summary: Record<string, number>;
 };
 
 export type PaymentRecordPayload = {
@@ -495,6 +554,14 @@ export const api = {
     request<{ request: PaymentRequest }>(`/api/batches/${batchId}/requests`, { method: "POST", body: JSON.stringify(payload) }),
   updateRequest: (batchId: number, requestId: number, payload: Partial<PaymentRequest> & { reason?: string }) =>
     request<{ request: PaymentRequest }>(`/api/batches/${batchId}/requests/${requestId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  previewCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; reason?: string; expected_updated_at?: string }) =>
+    request<{ preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/preview`, { method: "POST", body: JSON.stringify(payload) }),
+  applyCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; reason?: string; expected_updated_at?: string }) =>
+    request<{ status: string; request: PaymentRequest; preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/apply`, { method: "POST", body: JSON.stringify(payload) }),
+  previewHistoricalCurrencyRestore: (batchId: number) =>
+    request<HistoricalCurrencyRestorePreview>(`/api/batches/${batchId}/historical-currency-restore/preview`),
+  applyHistoricalCurrencyRestore: (batchId: number, payload: { request_ids: number[]; reason?: string }) =>
+    request<{ status: string; operation_id: string; restored_request_ids: number[]; count: number }>(`/api/batches/${batchId}/historical-currency-restore/apply`, { method: "POST", body: JSON.stringify(payload) }),
   bulkSaveRequests: (
     batchId: number,
     payload: {

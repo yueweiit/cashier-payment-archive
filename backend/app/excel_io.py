@@ -27,6 +27,11 @@ CORE_FIELDS = {
     "amount": "应付金额",
     "paid_amount": "已支付金额",
     "pending_amount": "待付款金额",
+    "currency": "货币类型",
+    "base_amount_cny": "折合人民币金额",
+    "fx_rate_cny_per_unit": "人民币兑本币汇率",
+    "fx_rate_date": "汇率日期",
+    "fx_rate_actual_date": "实际汇率日期",
     "project": "项目归属",
     "bu": "BU归属",
     "payee_account": "收款账户",
@@ -78,6 +83,11 @@ KNOWN_HEADER_ALIASES = {
     "amount": ["应付金额", "金额", "付款金额", "申请金额", "报销金额"],
     "paid_amount": ["已支付金额", "已付款金额", "已付金额", "累计支付金额"],
     "pending_amount": ["待付款金额", "未付款金额", "剩余应付金额", "剩余付款金额"],
+    "currency": ["货币类型", "币种", "Currency", "Moneda"],
+    "base_amount_cny": ["折合人民币金额", "人民币基准金额"],
+    "fx_rate_cny_per_unit": ["人民币兑本币汇率", "汇率"],
+    "fx_rate_date": ["汇率日期"],
+    "fx_rate_actual_date": ["实际汇率日期"],
     "project": ["项目归属", "项目", "所属项目"],
     "bu": ["BU归属", "BU"],
     "payee_account": ["收款信息", "收款账户", "账号", "银行账号", "收款账号"],
@@ -142,6 +152,11 @@ for _headers in SHEET_HEADERS.values():
         _headers.insert(_headers.index("钉钉申请单号") + 1, "申请人")
     if "请款标识" not in _headers:
         _headers.append("请款标识")
+    _currency_headers = ["货币类型", "折合人民币金额", "人民币兑本币汇率", "汇率日期", "实际汇率日期"]
+    _insert_at = _headers.index("待付款金额") + 1
+    for _header in reversed(_currency_headers):
+        if _header not in _headers:
+            _headers.insert(_insert_at, _header)
 
 PAYMENT_DETAIL_SHEET = "付款明细"
 ALL_EXPORT_SHEET = "全部"
@@ -158,6 +173,11 @@ PAYMENT_DETAIL_HEADERS = [
     "备注",
     "来源标记",
     "凭证信息",
+    "货币类型",
+    "折合人民币金额",
+    "人民币兑本币汇率",
+    "汇率日期",
+    "实际汇率日期",
 ]
 SYSTEM_INFO_SHEET = "_系统信息"
 EXPORT_FORMAT_VERSION = 2
@@ -521,6 +541,11 @@ def row_from_sheet(
         "amount": amount_number(first_value(values_by_header, ["应付金额"])),
         "paid_amount": amount_number(first_value(values_by_header, ["已支付金额", "已付款金额", "已付金额"])),
         "pending_amount": amount_number(first_value(values_by_header, ["待付款金额", "未付款金额", "剩余应付金额"])),
+        "currency": stringify(first_value(values_by_header, ["货币类型", "币种", "Currency", "Moneda"])),
+        "base_amount_cny": amount_number(first_value(values_by_header, ["折合人民币金额", "人民币基准金额"])),
+        "fx_rate_cny_per_unit": amount_number(first_value(values_by_header, ["人民币兑本币汇率", "汇率"])),
+        "fx_rate_date": date_string(first_value(values_by_header, ["汇率日期"])),
+        "fx_rate_actual_date": date_string(first_value(values_by_header, ["实际汇率日期"])),
         "project": stringify(first_value(values_by_header, ["项目归属", "项目"])),
         "bu": stringify(first_value(values_by_header, ["BU归属"])),
         "payee_account": stringify(first_value(values_by_header, ["收款信息", "收款账户", "账号"])),
@@ -1004,6 +1029,11 @@ def write_payment_detail_sheet(ws, payments: List[Dict[str, Any]]) -> None:
             payment.get("remark"),
             payment.get("source_type"),
             voucher_text or None,
+            payment.get("request_currency") or "CNY",
+            payment.get("base_amount_cny"),
+            payment.get("fx_rate_cny_per_unit"),
+            payment.get("fx_rate_date"),
+            payment.get("fx_rate_actual_date"),
         ]
         for col, value in enumerate(values, start=1):
             cell = ws.cell(row_idx, col, value)
@@ -1034,7 +1064,7 @@ def write_payment_detail_sheet(ws, payments: List[Dict[str, Any]]) -> None:
             image.width = int(image.width * scale)
             image.height = int(image.height * scale)
             ws.add_image(image, f"{get_column_letter(col)}{row_idx}")
-    widths = [14, 14, 22, 22, 14, 14, 16, 18, 22, 30, 18, 42]
+    widths = [14, 14, 22, 22, 14, 14, 14, 18, 18, 14, 16, 16, 18, 22, 30, 18, 42]
     for col, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
     for col in range(len(PAYMENT_DETAIL_HEADERS) + 1, len(headers) + 1):
@@ -1135,8 +1165,10 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
             cell = ws.cell(row_idx, col, value=value)
             cell.border = border
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-            if headers[col - 1] in {"应付金额", "已支付金额", "待付款金额"}:
+            if headers[col - 1] in {"应付金额", "已支付金额", "待付款金额", "折合人民币金额"}:
                 cell.number_format = '#,##0.00'
+            if headers[col - 1] == "人民币兑本币汇率":
+                cell.number_format = '0.000000'
             if ("日期" in headers[col - 1] or "时间" in headers[col - 1]) and value:
                 cell.number_format = "yyyy-mm-dd"
         if kind == "mold":
@@ -1167,7 +1199,7 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
             width = 36
         elif header in {"钉钉申请单号", "收款账户", "收款信息", "账户名", "开户行"}:
             width = 22
-        elif header in {"应付金额", "已支付金额", "待付款金额"}:
+        elif header in {"应付金额", "已支付金额", "待付款金额", "折合人民币金额"}:
             width = 14
         elif header.startswith("图片附件"):
             width = 18
@@ -1206,6 +1238,16 @@ def values_for_headers(headers: List[str], record: Dict[str, Any]) -> List[Any]:
             values.append(record.get("paid_amount"))
         elif header == "待付款金额":
             values.append(record.get("pending_amount"))
+        elif header == "货币类型":
+            values.append(record.get("currency") or "CNY")
+        elif header == "折合人民币金额":
+            values.append(record.get("base_amount_cny"))
+        elif header == "人民币兑本币汇率":
+            values.append(record.get("fx_rate_cny_per_unit"))
+        elif header == "汇率日期":
+            values.append(record.get("fx_rate_date"))
+        elif header == "实际汇率日期":
+            values.append(record.get("fx_rate_actual_date"))
         elif header in {"项目归属", "项目"}:
             values.append(record.get("project"))
         elif header == "BU归属":

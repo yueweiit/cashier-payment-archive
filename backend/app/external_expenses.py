@@ -19,10 +19,13 @@ from dotenv import dotenv_values
 from psycopg.rows import dict_row
 
 from .db import ROOT_DIR
+from .fx_rates import normalize_currency
 
 
 ALLOWED_SOURCE_TYPES = ("operation", "purchase")
 ALLOWED_APPROVAL_STATUSES = ("COMPLETED", "RUNNING")
+DISALLOWED_APPROVAL_RESULT_PATTERN = r"(refus|reject|cancel|terminat|revok|void|abort|作废|拒绝|撤销|撤回|取消|终止)"
+DISALLOWED_APPROVAL_RESULT_RE = re.compile(DISALLOWED_APPROVAL_RESULT_PATTERN, re.IGNORECASE)
 SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出"}
 SOURCE_TABLES = {
     "operation": "approval_expense_operation",
@@ -294,12 +297,16 @@ def _preview_conditions(
     normalized_sources = [source for source in source_types if source in ALLOWED_SOURCE_TYPES]
     conditions = [
         "source_type = ANY(%s)",
-        "approval_status = ANY(%s)",
+        "UPPER(BTRIM(COALESCE(approval_status, ''))) = ANY(%s)",
         "(execution_region ILIKE '%%中国%%' OR execution_region ILIKE '%%china%%')",
-        "LOWER(COALESCE(approval_result, '')) <> 'refuse'",
+        "COALESCE(approval_result, '') !~* %s",
         "(base_currency_amount IS NULL OR base_currency_amount <> 0)",
     ]
-    params: list[Any] = [normalized_sources, list(ALLOWED_APPROVAL_STATUSES)]
+    params: list[Any] = [
+        normalized_sources,
+        list(ALLOWED_APPROVAL_STATUSES),
+        DISALLOWED_APPROVAL_RESULT_PATTERN,
+    ]
     normalized_approval_no = approval_no.strip()
     if normalized_approval_no:
         conditions.append("BTRIM(approval_no) = %s")
@@ -791,15 +798,18 @@ def fetch_external_expenses(items: Iterable[Dict[str, str]]) -> list[Dict[str, A
                 SELECT BTRIM(approval_no) AS approval_no, COUNT(*) AS count
                 FROM source_rows
                 WHERE BTRIM(approval_no) = ANY(%s)
-                  AND approval_status = ANY(%s)
+                  AND UPPER(BTRIM(COALESCE(approval_status, ''))) = ANY(%s)
                   AND (execution_region ILIKE '%%中国%%' OR execution_region ILIKE '%%china%%')
-                  AND LOWER(COALESCE(approval_result, '')) <> 'refuse'
+                  AND COALESCE(approval_result, '') !~* %s
                 GROUP BY BTRIM(approval_no)
                 HAVING COUNT(*) > 1
             """
             conflicts = {
                 str(row["approval_no"])
-                for row in conn.execute(conflict_query, [approval_nos, list(ALLOWED_APPROVAL_STATUSES)]).fetchall()
+                for row in conn.execute(
+                    conflict_query,
+                    [approval_nos, list(ALLOWED_APPROVAL_STATUSES), DISALLOWED_APPROVAL_RESULT_PATTERN],
+                ).fetchall()
             }
     user_names = fetch_dingtalk_user_names(row.get("creator_name") for row in source_rows)
     rows = [map_external_expense(row, user_names) for row in source_rows]
@@ -823,37 +833,58 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         summary = detail_values[0] if detail_values else _first_text(row.get("product_name"), row.get("order_name"), row.get("project"), row.get("expense_type"))
         payment_date_values = _component_values(form_values, "付款日期")
         needed_payment_date = _date_text(payment_date_values[0]) if payment_date_values else None
+        currency_values = (
+            _component_values(form_values, "币种")
+            or _component_values(form_values, "货币")
+            or _component_values(form_values, "Currency")
+            or _component_values(form_values, "Moneda")
+        )
+        source_currency_text = currency_values[0] if currency_values else row.get("source_currency")
     else:
         beneficiary = _text(row.get("beneficiary")) or ""
         beneficiary_values = [beneficiary] if beneficiary else []
         summary = _text(row.get("summary"))
         needed_payment_date = _date_text(row.get("needed_payment_date"))
+        source_currency_text = row.get("source_currency")
 
     approval_no = _text(row.get("approval_no")) or ""
     approval_status = (_text(row.get("approval_status")) or "").upper()
     approval_result = (_text(row.get("approval_result")) or "").lower()
     execution_region = _text(row.get("execution_region")) or ""
-    amount = _number(row.get("base_currency_amount"))
+    base_amount = _number(row.get("base_currency_amount"))
+    source_amount = _number(row.get("source_amount"))
+    source_currency = normalize_currency(source_currency_text)
     warnings: list[str] = []
     errors: list[str] = []
+    if source_currency in {"USD", "MXN"} and source_amount is not None and source_amount > 0 and base_amount is not None:
+        amount = source_amount
+        fx_rate = float(Decimal(str(base_amount)) / Decimal(str(source_amount)))
+    else:
+        amount = base_amount
+        fx_rate = 1.0
+        if source_currency not in {None, "CNY"}:
+            warnings.append("来源币种无法识别，已按 CNY 导入")
+        elif source_type == "purchase" and not source_currency:
+            warnings.append("采购支出未识别到币种，已按 CNY 导入")
+        source_currency = "CNY"
     if not beneficiary:
         warnings.append("缺少收款信息")
     if len(beneficiary_values) > 1:
         warnings.append("存在多个收款人，请确认")
-    if amount == 0:
+    if base_amount == 0:
         errors.append("应付金额为 0，暂不导入")
     if not approval_no:
         errors.append("缺少钉钉单号")
-    if amount is None:
+    if base_amount is None:
         errors.append("缺少应付金额")
-    elif amount < 0:
+    elif base_amount < 0:
         errors.append("应付金额不能为负数")
     if "中国" not in execution_region and "china" not in execution_region.lower():
         errors.append("执行地区不是中国")
     if approval_status not in ALLOWED_APPROVAL_STATUSES:
         errors.append("审批状态不允许导入")
-    if approval_result == "refuse":
-        errors.append("审批结果为拒绝")
+    if approval_result_is_disallowed(approval_result):
+        errors.append("审批已拒绝、作废或终止，默认不导入")
 
     application_date = _date_text(row.get("effective_date"))
     applicant_id = _text(row.get("creator_name")) or ""
@@ -875,7 +906,11 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "expense_type": _text(row.get("expense_type")),
         "summary": summary,
         "amount": amount,
-        "currency": "CNY",
+        "currency": source_currency or "CNY",
+        "base_amount_cny": base_amount,
+        "fx_rate_cny_per_unit": fx_rate,
+        "fx_rate_date": application_date,
+        "fx_rate_actual_date": application_date,
         "project": _text(row.get("project")),
         "payee_account": beneficiary or None,
         "needed_payment_date": needed_payment_date,
@@ -895,8 +930,9 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 "application_date": application_date,
                 "source_created_at": _datetime_text(row.get("source_created_at")),
                 "source_updated_at": _datetime_text(row.get("source_updated_at")),
-                "source_currency": _text(row.get("source_currency")),
-                "source_amount": _number(row.get("source_amount")),
+                "source_currency": source_currency,
+                "source_amount": source_amount,
+                "base_currency_amount": base_amount,
             }
         },
     }
@@ -913,6 +949,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "approval_result": approval_result or None,
         "summary": summary or "",
         "amount": amount,
+        "base_amount_cny": base_amount,
+        "currency": source_currency or "CNY",
         "beneficiary": beneficiary,
         "needed_payment_date": needed_payment_date,
         "warnings": warnings,
@@ -920,6 +958,10 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "source_conflict": False,
         "request_data": request_data,
     }
+
+
+def approval_result_is_disallowed(value: Any) -> bool:
+    return bool(DISALLOWED_APPROVAL_RESULT_RE.search(_text(value) or ""))
 
 
 def applicant_name_from_title(value: Any) -> str:

@@ -85,6 +85,24 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_user_sheet_permissions_sheet
             ON user_sheet_permissions(sheet_name, user_id);
 
+            CREATE TABLE IF NOT EXISTS employee_department_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                employee_name TEXT NOT NULL,
+                second_level_department TEXT NOT NULL,
+                third_level_department TEXT,
+                source_file TEXT,
+                source_file_hash TEXT,
+                imported_by INTEGER REFERENCES users(id),
+                imported_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_employee_department_user_id
+            ON employee_department_mappings(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_employee_department_name
+            ON employee_department_mappings(employee_name);
+
             CREATE TABLE IF NOT EXISTS request_batches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 parent_batch_id INTEGER REFERENCES request_batches(id) ON DELETE SET NULL,
@@ -115,6 +133,10 @@ def init_db() -> None:
                 paid_amount REAL,
                 pending_amount REAL,
                 currency TEXT DEFAULT 'CNY',
+                base_amount_cny REAL,
+                fx_rate_cny_per_unit REAL,
+                fx_rate_date TEXT,
+                fx_rate_actual_date TEXT,
                 project TEXT,
                 bu TEXT,
                 payee_account TEXT,
@@ -153,6 +175,10 @@ def init_db() -> None:
                 copied_from_payment_id INTEGER REFERENCES payment_records(id) ON DELETE SET NULL,
                 root_payment_id INTEGER,
                 amount REAL NOT NULL,
+                base_amount_cny REAL,
+                fx_rate_cny_per_unit REAL,
+                fx_rate_date TEXT,
+                fx_rate_actual_date TEXT,
                 payment_date TEXT,
                 payer TEXT,
                 payment_account TEXT,
@@ -303,12 +329,17 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     migrate_user_roles(conn)
     ensure_column(conn, "users", "deleted_at", "TEXT")
     ensure_column(conn, "users", "deleted_by", "INTEGER REFERENCES users(id)")
+    ensure_column(conn, "employee_department_mappings", "third_level_department", "TEXT")
     ensure_column(conn, "request_batches", "parent_batch_id", "INTEGER REFERENCES request_batches(id) ON DELETE SET NULL")
     ensure_column(conn, "request_batches", "sheet_order_json", "TEXT")
     ensure_column(conn, "payment_requests", "copied_from_request_id", "INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL")
     ensure_column(conn, "payment_requests", "applicant", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_approval_date", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_opinion", "TEXT")
+    ensure_column(conn, "payment_requests", "base_amount_cny", "REAL")
+    ensure_column(conn, "payment_requests", "fx_rate_cny_per_unit", "REAL")
+    ensure_column(conn, "payment_requests", "fx_rate_date", "TEXT")
+    ensure_column(conn, "payment_requests", "fx_rate_actual_date", "TEXT")
     migrate_payment_amounts(conn)
     ensure_column(conn, "audit_logs", "operation_id", "TEXT")
     ensure_column(conn, "attachment_links", "attachment_type", "TEXT NOT NULL DEFAULT 'link'")
@@ -328,6 +359,7 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_batch_snapshots_table(conn)
     migrate_approval_date_values(conn)
     ensure_payment_detail_tables(conn)
+    migrate_currency_amount_anchors(conn)
     ensure_dingtalk_workflow_events_table(conn)
     migrate_payment_summaries_to_details(conn)
     refresh_payment_summaries(conn)
@@ -511,6 +543,10 @@ def ensure_payment_detail_tables(conn: sqlite3.Connection) -> None:
             copied_from_payment_id INTEGER REFERENCES payment_records(id) ON DELETE SET NULL,
             root_payment_id INTEGER,
             amount REAL NOT NULL,
+            base_amount_cny REAL,
+            fx_rate_cny_per_unit REAL,
+            fx_rate_date TEXT,
+            fx_rate_actual_date TEXT,
             payment_date TEXT,
             payer TEXT,
             payment_account TEXT,
@@ -546,6 +582,66 @@ def ensure_payment_detail_tables(conn: sqlite3.Connection) -> None:
             key TEXT PRIMARY KEY,
             applied_at TEXT NOT NULL
         );
+        """
+    )
+    ensure_column(conn, "payment_records", "base_amount_cny", "REAL")
+    ensure_column(conn, "payment_records", "fx_rate_cny_per_unit", "REAL")
+    ensure_column(conn, "payment_records", "fx_rate_date", "TEXT")
+    ensure_column(conn, "payment_records", "fx_rate_actual_date", "TEXT")
+
+
+def migrate_currency_amount_anchors(conn: sqlite3.Connection) -> None:
+    """Backfill safe CNY anchors without guessing historical foreign currencies."""
+    conn.execute(
+        """
+        UPDATE payment_requests
+        SET currency = 'CNY'
+        WHERE UPPER(TRIM(COALESCE(currency, ''))) NOT IN ('CNY', 'USD', 'MXN')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE payment_requests
+        SET base_amount_cny = CASE
+                WHEN base_amount_cny IS NOT NULL THEN base_amount_cny
+                WHEN UPPER(TRIM(COALESCE(currency, 'CNY'))) = 'CNY' THEN amount
+                WHEN fx_rate_cny_per_unit IS NOT NULL THEN ROUND(amount * fx_rate_cny_per_unit, 2)
+                ELSE NULL
+            END,
+            fx_rate_cny_per_unit = CASE
+                WHEN UPPER(TRIM(COALESCE(currency, 'CNY'))) = 'CNY' THEN 1
+                ELSE fx_rate_cny_per_unit
+            END
+        """
+    )
+    conn.execute(
+        """
+        UPDATE payment_records
+        SET base_amount_cny = CASE
+                WHEN base_amount_cny IS NOT NULL THEN base_amount_cny
+                WHEN COALESCE((
+                    SELECT UPPER(TRIM(COALESCE(currency, 'CNY')))
+                    FROM payment_requests WHERE payment_requests.id = payment_records.request_id
+                ), 'CNY') = 'CNY' THEN amount
+                WHEN COALESCE(fx_rate_cny_per_unit, (
+                    SELECT fx_rate_cny_per_unit
+                    FROM payment_requests WHERE payment_requests.id = payment_records.request_id
+                )) IS NOT NULL THEN ROUND(amount * COALESCE(fx_rate_cny_per_unit, (
+                    SELECT fx_rate_cny_per_unit
+                    FROM payment_requests WHERE payment_requests.id = payment_records.request_id
+                )), 2)
+                ELSE NULL
+            END,
+            fx_rate_cny_per_unit = COALESCE(fx_rate_cny_per_unit, (
+                SELECT fx_rate_cny_per_unit
+                FROM payment_requests WHERE payment_requests.id = payment_records.request_id
+            )),
+            fx_rate_date = COALESCE(fx_rate_date, (
+                SELECT fx_rate_date FROM payment_requests WHERE payment_requests.id = payment_records.request_id
+            )),
+            fx_rate_actual_date = COALESCE(fx_rate_actual_date, (
+                SELECT fx_rate_actual_date FROM payment_requests WHERE payment_requests.id = payment_records.request_id
+            ))
         """
     )
 

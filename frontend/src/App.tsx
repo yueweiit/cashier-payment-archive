@@ -36,6 +36,9 @@ import {
   AttachmentLink,
   AuditLog,
   Batch,
+  CurrencyCode,
+  CurrencyConversionPreview,
+  HistoricalCurrencyRestorePreview,
   DingtalkWorkflow,
   EmployeeDepartmentImportResult,
   ExternalExpenseImportResult,
@@ -76,10 +79,11 @@ const generalManagerApprovalOptions = ["同意付款", "延缓批付", "存在�
 const generalManagerApprovalFilterOptions = [...generalManagerApprovalOptions, "无需审批"];
 const GENERAL_MANAGER_EMPTY_FILTER = "__empty_general_manager_approval__";
 const selectOptionsByField: Partial<Record<keyof PaymentRequest, string[]>> = {
+  currency: ["CNY", "USD", "MXN"],
   finance_review: financeApprovalOptions,
   general_manager_approval: generalManagerApprovalOptions,
 };
-const strictSelectFields = new Set<keyof PaymentRequest>(["finance_review", "general_manager_approval"]);
+const strictSelectFields = new Set<keyof PaymentRequest>(["currency", "finance_review", "general_manager_approval"]);
 
 const roleLabels: Record<UserRole, string> = {
   business: "业务人员",
@@ -89,6 +93,7 @@ const roleLabels: Record<UserRole, string> = {
 };
 
 const financeControlledFields = new Set<keyof PaymentRequest>([
+  "currency",
   "paid_amount",
   "finance_review",
   "finance_manager_approval",
@@ -150,6 +155,11 @@ const fieldLabels: Record<string, string> = {
   overdue_status: "逾期情况",
   payer: "付款人",
   source_sheet: "来源 Sheet",
+  currency: "货币类型",
+  base_amount_cny: "折合人民币金额",
+  fx_rate_cny_per_unit: "人民币兑本币汇率",
+  fx_rate_date: "汇率日期",
+  fx_rate_actual_date: "实际汇率日期",
 };
 
 type GridRow = Partial<PaymentRequest> & {
@@ -1351,7 +1361,7 @@ function ExternalExpenseImportDialog({
                     <td title={row.applicant_id ? `钉钉用户 ID：${row.applicant_id}` : undefined}><strong>{row.applicant || "—"}</strong><small>{row.applicant_department || ""}</small></td>
                     <td><ExternalApprovalBadge status={row.approval_status} result={row.approval_result} /></td>
                     <td className="external-summary-cell" title={row.summary}>{row.summary || "—"}</td>
-                    <td className="amount">{row.amount === undefined || row.amount === null ? "—" : formatMoney(row.amount)}</td>
+                    <td className="amount">{row.amount === undefined || row.amount === null ? "—" : formatMoney(row.amount, row.currency)}</td>
                     <td className="external-beneficiary-cell" title={row.beneficiary}>{row.beneficiary || "—"}</td>
                     <td><ExternalExpenseValidation row={row} /></td>
                   </tr>
@@ -1444,6 +1454,8 @@ function Workspace({
   const [mobileViewOverride, setMobileViewOverride] = useState<MobileViewOverride>(null);
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
   const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
+  const [currencyConversion, setCurrencyConversion] = useState<{ request: PaymentRequest; target: CurrencyCode } | null>(null);
+  const [historicalCurrencyOpen, setHistoricalCurrencyOpen] = useState(false);
   const batchMenuRef = useRef<HTMLDivElement | null>(null);
   const [reason, setReason] = useState("");
   const hasUnsavedChanges = dirtyCells.size > 0 || deletedLocalIds.size > 0 || deletedSheetNames.size > 0;
@@ -1513,12 +1525,13 @@ function Workspace({
   const visibleTotals = useMemo(
     () => ({
       count: visibleActiveRows.length,
-      amount: visibleActiveRows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0),
-      paidAmount: visibleActiveRows.reduce((sum, row) => sum + (Number(row.paid_amount) || 0), 0),
-      pendingAmount: visibleActiveRows.reduce((sum, row) => sum + (Number(row.pending_amount) || 0), 0),
+      amount: visibleActiveRows.reduce((sum, row) => sum + requestAmountCny(row, "amount"), 0),
+      paidAmount: visibleActiveRows.reduce((sum, row) => sum + requestAmountCny(row, "paid_amount"), 0),
+      pendingAmount: visibleActiveRows.reduce((sum, row) => sum + requestAmountCny(row, "pending_amount"), 0),
     }),
     [visibleActiveRows],
   );
+  const visibleCurrencyTotals = useMemo(() => currencySubtotals(visibleActiveRows), [visibleActiveRows]);
   const financeReviewCounts = useMemo(
     () => ({
       paid: visibleActiveRows.filter((row) => row.finance_review === "已付款").length,
@@ -1669,6 +1682,27 @@ function Workspace({
     await reloadBatches();
     setMessage("已保存");
     return savedRequest;
+  }
+
+  function requestCurrencyConversion(request: Partial<PaymentRequest>, target: string) {
+    if (!request.id || !["CNY", "USD", "MXN"].includes(target)) return;
+    if (hasUnsavedChanges || editorDirty) {
+      setMessage("当前有未保存修改，请先保存或放弃后再切换币种");
+      return;
+    }
+    const currentCurrency = String(request.currency || "CNY").toUpperCase();
+    if (currentCurrency === target) return;
+    setCurrencyConversion({ request: request as PaymentRequest, target: target as CurrencyCode });
+  }
+
+  async function currencyConversionApplied(updatedRequest: PaymentRequest) {
+    setCurrencyConversion(null);
+    if (editing?.id === updatedRequest.id) setEditing(updatedRequest);
+    setEditorDraft(null);
+    setEditorDirty(false);
+    await loadRequests();
+    await reloadBatches();
+    setMessage(`币种已切换为 ${currencyLabel(updatedRequest.currency)}`);
   }
 
   function activateRequestEditor(request: Partial<PaymentRequest>, initialTab: RequestEditorTab) {
@@ -2198,7 +2232,7 @@ function Workspace({
                 恢复草稿
               </button>
             )}
-            {canManageDraftState && (
+            {(canManageDraftState || user.role === "admin") && (
               <div className="batch-more" ref={batchMenuRef}>
                 <button
                   className="ghost-button"
@@ -2212,19 +2246,33 @@ function Workspace({
                 </button>
                 {batchMenuOpen && (
                   <div className="batch-more-menu" role="menu">
-                    <button type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void setCurrentBaseline(); }}>
-                      <Save size={16} />
-                      设为还原点
-                    </button>
-                    <button type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void restoreInitialDraftState(); }}>
-                      <Undo2 size={16} />
-                      还原到初始状态
-                    </button>
-                    <div className="batch-more-separator" role="separator" />
-                    <button className="danger-menu-item" type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void deleteCurrentDraft(); }}>
-                      <Trash2 size={16} />
-                      删除当前草稿
-                    </button>
+                    {canManageDraftState && (
+                      <>
+                        <button type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void setCurrentBaseline(); }}>
+                          <Save size={16} />
+                          设为还原点
+                        </button>
+                        <button type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void restoreInitialDraftState(); }}>
+                          <Undo2 size={16} />
+                          还原到初始状态
+                        </button>
+                      </>
+                    )}
+                    {user.role === "admin" && (
+                      <button type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); setHistoricalCurrencyOpen(true); }}>
+                        <RefreshCcw size={16} />
+                        历史币种恢复
+                      </button>
+                    )}
+                    {canManageDraftState && (
+                      <>
+                        <div className="batch-more-separator" role="separator" />
+                        <button className="danger-menu-item" type="button" role="menuitem" onClick={() => { setBatchMenuOpen(false); void deleteCurrentDraft(); }}>
+                          <Trash2 size={16} />
+                          删除当前草稿
+                        </button>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
@@ -2237,15 +2285,15 @@ function Workspace({
             <strong>{selectedBatch.request_count || 0} 条</strong>
           </div>
           <div className="batch-metric-card">
-            <span>批次应付</span>
+            <span>批次应付（折合人民币）</span>
             <strong>{formatMoney(batchPayableAmount)}</strong>
           </div>
           <div className="batch-metric-card">
-            <span>累计已支付</span>
+            <span>累计已支付（折合人民币）</span>
             <strong>{formatMoney(batchPaidAmount)}</strong>
           </div>
           <div className="batch-metric-card">
-            <span>待付款</span>
+            <span>待付款（折合人民币）</span>
             <strong>{formatMoney(selectedBatch.total_pending_amount || 0)}</strong>
           </div>
         </div>
@@ -2258,6 +2306,13 @@ function Workspace({
             <div className="payment-progress-fill" style={{ width: `${paymentProgress}%` }} />
           </div>
         </div>
+        {!!selectedBatch.currency_totals?.length && (
+          <div className="batch-currency-subtotals" aria-label="批次各币种小计">
+            {selectedBatch.currency_totals.map((subtotal) => (
+              <span key={subtotal.currency}>{subtotal.currency}：应付 {formatMoney(subtotal.amount, subtotal.currency)} · 已付 {formatMoney(subtotal.paid_amount, subtotal.currency)} · 待付 {formatMoney(subtotal.pending_amount, subtotal.currency)}</span>
+            ))}
+          </div>
+        )}
       </section>
       {isSmallScreen && canManageBatchOperations && (
         <button
@@ -2367,8 +2422,8 @@ function Workspace({
           </div>
           <input value={filters.payment_account} onChange={(event) => setFilters({ ...filters, payment_account: event.target.value })} placeholder="付款账户" />
           <input value={filters.invoice_status} onChange={(event) => setFilters({ ...filters, invoice_status: event.target.value })} placeholder="开票情况" />
-          <div className="pending-amount-filter" aria-label="待付金额区间">
-            <span>待付金额</span>
+          <div className="pending-amount-filter" aria-label="待付金额（折合人民币）区间">
+            <span>待付金额（折合人民币）</span>
             <input
               type="number"
               min="0"
@@ -2470,9 +2525,14 @@ function Workspace({
             <strong>{visibleTotals.count} 条</strong>
           </div>
           <div className="filtered-summary-amounts">
-            <span>应付 <strong>{formatMoney(visibleTotals.amount)}</strong></span>
+            <span>折合人民币应付 <strong>{formatMoney(visibleTotals.amount)}</strong></span>
             <span>已付 <strong>{formatMoney(visibleTotals.paidAmount)}</strong></span>
             <span>待付 <strong>{formatMoney(visibleTotals.pendingAmount)}</strong></span>
+          </div>
+          <div className="currency-subtotals" aria-label="各币种小计">
+            {visibleCurrencyTotals.map((subtotal) => (
+              <span key={subtotal.currency}>{subtotal.currency}：应付 {formatMoney(subtotal.amount, subtotal.currency)} / 待付 {formatMoney(subtotal.pending_amount, subtotal.currency)}</span>
+            ))}
           </div>
           <div className="filtered-summary-statuses">
             <span className="summary-status paid">已付款 {financeReviewCounts.paid} 单</span>
@@ -2631,6 +2691,7 @@ function Workspace({
             defaultSourceSheet={defaultSourceSheet}
             wrapText={wrapText}
             headerLanguage={gridHeaderLanguage}
+            onCurrencyChange={requestCurrencyConversion}
           />
         )}
       </section>
@@ -2682,6 +2743,29 @@ function Workspace({
           }}
           canEditAttachments={selectedBatch.status !== "archived" || isPrivilegedRole(user.role)}
           canEditField={(field) => canEditGrid && canEditRequestField(user.role, field) && (user.role !== "business" || field !== "source_sheet")}
+          onCurrencyChange={requestCurrencyConversion}
+        />
+      )}
+      {currencyConversion && selectedBatch && (
+        <CurrencyConversionDialog
+          batch={selectedBatch}
+          request={currencyConversion.request}
+          targetCurrency={currencyConversion.target}
+          reason={reason}
+          onClose={() => setCurrencyConversion(null)}
+          onApplied={currencyConversionApplied}
+        />
+      )}
+      {historicalCurrencyOpen && selectedBatch && (
+        <HistoricalCurrencyRestoreDialog
+          batch={selectedBatch}
+          onClose={() => setHistoricalCurrencyOpen(false)}
+          onApplied={async (count) => {
+            setHistoricalCurrencyOpen(false);
+            await loadRequests();
+            await reloadBatches();
+            setMessage(`已恢复 ${count} 条历史币种记录`);
+          }}
         />
       )}
       {pendingEditorNavigation && (
@@ -2801,6 +2885,169 @@ function Modal({ title, onClose, children, className = "" }: { title: string; on
         {children}
       </section>
     </div>
+  );
+}
+
+function CurrencyConversionDialog({
+  batch,
+  request,
+  targetCurrency,
+  reason,
+  onClose,
+  onApplied,
+}: {
+  batch: Batch;
+  request: PaymentRequest;
+  targetCurrency: CurrencyCode;
+  reason: string;
+  onClose: () => void;
+  onApplied: (request: PaymentRequest) => Promise<void> | void;
+}) {
+  const [rateDate, setRateDate] = useState(localIsoDate(new Date()));
+  const [preview, setPreview] = useState<CurrencyConversionPreview | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const maxDate = localIsoDate(new Date());
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    setPreview(null);
+    api.previewCurrencyConversion(batch.id, request.id, {
+      target_currency: targetCurrency,
+      rate_date: rateDate,
+      reason,
+      expected_updated_at: request.updated_at,
+    })
+      .then((result) => active && setPreview(result.preview))
+      .catch((err) => active && setError((err as Error).message))
+      .finally(() => active && setLoading(false));
+    return () => { active = false; };
+  }, [batch.id, rateDate, reason, request.id, request.updated_at, targetCurrency]);
+
+  async function applyConversion() {
+    if (!preview || applying) return;
+    setApplying(true);
+    setError("");
+    try {
+      const result = await api.applyCurrencyConversion(batch.id, request.id, {
+        target_currency: targetCurrency,
+        rate_date: rateDate,
+        reason,
+        expected_updated_at: request.updated_at,
+      });
+      await onApplied(result.request);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  return (
+    <Modal title="确认币种换算" onClose={applying ? () => undefined : onClose} className="currency-conversion-modal">
+      <div className="currency-conversion-route">
+        <strong>{currencyLabel(request.currency)}</strong><ArrowRight size={18} /><strong>{currencyLabel(targetCurrency)}</strong>
+      </div>
+      <label className="currency-rate-date">
+        汇率日期
+        <input type="date" value={rateDate} max={maxDate} onChange={(event) => setRateDate(event.target.value)} disabled={applying} />
+      </label>
+      {loading && <div className="editor-info-banner">正在读取汇率…</div>}
+      {error && <p className="error-text" role="alert">{error}</p>}
+      {preview && (
+        <>
+          <div className="currency-rate-summary">
+            <div><span>原币汇率</span><strong>1 {preview.source_currency} = ¥{Number(preview.source_rate || 1).toFixed(6)}</strong></div>
+            <div><span>目标币汇率</span><strong>1 {preview.target_currency} = ¥{Number(preview.target_rate).toFixed(6)}</strong></div>
+            <div><span>选择日期</span><strong>{preview.requested_rate_date}</strong></div>
+            <div><span>实际命中日期</span><strong>{preview.actual_rate_date}{preview.used_previous_rate ? "（使用此前最近汇率）" : ""}</strong></div>
+          </div>
+          <div className="currency-amount-comparison">
+            <div className="currency-comparison-head"><span>项目</span><span>换算前</span><span>换算后</span></div>
+            {(["amount", "paid_amount", "pending_amount"] as const).map((field) => (
+              <div key={field}>
+                <span>{{ amount: "应付", paid_amount: "已付", pending_amount: "待付" }[field]}</span>
+                <strong>{formatMoney(preview.before[field], preview.source_currency)}</strong>
+                <strong>{formatMoney(preview.after[field], preview.target_currency)}</strong>
+              </div>
+            ))}
+          </div>
+          <p className="currency-anchor-note">人民币基准金额保持为 {formatMoney(preview.base_amount_cny)}；将同步换算 {preview.payment_count} 笔付款明细。</p>
+        </>
+      )}
+      <div className="modal-actions">
+        <button className="ghost-button" type="button" onClick={onClose} disabled={applying}>取消</button>
+        <button className="primary-button" type="button" onClick={applyConversion} disabled={!preview || loading || applying}>
+          {applying ? "换算中" : "确认换算并保存"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function HistoricalCurrencyRestoreDialog({ batch, onClose, onApplied }: { batch: Batch; onClose: () => void; onApplied: (count: number) => Promise<void> | void }) {
+  const [preview, setPreview] = useState<HistoricalCurrencyRestorePreview | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.previewHistoricalCurrencyRestore(batch.id)
+      .then((result) => {
+        setPreview(result);
+        setSelected(new Set(result.rows.filter((row) => row.status === "recoverable").map((row) => row.request_id)));
+      })
+      .catch((err) => setError((err as Error).message));
+  }, [batch.id]);
+
+  async function applyRestore() {
+    if (!selected.size || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.applyHistoricalCurrencyRestore(batch.id, { request_ids: Array.from(selected), reason });
+      await onApplied(result.count);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="历史币种恢复" onClose={busy ? () => undefined : onClose} className="historical-currency-modal">
+      <p className="muted-text">只恢复能够从可靠钉钉来源同时确认原币、原币金额和人民币基准金额的记录。</p>
+      {preview && <div className="history-currency-summary">可恢复 {preview.summary.recoverable || 0} · 无法判断 {preview.summary.undetermined || 0} · 金额异常 {preview.summary.amount_error || 0}</div>}
+      {error && <p className="error-text" role="alert">{error}</p>}
+      <div className="history-currency-list">
+        {!preview && !error && <div className="editor-info-banner">正在分析历史记录…</div>}
+        {preview?.rows.map((row) => (
+          <label className={row.status === "recoverable" ? "history-currency-row" : "history-currency-row disabled"} key={row.request_id}>
+            <input
+              type="checkbox"
+              disabled={row.status !== "recoverable" || busy}
+              checked={selected.has(row.request_id)}
+              onChange={(event) => {
+                const next = new Set(selected);
+                event.target.checked ? next.add(row.request_id) : next.delete(row.request_id);
+                setSelected(next);
+              }}
+            />
+            <span><strong>{row.dingding_id || `请款 ${row.request_id}`}</strong><small>{row.source_sheet || "未分 Sheet"} · {row.applicant || "申请人未知"}</small></span>
+            <span>{row.status === "recoverable" ? `${formatMoney(Number(row.base_amount_cny || 0))} → ${formatMoney(Number(row.source_amount || 0), row.source_currency)}` : (row.reasons || []).join("；")}</span>
+          </label>
+        ))}
+      </div>
+      {batch.status === "archived" && <input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="归档更正原因（必填）" disabled={busy} />}
+      <div className="modal-actions">
+        <button className="ghost-button" type="button" onClick={onClose} disabled={busy}>取消</button>
+        <button className="primary-button" type="button" onClick={applyRestore} disabled={!selected.size || busy || (batch.status === "archived" && !reason.trim())}>{busy ? "恢复中" : `恢复选中 ${selected.size} 条`}</button>
+      </div>
+    </Modal>
   );
 }
 
@@ -2979,9 +3226,9 @@ function MobileRequestCardList({
               <div><dt>{labels.applicant}</dt><dd>{applicant}</dd></div>
             </dl>
             <div className="mobile-request-amounts">
-              <div><span>{labels.payable}</span><strong>{formatMoney(Number(row.amount || 0))}</strong></div>
-              <div><span>{labels.paid}</span><strong>{formatMoney(Number(row.paid_amount || 0))}</strong></div>
-              <div className="pending"><span>{labels.pending}</span><strong>{formatMoney(Number(row.pending_amount || 0))}</strong></div>
+              <div><span>{labels.payable}</span><strong>{formatMoney(Number(row.amount || 0), row.currency)}</strong></div>
+              <div><span>{labels.paid}</span><strong>{formatMoney(Number(row.paid_amount || 0), row.currency)}</strong></div>
+              <div className="pending"><span>{labels.pending}</span><strong>{formatMoney(Number(row.pending_amount || 0), row.currency)}</strong></div>
             </div>
             <dl className="mobile-request-meta">
               <div><dt>{labels.neededDate}</dt><dd>{row.needed_payment_date || "—"}</dd></div>
@@ -3024,6 +3271,7 @@ function EditablePaymentGrid({
   wrapText,
   headerLanguage,
   canEditField,
+  onCurrencyChange,
 }: {
   rows: GridRow[];
   onRowsChange: (rows: GridRow[]) => void;
@@ -3039,6 +3287,7 @@ function EditablePaymentGrid({
   wrapText: boolean;
   headerLanguage: GridHeaderLanguage;
   canEditField: (field: keyof PaymentRequest) => boolean;
+  onCurrencyChange: (request: Partial<PaymentRequest>, target: string) => void;
 }) {
   const [activeCell, setActiveCell] = useState<{ row: number; col: number }>({ row: 0, col: 0 });
   const tableWrapRef = useRef<HTMLDivElement | null>(null);
@@ -3220,7 +3469,9 @@ function EditablePaymentGrid({
 	                  const selectOptions = selectOptionsForField(column.key, cellValue);
 	                  const shouldWrap = wrapText && wrappableColumnKeys.has(column.key) && column.type !== "number" && column.type !== "date";
 	                  const terminatedManagerField = requestDingTalkTerminated(row) && generalManagerControlledFields.has(column.key);
-	                  const cellReadOnly = readOnly || row.__deleted || !canEditField(column.key) || terminatedManagerField;
+	                  const cellReadOnly = readOnly || row.__deleted || !canEditField(column.key) || terminatedManagerField
+	                    || (column.key === "currency" && Boolean(row.__isNew))
+	                    || (column.key === "amount" && currencyCode(row.currency) !== "CNY");
 	                  const fieldClass = [
 	                    column.key === "dingding_id" ? "mono" : "",
 	                    moneyFields.has(column.key) ? "amount-input" : "",
@@ -3254,7 +3505,13 @@ function EditablePaymentGrid({
 	                            disabled={cellReadOnly}
                             onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
                             onKeyDown={(event) => handleSelectKeyDown(event, rowIndex, colIndex)}
-                            onChange={(event) => updateCell(rowIndex, column, event.target.value)}
+                            onChange={(event) => {
+                              if (column.key === "currency" && row.id) {
+                                onCurrencyChange(row, event.target.value);
+                                return;
+                              }
+                              updateCell(rowIndex, column, event.target.value);
+                            }}
                           >
                             {selectOptions.map((option) => (
                               <option key={option} value={option}>{option || "未选择"}</option>
@@ -3317,6 +3574,7 @@ function RequestEditor({
   onPaymentsChanged,
   canEditAttachments,
   canEditField,
+  onCurrencyChange,
 }: {
   batch: Batch;
   user: User;
@@ -3333,6 +3591,7 @@ function RequestEditor({
   onPaymentsChanged?: (request: PaymentRequest) => Promise<void> | void;
   canEditAttachments: boolean;
   canEditField: (field: keyof PaymentRequest) => boolean;
+  onCurrencyChange: (request: Partial<PaymentRequest>, target: string) => void;
 }) {
   const [form, setForm] = useState<Partial<PaymentRequest>>(request);
   const [activeTab, setActiveTab] = useState<RequestEditorTab>(initialTab);
@@ -3355,6 +3614,7 @@ function RequestEditor({
     "expense_type",
     "summary",
     "amount",
+    "currency",
     "paid_amount",
     "pending_amount",
     "project",
@@ -3480,7 +3740,9 @@ function RequestEditor({
   }
 
   function renderField(field: keyof PaymentRequest, options: { span?: boolean } = {}) {
-    const fieldEditable = canEditField(field) && !(requestDingTalkTerminated(form) && generalManagerControlledFields.has(field));
+    const fieldEditable = canEditField(field)
+      && !(requestDingTalkTerminated(form) && generalManagerControlledFields.has(field))
+      && !(field === "amount" && currencyCode(form.currency) !== "CNY");
     const className = options.span ? "editor-field span-2" : "editor-field";
     const label = fieldLabels[field] || field;
     const value = field === "applicant" ? requestApplicantName(form) : form[field];
@@ -3491,7 +3753,7 @@ function RequestEditor({
           {field === "finance_review" ? (
             <StatusPill value={String(value || "未付款")} />
           ) : (
-            <strong>{moneyFields.has(field) ? formatMoney(Number(value || 0)) : String(value || "未填写")}</strong>
+            <strong>{moneyFields.has(field) ? formatMoney(Number(value || 0), form.currency) : String(value || "未填写")}</strong>
           )}
         </div>
       );
@@ -3500,7 +3762,18 @@ function RequestEditor({
       <label className={className} key={field}>
         {label}
         {selectOptionsForField(field, String(value || "")) ? (
-          <select value={String(value || "")} onChange={(event) => setForm(withPaymentAmountChange(form, field, event.target.value))}>
+          <select
+            value={String(value || "")}
+            disabled={field === "currency" && !form.id}
+            title={field === "currency" && !form.id ? "请先保存请款，再通过汇率确认切换币种" : undefined}
+            onChange={(event) => {
+              if (field === "currency" && form.id) {
+                onCurrencyChange(form, event.target.value);
+                return;
+              }
+              setForm(withPaymentAmountChange(form, field, event.target.value));
+            }}
+          >
             {selectOptionsForField(field, String(value || ""))!.map((option) => (
               <option key={option} value={option}>{option || "未选择"}</option>
             ))}
@@ -3569,9 +3842,9 @@ function RequestEditor({
           <button className="ghost-button" onClick={onCancel} type="button">关闭</button>
         </div>
         <div className="request-editor-overview">
-          <div><span>应付金额</span><strong>{formatMoney(payableAmount)}</strong></div>
-          <div><span>累计已付</span><strong>{formatMoney(paidAmount)}</strong></div>
-          <div><span>待付款</span><strong>{formatMoney(pendingAmount)}</strong></div>
+          <div><span>应付金额</span><strong>{formatMoney(payableAmount, form.currency)}</strong></div>
+          <div><span>累计已付</span><strong>{formatMoney(paidAmount, form.currency)}</strong></div>
+          <div><span>待付款</span><strong>{formatMoney(pendingAmount, form.currency)}</strong></div>
         </div>
         <nav className="request-editor-tabs" aria-label="请款编辑区域">
           {editorTabs.map((tab) => (
@@ -3623,6 +3896,7 @@ function RequestEditor({
               </div>
               <div className="editor-form-grid">
                 {renderField("amount")}
+                {renderField("currency")}
                 {renderField("needed_payment_date")}
                 {renderField("payee_account")}
                 {renderField("payee_name")}
@@ -3938,7 +4212,7 @@ function PaymentDetailsPanel({
       return;
     }
     if (Number(paymentForm.amount) > maxPayable + 0.000001) {
-      setError(`本次金额不能超过 ${formatMoney(maxPayable)}`);
+      setError(`本次金额不能超过 ${formatMoney(maxPayable, request.currency)}`);
       return;
     }
     if (batch.status === "archived" && !reason.trim()) {
@@ -3963,7 +4237,7 @@ function PaymentDetailsPanel({
   }
 
   async function removePayment(payment: PaymentRecord) {
-    if (!canManage || payment.inherited || !window.confirm(`确定删除这笔 ${formatMoney(payment.amount)} 的付款记录吗？`)) return;
+    if (!canManage || payment.inherited || !window.confirm(`确定删除这笔 ${formatMoney(payment.amount, request.currency)} 的付款记录吗？`)) return;
     if (batch.status === "archived" && !reason.trim()) {
       setError("归档后删除付款必须填写原因");
       return;
@@ -4029,9 +4303,9 @@ function PaymentDetailsPanel({
         </div>
       </div>
       <div className="payment-summary-grid">
-        <div><span>应付金额</span><strong>{formatMoney(summary.amount || 0)}</strong></div>
-        <div><span>累计已付</span><strong>{formatMoney(summary.paid_amount || 0)}</strong></div>
-        <div><span>待付款</span><strong>{formatMoney(summary.pending_amount || 0)}</strong></div>
+        <div><span>应付金额</span><strong>{formatMoney(summary.amount || 0, request.currency)}</strong></div>
+        <div><span>累计已付</span><strong>{formatMoney(summary.paid_amount || 0, request.currency)}</strong></div>
+        <div><span>待付款</span><strong>{formatMoney(summary.pending_amount || 0, request.currency)}</strong></div>
       </div>
       <div className="payment-detail-progress">
         <div><span>付款进度</span><strong>{paymentProgress.toFixed(1)}%</strong></div>
@@ -4053,7 +4327,7 @@ function PaymentDetailsPanel({
           <article className="payment-record-card" key={payment.id}>
             <div className="payment-record-head">
               <div>
-                <strong>第 {index + 1} 笔 · {formatMoney(payment.amount)}</strong>
+                <strong>第 {index + 1} 笔 · {formatMoney(payment.amount, request.currency)}</strong>
                 <span>{payment.payment_date || "日期未知"} · {payment.payer || "付款人未填写"}</span>
               </div>
               <span className={payment.inherited ? "source-badge inherited" : "source-badge"}>{paymentSourceLabel(payment.source_type)}</span>
@@ -4113,7 +4387,7 @@ function PaymentDetailsPanel({
             <button className="ghost-button" type="button" onClick={() => resetPaymentForm()} disabled={busy}>取消</button>
           </div>
           <label>
-            本次金额（最大 {formatMoney(maxPayable)}）
+            本次金额（最大 {formatMoney(maxPayable, request.currency)}）
             <input type="number" min="0.01" max={maxPayable} step="0.01" value={paymentForm.amount || ""} onChange={(event) => setPaymentForm({ ...paymentForm, amount: Number(event.target.value) })} />
           </label>
           <label>
@@ -4903,7 +5177,7 @@ function normalizeSheetName(sheetName?: string) {
 function selectOptionsForField(field: keyof PaymentRequest, currentValue: string) {
   const baseOptions = selectOptionsByField[field];
   if (!baseOptions) return null;
-  const options = ["", ...baseOptions];
+  const options = field === "currency" ? [...baseOptions] : ["", ...baseOptions];
   const value = currentValue.trim();
   if (strictSelectFields.has(field)) {
     if (field === "general_manager_approval" && value === "无需审批") options.push(value);
@@ -4956,7 +5230,7 @@ function rowMatchesFilters(
   }
   if (filters.payment_account.trim() && !String(row.payment_account || "").includes(filters.payment_account.trim())) return false;
   if (filters.invoice_status.trim() && !String(row.invoice_status || "").includes(filters.invoice_status.trim())) return false;
-  const pendingAmount = Number(row.pending_amount) || 0;
+  const pendingAmount = requestAmountCny(row, "pending_amount");
   const pendingAmountMin = optionalNumber(filters.pending_amount_min);
   const pendingAmountMax = optionalNumber(filters.pending_amount_max);
   if (pendingAmountMin !== undefined && pendingAmount < pendingAmountMin) return false;
@@ -5257,8 +5531,43 @@ function formatFileSize(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function formatMoney(value: number) {
-  return new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 2 }).format(value || 0);
+function currencyCode(value?: string): CurrencyCode {
+  const normalized = String(value || "CNY").trim().toUpperCase();
+  return normalized === "USD" || normalized === "MXN" ? normalized : "CNY";
+}
+
+function currencyLabel(value?: string) {
+  return { CNY: "CNY 人民币", USD: "USD 美元", MXN: "MXN 墨西哥比索" }[currencyCode(value)];
+}
+
+function formatMoney(value: number, currency?: string) {
+  return new Intl.NumberFormat("zh-CN", { style: "currency", currency: currencyCode(currency), maximumFractionDigits: 2 }).format(value || 0);
+}
+
+function requestFxRate(request: Partial<PaymentRequest>) {
+  if (currencyCode(request.currency) === "CNY") return 1;
+  const rate = Number(request.fx_rate_cny_per_unit || 0);
+  return rate > 0 ? rate : 1;
+}
+
+function requestAmountCny(request: Partial<PaymentRequest>, field: "amount" | "paid_amount" | "pending_amount") {
+  if (field === "amount" && request.base_amount_cny !== undefined && request.base_amount_cny !== null) {
+    return Number(request.base_amount_cny) || 0;
+  }
+  return roundMoney((Number(request[field]) || 0) * requestFxRate(request));
+}
+
+function currencySubtotals(rows: Array<Partial<PaymentRequest>>) {
+  const totals = new Map<string, { currency: string; amount: number; paid_amount: number; pending_amount: number }>();
+  rows.forEach((row) => {
+    const currency = currencyCode(row.currency);
+    const current = totals.get(currency) || { currency, amount: 0, paid_amount: 0, pending_amount: 0 };
+    current.amount = roundMoney(current.amount + (Number(row.amount) || 0));
+    current.paid_amount = roundMoney(current.paid_amount + (Number(row.paid_amount) || 0));
+    current.pending_amount = roundMoney(current.pending_amount + (Number(row.pending_amount) || 0));
+    totals.set(currency, current);
+  });
+  return ["CNY", "USD", "MXN"].map((code) => totals.get(code)).filter(Boolean) as Array<{ currency: string; amount: number; paid_amount: number; pending_amount: number }>;
 }
 
 function formatDateTime(value: string) {

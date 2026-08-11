@@ -7,6 +7,7 @@ import shutil
 import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import quote
@@ -54,6 +55,22 @@ from .external_expenses import (
     fetch_external_expense_metadata,
     fetch_external_expenses,
     preview_external_expenses,
+)
+from .fx_rates import (
+    FxRateError,
+    SUPPORTED_CURRENCIES,
+    divide_money,
+    fetch_rates,
+    money,
+    multiply_money,
+    normalize_currency,
+)
+from .employee_departments import (
+    EmployeeDepartmentError,
+    apply_employee_department_mapping,
+    parse_employee_department_workbook,
+    replace_employee_department_mappings,
+    resolve_employee_department,
 )
 from .security import new_session_token, verify_password, hash_password
 from .sheet_names import canonical_sheet_name, canonical_sheet_order
@@ -115,6 +132,10 @@ class RequestIn(BaseModel):
     paid_amount: Optional[float] = None
     pending_amount: Optional[float] = None
     currency: str = "CNY"
+    base_amount_cny: Optional[float] = None
+    fx_rate_cny_per_unit: Optional[float] = None
+    fx_rate_date: Optional[str] = None
+    fx_rate_actual_date: Optional[str] = None
     project: Optional[str] = None
     bu: Optional[str] = None
     payee_account: Optional[str] = None
@@ -139,6 +160,18 @@ class RequestIn(BaseModel):
 
 
 class RequestPatch(RequestIn):
+    reason: Optional[str] = None
+
+
+class CurrencyConversionIn(BaseModel):
+    target_currency: str
+    rate_date: str
+    reason: Optional[str] = None
+    expected_updated_at: Optional[str] = None
+
+
+class HistoricalCurrencyRestoreIn(BaseModel):
+    request_ids: list[int] = Field(default_factory=list)
     reason: Optional[str] = None
 
 
@@ -265,6 +298,7 @@ FINANCE_CONTROLLED_FIELDS = {
     "payment_status",
     "overdue_status",
     "payer",
+    "currency",
 }
 GENERAL_MANAGER_CONTROLLED_FIELDS = {
     "general_manager_approval",
@@ -281,6 +315,7 @@ REQUEST_FIELD_LABELS = {
     "payment_status": "付款情况",
     "overdue_status": "逾期情况",
     "payer": "付款人",
+    "currency": "货币类型",
     "general_manager_approval": "总经理审批",
     "general_manager_approval_date": "总经理审批时间",
     "general_manager_opinion": "总经理意见",
@@ -296,6 +331,10 @@ REQUEST_WRITE_FIELDS = {
     "paid_amount",
     "pending_amount",
     "currency",
+    "base_amount_cny",
+    "fx_rate_cny_per_unit",
+    "fx_rate_date",
+    "fx_rate_actual_date",
     "project",
     "bu",
     "payee_account",
@@ -591,6 +630,25 @@ def batch_public_for_user(
 ) -> Dict[str, Any]:
     data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
     data["sheet_order"] = batch_sheet_order(data)
+    access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
+    currency_rows = conn.execute(
+        f"""
+        SELECT UPPER(COALESCE(NULLIF(TRIM(p.currency), ''), 'CNY')) AS currency,
+               COUNT(*) AS request_count,
+               COALESCE(SUM(p.amount), 0) AS amount,
+               COALESCE(SUM(p.paid_amount), 0) AS paid_amount,
+               COALESCE(SUM(p.pending_amount), 0) AS pending_amount,
+               COALESCE(SUM(COALESCE(p.base_amount_cny, p.amount)), 0) AS amount_cny,
+               COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS paid_amount_cny,
+               COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS pending_amount_cny
+        FROM payment_requests p
+        WHERE p.batch_id = ? AND {access_sql}
+        GROUP BY UPPER(COALESCE(NULLIF(TRIM(p.currency), ''), 'CNY'))
+        ORDER BY currency
+        """,
+        [data["id"], *access_params],
+    ).fetchall()
+    data["currency_totals"] = rows_to_dicts(currency_rows)
     if not user_has_restricted_sheet_access(user):
         return data
     allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
@@ -817,9 +875,9 @@ def list_batches(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]
         rows = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
-                   COALESCE(SUM(p.amount), 0) AS total_amount,
-                   COALESCE(SUM(p.paid_amount), 0) AS total_paid_amount,
-                   COALESCE(SUM(p.pending_amount), 0) AS total_pending_amount
+                   COALESCE(SUM(COALESCE(p.base_amount_cny, p.amount)), 0) AS total_amount,
+                   COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_paid_amount,
+                   COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
             FROM request_batches b
             LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql}
             GROUP BY b.id
@@ -955,9 +1013,9 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
         row = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
-                   COALESCE(SUM(p.amount), 0) AS total_amount,
-                   COALESCE(SUM(p.paid_amount), 0) AS total_paid_amount,
-                   COALESCE(SUM(p.pending_amount), 0) AS total_pending_amount
+                   COALESCE(SUM(COALESCE(p.base_amount_cny, p.amount)), 0) AS total_amount,
+                   COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_paid_amount,
+                   COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
             FROM request_batches b
             LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql}
             WHERE b.id = ?
@@ -971,9 +1029,9 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
         stats = conn.execute(
             f"""
             SELECT payment_account, invoice_status, project, COUNT(*) AS count,
-                   COALESCE(SUM(amount), 0) AS amount,
-                   COALESCE(SUM(paid_amount), 0) AS paid_amount,
-                   COALESCE(SUM(pending_amount), 0) AS pending_amount
+                   COALESCE(SUM(COALESCE(base_amount_cny, amount)), 0) AS amount,
+                   COALESCE(SUM(COALESCE(paid_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS paid_amount,
+                   COALESCE(SUM(COALESCE(pending_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS pending_amount
             FROM payment_requests
             WHERE batch_id = ? AND {stats_access_sql}
             GROUP BY payment_account, invoice_status, project
@@ -1183,6 +1241,8 @@ def payment_request_filter_parts(
     q: str = "",
     payment_account: str = "",
     invoice_status: str = "",
+    pending_amount_min: Optional[float] = None,
+    pending_amount_max: Optional[float] = None,
     finance_review: str = "",
     general_manager_approval: str = "",
     payment_status: str = "",
@@ -1217,6 +1277,12 @@ def payment_request_filter_parts(
     if invoice_status:
         conditions.append("invoice_status LIKE ?")
         params.append(f"%{invoice_status}%")
+    if pending_amount_min is not None:
+        conditions.append("COALESCE(pending_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1) >= ?")
+        params.append(pending_amount_min)
+    if pending_amount_max is not None:
+        conditions.append("COALESCE(pending_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1) <= ?")
+        params.append(pending_amount_max)
     normalized_finance_review = finance_review or {"未支付": "未付款", "已支付": "已付款"}.get(payment_status, payment_status)
     if normalized_finance_review:
         conditions.append("finance_review = ?")
@@ -1238,6 +1304,8 @@ def list_requests(
     q: str = "",
     payment_account: str = "",
     invoice_status: str = "",
+    pending_amount_min: Optional[float] = Query(default=None, ge=0),
+    pending_amount_max: Optional[float] = Query(default=None, ge=0),
     finance_review: str = "",
     general_manager_approval: str = "",
     payment_status: str = "",
@@ -1249,6 +1317,8 @@ def list_requests(
         q=q,
         payment_account=payment_account,
         invoice_status=invoice_status,
+        pending_amount_min=pending_amount_min,
+        pending_amount_max=pending_amount_max,
         finance_review=finance_review,
         general_manager_approval=general_manager_approval,
         payment_status=payment_status,
@@ -1421,6 +1491,453 @@ def update_request(
                 reason,
             )
     return {"request": row_to_dict(new_row)}
+
+
+def parse_fx_rate_date(value: str) -> date:
+    try:
+        parsed = date.fromisoformat(str(value or "").strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="汇率日期格式无效") from exc
+    if parsed > date.today():
+        raise HTTPException(status_code=400, detail="汇率日期不能晚于今天")
+    return parsed
+
+
+def request_cny_anchor(request_row: Dict[str, Any]) -> float:
+    if request_row.get("base_amount_cny") is not None:
+        return money(request_row["base_amount_cny"])
+    currency = normalize_currency(request_row.get("currency"), default="CNY")
+    rate = float(request_row.get("fx_rate_cny_per_unit") or (1 if currency == "CNY" else 0))
+    if rate <= 0:
+        raise HTTPException(status_code=400, detail="当前记录缺少人民币基准金额，无法安全换算")
+    return multiply_money(request_row.get("amount") or 0, rate)
+
+
+def currency_conversion_preview_data(
+    request_row: Dict[str, Any],
+    payments: list[Dict[str, Any]],
+    target_rate: Dict[str, Any],
+) -> Dict[str, Any]:
+    source_currency = normalize_currency(request_row.get("currency"), default="CNY") or "CNY"
+    target_currency = str(target_rate["currency"])
+    source_rate = float(request_row.get("fx_rate_cny_per_unit") or (1 if source_currency == "CNY" else 0))
+    base_amount = request_cny_anchor(request_row)
+    target_rate_value = float(target_rate["cny_per_unit"])
+    target_amount = divide_money(base_amount, target_rate_value)
+    converted_payments: list[Dict[str, Any]] = []
+    payment_base_total = 0.0
+    for payment in payments:
+        payment_base = payment.get("base_amount_cny")
+        if payment_base is None:
+            if source_rate <= 0:
+                raise HTTPException(status_code=400, detail="付款明细缺少人民币基准金额")
+            payment_base = multiply_money(payment.get("amount") or 0, source_rate)
+        payment_base = money(payment_base)
+        payment_base_total = money(payment_base_total + payment_base)
+        converted_payments.append(
+            {
+                "id": int(payment["id"]),
+                "before_amount": money(payment.get("amount") or 0),
+                "after_amount": divide_money(payment_base, target_rate_value),
+                "base_amount_cny": payment_base,
+                "payment_date": payment.get("payment_date"),
+            }
+        )
+    target_paid = divide_money(payment_base_total, target_rate_value)
+    if converted_payments:
+        rounded_sum = money(sum(item["after_amount"] for item in converted_payments))
+        correction = money(target_paid - rounded_sum)
+        converted_payments[-1]["after_amount"] = money(converted_payments[-1]["after_amount"] + correction)
+    target_pending = money(target_amount - target_paid)
+    if target_pending < -0.01:
+        raise HTTPException(status_code=400, detail="换算后累计已付超过应付金额")
+    return {
+        "request_id": int(request_row["id"]),
+        "source_currency": source_currency,
+        "target_currency": target_currency,
+        "requested_rate_date": target_rate["requested_date"],
+        "actual_rate_date": target_rate["actual_date"],
+        "used_previous_rate": bool(target_rate.get("fallback")),
+        "source_rate": source_rate or None,
+        "target_rate": target_rate_value,
+        "base_amount_cny": base_amount,
+        "payment_count": len(converted_payments),
+        "before": {
+            "amount": money(request_row.get("amount") or 0),
+            "paid_amount": money(request_row.get("paid_amount") or 0),
+            "pending_amount": money(request_row.get("pending_amount") or 0),
+        },
+        "after": {
+            "amount": target_amount,
+            "paid_amount": target_paid,
+            "pending_amount": max(0.0, target_pending),
+        },
+        "payments": converted_payments,
+    }
+
+
+def require_currency_conversion_permission(batch, user: Dict[str, Any], reason: Optional[str]) -> None:
+    if user["role"] not in FINANCE_FIELD_ROLES:
+        raise HTTPException(status_code=403, detail="只有财务、总经理或管理员可以切换币种")
+    if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
+        raise HTTPException(status_code=403, detail="归档批次只能由总经理或管理员更正币种")
+    if batch["status"] == "archived" and not str(reason or "").strip():
+        raise HTTPException(status_code=400, detail="归档后换算必须填写更正原因")
+
+
+@app.post("/api/batches/{batch_id}/requests/{request_id}/currency-conversion/preview")
+def preview_request_currency_conversion(
+    batch_id: int,
+    request_id: int,
+    payload: CurrencyConversionIn,
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
+    target_currency = normalize_currency(payload.target_currency)
+    if target_currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=400, detail="仅支持 CNY、USD 和 MXN")
+    requested_date = parse_fx_rate_date(payload.rate_date)
+    with connect() as conn:
+        batch = require_batch(conn, batch_id)
+        require_currency_conversion_permission(batch, user, payload.reason)
+        request_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
+        if normalize_currency(request_row.get("currency"), default="CNY") == target_currency:
+            raise HTTPException(status_code=400, detail="目标币种与当前币种相同")
+        payments = rows_to_dicts(
+            conn.execute("SELECT * FROM payment_records WHERE request_id = ? ORDER BY id", (request_id,)).fetchall()
+        )
+    try:
+        target_rate = fetch_rates(requested_date, [target_currency])[target_currency]
+    except FxRateError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"preview": currency_conversion_preview_data(request_row, payments, target_rate)}
+
+
+@app.post("/api/batches/{batch_id}/requests/{request_id}/currency-conversion/apply")
+def apply_request_currency_conversion(
+    batch_id: int,
+    request_id: int,
+    payload: CurrencyConversionIn,
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
+    target_currency = normalize_currency(payload.target_currency)
+    if target_currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=400, detail="仅支持 CNY、USD 和 MXN")
+    requested_date = parse_fx_rate_date(payload.rate_date)
+    try:
+        target_rate = fetch_rates(requested_date, [target_currency])[target_currency]
+    except FxRateError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        batch = require_batch(conn, batch_id)
+        require_currency_conversion_permission(batch, user, payload.reason)
+        request_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
+        if payload.expected_updated_at and request_row.get("updated_at") != payload.expected_updated_at:
+            raise HTTPException(status_code=409, detail="请款已被其他用户修改，请刷新后重新换算")
+        if normalize_currency(request_row.get("currency"), default="CNY") == target_currency:
+            raise HTTPException(status_code=400, detail="目标币种与当前币种相同")
+        payments = rows_to_dicts(
+            conn.execute("SELECT * FROM payment_records WHERE request_id = ? ORDER BY id", (request_id,)).fetchall()
+        )
+        preview = currency_conversion_preview_data(request_row, payments, target_rate)
+        timestamp = now_iso()
+        conn.execute(
+            """
+            UPDATE payment_requests
+            SET currency = ?, amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
+                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                target_currency,
+                preview["after"]["amount"],
+                preview["base_amount_cny"],
+                preview["target_rate"],
+                preview["requested_rate_date"],
+                preview["actual_rate_date"],
+                user["id"],
+                timestamp,
+                request_id,
+            ),
+        )
+        for converted in preview["payments"]:
+            old_payment = next(item for item in payments if int(item["id"]) == int(converted["id"]))
+            new_hash = payment_record_hash(
+                request_id,
+                converted["after_amount"],
+                old_payment.get("payment_date"),
+                old_payment.get("payer"),
+                old_payment.get("bank_reference"),
+            )
+            conn.execute(
+                """
+                UPDATE payment_records
+                SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
+                    fx_rate_date = ?, fx_rate_actual_date = ?, content_hash = ?,
+                    updated_by = ?, updated_at = ?
+                WHERE id = ? AND request_id = ?
+                """,
+                (
+                    converted["after_amount"],
+                    converted["base_amount_cny"],
+                    preview["target_rate"],
+                    preview["requested_rate_date"],
+                    preview["actual_rate_date"],
+                    new_hash,
+                    user["id"],
+                    timestamp,
+                    converted["id"],
+                    request_id,
+                ),
+            )
+        refresh_payment_summaries(conn, request_id)
+        updated_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        updated = row_to_dict(updated_row)
+        conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
+        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        write_audit(
+            conn,
+            user["id"],
+            "request.currency_convert",
+            "payment_request",
+            request_id,
+            batch_id=batch_id,
+            old_value={
+                "currency": request_row.get("currency"),
+                "amount": request_row.get("amount"),
+                "paid_amount": request_row.get("paid_amount"),
+                "pending_amount": request_row.get("pending_amount"),
+            },
+            new_value={
+                "currency": target_currency,
+                **preview["after"],
+                "rate_date": preview["requested_rate_date"],
+                "actual_rate_date": preview["actual_rate_date"],
+                "rate": preview["target_rate"],
+                "payment_count": preview["payment_count"],
+            },
+            reason=payload.reason,
+        )
+        payment_rows = payment_records_public(conn, request_id)
+    return {"status": "ok", "preview": preview, "request": updated, "payments": payment_rows}
+
+
+def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
+    rows = rows_to_dicts(
+        conn.execute("SELECT * FROM payment_requests WHERE batch_id = ? ORDER BY id", (batch_id,)).fetchall()
+    )
+    candidates: list[Dict[str, Any]] = []
+    for row in rows:
+        external = (row.get("raw_extra") or {}).get("external_source") or {}
+        source_currency = normalize_currency(external.get("source_currency"))
+        source_amount = external.get("source_amount")
+        base_amount = external.get("base_currency_amount")
+        if base_amount in (None, ""):
+            base_amount = row.get("base_amount_cny") if row.get("base_amount_cny") is not None else row.get("amount")
+        reasons: list[str] = []
+        status = "recoverable"
+        if external.get("system") != "dingtalk_expense_database":
+            status = "undetermined"
+            reasons.append("不是可验证的钉钉直连来源")
+        if source_currency not in {"USD", "MXN"}:
+            status = "undetermined"
+            reasons.append("来源币种不是 USD 或 MXN")
+        try:
+            source_amount_number = money(source_amount)
+            base_amount_number = money(base_amount)
+            if source_amount_number <= 0 or base_amount_number <= 0:
+                raise ValueError
+        except (FxRateError, TypeError, ValueError):
+            source_amount_number = 0.0
+            base_amount_number = 0.0
+            status = "amount_error"
+            reasons.append("原币金额或人民币基准金额异常")
+        current_currency = normalize_currency(row.get("currency"), default="CNY")
+        if current_currency == source_currency:
+            status = "already_restored"
+            reasons = ["当前已是来源币种"]
+        elif current_currency != "CNY":
+            status = "undetermined"
+            reasons.append("当前已是其他外币")
+        if status == "recoverable" and abs(money(row.get("amount") or 0) - base_amount_number) > 0.02:
+            status = "amount_error"
+            reasons.append("当前 CNY 金额与来源人民币基准金额不一致")
+        payment_count = int(
+            conn.execute("SELECT COUNT(*) AS count FROM payment_records WHERE request_id = ?", (row["id"],)).fetchone()["count"]
+        )
+        candidates.append(
+            {
+                "request_id": int(row["id"]),
+                "dingding_id": row.get("dingding_id"),
+                "applicant": row.get("applicant") or external.get("applicant"),
+                "summary": row.get("summary"),
+                "source_sheet": row.get("source_sheet"),
+                "current_currency": current_currency,
+                "current_amount": row.get("amount"),
+                "source_currency": source_currency,
+                "source_amount": source_amount_number or None,
+                "base_amount_cny": base_amount_number or None,
+                "implied_rate": (
+                    float(Decimal(str(base_amount_number)) / Decimal(str(source_amount_number)))
+                    if source_amount_number > 0 and base_amount_number > 0
+                    else None
+                ),
+                "rate_date": external.get("application_date"),
+                "payment_count": payment_count,
+                "status": status,
+                "reasons": reasons,
+            }
+        )
+    return candidates
+
+
+@app.get("/api/batches/{batch_id}/historical-currency-restore/preview")
+def preview_historical_currency_restore(
+    batch_id: int,
+    user: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        require_batch(conn, batch_id)
+        rows = historical_currency_candidates(conn, batch_id)
+    return {
+        "rows": rows,
+        "summary": dict(Counter(row["status"] for row in rows)),
+    }
+
+
+@app.post("/api/batches/{batch_id}/historical-currency-restore/apply")
+def apply_historical_currency_restore(
+    batch_id: int,
+    payload: HistoricalCurrencyRestoreIn,
+    user: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+) -> Dict[str, Any]:
+    selected = {int(value) for value in payload.request_ids}
+    if not selected:
+        raise HTTPException(status_code=400, detail="请至少选择一条可恢复记录")
+    operation_id = uuid.uuid4().hex
+    restored: list[int] = []
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        batch = require_batch(conn, batch_id)
+        original_sheet_order = batch_sheet_order(row_to_dict(batch))
+        if batch["status"] == "archived" and not str(payload.reason or "").strip():
+            raise HTTPException(status_code=400, detail="归档批次恢复历史币种必须填写原因")
+        candidates = {row["request_id"]: row for row in historical_currency_candidates(conn, batch_id)}
+        invalid = [request_id for request_id in selected if not candidates.get(request_id) or candidates[request_id]["status"] != "recoverable"]
+        if invalid:
+            raise HTTPException(status_code=409, detail=f"所选记录中有 {len(invalid)} 条已不可恢复，请重新预览")
+        timestamp = now_iso()
+        manifest: Dict[str, Any] = {
+            "operation_id": operation_id,
+            "created_requests": [],
+            "updated_requests": [],
+            "created_payments": [],
+            "updated_payments": [],
+            "created_attachments": [],
+            "created_vouchers": [],
+            "old_sheet_order": original_sheet_order,
+            "new_sheet_order": original_sheet_order,
+        }
+        for request_id in sorted(selected):
+            candidate = candidates[request_id]
+            old = table_row_snapshot(conn, "payment_requests", request_id)
+            manifest["updated_requests"].append({"id": request_id, "old": old})
+            rate = float(candidate["implied_rate"])
+            request_date = candidate.get("rate_date") or date.today().isoformat()
+            payments = rows_to_dicts(
+                conn.execute("SELECT * FROM payment_records WHERE request_id = ? ORDER BY id", (request_id,)).fetchall()
+            )
+            target_paid = divide_money(sum(money(payment.get("base_amount_cny") if payment.get("base_amount_cny") is not None else payment.get("amount")) for payment in payments), rate)
+            converted_payments = []
+            for payment in payments:
+                manifest["updated_payments"].append(
+                    {"id": int(payment["id"]), "old": table_row_snapshot(conn, "payment_records", int(payment["id"]))}
+                )
+                base_payment = money(payment.get("base_amount_cny") if payment.get("base_amount_cny") is not None else payment.get("amount"))
+                converted_payments.append([payment, base_payment, divide_money(base_payment, rate)])
+            if converted_payments:
+                delta = money(target_paid - sum(item[2] for item in converted_payments))
+                converted_payments[-1][2] = money(converted_payments[-1][2] + delta)
+            conn.execute(
+                """
+                UPDATE payment_requests
+                SET currency = ?, amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
+                    fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    candidate["source_currency"], candidate["source_amount"], candidate["base_amount_cny"], rate,
+                    request_date, request_date, user["id"], timestamp, request_id,
+                ),
+            )
+            for payment, base_payment, converted_amount in converted_payments:
+                conn.execute(
+                    """
+                    UPDATE payment_records
+                    SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
+                        fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (converted_amount, base_payment, rate, request_date, request_date, user["id"], timestamp, payment["id"]),
+                )
+            refresh_payment_summaries(conn, request_id)
+            updated = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
+            conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
+            write_audit(
+                conn, user["id"], "request.historical_currency_restore", "payment_request", request_id, batch_id,
+                old_value={"currency": old.get("currency"), "amount": old.get("amount")},
+                new_value={"currency": candidate["source_currency"], "amount": candidate["source_amount"], "rate": rate, "payment_count": len(payments)},
+                reason=payload.reason, operation_id=operation_id,
+            )
+            restored.append(request_id)
+        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        manifest["request_post_versions"] = {
+            str(request_id): table_row_snapshot(conn, "payment_requests", request_id).get("updated_at")
+            for request_id in restored
+        }
+        manifest["request_post_signatures"] = {
+            str(request_id): merge_database_row_signature(table_row_snapshot(conn, "payment_requests", request_id))
+            for request_id in restored
+        }
+        restored_payment_ids = [int(item["id"]) for item in manifest["updated_payments"]]
+        manifest["payment_post_versions"] = {
+            str(payment_id): table_row_snapshot(conn, "payment_records", payment_id).get("updated_at")
+            for payment_id in restored_payment_ids
+        }
+        manifest["payment_post_signatures"] = {
+            str(payment_id): merge_database_row_signature(table_row_snapshot(conn, "payment_records", payment_id))
+            for payment_id in restored_payment_ids
+        }
+        manifest["request_payment_signatures"] = {
+            str(request_id): request_payment_signature(conn, request_id) for request_id in restored
+        }
+        manifest["request_attachment_signatures"] = {
+            str(request_id): merge_related_rows_signature(conn, "attachment_links", "request_id", request_id)
+            for request_id in restored
+        }
+        manifest["payment_voucher_signatures"] = {
+            str(payment_id): merge_related_rows_signature(conn, "payment_vouchers", "payment_id", payment_id)
+            for payment_id in restored_payment_ids
+        }
+        manifest["batch_post_updated_at"] = timestamp
+        write_import_job(
+            conn,
+            "historical-currency-restore",
+            "历史币种恢复",
+            "imported",
+            batch_id,
+            [{"request_id": request_id} for request_id in restored],
+            [],
+            {"rollback_manifest": manifest, "applied_summary": {"restored": len(restored)}},
+            user["id"],
+        )
+        write_audit(
+            conn, user["id"], "batch.historical_currency_restore", "batch", batch_id, batch_id,
+            new_value={"restored_request_ids": restored, "count": len(restored)},
+            reason=payload.reason, operation_id=operation_id,
+        )
+    return {"status": "ok", "operation_id": operation_id, "restored_request_ids": restored, "count": len(restored)}
 
 
 @app.delete("/api/batches/{batch_id}/requests/{request_id}")
@@ -1626,11 +2143,19 @@ def update_request_payment(
             merged["payer"],
             merged["bank_reference"],
         )
+        request_currency = conn.execute(
+            "SELECT fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        payment_rate = float(request_currency["fx_rate_cny_per_unit"] or 1)
+        payment_base_amount = multiply_money(merged["amount"], payment_rate)
         conn.execute(
             """
             UPDATE payment_records
             SET amount = ?, payment_date = ?, payer = ?, payment_account = ?,
-                bank_reference = ?, remark = ?, content_hash = ?, updated_by = ?, updated_at = ?
+                bank_reference = ?, remark = ?, content_hash = ?,
+                base_amount_cny = ?, fx_rate_cny_per_unit = ?, fx_rate_date = ?, fx_rate_actual_date = ?,
+                updated_by = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -1641,6 +2166,10 @@ def update_request_payment(
                 str(merged["bank_reference"] or "").strip() or None,
                 str(merged["remark"] or "").strip() or None,
                 merged["content_hash"],
+                payment_base_amount,
+                payment_rate,
+                request_currency["fx_rate_date"],
+                request_currency["fx_rate_actual_date"],
                 user["id"],
                 now_iso(),
                 payment_id,
@@ -2176,6 +2705,12 @@ def build_weekly_merge_plan(
             errors.append("该文件由其他批次导出，不能直接合并到当前批次")
 
         payload = merge_request_payload(row, creating=action == "create")
+        if existing and "currency" in payload:
+            incoming_currency = normalize_currency(payload.get("currency"), default="CNY")
+            existing_currency = normalize_currency(existing.get("currency"), default="CNY")
+            if incoming_currency != existing_currency:
+                action = "conflict"
+                errors.append("币种不能通过 Excel 合并修改，请在网页使用币种换算")
         if existing and "applicant" in payload and existing.get("applicant") is None:
             external_source = (existing.get("raw_extra") or {}).get("external_source") or {}
             if request_values_equal(payload.get("applicant"), external_source.get("applicant")):
@@ -2741,6 +3276,16 @@ def update_payment_from_merge(
     if "payment_date" in payload:
         payload["payment_date"] = normalize_payment_date(payload["payment_date"], required=True)
     merged = {**existing, **payload}
+    if "amount" in payload:
+        request_currency = conn.execute(
+            "SELECT fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date FROM payment_requests WHERE id = ?",
+            (int(existing["request_id"]),),
+        ).fetchone()
+        payment_rate = float(request_currency["fx_rate_cny_per_unit"] or 1)
+        payload["base_amount_cny"] = multiply_money(payload["amount"], payment_rate)
+        payload["fx_rate_cny_per_unit"] = payment_rate
+        payload["fx_rate_date"] = request_currency["fx_rate_date"]
+        payload["fx_rate_actual_date"] = request_currency["fx_rate_actual_date"]
     payload["content_hash"] = payment_record_hash(
         int(existing["request_id"]),
         merged.get("amount"),
@@ -3281,6 +3826,142 @@ async def import_dingtalk(
     return {"status": "imported", "job_id": job_id, "batch_id": batch_id, "imported_rows": len(imported), "duplicate_rows": len(duplicates), "duplicates": duplicates[:100], "meta": meta}
 
 
+@app.post("/api/batches/{batch_id}/employee-departments/import")
+async def import_employee_departments(
+    batch_id: int,
+    file: UploadFile = File(...),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
+    content = await file.read()
+    try:
+        parsed = parse_employee_department_workbook(content, file.filename or "员工信息.xls")
+    except EmployeeDepartmentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        batch = require_batch(conn, batch_id)
+        if batch["status"] != "draft":
+            raise HTTPException(status_code=400, detail="只能调整草稿批次的 Sheet 归属")
+
+        old_order = batch_sheet_order(row_to_dict(batch))
+        before_sheet_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name,
+                   COUNT(*) AS row_count
+            FROM payment_requests
+            WHERE batch_id = ?
+            GROUP BY COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet')
+            """,
+            (batch_id,),
+        ).fetchall()
+        before_nonempty = {canonical_sheet_name(row["sheet_name"]) for row in before_sheet_rows}
+
+        replace_employee_department_mappings(
+            conn,
+            parsed["records"],
+            filename=parsed["filename"],
+            file_hash=parsed["file_hash"],
+            actor_id=int(user["id"]),
+        )
+
+        counts = Counter()
+        changed_request_ids: list[int] = []
+        request_rows = conn.execute(
+            "SELECT * FROM payment_requests WHERE batch_id = ? ORDER BY id",
+            (batch_id,),
+        ).fetchall()
+        timestamp = now_iso()
+        for request_row in request_rows:
+            current = row_to_dict(request_row)
+            mapped, mapping, reason = apply_employee_department_mapping(conn, current)
+            if not mapping:
+                counts[reason] += 1
+                continue
+            counts["matched"] += 1
+            old_sheet = canonical_sheet_name(current.get("source_sheet"))
+            new_sheet = canonical_sheet_name(mapped.get("source_sheet"))
+            raw_extra_json = json.dumps(mapped.get("raw_extra") or {}, ensure_ascii=False, default=str)
+            if old_sheet == new_sheet:
+                counts["unchanged"] += 1
+            else:
+                counts["moved"] += 1
+            conn.execute(
+                """
+                UPDATE payment_requests
+                SET source_sheet = ?, raw_extra_json = ?, updated_by = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (new_sheet, raw_extra_json, user["id"], timestamp, current["id"]),
+            )
+            refreshed = row_to_dict(
+                conn.execute("SELECT * FROM payment_requests WHERE id = ?", (current["id"],)).fetchone()
+            )
+            conn.execute(
+                "UPDATE payment_requests SET content_hash = ? WHERE id = ?",
+                (content_hash(refreshed), current["id"]),
+            )
+            changed_request_ids.append(int(current["id"]))
+
+        after_sheet_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name,
+                   MIN(id) AS first_request_id
+            FROM payment_requests
+            WHERE batch_id = ?
+            GROUP BY COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet')
+            ORDER BY first_request_id
+            """,
+            (batch_id,),
+        ).fetchall()
+        after_nonempty_order = [canonical_sheet_name(row["sheet_name"]) for row in after_sheet_rows]
+        after_nonempty = set(after_nonempty_order)
+        emptied_sheets = before_nonempty - after_nonempty
+        final_order = canonical_sheet_order(
+            [sheet for sheet in old_order if canonical_sheet_name(sheet) not in emptied_sheets]
+            + after_nonempty_order
+        )
+        conn.execute(
+            "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(final_order, ensure_ascii=False), timestamp, batch_id),
+        )
+        result = {
+            "status": "ok",
+            "batch_id": batch_id,
+            "mapping_rows": parsed["imported_rows"],
+            "employee_rows": parsed["total_rows"],
+            "skipped_employee_no_name": parsed["skipped_no_name"],
+            "skipped_employee_no_department": parsed["skipped_no_department"],
+            "ambiguous_employee_names": parsed["ambiguous_names"],
+            "departments": parsed["departments"],
+            "matched_requests": counts["matched"],
+            "moved_requests": counts["moved"],
+            "unchanged_requests": counts["unchanged"],
+            "missing_applicant": counts["missing_applicant"],
+            "unmatched_applicant": counts["unmatched"],
+            "ambiguous_applicant": counts["ambiguous"],
+            "removed_empty_sheets": sorted(emptied_sheets),
+            "sheet_order": final_order,
+            "permissions_unchanged": True,
+        }
+        write_audit(
+            conn,
+            user["id"],
+            "employee_departments.import_and_regroup",
+            "batch",
+            batch_id,
+            batch_id=batch_id,
+            old_value={"sheet_order": old_order},
+            new_value={
+                **result,
+                "filename": parsed["filename"],
+                "file_hash": parsed["file_hash"],
+                "changed_request_ids": changed_request_ids,
+            },
+        )
+    return result
+
+
 @app.post("/api/external-expenses/preview")
 def preview_external_expense_rows(
     payload: ExternalExpensePreviewIn,
@@ -3305,6 +3986,24 @@ def preview_external_expense_rows(
     conflict_approval_nos = {approval_no for approval_no, count in approval_counts.items() if count > 1}
     with connect() as conn:
         duplicates = external_expense_duplicate_map(conn, [row.get("approval_no") for row in rows])
+        for source_row in rows:
+            mapped, mapping, _ = apply_employee_department_mapping(conn, dict(source_row.get("request_data") or {}))
+            if mapping:
+                source_row["original_applicant_department"] = source_row.get("applicant_department")
+                source_row["applicant_department"] = mapping["second_level_department"]
+                source_row["request_data"] = mapped
+        applicant_options = []
+        for option in source_result["applicant_options"]:
+            mapping, _ = resolve_employee_department(
+                conn,
+                applicant_id=option.get("id"),
+                applicant_name=option.get("name"),
+            )
+            applicant_options.append({
+                **option,
+                "original_department": option.get("department"),
+                "department": mapping["second_level_department"] if mapping else option.get("department"),
+            })
 
     public_rows: list[Dict[str, Any]] = []
     for source_row in rows:
@@ -3343,7 +4042,7 @@ def preview_external_expense_rows(
     return {
         "rows": page_rows,
         "all_rows": public_rows,
-        "applicant_options": source_result["applicant_options"],
+        "applicant_options": applicant_options,
         "summary": summary,
         "pagination": {
             "page": page,
@@ -4179,7 +4878,7 @@ def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require
             SELECT * FROM import_jobs
             WHERE batch_id = ?
               AND status = 'imported'
-              AND kind IN ('weekly-excel', 'weekly-excel-merge', 'dingtalk', 'external-expenses')
+              AND kind IN ('weekly-excel', 'weekly-excel-merge', 'dingtalk', 'external-expenses', 'historical-currency-restore')
             ORDER BY created_at DESC, id DESC
             LIMIT 1
             """,
@@ -4191,7 +4890,7 @@ def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require
             meta = json.loads(job["mapping_json"] or "{}")
         except json.JSONDecodeError:
             meta = {}
-        if job["kind"] == "weekly-excel-merge":
+        if job["kind"] in {"weekly-excel-merge", "historical-currency-restore"}:
             return rollback_weekly_merge_job(conn, batch, job, meta, user)
         raw_payment_ids = [
             int(value)
@@ -4329,6 +5028,8 @@ def export_batch(
     q: str = "",
     payment_account: str = "",
     invoice_status: str = "",
+    pending_amount_min: Optional[float] = Query(default=None, ge=0),
+    pending_amount_max: Optional[float] = Query(default=None, ge=0),
     finance_review: str = "",
     general_manager_approval: str = "",
     source_sheet: str = "",
@@ -4342,6 +5043,8 @@ def export_batch(
                 q=q,
                 payment_account=payment_account,
                 invoice_status=invoice_status,
+                pending_amount_min=pending_amount_min,
+                pending_amount_max=pending_amount_max,
                 finance_review=finance_review,
                 general_manager_approval=general_manager_approval,
                 source_sheet=source_sheet,
@@ -4383,7 +5086,8 @@ def export_batch(
             conn.execute(
                 """
                 SELECT payment_records.*, payment_requests.dingding_id,
-                       payment_requests.source_sheet AS request_source_sheet
+                       payment_requests.source_sheet AS request_source_sheet,
+                       payment_requests.currency AS request_currency
                 FROM payment_records
                 JOIN payment_requests ON payment_requests.id = payment_records.request_id
                 WHERE payment_requests.batch_id = ?
@@ -4837,21 +5541,37 @@ def insert_payment_record_internal(
     )
     if validate_total:
         validate_payment_total(conn, request_id, normalized_amount)
+    request_currency = conn.execute(
+        """
+        SELECT currency, fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date
+        FROM payment_requests WHERE id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+    if not request_currency:
+        raise HTTPException(status_code=404, detail="请款记录不存在")
+    payment_rate = float(request_currency["fx_rate_cny_per_unit"] or 1)
+    payment_base_amount = multiply_money(normalized_amount, payment_rate)
     timestamp = now_iso()
     record_hash = payment_record_hash(request_id, normalized_amount, normalized_date, payer, bank_reference)
     cursor = conn.execute(
         """
         INSERT INTO payment_records (
-            request_id, copied_from_payment_id, root_payment_id, amount, payment_date,
+            request_id, copied_from_payment_id, root_payment_id, amount,
+            base_amount_cny, fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date, payment_date,
             payer, payment_account, bank_reference, remark, source_type, content_hash,
             created_by, updated_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             request_id,
             copied_from_payment_id,
             root_payment_id,
             normalized_amount,
+            payment_base_amount,
+            payment_rate,
+            request_currency["fx_rate_date"],
+            request_currency["fx_rate_actual_date"],
             normalized_date,
             str(payer or "").strip() or None,
             str(payment_account or "").strip() or None,
@@ -4929,6 +5649,8 @@ def insert_request(
     create_summary_payment: bool = True,
 ) -> int:
     data = enforce_request_field_permissions(data, user_role, creating=True)
+    if user_role != ROLE_BUSINESS:
+        data, _, _ = apply_employee_department_mapping(conn, data)
     summary_paid_amount = data.get("paid_amount")
     summary_payment_date = data.get("actual_payment_date")
     summary_payer = data.get("payer")
@@ -4977,8 +5699,31 @@ def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         payload["raw_extra_json"] = json.dumps(data["raw_extra"], ensure_ascii=False, default=str)
     if "raw_extra_json" not in payload:
         payload["raw_extra_json"] = json.dumps({}, ensure_ascii=False)
-    if "currency" not in payload or not payload["currency"]:
-        payload["currency"] = "CNY"
+    currency = normalize_currency(payload.get("currency"), default="CNY")
+    if currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=400, detail="仅支持 CNY、USD 和 MXN")
+    payload["currency"] = currency
+    if payload.get("amount") not in (None, ""):
+        try:
+            payload["amount"] = money(payload["amount"])
+        except FxRateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        rate = payload.get("fx_rate_cny_per_unit")
+        if currency == "CNY":
+            payload["fx_rate_cny_per_unit"] = 1.0
+            payload["base_amount_cny"] = payload["amount"]
+        elif rate not in (None, ""):
+            try:
+                payload["fx_rate_cny_per_unit"] = float(rate)
+                payload["base_amount_cny"] = money(
+                    payload.get("base_amount_cny")
+                    if payload.get("base_amount_cny") not in (None, "")
+                    else multiply_money(payload["amount"], rate)
+                )
+            except (TypeError, ValueError, FxRateError) as exc:
+                raise HTTPException(status_code=400, detail="外币汇率或人民币基准金额无效") from exc
+        else:
+            raise HTTPException(status_code=400, detail="外币请款必须包含汇率和人民币基准金额")
     normalize_request_business_fields(payload)
     if "content_hash" not in payload:
         payload["content_hash"] = content_hash(payload)
@@ -4998,6 +5743,22 @@ def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int
     if not existing_row:
         raise HTTPException(status_code=404, detail="请款记录不存在")
     existing = row_to_dict(existing_row)
+    if "currency" in payload:
+        requested_currency = normalize_currency(payload.get("currency"), default="CNY")
+        existing_currency = normalize_currency(existing.get("currency"), default="CNY")
+        if requested_currency != existing_currency:
+            raise HTTPException(status_code=400, detail="请使用币种换算功能修改货币类型")
+        payload.pop("currency", None)
+    for field in ("base_amount_cny", "fx_rate_cny_per_unit", "fx_rate_date", "fx_rate_actual_date"):
+        payload.pop(field, None)
+    if user_role != ROLE_BUSINESS and (data.get("applicant") or "raw_extra" in data or "raw_extra_json" in data):
+        mapping_input = {**existing, **data}
+        if "raw_extra" not in data and "raw_extra_json" not in data:
+            mapping_input["raw_extra"] = existing.get("raw_extra") or {}
+        mapped, mapping, _ = apply_employee_department_mapping(conn, mapping_input)
+        if mapping:
+            payload["source_sheet"] = canonical_sheet_name(mapped.get("source_sheet"))
+            payload["raw_extra_json"] = json.dumps(mapped.get("raw_extra") or {}, ensure_ascii=False, default=str)
     reject_direct_payment_summary_changes(payload, existing)
     for field in DERIVED_PAYMENT_FIELDS:
         payload.pop(field, None)
@@ -5018,6 +5779,10 @@ def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int
         )
         if next_amount is not None and paid_amount > next_amount + 0.000001:
             raise HTTPException(status_code=400, detail=f"应付金额不能低于累计已支付金额 {paid_amount:.2f}")
+        if normalize_currency(existing.get("currency"), default="CNY") != "CNY":
+            raise HTTPException(status_code=400, detail="外币应付金额请通过币种换算功能调整")
+        payload["base_amount_cny"] = next_amount
+        payload["fx_rate_cny_per_unit"] = 1.0
     merged = {**existing, **payload}
     normalize_request_business_fields(merged)
     for key in (

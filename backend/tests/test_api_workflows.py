@@ -25,6 +25,7 @@ from backend.app.external_expenses import (
     ExternalExpenseError,
     _parse_workflow_events,
     _preview_conditions,
+    approval_result_is_disallowed,
     applicant_name_from_title,
     classify_dingtalk_payment_event,
     map_external_expense,
@@ -161,6 +162,204 @@ def test_empty_sheet_registry_and_business_sheet_boundaries():
         )
         assert removed_empty_sheet.status_code == 200
         assert removed_empty_sheet.json()["batch"]["sheet_order"] == ["部门 A", "空部门"]
+
+
+def test_employee_workbook_regroups_requests_by_level_two_department_and_keeps_unmatched_sheets():
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "员工数据"
+    worksheet.append(["员工UserID", "姓名", "1级部门", "2级部门"])
+    worksheet.append(["LEVEL2-U1", "二级映射张甲", "一级", "二级制造"])
+    worksheet.append(["LEVEL2-U2", "二级映射李乙", "一级", "二级供应链"])
+    worksheet.append(["LEVEL2-U3", "二级映射王同名", "一级", "二级甲"])
+    worksheet.append(["LEVEL2-U4", "二级映射王同名", "一级", "二级乙"])
+    worksheet.append(["LEVEL2-U5", "二级映射无部门", "一级", ""])
+    workbook_buffer = io.BytesIO()
+    workbook.save(workbook_buffer)
+
+    with TestClient(app) as admin_client, TestClient(app) as business_client:
+        login(admin_client)
+        batch = admin_client.post(
+            "/api/batches",
+            json={"name": "员工2级部门归组", "start_date": "2026-08-01", "end_date": "2026-08-07"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+        old_order = ["旧 Sheet A", "旧 Sheet B", "保留原 Sheet", "保留空 Sheet"]
+        assert admin_client.put(
+            f"/api/batches/{batch_id}/sheet-order",
+            json={"sheet_order": old_order},
+        ).status_code == 200
+
+        by_id_request = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={
+                "applicant": "二级映射张甲",
+                "source_sheet": "旧 Sheet A",
+                "summary": "按钉钉用户 ID 匹配",
+                "amount": 10,
+                "raw_extra": {"external_source": {"applicant_id": "LEVEL2-U1", "applicant": "二级映射张甲"}},
+            },
+        ).json()["request"]
+        by_name_request = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"applicant": "二级映射李乙", "source_sheet": "旧 Sheet B", "summary": "按姓名匹配", "amount": 20},
+        ).json()["request"]
+        ambiguous_request = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"applicant": "二级映射王同名", "source_sheet": "保留原 Sheet", "summary": "重名保留", "amount": 30},
+        ).json()["request"]
+        missing_request = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"source_sheet": "保留原 Sheet", "summary": "无申请人保留", "amount": 40},
+        ).json()["request"]
+        unmatched_request = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"applicant": "二级映射表外人员", "source_sheet": "保留原 Sheet", "summary": "表外人员保留", "amount": 50},
+        ).json()["request"]
+
+        imported = admin_client.post(
+            f"/api/batches/{batch_id}/employee-departments/import",
+            files={
+                "file": (
+                    "员工信息.xlsx",
+                    workbook_buffer.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+        assert imported.status_code == 200, imported.text
+        result = imported.json()
+        assert result["mapping_rows"] == 4
+        assert result["skipped_employee_no_department"] == 1
+        assert result["matched_requests"] == 2
+        assert result["moved_requests"] == 2
+        assert result["missing_applicant"] == 1
+        assert result["unmatched_applicant"] == 1
+        assert result["ambiguous_applicant"] == 1
+        assert set(result["removed_empty_sheets"]) == {"旧 Sheet A", "旧 Sheet B"}
+        assert "保留空 Sheet" in result["sheet_order"]
+
+        with connect() as conn:
+            rows = {
+                row["id"]: row
+                for row in conn.execute(
+                    "SELECT id, source_sheet, raw_extra_json FROM payment_requests WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchall()
+            }
+            assert rows[by_id_request["id"]]["source_sheet"] == "二级制造"
+            assert rows[by_name_request["id"]]["source_sheet"] == "二级供应链"
+            assert rows[ambiguous_request["id"]]["source_sheet"] == "保留原 Sheet"
+            assert rows[missing_request["id"]]["source_sheet"] == "保留原 Sheet"
+            assert rows[unmatched_request["id"]]["source_sheet"] == "保留原 Sheet"
+            raw_extra = json.loads(rows[by_id_request["id"]]["raw_extra_json"])
+            assert raw_extra["employee_department_mapping"]["second_level_department"] == "二级制造"
+
+        future = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"applicant": "二级映射张甲", "source_sheet": "人工临时 Sheet", "summary": "后续新增自动归组", "amount": 60},
+        )
+        assert future.status_code == 200
+        assert future.json()["request"]["source_sheet"] == "二级制造"
+        assert future.json()["request"]["raw_extra"]["employee_department_mapping"]["second_level_department"] == "二级制造"
+
+        created_user = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": "level-two-business-user",
+                "password": "Yuewei123",
+                "display_name": "二级部门业务用户",
+                "role": "business",
+                "active": True,
+                "sheet_permissions": ["保留空 Sheet"],
+            },
+        )
+        assert created_user.status_code == 200
+        login(business_client, "level-two-business-user", "Yuewei123")
+        business_created = business_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"applicant": "二级映射张甲", "source_sheet": "保留空 Sheet", "summary": "业务人员不被跨 Sheet 移动", "amount": 70},
+        )
+        assert business_created.status_code == 200
+        assert business_created.json()["request"]["source_sheet"] == "保留空 Sheet"
+
+        archived_batch = admin_client.post(
+            "/api/batches",
+            json={"name": "员工归组归档限制", "start_date": "2026-08-08", "end_date": "2026-08-14"},
+        ).json()["batch"]
+        assert admin_client.post(f"/api/batches/{archived_batch['id']}/archive").status_code == 200
+        rejected = admin_client.post(
+            f"/api/batches/{archived_batch['id']}/employee-departments/import",
+            files={"file": ("员工信息.xlsx", workbook_buffer.getvalue())},
+        )
+        assert rejected.status_code == 400
+
+
+def test_employee_workbook_splits_supply_chain_center_by_level_three_department():
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "员工数据"
+    worksheet.append(["员工UserID", "姓名", "1级部门", "2级部门", "3级部门"])
+    worksheet.append([
+        "LEVEL3-U1",
+        "三级映射李甲",
+        "悦为集团",
+        "凌翔/星铭供应链及职能中心",
+        "凌翔产品&开发",
+    ])
+    worksheet.append([
+        "LEVEL3-U2",
+        "三级映射吴乙",
+        "悦为集团",
+        "凌翔/星铭供应链及职能中心",
+        "星铭FC财务中心",
+    ])
+    worksheet.append([
+        "LEVEL3-U3",
+        "三级映射普通部门",
+        "悦为集团",
+        "普通二级部门",
+        "普通三级部门",
+    ])
+    workbook_buffer = io.BytesIO()
+    workbook.save(workbook_buffer)
+
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post(
+            "/api/batches",
+            json={"name": "员工3级部门例外归组", "start_date": "2026-08-08", "end_date": "2026-08-14"},
+        ).json()["batch"]["id"]
+        requests = []
+        for applicant in ("三级映射李甲", "三级映射吴乙", "三级映射普通部门"):
+            requests.append(
+                client.post(
+                    f"/api/batches/{batch_id}/requests",
+                    json={"applicant": applicant, "source_sheet": "原 Sheet", "summary": applicant, "amount": 10},
+                ).json()["request"]
+            )
+
+        response = client.post(
+            f"/api/batches/{batch_id}/employee-departments/import",
+            files={
+                "file": (
+                    "员工信息.xlsx",
+                    workbook_buffer.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+        assert response.status_code == 200, response.text
+        rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        sheets = {row["applicant"]: row["source_sheet"] for row in rows}
+        assert sheets == {
+            "三级映射李甲": "凌翔产品&开发",
+            "三级映射吴乙": "星铭FC财务中心",
+            "三级映射普通部门": "普通二级部门",
+        }
+        mapped = next(row for row in rows if row["id"] == requests[0]["id"])
+        assert mapped["raw_extra"]["employee_department_mapping"]["third_level_department"] == "凌翔产品&开发"
+        assert mapped["raw_extra"]["employee_department_mapping"]["assigned_department"] == "凌翔产品&开发"
 
 
 def test_legacy_mould_sheet_names_are_migrated_in_rows_order_and_permissions():
@@ -313,6 +512,26 @@ def test_filtered_export_matches_workspace_filters_and_keeps_all_sheet():
         }
         assert exported_request_ids == {expected_a["id"], expected_b["id"]}
         assert workbook["付款明细"].max_row == 1
+
+        amount_filtered = client.get(
+            f"/api/batches/{batch['id']}/export.xlsx",
+            params={
+                "filtered": "true",
+                "pending_amount_min": "250",
+                "pending_amount_max": "350",
+            },
+        )
+        assert amount_filtered.status_code == 200
+        amount_workbook = load_workbook(io.BytesIO(amount_filtered.content), data_only=False)
+        amount_all_sheet = amount_workbook["全部"]
+        amount_headers = [cell.value for cell in amount_all_sheet[2]]
+        amount_request_id_column = amount_headers.index("请款标识") + 1
+        amount_request_ids = {
+            amount_all_sheet.cell(row, amount_request_id_column).value
+            for row in range(3, amount_all_sheet.max_row + 1)
+            if amount_all_sheet.cell(row, amount_request_id_column).value
+        }
+        assert amount_request_ids == {expected_b["id"]}
 
         sheet_filtered = client.get(
             f"/api/batches/{batch['id']}/export.xlsx",
@@ -1674,9 +1893,16 @@ def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
             "raw_data": {},
         }
     )
-    assert refused["amount"] == 72.3
-    assert "审批结果为拒绝" in refused["errors"]
+    assert refused["amount"] == 10.0
+    assert refused["request_data"]["currency"] == "USD"
+    assert refused["request_data"]["base_amount_cny"] == 72.3
+    assert "审批已拒绝、作废或终止，默认不导入" in refused["errors"]
     assert refused["applicant"] == "Operador Uno"
+
+    for result in ("refuse", "REJECTED", "cancelled", "revoked", "voided", "已作废", "审批已拒绝", "已撤回"):
+        assert approval_result_is_disallowed(result)
+    for result in ("", "agree", "approved", "同意"):
+        assert not approval_result_is_disallowed(result)
 
 
 def test_external_expense_applicant_title_patterns():
@@ -1718,6 +1944,7 @@ def test_external_expense_exact_approval_number_ignores_dates():
     assert "effective_date" not in exact_sql
     assert "BTRIM(approval_no) = %s" in exact_sql
     assert "base_currency_amount <> 0" in exact_sql
+    assert "!~* %s" in exact_sql
     assert exact_params[-1] == "202607071704000140246"
 
     dated_sql, dated_params = _preview_conditions(date(2026, 7, 1), date(2026, 7, 15), ["operation"], "", [])
@@ -2709,3 +2936,122 @@ def test_weekly_merge_payment_detail_is_authoritative_and_missing_main_row_is_pr
 
 def teardown_module():
     shutil.rmtree(TEST_DIR, ignore_errors=True)
+
+
+def test_currency_conversion_preview_apply_and_roundtrip(monkeypatch):
+    def fake_rates(selected_date, currencies):
+        values = {"CNY": 1.0, "USD": 6.8, "MXN": 0.4}
+        return {
+            currency: {
+                "currency": currency,
+                "cny_per_unit": values[currency],
+                "requested_date": selected_date.isoformat(),
+                "actual_date": "2026-08-07" if currency != "CNY" else selected_date.isoformat(),
+                "fallback": currency != "CNY" and selected_date.isoformat() != "2026-08-07",
+            }
+            for currency in currencies
+        }
+
+    monkeypatch.setattr(main_module, "fetch_rates", fake_rates)
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "currency-conversion", "start_date": "2026-08-01", "end_date": "2026-08-10"},
+        ).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"amount": 680, "currency": "CNY", "source_sheet": "汇率测试"},
+        ).json()["request"]
+        for amount, day in ((100, "2026-08-05"), (240, "2026-08-06")):
+            response = client.post(
+                f"/api/batches/{batch['id']}/requests/{request['id']}/payments",
+                json={"amount": amount, "payment_date": day},
+            )
+            assert response.status_code == 200
+
+        preview_response = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/currency-conversion/preview",
+            json={"target_currency": "USD", "rate_date": "2026-08-08"},
+        )
+        assert preview_response.status_code == 200
+        preview = preview_response.json()["preview"]
+        assert preview["after"] == {"amount": 100.0, "paid_amount": 50.0, "pending_amount": 50.0}
+        assert preview["actual_rate_date"] == "2026-08-07"
+        assert preview["used_previous_rate"] is True
+
+        applied = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/currency-conversion/apply",
+            json={"target_currency": "USD", "rate_date": "2026-08-08", "expected_updated_at": request["updated_at"]},
+        )
+        assert applied.status_code == 200
+        converted = applied.json()["request"]
+        assert converted["currency"] == "USD"
+        assert converted["amount"] == 100
+        assert converted["paid_amount"] == 50
+        assert converted["pending_amount"] == 50
+        payments = client.get(f"/api/batches/{batch['id']}/requests/{request['id']}/payments").json()["payments"]
+        assert round(sum(item["amount"] for item in payments), 2) == 50
+        assert all(item["fx_rate_cny_per_unit"] == 6.8 for item in payments)
+
+        roundtrip = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/currency-conversion/apply",
+            json={"target_currency": "CNY", "rate_date": "2026-08-08", "expected_updated_at": converted["updated_at"]},
+        )
+        assert roundtrip.status_code == 200
+        restored = roundtrip.json()["request"]
+        assert restored["currency"] == "CNY"
+        assert restored["amount"] == 680
+        assert restored["paid_amount"] == 340
+        assert restored["pending_amount"] == 340
+
+
+def test_historical_currency_restore_can_be_rolled_back():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "historical-currency", "start_date": "2026-08-01", "end_date": "2026-08-10"},
+        ).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": "FX-HISTORY-1", "amount": 680, "currency": "CNY", "source_sheet": "汇率测试"},
+        ).json()["request"]
+        client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/payments",
+            json={"amount": 340, "payment_date": "2026-08-07"},
+        )
+        external_source = {
+            "system": "dingtalk_expense_database",
+            "source_currency": "USD",
+            "source_amount": 100,
+            "base_currency_amount": 680,
+            "application_date": "2026-08-07",
+        }
+        with connect() as conn:
+            conn.execute(
+                "UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?",
+                (json.dumps({"external_source": external_source}), request["id"]),
+            )
+
+        preview = client.get(f"/api/batches/{batch['id']}/historical-currency-restore/preview")
+        assert preview.status_code == 200
+        candidate = next(item for item in preview.json()["rows"] if item["request_id"] == request["id"])
+        assert candidate["status"] == "recoverable"
+
+        applied = client.post(
+            f"/api/batches/{batch['id']}/historical-currency-restore/apply",
+            json={"request_ids": [request["id"]]},
+        )
+        assert applied.status_code == 200, applied.text
+        converted = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"][0]
+        assert converted["currency"] == "USD"
+        assert converted["amount"] == 100
+        assert converted["paid_amount"] == 50
+
+        rolled_back = client.post(f"/api/batches/{batch['id']}/imports/latest/rollback")
+        assert rolled_back.status_code == 200, rolled_back.text
+        restored = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"][0]
+        assert restored["currency"] == "CNY"
+        assert restored["amount"] == 680
+        assert restored["paid_amount"] == 340
