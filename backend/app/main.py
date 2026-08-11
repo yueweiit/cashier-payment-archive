@@ -166,8 +166,14 @@ class RequestPatch(RequestIn):
 class CurrencyConversionIn(BaseModel):
     target_currency: str
     rate_date: str
+    mode: str = "convert"
     reason: Optional[str] = None
     expected_updated_at: Optional[str] = None
+
+
+class RequestGridPreferenceIn(BaseModel):
+    order: list[str] = Field(default_factory=list)
+    hidden: list[str] = Field(default_factory=list)
 
 
 class HistoricalCurrencyRestoreIn(BaseModel):
@@ -282,6 +288,52 @@ PRIVILEGED_ROLES = (ROLE_GENERAL_MANAGER, ROLE_ADMIN)
 ALL_ROLES = (ROLE_BUSINESS, ROLE_FINANCE, ROLE_GENERAL_MANAGER, ROLE_ADMIN)
 FINANCE_FIELD_ROLES = (ROLE_FINANCE, *PRIVILEGED_ROLES)
 GENERAL_MANAGER_ROLES = PRIVILEGED_ROLES
+REQUEST_GRID_PREFERENCE_KEY = "request_grid_v1"
+REQUEST_GRID_COLUMN_KEYS = [
+    "dingding_id",
+    "source_sheet",
+    "applicant",
+    "payment_account",
+    "expense_type",
+    "style_name",
+    "summary",
+    "amount",
+    "paid_amount",
+    "pending_amount",
+    "currency",
+    "project",
+    "bu",
+    "payee_name",
+    "payee_account",
+    "bank_name",
+    "invoice_status",
+    "needed_payment_date",
+    "owner_confirmation",
+    "finance_review",
+    "finance_manager_approval",
+    "general_manager_approval",
+    "general_manager_approval_date",
+    "general_manager_opinion",
+    "actual_payment_date",
+    "payer",
+    "remark",
+    "overdue_status",
+]
+REQUEST_GRID_DEFAULT_VISIBLE = [
+    "dingding_id",
+    "source_sheet",
+    "payment_account",
+    "summary",
+    "amount",
+    "paid_amount",
+    "pending_amount",
+    "currency",
+    "project",
+    "payee_name",
+    "needed_payment_date",
+    "remark",
+    "overdue_status",
+]
 DERIVED_PAYMENT_FIELDS = {
     "paid_amount",
     "pending_amount",
@@ -631,6 +683,7 @@ def batch_public_for_user(
     data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
     data["sheet_order"] = batch_sheet_order(data)
     access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
+    active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
     currency_rows = conn.execute(
         f"""
         SELECT UPPER(COALESCE(NULLIF(TRIM(p.currency), ''), 'CNY')) AS currency,
@@ -642,7 +695,7 @@ def batch_public_for_user(
                COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS paid_amount_cny,
                COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS pending_amount_cny
         FROM payment_requests p
-        WHERE p.batch_id = ? AND {access_sql}
+        WHERE p.batch_id = ? AND {access_sql} AND {active_sql}
         GROUP BY UPPER(COALESCE(NULLIF(TRIM(p.currency), ''), 'CNY'))
         ORDER BY currency
         """,
@@ -816,6 +869,74 @@ def me(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
         return {"user": user_public_with_permissions(conn, user)}
 
 
+def normalized_request_grid_preference(value: Any = None) -> Dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    requested_order = source.get("order") if isinstance(source.get("order"), list) else []
+    requested_hidden = source.get("hidden") if isinstance(source.get("hidden"), list) else []
+    allowed = set(REQUEST_GRID_COLUMN_KEYS)
+    order: list[str] = []
+    for key in requested_order:
+        normalized = str(key or "").strip()
+        if normalized in allowed and normalized not in order:
+            order.append(normalized)
+    order.extend(key for key in REQUEST_GRID_COLUMN_KEYS if key not in order)
+    hidden = {
+        str(key or "").strip()
+        for key in requested_hidden
+        if str(key or "").strip() in allowed
+    }
+    if not source:
+        hidden = set(REQUEST_GRID_COLUMN_KEYS) - set(REQUEST_GRID_DEFAULT_VISIBLE)
+    if len(hidden) >= len(REQUEST_GRID_COLUMN_KEYS):
+        hidden.discard(REQUEST_GRID_DEFAULT_VISIBLE[0])
+    return {"version": 1, "order": order, "hidden": [key for key in order if key in hidden]}
+
+
+@app.get("/api/me/preferences/request-grid")
+def get_request_grid_preference(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value_json FROM user_ui_preferences WHERE user_id = ? AND preference_key = ?",
+            (user["id"], REQUEST_GRID_PREFERENCE_KEY),
+        ).fetchone()
+    try:
+        value = json.loads(row["value_json"]) if row else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        value = None
+    return {"preference": normalized_request_grid_preference(value)}
+
+
+@app.put("/api/me/preferences/request-grid")
+def update_request_grid_preference(
+    payload: RequestGridPreferenceIn,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    allowed = set(REQUEST_GRID_COLUMN_KEYS)
+    submitted = [str(key or "").strip() for key in [*payload.order, *payload.hidden]]
+    invalid = sorted({key for key in submitted if key not in allowed})
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"不支持的列：{', '.join(invalid)}")
+    preference = normalized_request_grid_preference({"order": payload.order, "hidden": payload.hidden})
+    timestamp = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_ui_preferences (user_id, preference_key, value_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, preference_key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user["id"],
+                REQUEST_GRID_PREFERENCE_KEY,
+                json.dumps(preference, ensure_ascii=False),
+                timestamp,
+            ),
+        )
+    return {"preference": preference}
+
+
 @app.post("/api/auth/change-password")
 def change_password(
     payload: ChangePasswordIn,
@@ -872,6 +993,7 @@ def change_password(
 def list_batches(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
     with connect() as conn:
         access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
+        active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
         rows = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
@@ -879,7 +1001,7 @@ def list_batches(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]
                    COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_paid_amount,
                    COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
             FROM request_batches b
-            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql}
+            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql} AND {active_sql}
             GROUP BY b.id
             ORDER BY COALESCE(b.end_date, b.created_at) DESC, b.id DESC
             """,
@@ -1010,6 +1132,7 @@ def rollover_batch(
 def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
     with connect() as conn:
         access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
+        active_join_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
         row = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
@@ -1017,7 +1140,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
                    COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_paid_amount,
                    COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
             FROM request_batches b
-            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql}
+            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql} AND {active_join_sql}
             WHERE b.id = ?
             GROUP BY b.id
             """,
@@ -1026,6 +1149,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
         if not row:
             raise HTTPException(status_code=404, detail="批次不存在")
         stats_access_sql, stats_access_params = sheet_access_filter(conn, user, "source_sheet")
+        active_stats_sql = f"NOT {dingtalk_inactive_sql('raw_extra_json')}"
         stats = conn.execute(
             f"""
             SELECT payment_account, invoice_status, project, COUNT(*) AS count,
@@ -1033,7 +1157,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
                    COALESCE(SUM(COALESCE(paid_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS paid_amount,
                    COALESCE(SUM(COALESCE(pending_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS pending_amount
             FROM payment_requests
-            WHERE batch_id = ? AND {stats_access_sql}
+            WHERE batch_id = ? AND {stats_access_sql} AND {active_stats_sql}
             GROUP BY payment_account, invoice_status, project
             """,
             [batch_id, *stats_access_params],
@@ -1236,6 +1360,29 @@ def correct_archived_request(
     return {"request": row_to_dict(new_row)}
 
 
+def dingtalk_inactive_sql(raw_extra_column: str = "raw_extra_json") -> str:
+    status = (
+        f"CASE WHEN json_valid(COALESCE({raw_extra_column}, '')) "
+        f"THEN UPPER(TRIM(COALESCE(json_extract({raw_extra_column}, '$.external_source.approval_status'), ''))) "
+        "ELSE '' END"
+    )
+    result = (
+        f"CASE WHEN json_valid(COALESCE({raw_extra_column}, '')) "
+        f"THEN LOWER(TRIM(COALESCE(json_extract({raw_extra_column}, '$.external_source.approval_result'), ''))) "
+        "ELSE '' END"
+    )
+    return f"(({status}) = 'TERMINATED' OR ({result}) = 'refuse')"
+
+
+def request_lifecycle_for_user(user: Dict[str, Any], requested: str) -> str:
+    lifecycle = str(requested or "active").strip().lower() or "active"
+    if lifecycle not in {"active", "inactive", "all"}:
+        raise HTTPException(status_code=400, detail="钉钉流程范围无效")
+    if user["role"] == ROLE_BUSINESS:
+        return "active"
+    return lifecycle
+
+
 def payment_request_filter_parts(
     batch_id: int,
     q: str = "",
@@ -1247,6 +1394,7 @@ def payment_request_filter_parts(
     general_manager_approval: str = "",
     payment_status: str = "",
     source_sheet: str = "",
+    dingtalk_lifecycle: str = "active",
 ) -> tuple[list[str], list[Any]]:
     q = q.strip()
     payment_account = payment_account.strip()
@@ -1257,6 +1405,11 @@ def payment_request_filter_parts(
     source_sheet = canonical_sheet_name(source_sheet) if source_sheet.strip() else ""
     conditions = ["batch_id = ?"]
     params: list[Any] = [batch_id]
+    inactive_condition = dingtalk_inactive_sql()
+    if dingtalk_lifecycle == "active":
+        conditions.append(f"NOT {inactive_condition}")
+    elif dingtalk_lifecycle == "inactive":
+        conditions.append(inactive_condition)
     if q:
         conditions.append(
             """
@@ -1310,8 +1463,10 @@ def list_requests(
     general_manager_approval: str = "",
     payment_status: str = "",
     source_sheet: str = "",
+    dingtalk_lifecycle: str = "active",
     user: Dict[str, Any] = Depends(current_user),
 ) -> Dict[str, Any]:
+    resolved_lifecycle = request_lifecycle_for_user(user, dingtalk_lifecycle)
     conditions, params = payment_request_filter_parts(
         batch_id,
         q=q,
@@ -1323,6 +1478,7 @@ def list_requests(
         general_manager_approval=general_manager_approval,
         payment_status=payment_status,
         source_sheet=source_sheet,
+        dingtalk_lifecycle=resolved_lifecycle,
     )
     with connect() as conn:
         require_batch(conn, batch_id)
@@ -1517,34 +1673,57 @@ def currency_conversion_preview_data(
     request_row: Dict[str, Any],
     payments: list[Dict[str, Any]],
     target_rate: Dict[str, Any],
+    mode: str = "convert",
 ) -> Dict[str, Any]:
+    if mode not in {"convert", "correct"}:
+        raise HTTPException(status_code=400, detail="币种处理方式无效")
     source_currency = normalize_currency(request_row.get("currency"), default="CNY") or "CNY"
     target_currency = str(target_rate["currency"])
     source_rate = float(request_row.get("fx_rate_cny_per_unit") or (1 if source_currency == "CNY" else 0))
-    base_amount = request_cny_anchor(request_row)
+    before_base_amount = request_cny_anchor(request_row)
     target_rate_value = float(target_rate["cny_per_unit"])
-    target_amount = divide_money(base_amount, target_rate_value)
+    before_amount = money(request_row.get("amount") or 0)
+    target_amount = (
+        divide_money(before_base_amount, target_rate_value)
+        if mode == "convert"
+        else before_amount
+    )
+    base_amount = (
+        before_base_amount
+        if mode == "convert"
+        else multiply_money(target_amount, target_rate_value)
+    )
     converted_payments: list[Dict[str, Any]] = []
     payment_base_total = 0.0
     for payment in payments:
-        payment_base = payment.get("base_amount_cny")
-        if payment_base is None:
-            if source_rate <= 0:
-                raise HTTPException(status_code=400, detail="付款明细缺少人民币基准金额")
-            payment_base = multiply_money(payment.get("amount") or 0, source_rate)
-        payment_base = money(payment_base)
+        before_payment_amount = money(payment.get("amount") or 0)
+        if mode == "correct":
+            after_payment_amount = before_payment_amount
+            payment_base = multiply_money(after_payment_amount, target_rate_value)
+        else:
+            payment_base = payment.get("base_amount_cny")
+            if payment_base is None:
+                if source_rate <= 0:
+                    raise HTTPException(status_code=400, detail="付款明细缺少人民币基准金额")
+                payment_base = multiply_money(before_payment_amount, source_rate)
+            payment_base = money(payment_base)
+            after_payment_amount = divide_money(payment_base, target_rate_value)
         payment_base_total = money(payment_base_total + payment_base)
         converted_payments.append(
             {
                 "id": int(payment["id"]),
-                "before_amount": money(payment.get("amount") or 0),
-                "after_amount": divide_money(payment_base, target_rate_value),
+                "before_amount": before_payment_amount,
+                "after_amount": after_payment_amount,
                 "base_amount_cny": payment_base,
                 "payment_date": payment.get("payment_date"),
             }
         )
-    target_paid = divide_money(payment_base_total, target_rate_value)
-    if converted_payments:
+    target_paid = (
+        divide_money(payment_base_total, target_rate_value)
+        if mode == "convert"
+        else money(sum(item["after_amount"] for item in converted_payments))
+    )
+    if converted_payments and mode == "convert":
         rounded_sum = money(sum(item["after_amount"] for item in converted_payments))
         correction = money(target_paid - rounded_sum)
         converted_payments[-1]["after_amount"] = money(converted_payments[-1]["after_amount"] + correction)
@@ -1553,6 +1732,7 @@ def currency_conversion_preview_data(
         raise HTTPException(status_code=400, detail="换算后累计已付超过应付金额")
     return {
         "request_id": int(request_row["id"]),
+        "mode": mode,
         "source_currency": source_currency,
         "target_currency": target_currency,
         "requested_rate_date": target_rate["requested_date"],
@@ -1560,10 +1740,11 @@ def currency_conversion_preview_data(
         "used_previous_rate": bool(target_rate.get("fallback")),
         "source_rate": source_rate or None,
         "target_rate": target_rate_value,
+        "before_base_amount_cny": before_base_amount,
         "base_amount_cny": base_amount,
         "payment_count": len(converted_payments),
         "before": {
-            "amount": money(request_row.get("amount") or 0),
+            "amount": before_amount,
             "paid_amount": money(request_row.get("paid_amount") or 0),
             "pending_amount": money(request_row.get("pending_amount") or 0),
         },
@@ -1596,6 +1777,9 @@ def preview_request_currency_conversion(
     if target_currency not in SUPPORTED_CURRENCIES:
         raise HTTPException(status_code=400, detail="仅支持 CNY、USD 和 MXN")
     requested_date = parse_fx_rate_date(payload.rate_date)
+    mode = str(payload.mode or "convert").strip().lower()
+    if mode not in {"convert", "correct"}:
+        raise HTTPException(status_code=400, detail="币种处理方式无效")
     with connect() as conn:
         batch = require_batch(conn, batch_id)
         require_currency_conversion_permission(batch, user, payload.reason)
@@ -1609,7 +1793,7 @@ def preview_request_currency_conversion(
         target_rate = fetch_rates(requested_date, [target_currency])[target_currency]
     except FxRateError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {"preview": currency_conversion_preview_data(request_row, payments, target_rate)}
+    return {"preview": currency_conversion_preview_data(request_row, payments, target_rate, mode)}
 
 
 @app.post("/api/batches/{batch_id}/requests/{request_id}/currency-conversion/apply")
@@ -1623,6 +1807,9 @@ def apply_request_currency_conversion(
     if target_currency not in SUPPORTED_CURRENCIES:
         raise HTTPException(status_code=400, detail="仅支持 CNY、USD 和 MXN")
     requested_date = parse_fx_rate_date(payload.rate_date)
+    mode = str(payload.mode or "convert").strip().lower()
+    if mode not in {"convert", "correct"}:
+        raise HTTPException(status_code=400, detail="币种处理方式无效")
     try:
         target_rate = fetch_rates(requested_date, [target_currency])[target_currency]
     except FxRateError as exc:
@@ -1640,7 +1827,7 @@ def apply_request_currency_conversion(
         payments = rows_to_dicts(
             conn.execute("SELECT * FROM payment_records WHERE request_id = ? ORDER BY id", (request_id,)).fetchall()
         )
-        preview = currency_conversion_preview_data(request_row, payments, target_rate)
+        preview = currency_conversion_preview_data(request_row, payments, target_rate, mode)
         timestamp = now_iso()
         conn.execute(
             """
@@ -1699,7 +1886,7 @@ def apply_request_currency_conversion(
         write_audit(
             conn,
             user["id"],
-            "request.currency_convert",
+            "request.currency_correct" if mode == "correct" else "request.currency_convert",
             "payment_request",
             request_id,
             batch_id=batch_id,
@@ -1710,6 +1897,7 @@ def apply_request_currency_conversion(
                 "pending_amount": request_row.get("pending_amount"),
             },
             new_value={
+                "mode": mode,
                 "currency": target_currency,
                 **preview["after"],
                 "rate_date": preview["requested_rate_date"],
@@ -4504,6 +4692,13 @@ def sync_external_expense_metadata(
                         workflow_result=str(workflow.get("result") or ""),
                         paid_amount=paid_amount,
                     )
+                    source_inactive = (
+                        str(external_source.get("approval_status") or "").strip().upper() == "TERMINATED"
+                        or str(external_source.get("approval_result") or "").strip().lower() == "refuse"
+                    )
+                    if source_inactive and classification == "eligible":
+                        classification = "ignored"
+                        classification_reason = "钉钉流程已终止或已拒绝，不自动生成付款"
                     if classification == "eligible" and request_counts_by_approval[approval_no] > 1:
                         classification = "review_required"
                         classification_reason = "同一钉钉单号关联多条请款，无法自动分配付款"
@@ -5033,10 +5228,12 @@ def export_batch(
     finance_review: str = "",
     general_manager_approval: str = "",
     source_sheet: str = "",
+    dingtalk_lifecycle: str = "active",
     user: Dict[str, Any] = Depends(current_user),
 ) -> StreamingResponse:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
+        resolved_lifecycle = request_lifecycle_for_user(user, dingtalk_lifecycle)
         if filtered:
             conditions, params = payment_request_filter_parts(
                 batch_id,
@@ -5048,9 +5245,13 @@ def export_batch(
                 finance_review=finance_review,
                 general_manager_approval=general_manager_approval,
                 source_sheet=source_sheet,
+                dingtalk_lifecycle=resolved_lifecycle,
             )
         else:
-            conditions, params = ["batch_id = ?"], [batch_id]
+            conditions, params = payment_request_filter_parts(
+                batch_id,
+                dingtalk_lifecycle=resolved_lifecycle,
+            )
         access_sql, access_params = sheet_access_filter(conn, user)
         conditions.append(access_sql)
         params.extend(access_params)

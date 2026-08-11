@@ -86,6 +86,46 @@ def test_sheet_order_is_saved_and_inherited_by_rollover():
         assert reordered.json()["batch"]["sheet_order"] == archived_order
 
 
+def test_request_grid_preferences_are_saved_per_user():
+    with TestClient(app) as admin_client, TestClient(app) as business_client:
+        login(admin_client)
+        default_preference = admin_client.get("/api/me/preferences/request-grid")
+        assert default_preference.status_code == 200
+        assert "summary" in default_preference.json()["preference"]["order"]
+
+        saved = admin_client.put(
+            "/api/me/preferences/request-grid",
+            json={"order": ["summary", "amount", "currency"], "hidden": ["amount"]},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["preference"]["order"][:3] == ["summary", "amount", "currency"]
+        assert "amount" in saved.json()["preference"]["hidden"]
+        assert admin_client.get("/api/me/preferences/request-grid").json()["preference"] == saved.json()["preference"]
+
+        created_user = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": "grid-preference-user",
+                "password": "Yuewei123",
+                "display_name": "列偏好用户",
+                "role": "business",
+                "active": True,
+                "sheet_permissions": [],
+            },
+        )
+        assert created_user.status_code == 200
+        login(business_client, "grid-preference-user", "Yuewei123")
+        business_preference = business_client.get("/api/me/preferences/request-grid").json()["preference"]
+        assert business_preference != saved.json()["preference"]
+        assert "amount" not in business_preference["hidden"]
+
+        invalid = business_client.put(
+            "/api/me/preferences/request-grid",
+            json={"order": ["not_a_column"], "hidden": []},
+        )
+        assert invalid.status_code == 400
+
+
 def test_empty_sheet_registry_and_business_sheet_boundaries():
     with TestClient(app) as admin_client, TestClient(app) as business_client:
         login(admin_client)
@@ -2239,7 +2279,17 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             "attachment_failed": 0,
             "attachment_errors": [],
         }
-        rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        visible_rows = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        assert request_ids[4] not in {row["id"] for row in visible_rows}
+        inactive_rows = client.get(
+            f"/api/batches/{batch_id}/requests",
+            params={"dingtalk_lifecycle": "inactive"},
+        ).json()["requests"]
+        assert [row["id"] for row in inactive_rows] == [request_ids[4]]
+        rows = client.get(
+            f"/api/batches/{batch_id}/requests",
+            params={"dingtalk_lifecycle": "all"},
+        ).json()["requests"]
         by_id = {row["id"]: row for row in rows}
         matched_source = by_id[request_ids[0]]["raw_extra"]["external_source"]
         assert matched_source["lookup_status"] == "matched"
@@ -2253,6 +2303,22 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         assert by_id[request_ids[3]]["raw_extra"]["external_source"]["lookup_status"] == "unmatched"
         assert by_id[request_ids[4]]["raw_extra"]["external_source"]["approval_status"] == "TERMINATED"
         assert by_id[request_ids[4]]["general_manager_approval"] == "无需审批"
+        visible_batch = client.get(f"/api/batches/{batch_id}").json()["batch"]
+        assert visible_batch["request_count"] == 4
+        assert visible_batch["total_amount"] == 701
+        listed_batch = next(item for item in client.get("/api/batches").json()["batches"] if item["id"] == batch_id)
+        assert listed_batch["request_count"] == 4
+        exported = client.get(f"/api/batches/{batch_id}/export.xlsx")
+        assert exported.status_code == 200
+        workbook = load_workbook(io.BytesIO(exported.content))
+        all_sheet = workbook["全部"]
+        headers = [cell.value for cell in all_sheet[2]]
+        dingding_column = headers.index("钉钉申请单号") + 1
+        exported_dingding_ids = {
+            all_sheet.cell(row, dingding_column).value
+            for row in range(3, all_sheet.max_row + 1)
+        }
+        assert "SYNC-TERMINATED" not in exported_dingding_ids
         with connect() as conn:
             audit_row = conn.execute(
                 "SELECT new_value_json FROM audit_logs WHERE batch_id = ? AND action = 'external_expenses.metadata_sync'",
@@ -3004,6 +3070,78 @@ def test_currency_conversion_preview_apply_and_roundtrip(monkeypatch):
         assert restored["amount"] == 680
         assert restored["paid_amount"] == 340
         assert restored["pending_amount"] == 340
+
+
+def test_currency_correction_keeps_numeric_amounts_and_updates_cny_value(monkeypatch):
+    def fake_rates(selected_date, currencies):
+        values = {"CNY": 1.0, "USD": 6.8, "MXN": 0.4}
+        return {
+            currency: {
+                "currency": currency,
+                "cny_per_unit": values[currency],
+                "requested_date": selected_date.isoformat(),
+                "actual_date": selected_date.isoformat(),
+                "fallback": False,
+            }
+            for currency in currencies
+        }
+
+    monkeypatch.setattr(main_module, "fetch_rates", fake_rates)
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "currency-correction", "start_date": "2026-08-01", "end_date": "2026-08-10"},
+        ).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"amount": 25000, "currency": "CNY", "source_sheet": "币种更正"},
+        ).json()["request"]
+        payment = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/payments",
+            json={"amount": 5000, "payment_date": "2026-08-08"},
+        )
+        assert payment.status_code == 200
+
+        preview_response = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/currency-conversion/preview",
+            json={"target_currency": "USD", "rate_date": "2026-08-08", "mode": "correct"},
+        )
+        assert preview_response.status_code == 200, preview_response.text
+        preview = preview_response.json()["preview"]
+        assert preview["mode"] == "correct"
+        assert preview["before"] == {"amount": 25000.0, "paid_amount": 5000.0, "pending_amount": 20000.0}
+        assert preview["after"] == preview["before"]
+        assert preview["before_base_amount_cny"] == 25000.0
+        assert preview["base_amount_cny"] == 170000.0
+
+        current = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"][0]
+        applied = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/currency-conversion/apply",
+            json={
+                "target_currency": "USD",
+                "rate_date": "2026-08-08",
+                "mode": "correct",
+                "expected_updated_at": current["updated_at"],
+            },
+        )
+        assert applied.status_code == 200, applied.text
+        corrected = applied.json()["request"]
+        assert corrected["currency"] == "USD"
+        assert corrected["amount"] == 25000
+        assert corrected["paid_amount"] == 5000
+        assert corrected["pending_amount"] == 20000
+        assert corrected["base_amount_cny"] == 170000
+        payments = client.get(f"/api/batches/{batch['id']}/requests/{request['id']}/payments").json()["payments"]
+        assert payments[0]["amount"] == 5000
+        assert payments[0]["base_amount_cny"] == 34000
+        with connect() as conn:
+            audit = conn.execute(
+                "SELECT action, new_value_json FROM audit_logs WHERE entity_id = ? AND action = 'request.currency_correct' ORDER BY id DESC LIMIT 1",
+                (request["id"],),
+            ).fetchone()
+            assert audit is not None
+            assert json.loads(audit["new_value_json"])["mode"] == "correct"
 
 
 def test_historical_currency_restore_can_be_rolled_back():

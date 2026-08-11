@@ -85,6 +85,14 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_user_sheet_permissions_sheet
             ON user_sheet_permissions(sheet_name, user_id);
 
+            CREATE TABLE IF NOT EXISTS user_ui_preferences (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                preference_key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, preference_key)
+            );
+
             CREATE TABLE IF NOT EXISTS employee_department_mappings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT,
@@ -330,6 +338,17 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "users", "deleted_at", "TEXT")
     ensure_column(conn, "users", "deleted_by", "INTEGER REFERENCES users(id)")
     ensure_column(conn, "employee_department_mappings", "third_level_department", "TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_ui_preferences (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            preference_key TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, preference_key)
+        )
+        """
+    )
     ensure_column(conn, "request_batches", "parent_batch_id", "INTEGER REFERENCES request_batches(id) ON DELETE SET NULL")
     ensure_column(conn, "request_batches", "sheet_order_json", "TEXT")
     ensure_column(conn, "payment_requests", "copied_from_request_id", "INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL")

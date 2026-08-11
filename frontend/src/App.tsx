@@ -53,6 +53,7 @@ import {
   PaymentRequest,
   PaymentSummary,
   PaymentVoucher,
+  RequestGridPreference,
   RolloverCopyMode,
   User,
   UserRole,
@@ -61,6 +62,7 @@ import {
   WeeklyMergeResolution,
   WeeklyMergeRow,
 } from "./api";
+import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
 
 type Tab = "workspace" | "archive" | "admin";
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
@@ -183,18 +185,57 @@ type GridColumn = {
 const gridColumns: GridColumn[] = [
   { key: "dingding_id", labelZh: "钉钉申请单号", labelEs: "Número de solicitud en DingTalk", width: 220 },
   { key: "source_sheet", labelZh: "应付款公司", labelEs: "Empresa a pagar", width: 220 },
+  { key: "applicant", labelZh: "申请人", labelEs: "Solicitante", width: 210 },
   { key: "payment_account", labelZh: "账户性质", labelEs: "Tipo de cuenta", width: 150 },
+  { key: "expense_type", labelZh: "支出性质", labelEs: "Naturaleza del gasto", width: 190 },
+  { key: "style_name", labelZh: "支出类别", labelEs: "Categoría del gasto", width: 190 },
   { key: "summary", labelZh: "摘要", labelEs: "Resumen / Concepto", width: 360 },
   { key: "amount", labelZh: "应付金额", labelEs: "Monto a pagar", width: 140, type: "number" },
   { key: "paid_amount", labelZh: "已支付金额", labelEs: "Monto pagado", width: 140, type: "number" },
   { key: "pending_amount", labelZh: "待付款金额", labelEs: "Monto pendiente de pago", width: 180, type: "number" },
   { key: "currency", labelZh: "货币类型", labelEs: "Tipo de moneda", width: 140 },
   { key: "project", labelZh: "项目归属", labelEs: "Proyecto al que pertenece", width: 210 },
+  { key: "bu", labelZh: "BU 归属", labelEs: "Unidad de negocio", width: 180 },
   { key: "payee_name", labelZh: "收款人名称", labelEs: "Nombre del beneficiario", width: 200 },
+  { key: "payee_account", labelZh: "收款账号", labelEs: "Cuenta del beneficiario", width: 220 },
+  { key: "bank_name", labelZh: "收款行", labelEs: "Banco / Sucursal del beneficiario", width: 240 },
+  { key: "invoice_status", labelZh: "是否开具发票", labelEs: "¿Factura emitida?", width: 180 },
   { key: "needed_payment_date", labelZh: "需求付款日期", labelEs: "Fecha de pago requerida", width: 190, type: "date" },
+  { key: "owner_confirmation", labelZh: "负责人确认", labelEs: "Confirmación del responsable", width: 190 },
+  { key: "finance_review", labelZh: "财务审批", labelEs: "Revisión financiera", width: 170 },
+  { key: "finance_manager_approval", labelZh: "财务主管审批", labelEs: "Aprobación del responsable financiero", width: 220 },
+  { key: "general_manager_approval", labelZh: "总经理审批", labelEs: "Aprobación de dirección general", width: 210 },
+  { key: "general_manager_approval_date", labelZh: "总经理审批时间", labelEs: "Fecha de aprobación de dirección", width: 220, type: "date" },
+  { key: "general_manager_opinion", labelZh: "总经理意见", labelEs: "Opinión de dirección general", width: 260 },
+  { key: "actual_payment_date", labelZh: "财务付款时间", labelEs: "Fecha real de pago", width: 190, type: "date" },
+  { key: "payer", labelZh: "付款人", labelEs: "Pagador", width: 170 },
   { key: "remark", labelZh: "备注", labelEs: "Observaciones", width: 240 },
   { key: "overdue_status", labelZh: "逾期情况", labelEs: "Estado de vencimiento", width: 180 },
 ];
+
+const defaultVisibleGridColumnKeys = new Set<keyof PaymentRequest>([
+  "dingding_id",
+  "source_sheet",
+  "payment_account",
+  "summary",
+  "amount",
+  "paid_amount",
+  "pending_amount",
+  "currency",
+  "project",
+  "payee_name",
+  "needed_payment_date",
+  "remark",
+  "overdue_status",
+]);
+
+function defaultGridPreference(): RequestGridPreference {
+  return {
+    version: 1,
+    order: gridColumns.map((column) => String(column.key)),
+    hidden: gridColumns.filter((column) => !defaultVisibleGridColumnKeys.has(column.key)).map((column) => String(column.key)),
+  };
+}
 
 const ALL_SHEET = "__all__";
 type SheetTab = {
@@ -234,6 +275,10 @@ function useSmallScreen() {
 }
 
 export function App() {
+  return <LanguageProvider><AppContent /></LanguageProvider>;
+}
+
+function AppContent() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
@@ -246,13 +291,15 @@ export function App() {
       .finally(() => setLoading(false));
   }, []);
 
-  if (loading) return <div className="center-screen">加载中</div>;
+  const { t } = useLanguage();
+  if (loading) return <div className="center-screen">{t("加载中", "Cargando")}</div>;
   if (!user) return <Login onLogin={setUser} />;
 
   return <Shell user={user} message={message} setMessage={setMessage} onLogout={() => setUser(null)} />;
 }
 
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
+  const { language, t, toggleLanguage } = useLanguage();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -275,15 +322,18 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
   return (
     <main className="login-shell">
       <form className="login-panel" onSubmit={submit} autoComplete="off">
+        <button className="login-language-button ghost-button" type="button" onClick={toggleLanguage}>
+          <Languages size={15} />{language === "zh" ? "Español" : "中文"}
+        </button>
         <div className="brand-row">
           <FileSpreadsheet size={28} />
           <div>
-            <h1>出纳请款明细</h1>
-            <span>内网归档工作台</span>
+            <h1>{t("出纳请款明细", "Detalle de solicitudes de pago de tesorería")}</h1>
+            <span>{t("内网归档工作台", "Centro interno de pagos y archivo")}</span>
           </div>
         </div>
         <label>
-          账号
+          {t("账号", "Usuario")}
           <input
             value={username}
             name="cashier-username"
@@ -293,7 +343,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
           />
         </label>
         <label>
-          密码
+          {t("密码", "Contraseña")}
           <input
             type="password"
             value={password}
@@ -305,7 +355,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
         {error && <p className="error-text">{error}</p>}
         <button className="primary-button" type="submit">
           <Shield size={16} />
-          登录
+          {t("登录", "Iniciar sesión")}
         </button>
       </form>
     </main>
@@ -323,6 +373,7 @@ function Shell({
   setMessage: (message: string) => void;
   onLogout: () => void;
 }) {
+  const { language, t, toggleLanguage } = useLanguage();
   const [tab, setTab] = useState<Tab>("workspace");
   const [batches, setBatches] = useState<Batch[]>([]);
   const [selectedBatchId, setSelectedBatchId] = useState<number | null>(null);
@@ -362,7 +413,7 @@ function Shell({
       <header className="app-header">
         <div className="app-brand">
           <FileSpreadsheet />
-          <strong>请款明细</strong>
+          <strong>{t("出纳请款明细", "Detalle de solicitudes de pago de tesorería")}</strong>
         </div>
         <nav className="app-nav">
           <button className={tab === "workspace" ? "active" : ""} onPointerDown={() => setTab("workspace")} onClick={() => setTab("workspace")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("workspace"))}>
@@ -381,6 +432,9 @@ function Shell({
           )}
         </nav>
         <div className="app-userbar">
+          <button className="icon-text language-button" type="button" onClick={toggleLanguage} title={language === "zh" ? "Cambiar a español" : "切换为中文"}>
+            <Languages size={15} />{language === "zh" ? "Español" : "中文"}
+          </button>
           <button className="app-user account-button" type="button" title="修改密码" aria-label={`${user.display_name}，${roleLabels[user.role]}，修改密码`} onClick={() => setPasswordDialogOpen(true)}>
             <span>{user.display_name}</span>
             <small>{roleLabels[user.role]}</small>
@@ -395,7 +449,7 @@ function Shell({
       </header>
       <main className="main-pane">
         <header className="topbar">
-          <h1>{tabTitle(tab)}</h1>
+          <h1>{tabTitle(tab, language)}</h1>
         </header>
         {tab === "workspace" && (
           <Workspace
@@ -517,12 +571,10 @@ function ChangePasswordDialog({ onClose, onSuccess }: { onClose: () => void; onS
   );
 }
 
-function tabTitle(tab: Tab) {
-  return {
-    workspace: "当前周工作台",
-    archive: "历史归档",
-    admin: "用户管理",
-  }[tab];
+function tabTitle(tab: Tab, language: GridHeaderLanguage = "zh") {
+  return language === "es"
+    ? { workspace: "Panel de la semana actual", archive: "Archivo histórico", admin: "Gestión de usuarios" }[tab]
+    : { workspace: "当前周工作台", archive: "历史归档", admin: "用户管理" }[tab];
 }
 
 function TopbarImportActions({
@@ -1414,6 +1466,7 @@ function Workspace({
   onImported: () => void;
   setMessage: (message: string) => void;
 }) {
+  const { language } = useLanguage();
   const isSmallScreen = useSmallScreen();
   const [gridRows, setGridRows] = useState<GridRow[]>([]);
   const [dirtyCells, setDirtyCells] = useState<Set<string>>(new Set());
@@ -1427,6 +1480,7 @@ function Workspace({
     pending_amount_max: "",
     finance_review: "",
     general_manager_approval: "",
+    dingtalk_lifecycle: "active",
   });
   const [activeSheet, setActiveSheet] = useState(ALL_SHEET);
   const [editingSheet, setEditingSheet] = useState<{ key: string; value: string } | null>(null);
@@ -1436,9 +1490,7 @@ function Workspace({
   const [sheetDropTarget, setSheetDropTarget] = useState<{ key: string; position: "before" | "after" } | null>(null);
   const [sheetOrderSaving, setSheetOrderSaving] = useState(false);
   const [wrapText, setWrapText] = useState(false);
-  const [gridHeaderLanguage, setGridHeaderLanguage] = useState<GridHeaderLanguage>(() =>
-    window.localStorage.getItem("payment-grid-header-language") === "es" ? "es" : "zh",
-  );
+  const gridHeaderLanguage: GridHeaderLanguage = language;
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [rolloverDialogOpen, setRolloverDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Partial<PaymentRequest> | null>(null);
@@ -1456,14 +1508,18 @@ function Workspace({
   const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
   const [currencyConversion, setCurrencyConversion] = useState<{ request: PaymentRequest; target: CurrencyCode } | null>(null);
   const [historicalCurrencyOpen, setHistoricalCurrencyOpen] = useState(false);
+  const [columnSettingsOpen, setColumnSettingsOpen] = useState(false);
+  const [gridPreference, setGridPreference] = useState<RequestGridPreference>(defaultGridPreference);
   const batchMenuRef = useRef<HTMLDivElement | null>(null);
   const [reason, setReason] = useState("");
   const hasUnsavedChanges = dirtyCells.size > 0 || deletedLocalIds.size > 0 || deletedSheetNames.size > 0;
   const showMobileCards = isSmallScreen && mobileViewOverride !== "table";
 
   useEffect(() => {
-    window.localStorage.setItem("payment-grid-header-language", gridHeaderLanguage);
-  }, [gridHeaderLanguage]);
+    api.requestGridPreference()
+      .then((result) => setGridPreference(result.preference))
+      .catch((err) => setMessage((err as Error).message));
+  }, [user.id]);
 
   useEffect(() => {
     if (isSmallScreen) return;
@@ -1479,7 +1535,10 @@ function Workspace({
 
   async function loadRequests() {
     if (!selectedBatch) return;
-    const [requestsRes, attachmentsRes] = await Promise.all([api.requests(selectedBatch.id, {}), api.batchAttachments(selectedBatch.id)]);
+    const [requestsRes, attachmentsRes] = await Promise.all([
+      api.requests(selectedBatch.id, { dingtalk_lifecycle: filters.dingtalk_lifecycle }),
+      api.batchAttachments(selectedBatch.id),
+    ]);
     const attachmentGroups = groupAttachmentsByRequest(attachmentsRes.attachments);
     setGridRows(toGridRows(requestsRes.requests));
     setAttachmentCounts(countAttachmentsByGroup(attachmentGroups));
@@ -1502,7 +1561,7 @@ function Workspace({
 
   useEffect(() => {
     loadRequests().catch((err) => setMessage((err as Error).message));
-  }, [selectedBatch?.id, refreshToken]);
+  }, [selectedBatch?.id, refreshToken, filters.dingtalk_lifecycle]);
 
   useEffect(() => {
     setSheetOrder(selectedBatch?.sheet_order || []);
@@ -1516,8 +1575,17 @@ function Workspace({
     [gridRows, sheetOrder, deletedSheetNames],
   );
   const visibleRows = useMemo(() => gridRows.filter((row) => rowMatchesFilters(row, filters, activeSheet)), [gridRows, filters, activeSheet]);
+  const visibleGridColumns = useMemo(() => {
+    const byKey = new Map(gridColumns.map((column) => [String(column.key), column]));
+    const hidden = new Set(gridPreference.hidden);
+    return gridPreference.order
+      .map((key) => byKey.get(key))
+      .filter((column): column is GridColumn => Boolean(column) && !hidden.has(String(column!.key)));
+  }, [gridPreference]);
   const visibleActiveRows = useMemo(() => visibleRows.filter((row) => !row.__deleted), [visibleRows]);
-  const hasActiveExportFilter = activeSheet !== ALL_SHEET || Object.values(filters).some((value) => value.trim());
+  const hasActiveExportFilter = activeSheet !== ALL_SHEET || Object.entries(filters).some(([key, value]) => (
+    key === "dingtalk_lifecycle" ? value !== "active" : value.trim()
+  ));
   const activeSheetRows = useMemo(
     () => (activeSheet === ALL_SHEET ? [] : gridRows.filter((row) => normalizeSheetName(row.source_sheet) === activeSheet)),
     [activeSheet, gridRows],
@@ -1846,6 +1914,7 @@ function Workspace({
       pending_amount_max: filters.pending_amount_max.trim(),
       finance_review: filters.finance_review.trim(),
       general_manager_approval: filters.general_manager_approval.trim(),
+      dingtalk_lifecycle: filters.dingtalk_lifecycle,
     };
     Object.entries(exportFilters).forEach(([key, value]) => {
       if (value) params.set(key, value);
@@ -1983,6 +2052,7 @@ function Workspace({
         pending_amount_max: "",
         finance_review: "",
         general_manager_approval: "",
+        dingtalk_lifecycle: "active",
       });
       setActiveSheet(name);
       await reloadBatches();
@@ -2282,7 +2352,7 @@ function Workspace({
         <div className="batch-metric-grid">
           <div className="batch-metric-card">
             <span>批次记录</span>
-            <strong>{selectedBatch.request_count || 0} 条</strong>
+            <strong>{language === "es" ? `${selectedBatch.request_count || 0} registro(s)` : `${selectedBatch.request_count || 0} 条`}</strong>
           </div>
           <div className="batch-metric-card">
             <span>批次应付（折合人民币）</span>
@@ -2309,7 +2379,11 @@ function Workspace({
         {!!selectedBatch.currency_totals?.length && (
           <div className="batch-currency-subtotals" aria-label="批次各币种小计">
             {selectedBatch.currency_totals.map((subtotal) => (
-              <span key={subtotal.currency}>{subtotal.currency}：应付 {formatMoney(subtotal.amount, subtotal.currency)} · 已付 {formatMoney(subtotal.paid_amount, subtotal.currency)} · 待付 {formatMoney(subtotal.pending_amount, subtotal.currency)}</span>
+              <span key={subtotal.currency}>
+                {language === "es"
+                  ? `${subtotal.currency}: a pagar ${formatMoney(subtotal.amount, subtotal.currency)} · pagado ${formatMoney(subtotal.paid_amount, subtotal.currency)} · pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}`
+                  : `${subtotal.currency}：应付 ${formatMoney(subtotal.amount, subtotal.currency)} · 已付 ${formatMoney(subtotal.paid_amount, subtotal.currency)} · 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}
+              </span>
             ))}
           </div>
         )}
@@ -2377,13 +2451,6 @@ function Workspace({
                   <Table2 size={15} />完整表格
                 </button>
               </div>
-              <button
-                className="ghost-button mobile-language-button"
-                type="button"
-                onClick={() => setGridHeaderLanguage((language) => (language === "zh" ? "es" : "zh"))}
-              >
-                <Languages size={15} />{gridHeaderLanguage === "zh" ? "Español" : "中文"}
-              </button>
             </div>
             <div className="mobile-quick-filters" aria-label="快捷筛选">
               {([
@@ -2457,6 +2524,19 @@ function Workspace({
               <option key={option} value={option}>{option}</option>
             ))}
           </select>
+          {user.role !== "business" && (
+            <select
+              value={filters.dingtalk_lifecycle}
+              onChange={(event) => setFilters({ ...filters, dingtalk_lifecycle: event.target.value })}
+              aria-label="钉钉流程范围"
+              disabled={hasUnsavedChanges || editorDirty}
+              title={hasUnsavedChanges || editorDirty ? "请先保存或放弃未保存修改" : "选择是否查看已终止或已拒绝的钉钉流程"}
+            >
+              <option value="active">正常流程</option>
+              <option value="inactive">已终止/已拒绝</option>
+              <option value="all">全部流程</option>
+            </select>
+          )}
           <button className="ghost-button" onClick={() => { setMessage("筛选已应用"); setMobileFiltersOpen(false); }} onKeyDown={(event) => activateButtonByKeyboard(event, () => { setMessage("筛选已应用"); setMobileFiltersOpen(false); })}>
             <Filter size={16} />
             筛选
@@ -2499,16 +2579,9 @@ function Workspace({
             <AlignLeft size={16} />
             {wrapText ? "取消换行" : "换行"}
           </button>
-          <button
-            className="ghost-button"
-            type="button"
-            onClick={() => setGridHeaderLanguage((language) => (language === "zh" ? "es" : "zh"))}
-            onKeyDown={(event) => activateButtonByKeyboard(event, () => setGridHeaderLanguage((language) => (language === "zh" ? "es" : "zh")))}
-            aria-label={gridHeaderLanguage === "zh" ? "切换为西班牙语表头" : "Cambiar encabezados a chino"}
-            title={gridHeaderLanguage === "zh" ? "切换为西班牙语表头" : "Cambiar encabezados a chino"}
-          >
-            <Languages size={16} />
-            {gridHeaderLanguage === "zh" ? "Español" : "中文"}
+          <button className="ghost-button" type="button" onClick={() => setColumnSettingsOpen(true)}>
+            <SlidersHorizontal size={16} />
+            列设置
           </button>
           <button className="primary-button" onClick={saveGridChanges} onKeyDown={(event) => activateButtonByKeyboard(event, saveGridChanges)} disabled={!hasUnsavedChanges}>
             <Save size={16} />
@@ -2522,7 +2595,7 @@ function Workspace({
         <div className="filtered-summary-bar" aria-label="当前筛选结果">
           <div className="filtered-summary-count">
             <span>当前筛选</span>
-            <strong>{visibleTotals.count} 条</strong>
+            <strong>{language === "es" ? `${visibleTotals.count} registro(s)` : `${visibleTotals.count} 条`}</strong>
           </div>
           <div className="filtered-summary-amounts">
             <span>折合人民币应付 <strong>{formatMoney(visibleTotals.amount)}</strong></span>
@@ -2531,13 +2604,17 @@ function Workspace({
           </div>
           <div className="currency-subtotals" aria-label="各币种小计">
             {visibleCurrencyTotals.map((subtotal) => (
-              <span key={subtotal.currency}>{subtotal.currency}：应付 {formatMoney(subtotal.amount, subtotal.currency)} / 待付 {formatMoney(subtotal.pending_amount, subtotal.currency)}</span>
+              <span key={subtotal.currency}>
+                {language === "es"
+                  ? `${subtotal.currency}: a pagar ${formatMoney(subtotal.amount, subtotal.currency)} / pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}`
+                  : `${subtotal.currency}：应付 ${formatMoney(subtotal.amount, subtotal.currency)} / 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}
+              </span>
             ))}
           </div>
           <div className="filtered-summary-statuses">
-            <span className="summary-status paid">已付款 {financeReviewCounts.paid} 单</span>
-            <span className="summary-status partial">部分付款 {financeReviewCounts.partial} 单</span>
-            <span className="summary-status unpaid">未付款 {financeReviewCounts.unpaid} 单</span>
+            <span className="summary-status paid">{language === "es" ? `Pagado ${financeReviewCounts.paid} solicitud(es)` : `已付款 ${financeReviewCounts.paid} 单`}</span>
+            <span className="summary-status partial">{language === "es" ? `Pago parcial ${financeReviewCounts.partial} solicitud(es)` : `部分付款 ${financeReviewCounts.partial} 单`}</span>
+            <span className="summary-status unpaid">{language === "es" ? `No pagado ${financeReviewCounts.unpaid} solicitud(es)` : `未付款 ${financeReviewCounts.unpaid} 单`}</span>
           </div>
         </div>
         <div className="sheet-tabs" role="tablist" aria-label="Sheet 分页">
@@ -2692,6 +2769,8 @@ function Workspace({
             wrapText={wrapText}
             headerLanguage={gridHeaderLanguage}
             onCurrencyChange={requestCurrencyConversion}
+            columns={visibleGridColumns}
+            attachmentCounts={attachmentCounts}
           />
         )}
       </section>
@@ -2752,8 +2831,21 @@ function Workspace({
           request={currencyConversion.request}
           targetCurrency={currencyConversion.target}
           reason={reason}
+          language={gridHeaderLanguage}
           onClose={() => setCurrencyConversion(null)}
           onApplied={currencyConversionApplied}
+        />
+      )}
+      {columnSettingsOpen && (
+        <ColumnSettingsDialog
+          preference={gridPreference}
+          language={gridHeaderLanguage}
+          onClose={() => setColumnSettingsOpen(false)}
+          onSaved={(preference) => {
+            setGridPreference(preference);
+            setColumnSettingsOpen(false);
+            setMessage(gridHeaderLanguage === "es" ? "Configuración de columnas guardada" : "列设置已保存");
+          }}
         />
       )}
       {historicalCurrencyOpen && selectedBatch && (
@@ -2888,11 +2980,124 @@ function Modal({ title, onClose, children, className = "" }: { title: string; on
   );
 }
 
+function ColumnSettingsDialog({
+  preference,
+  language,
+  onClose,
+  onSaved,
+}: {
+  preference: RequestGridPreference;
+  language: GridHeaderLanguage;
+  onClose: () => void;
+  onSaved: (preference: RequestGridPreference) => void;
+}) {
+  const [order, setOrder] = useState<string[]>(preference.order);
+  const [hidden, setHidden] = useState<Set<string>>(new Set(preference.hidden));
+  const [dragged, setDragged] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const columnByKey = useMemo(() => new Map(gridColumns.map((column) => [String(column.key), column])), []);
+
+  function move(key: string, offset: number) {
+    const index = order.indexOf(key);
+    const target = index + offset;
+    if (index < 0 || target < 0 || target >= order.length) return;
+    const next = [...order];
+    [next[index], next[target]] = [next[target], next[index]];
+    setOrder(next);
+  }
+
+  function dropBefore(target: string) {
+    if (!dragged || dragged === target) return;
+    const next = order.filter((key) => key !== dragged);
+    next.splice(next.indexOf(target), 0, dragged);
+    setOrder(next);
+    setDragged(null);
+  }
+
+  function toggle(key: string, visible: boolean) {
+    const next = new Set(hidden);
+    if (visible) next.delete(key);
+    else if (order.length - next.size > 1) next.add(key);
+    setHidden(next);
+  }
+
+  function reset() {
+    const next = defaultGridPreference();
+    setOrder(next.order);
+    setHidden(new Set(next.hidden));
+  }
+
+  async function save() {
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const result = await api.updateRequestGridPreference({ order, hidden: order.filter((key) => hidden.has(key)) });
+      onSaved(result.preference);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const es = language === "es";
+  return (
+    <Modal title={es ? "Configurar columnas" : "列设置"} onClose={saving ? () => undefined : onClose} className="column-settings-modal">
+      <p className="form-hint">
+        {es
+          ? "El estado de pago queda fijo a la izquierda y los adjuntos a la derecha. Arrastre las demás columnas para ordenarlas."
+          : "付款状态固定在左侧，附件固定在右侧；其余列可拖拽排序或隐藏。"}
+      </p>
+      <div className="column-settings-fixed">
+        <span>{es ? "Fija: Estado de pago" : "固定：付款状态"}</span>
+        <span>{es ? "Fija: Adjuntos" : "固定：附件"}</span>
+      </div>
+      <div className="column-settings-list">
+        {order.map((key, index) => {
+          const column = columnByKey.get(key);
+          if (!column) return null;
+          const visible = !hidden.has(key);
+          return (
+            <div
+              className={`column-setting-row${dragged === key ? " dragging" : ""}`}
+              key={key}
+              draggable
+              onDragStart={() => setDragged(key)}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={() => dropBefore(key)}
+              onDragEnd={() => setDragged(null)}
+            >
+              <span className="column-drag-handle" aria-hidden="true">⋮⋮</span>
+              <label>
+                <input type="checkbox" checked={visible} onChange={(event) => toggle(key, event.target.checked)} />
+                <span>{es ? column.labelEs : column.labelZh}</span>
+              </label>
+              <div className="column-order-buttons">
+                <button type="button" className="icon-button" disabled={index === 0} onClick={() => move(key, -1)} aria-label={es ? "Subir" : "上移"}>↑</button>
+                <button type="button" className="icon-button" disabled={index === order.length - 1} onClick={() => move(key, 1)} aria-label={es ? "Bajar" : "下移"}>↓</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {error && <p className="error-text" role="alert">{error}</p>}
+      <div className="modal-actions">
+        <button className="ghost-button" type="button" onClick={reset} disabled={saving}>{es ? "Restablecer" : "恢复默认"}</button>
+        <button className="ghost-button" type="button" onClick={onClose} disabled={saving}>{es ? "Cancelar" : "取消"}</button>
+        <button className="primary-button" type="button" onClick={save} disabled={saving}><Save size={16} />{saving ? (es ? "Guardando" : "保存中") : (es ? "Guardar" : "保存")}</button>
+      </div>
+    </Modal>
+  );
+}
+
 function CurrencyConversionDialog({
   batch,
   request,
   targetCurrency,
   reason,
+  language,
   onClose,
   onApplied,
 }: {
@@ -2900,9 +3105,11 @@ function CurrencyConversionDialog({
   request: PaymentRequest;
   targetCurrency: CurrencyCode;
   reason: string;
+  language: GridHeaderLanguage;
   onClose: () => void;
   onApplied: (request: PaymentRequest) => Promise<void> | void;
 }) {
+  const [mode, setMode] = useState<"convert" | "correct">("convert");
   const [rateDate, setRateDate] = useState(localIsoDate(new Date()));
   const [preview, setPreview] = useState<CurrencyConversionPreview | null>(null);
   const [error, setError] = useState("");
@@ -2918,6 +3125,7 @@ function CurrencyConversionDialog({
     api.previewCurrencyConversion(batch.id, request.id, {
       target_currency: targetCurrency,
       rate_date: rateDate,
+      mode,
       reason,
       expected_updated_at: request.updated_at,
     })
@@ -2925,7 +3133,7 @@ function CurrencyConversionDialog({
       .catch((err) => active && setError((err as Error).message))
       .finally(() => active && setLoading(false));
     return () => { active = false; };
-  }, [batch.id, rateDate, reason, request.id, request.updated_at, targetCurrency]);
+  }, [batch.id, mode, rateDate, reason, request.id, request.updated_at, targetCurrency]);
 
   async function applyConversion() {
     if (!preview || applying) return;
@@ -2935,6 +3143,7 @@ function CurrencyConversionDialog({
       const result = await api.applyCurrencyConversion(batch.id, request.id, {
         target_currency: targetCurrency,
         rate_date: rateDate,
+        mode,
         reason,
         expected_updated_at: request.updated_at,
       });
@@ -2946,42 +3155,57 @@ function CurrencyConversionDialog({
     }
   }
 
+  const es = language === "es";
   return (
-    <Modal title="确认币种换算" onClose={applying ? () => undefined : onClose} className="currency-conversion-modal">
+    <Modal title={es ? "Confirmar cambio de moneda" : "确认币种处理"} onClose={applying ? () => undefined : onClose} className="currency-conversion-modal">
       <div className="currency-conversion-route">
         <strong>{currencyLabel(request.currency)}</strong><ArrowRight size={18} /><strong>{currencyLabel(targetCurrency)}</strong>
       </div>
+      <div className="currency-mode-options" role="radiogroup" aria-label={es ? "Modo de cambio" : "币种处理方式"}>
+        <label className={mode === "convert" ? "selected" : ""}>
+          <input type="radio" name="currency-mode" value="convert" checked={mode === "convert"} onChange={() => setMode("convert")} disabled={applying} />
+          <span><strong>{es ? "Convertir por tipo de cambio" : "按汇率换算"}</strong><small>{es ? "El valor equivalente en CNY no cambia." : "人民币基准价值不变，金额按汇率换算。"}</small></span>
+        </label>
+        <label className={mode === "correct" ? "selected" : ""}>
+          <input type="radio" name="currency-mode" value="correct" checked={mode === "correct"} onChange={() => setMode("correct")} disabled={applying} />
+          <span><strong>{es ? "Corregir moneda sin cambiar el importe" : "金额不变，仅更正币种"}</strong><small>{es ? "25.000 CNY pasa a 25.000 USD; cambia el equivalente en CNY." : "例如 25,000 CNY 更正为 25,000 USD，人民币折算值随之变化。"}</small></span>
+        </label>
+      </div>
       <label className="currency-rate-date">
-        汇率日期
+        {es ? "Fecha del tipo de cambio" : "汇率日期"}
         <input type="date" value={rateDate} max={maxDate} onChange={(event) => setRateDate(event.target.value)} disabled={applying} />
       </label>
-      {loading && <div className="editor-info-banner">正在读取汇率…</div>}
+      {loading && <div className="editor-info-banner">{es ? "Consultando el tipo de cambio…" : "正在读取汇率…"}</div>}
       {error && <p className="error-text" role="alert">{error}</p>}
       {preview && (
         <>
           <div className="currency-rate-summary">
-            <div><span>原币汇率</span><strong>1 {preview.source_currency} = ¥{Number(preview.source_rate || 1).toFixed(6)}</strong></div>
-            <div><span>目标币汇率</span><strong>1 {preview.target_currency} = ¥{Number(preview.target_rate).toFixed(6)}</strong></div>
-            <div><span>选择日期</span><strong>{preview.requested_rate_date}</strong></div>
-            <div><span>实际命中日期</span><strong>{preview.actual_rate_date}{preview.used_previous_rate ? "（使用此前最近汇率）" : ""}</strong></div>
+            <div><span>{es ? "Tipo de cambio original" : "原币汇率"}</span><strong>1 {preview.source_currency} = ¥{Number(preview.source_rate || 1).toFixed(6)}</strong></div>
+            <div><span>{es ? "Tipo de cambio destino" : "目标币汇率"}</span><strong>1 {preview.target_currency} = ¥{Number(preview.target_rate).toFixed(6)}</strong></div>
+            <div><span>{es ? "Fecha seleccionada" : "选择日期"}</span><strong>{preview.requested_rate_date}</strong></div>
+            <div><span>{es ? "Fecha aplicada" : "实际命中日期"}</span><strong>{preview.actual_rate_date}{preview.used_previous_rate ? (es ? " (fecha anterior más cercana)" : "（使用此前最近汇率）") : ""}</strong></div>
           </div>
           <div className="currency-amount-comparison">
-            <div className="currency-comparison-head"><span>项目</span><span>换算前</span><span>换算后</span></div>
+            <div className="currency-comparison-head"><span>{es ? "Concepto" : "项目"}</span><span>{es ? "Antes" : "处理前"}</span><span>{es ? "Después" : "处理后"}</span></div>
             {(["amount", "paid_amount", "pending_amount"] as const).map((field) => (
               <div key={field}>
-                <span>{{ amount: "应付", paid_amount: "已付", pending_amount: "待付" }[field]}</span>
+                <span>{es ? { amount: "A pagar", paid_amount: "Pagado", pending_amount: "Pendiente" }[field] : { amount: "应付", paid_amount: "已付", pending_amount: "待付" }[field]}</span>
                 <strong>{formatMoney(preview.before[field], preview.source_currency)}</strong>
                 <strong>{formatMoney(preview.after[field], preview.target_currency)}</strong>
               </div>
             ))}
           </div>
-          <p className="currency-anchor-note">人民币基准金额保持为 {formatMoney(preview.base_amount_cny)}；将同步换算 {preview.payment_count} 笔付款明细。</p>
+          <p className="currency-anchor-note">
+            {mode === "convert"
+              ? (es ? `El equivalente base se mantiene en ${formatMoney(preview.base_amount_cny)}; se convertirán ${preview.payment_count} pagos.` : `人民币基准金额保持为 ${formatMoney(preview.base_amount_cny)}；将同步换算 ${preview.payment_count} 笔付款明细。`)
+              : (es ? `El importe numérico no cambia; el equivalente base pasa de ${formatMoney(preview.before_base_amount_cny)} a ${formatMoney(preview.base_amount_cny)}. Se corregirán ${preview.payment_count} pagos.` : `金额数值不变；人民币折算值将从 ${formatMoney(preview.before_base_amount_cny)} 更新为 ${formatMoney(preview.base_amount_cny)}，并同步更正 ${preview.payment_count} 笔付款明细。`)}
+          </p>
         </>
       )}
       <div className="modal-actions">
-        <button className="ghost-button" type="button" onClick={onClose} disabled={applying}>取消</button>
+        <button className="ghost-button" type="button" onClick={onClose} disabled={applying}>{es ? "Cancelar" : "取消"}</button>
         <button className="primary-button" type="button" onClick={applyConversion} disabled={!preview || loading || applying}>
-          {applying ? "换算中" : "确认换算并保存"}
+          {applying ? (es ? "Guardando" : "处理中") : (es ? "Confirmar y guardar" : "确认处理并保存")}
         </button>
       </div>
     </Modal>
@@ -3272,6 +3496,8 @@ function EditablePaymentGrid({
   headerLanguage,
   canEditField,
   onCurrencyChange,
+  columns,
+  attachmentCounts,
 }: {
   rows: GridRow[];
   onRowsChange: (rows: GridRow[]) => void;
@@ -3280,7 +3506,7 @@ function EditablePaymentGrid({
   deletedLocalIds: Set<string>;
   selectedRows: number[];
   setSelectedRows: (ids: number[]) => void;
-  onEdit: (request: PaymentRequest) => void;
+  onEdit: (request: PaymentRequest, tab?: RequestEditorTab) => void;
   readOnly: boolean;
   onSave: () => void;
   defaultSourceSheet: string;
@@ -3288,6 +3514,8 @@ function EditablePaymentGrid({
   headerLanguage: GridHeaderLanguage;
   canEditField: (field: keyof PaymentRequest) => boolean;
   onCurrencyChange: (request: Partial<PaymentRequest>, target: string) => void;
+  columns: GridColumn[];
+  attachmentCounts: Record<number, number>;
 }) {
   const [activeCell, setActiveCell] = useState<{ row: number; col: number }>({ row: 0, col: 0 });
   const tableWrapRef = useRef<HTMLDivElement | null>(null);
@@ -3325,7 +3553,7 @@ function EditablePaymentGrid({
       topScrollbar.removeEventListener("scroll", syncFromTop);
       resizeObserver.disconnect();
     };
-  }, [rows.length]);
+  }, [rows.length, columns]);
 
   function scrollTableBy(delta: number) {
     tableWrapRef.current?.scrollBy({ left: delta, behavior: "smooth" });
@@ -3352,7 +3580,7 @@ function EditablePaymentGrid({
 
   function focusCell(rowIndex: number, colIndex: number) {
     const boundedRow = Math.max(0, Math.min(rowIndex, rows.length - 1));
-    const boundedCol = Math.max(0, Math.min(colIndex, gridColumns.length - 1));
+    const boundedCol = Math.max(0, Math.min(colIndex, columns.length - 1));
     setActiveCell({ row: boundedRow, col: boundedCol });
     requestAnimationFrame(() => {
       const target = document.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(`[data-cell="${boundedRow}-${boundedCol}"]`);
@@ -3421,7 +3649,7 @@ function EditablePaymentGrid({
       }
         let targetRow = { ...nextRows[targetRowIndex] };
         sourceRow.forEach((cellValue, colOffset) => {
-          const column = gridColumns[activeCell.col + colOffset];
+          const column = columns[activeCell.col + colOffset];
           if (!column || !canEditField(column.key)) return;
           targetRow = withPaymentAmountChange(targetRow, column.key, normalizeCellValue(column, cellValue));
           nextDirty.add(`${targetRow.__localId}:${column.key}`);
@@ -3450,11 +3678,13 @@ function EditablePaymentGrid({
           <thead>
             <tr>
               <th className="checkbox-col" style={{ width: 52, minWidth: 52 }}></th>
-              {gridColumns.map((column) => (
+              <th className="payment-detail-col fixed-grid-column">{headerLanguage === "es" ? "Estado de pago" : "付款状态"}</th>
+              {columns.map((column) => (
                 <th key={column.key} style={{ width: column.width, minWidth: column.width }}>
                   {headerLanguage === "es" ? column.labelEs : column.labelZh}
                 </th>
               ))}
+              <th className="attachment-col fixed-grid-column">{headerLanguage === "es" ? "Adjuntos" : "附件"}</th>
             </tr>
           </thead>
           <tbody>
@@ -3463,7 +3693,22 @@ function EditablePaymentGrid({
                 <td className="checkbox-col">
                   {row.id && <input type="checkbox" checked={selectedRows.includes(row.id)} onChange={() => toggle(row.id!)} />}
                 </td>
-	                {gridColumns.map((column, colIndex) => {
+                <td className="payment-detail-col fixed-grid-column">
+                  <button
+                    className={`payment-detail-chip${Number(row.payment_count || 0) > 0 ? " has-payments" : ""}`}
+                    type="button"
+                    disabled={!row.id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      if (row.id) onEdit(row as PaymentRequest, "payments");
+                    }}
+                  >
+                    {Number(row.payment_count || 0) > 0
+                      ? (headerLanguage === "es" ? `${Number(row.payment_count || 0)} pago(s)` : `付款 ${Number(row.payment_count || 0)} 笔`)
+                      : (headerLanguage === "es" ? "No pagado" : "未付款")}
+                  </button>
+                </td>
+	                {columns.map((column, colIndex) => {
 	                  const dirty = dirtyCells.has(`${row.__localId}:${column.key}`);
 	                  const cellValue = cellDisplayValue(row, column);
 	                  const selectOptions = selectOptionsForField(column.key, cellValue);
@@ -3549,6 +3794,22 @@ function EditablePaymentGrid({
                       </td>
 	                  );
 	                })}
+                <td className="attachment-col fixed-grid-column">
+                  <button
+                    className={`attachment-chip${row.id && Number(attachmentCounts[row.id] || 0) > 0 ? " has-attachments" : ""}`}
+                    type="button"
+                    disabled={!row.id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      if (row.id) onEdit(row as PaymentRequest, "attachments");
+                    }}
+                  >
+                    <Paperclip size={14} />
+                    {row.id && Number(attachmentCounts[row.id] || 0) > 0
+                      ? (headerLanguage === "es" ? `${Number(attachmentCounts[row.id] || 0)} archivo(s)` : `附件 ${Number(attachmentCounts[row.id] || 0)}`)
+                      : (headerLanguage === "es" ? "Subir" : "上传")}
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -5537,11 +5798,13 @@ function currencyCode(value?: string): CurrencyCode {
 }
 
 function currencyLabel(value?: string) {
-  return { CNY: "CNY 人民币", USD: "USD 美元", MXN: "MXN 墨西哥比索" }[currencyCode(value)];
+  return currentLanguage() === "es"
+    ? { CNY: "CNY Yuan chino", USD: "USD Dólar estadounidense", MXN: "MXN Peso mexicano" }[currencyCode(value)]
+    : { CNY: "CNY 人民币", USD: "USD 美元", MXN: "MXN 墨西哥比索" }[currencyCode(value)];
 }
 
 function formatMoney(value: number, currency?: string) {
-  return new Intl.NumberFormat("zh-CN", { style: "currency", currency: currencyCode(currency), maximumFractionDigits: 2 }).format(value || 0);
+  return new Intl.NumberFormat(currentLanguage() === "es" ? "es-MX" : "zh-CN", { style: "currency", currency: currencyCode(currency), maximumFractionDigits: 2 }).format(value || 0);
 }
 
 function requestFxRate(request: Partial<PaymentRequest>) {
@@ -5572,7 +5835,7 @@ function currencySubtotals(rows: Array<Partial<PaymentRequest>>) {
 
 function formatDateTime(value: string) {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString(currentLanguage() === "es" ? "es-MX" : "zh-CN", { hour12: false });
 }
 
 function workflowResultLabel(value: string) {
@@ -5585,10 +5848,11 @@ function workflowResultLabel(value: string) {
 }
 
 function formatDateRange(start?: string, end?: string) {
-  if (start && end) return `${start} 至 ${end}`;
-  if (start) return `${start} 起`;
-  if (end) return `截至 ${end}`;
-  return "未设置";
+  const es = currentLanguage() === "es";
+  if (start && end) return es ? `${start} a ${end}` : `${start} 至 ${end}`;
+  if (start) return es ? `Desde ${start}` : `${start} 起`;
+  if (end) return es ? `Hasta ${end}` : `截至 ${end}`;
+  return es ? "Sin configurar" : "未设置";
 }
 
 function formatBatchName(startDate: string, endDate: string) {

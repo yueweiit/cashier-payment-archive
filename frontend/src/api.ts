@@ -1,3 +1,5 @@
+import { translateKnownError } from "./i18n";
+
 export type User = {
   id: number;
   username: string;
@@ -384,6 +386,7 @@ export type CurrencySubtotal = {
 
 export type CurrencyConversionPreview = {
   request_id: number;
+  mode: "convert" | "correct";
   source_currency: CurrencyCode;
   target_currency: CurrencyCode;
   requested_rate_date: string;
@@ -391,11 +394,18 @@ export type CurrencyConversionPreview = {
   used_previous_rate: boolean;
   source_rate?: number;
   target_rate: number;
+  before_base_amount_cny: number;
   before: { amount: number; paid_amount: number; pending_amount: number };
   after: { amount: number; paid_amount: number; pending_amount: number };
   base_amount_cny: number;
   payment_count: number;
   request_updated_at?: string;
+};
+
+export type RequestGridPreference = {
+  version: number;
+  order: string[];
+  hidden: string[];
 };
 
 export type HistoricalCurrencyRestoreRow = {
@@ -512,7 +522,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(data.detail || "请求失败");
+    throw new Error(translateKnownError(data.detail || "请求失败"));
   }
   return data as T;
 }
@@ -550,13 +560,20 @@ export const api = {
     const query = new URLSearchParams(params);
     return request<{ requests: PaymentRequest[]; totals: { count: number; amount: number; paid_amount: number; pending_amount: number } }>(`/api/batches/${batchId}/requests?${query}`);
   },
+  requestGridPreference: () =>
+    request<{ preference: RequestGridPreference }>("/api/me/preferences/request-grid"),
+  updateRequestGridPreference: (payload: Pick<RequestGridPreference, "order" | "hidden">) =>
+    request<{ preference: RequestGridPreference }>("/api/me/preferences/request-grid", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
   createRequest: (batchId: number, payload: Partial<PaymentRequest>) =>
     request<{ request: PaymentRequest }>(`/api/batches/${batchId}/requests`, { method: "POST", body: JSON.stringify(payload) }),
   updateRequest: (batchId: number, requestId: number, payload: Partial<PaymentRequest> & { reason?: string }) =>
     request<{ request: PaymentRequest }>(`/api/batches/${batchId}/requests/${requestId}`, { method: "PATCH", body: JSON.stringify(payload) }),
-  previewCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; reason?: string; expected_updated_at?: string }) =>
+  previewCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; mode?: "convert" | "correct"; reason?: string; expected_updated_at?: string }) =>
     request<{ preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/preview`, { method: "POST", body: JSON.stringify(payload) }),
-  applyCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; reason?: string; expected_updated_at?: string }) =>
+  applyCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; mode?: "convert" | "correct"; reason?: string; expected_updated_at?: string }) =>
     request<{ status: string; request: PaymentRequest; preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/apply`, { method: "POST", body: JSON.stringify(payload) }),
   previewHistoricalCurrencyRestore: (batchId: number) =>
     request<HistoricalCurrencyRestorePreview>(`/api/batches/${batchId}/historical-currency-restore/preview`),

@@ -65,6 +65,11 @@ button:disabled {
   box-shadow: 0 24px 60px rgba(31, 41, 51, 0.12);
 }
 
+.login-language-button {
+  justify-self: end;
+  min-height: 36px;
+}
+
 .brand-row,
 .sidebar-title,
 .app-brand,
@@ -191,8 +196,13 @@ textarea {
 .app-brand {
   flex: 0 0 auto;
   min-width: 168px;
+  max-width: 360px;
   font-size: 18px;
   color: #ffffff;
+}
+
+.app-brand strong {
+  line-height: 1.25;
 }
 
 .app-brand svg,
@@ -4085,6 +4095,125 @@ textarea {
   background: #f3f7f7;
 }
 
+.currency-mode-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.currency-mode-options > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #d7e2e5;
+  border-radius: 10px;
+  cursor: pointer;
+  background: #fff;
+}
+
+.currency-mode-options > label.selected {
+  border-color: #21766f;
+  background: #eef8f6;
+  box-shadow: 0 0 0 1px #21766f inset;
+}
+
+.currency-mode-options input[type="radio"] {
+  width: 18px;
+  height: 18px;
+  margin: 2px 0 0;
+  flex: 0 0 auto;
+}
+
+.currency-mode-options span {
+  display: grid;
+  gap: 4px;
+}
+
+.currency-mode-options small {
+  color: #687d87;
+  line-height: 1.45;
+}
+
+.column-settings-modal {
+  width: min(720px, calc(100vw - 32px));
+}
+
+.column-settings-fixed {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+.column-settings-fixed span {
+  border-radius: 999px;
+  padding: 5px 10px;
+  background: #edf4f3;
+  color: #31535d;
+  font-size: 13px;
+}
+
+.column-settings-list {
+  max-height: min(55vh, 520px);
+  overflow: auto;
+  border: 1px solid #dce5e8;
+  border-radius: 10px;
+}
+
+.column-setting-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #e5ecef;
+  background: #fff;
+}
+
+.column-setting-row:last-child {
+  border-bottom: 0;
+}
+
+.column-setting-row.dragging {
+  opacity: 0.5;
+}
+
+.column-setting-row > label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.column-setting-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
+.column-drag-handle {
+  cursor: grab;
+  color: #82949d;
+  user-select: none;
+}
+
+.column-order-buttons {
+  display: flex;
+  gap: 5px;
+}
+
+.fixed-grid-column {
+  padding: 7px 6px !important;
+  vertical-align: middle;
+}
+
+.fixed-grid-column button:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
 .currency-rate-date {
   display: grid;
   gap: 6px;
@@ -4187,6 +4316,9 @@ textarea {
 }
 
 @media (max-width: 700px) {
+  .currency-mode-options {
+    grid-template-columns: 1fr;
+  }
   .currency-rate-summary {
     grid-template-columns: 1fr;
   }
