@@ -719,6 +719,50 @@ def test_rollover_copies_only_unfinished_rows():
         assert len(all_attachments.json()["attachments"]) == 9
 
 
+def test_rollover_preserves_legacy_foreign_currency_rows_without_rate_anchor():
+    with TestClient(app) as client:
+        login(client)
+        source = client.post(
+            "/api/batches",
+            json={"name": "legacy-fx-source", "start_date": "2026-08-01", "end_date": "2026-08-07"},
+        ).json()["batch"]
+        created = client.post(
+            f"/api/batches/{source['id']}/requests",
+            json={"source_sheet": "外币", "summary": "历史美元请款", "amount": 25000, "currency": "CNY"},
+        )
+        assert created.status_code == 200
+        request_id = created.json()["request"]["id"]
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE payment_requests
+                SET currency = 'USD', base_amount_cny = NULL,
+                    fx_rate_cny_per_unit = NULL, fx_rate_date = NULL,
+                    fx_rate_actual_date = NULL
+                WHERE id = ?
+                """,
+                (request_id,),
+            )
+
+        rollover = client.post(
+            f"/api/batches/{source['id']}/rollover",
+            json={
+                "name": "legacy-fx-target",
+                "start_date": "2026-08-08",
+                "end_date": "2026-08-14",
+                "copy_mode": "unfinished",
+            },
+        )
+        assert rollover.status_code == 200
+        target_id = rollover.json()["batch"]["id"]
+        copied = client.get(f"/api/batches/{target_id}/requests").json()["requests"]
+        assert len(copied) == 1
+        assert copied[0]["currency"] == "USD"
+        assert copied[0]["amount"] == 25000
+        assert copied[0]["base_amount_cny"] == 25000
+        assert copied[0]["fx_rate_cny_per_unit"] == 1
+
+
 def test_rollback_latest_import_restores_previous_batch_state():
     if not SAMPLE.exists():
         return

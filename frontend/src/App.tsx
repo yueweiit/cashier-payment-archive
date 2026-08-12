@@ -3293,6 +3293,7 @@ function RolloverPanel({
   const [endDate, setEndDate] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
   const [copyingMode, setCopyingMode] = useState<RolloverCopyMode | null>(null);
+  const [rolloverError, setRolloverError] = useState("");
   const generatedName = formatBatchName(startDate, endDate);
   const invalidDateRange = isInvalidDateRange(startDate, endDate);
   const canRollover = Boolean(sourceBatchId && startDate && endDate && name.trim() && !invalidDateRange && !copyingMode);
@@ -3307,6 +3308,7 @@ function RolloverPanel({
 
   async function rollover(copyMode: RolloverCopyMode) {
     if (!canRollover) return;
+    setRolloverError("");
     setCopyingMode(copyMode);
     try {
       const res = await api.rolloverBatch(Number(sourceBatchId), { name, start_date: startDate, end_date: endDate, copy_mode: copyMode });
@@ -3316,6 +3318,10 @@ function RolloverPanel({
       setNameTouched(false);
       onCreated(res.batch);
       setMessage(copyMode === "all" ? `已生成本周草稿，复制全部 ${res.copied_count} 条记录` : `已生成本周草稿，复制 ${res.copied_count} 条未完成记录`);
+    } catch (error) {
+      const detail = (error as Error).message || "生成本周批次失败";
+      setRolloverError(detail);
+      setMessage(detail);
     } finally {
       setCopyingMode(null);
     }
@@ -3366,6 +3372,7 @@ function RolloverPanel({
           按日期重新生成
         </button>
       )}
+      {rolloverError && <p className="error-text" role="alert">{rolloverError}</p>}
       <div className="rollover-actions">
         <button className="ghost-button" onClick={() => rollover("unfinished")} disabled={!canRollover}>
           <Archive size={16} />

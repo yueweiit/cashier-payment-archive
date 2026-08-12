@@ -1101,6 +1101,7 @@ def rollover_batch(
             ]:
                 source_data.pop(key, None)
             source_data["copied_from_request_id"] = copied_from_request_id
+            ensure_rollover_currency_anchors(source_data)
             new_request_id = insert_request(
                 conn,
                 target_batch_id,
@@ -5838,6 +5839,39 @@ def copy_payment_records(conn, source_request_id: int, target_request_id: int, u
         copied += 1
     refresh_payment_summaries(conn, target_request_id)
     return copied
+
+
+def ensure_rollover_currency_anchors(data: Dict[str, Any]) -> None:
+    """Keep legacy foreign-currency rows copyable without changing displayed amounts.
+
+    Some rows created before exchange-rate support have a foreign currency but no
+    CNY anchor.  Rollover is a snapshot operation, so preserve the source row's
+    current CNY valuation.  Prefer the stored anchor/rate when either exists and
+    only fall back to the legacy valuation (1:1, which is also how old summaries
+    were calculated) when both are absent.
+    """
+    currency = normalize_currency(data.get("currency"), default="CNY")
+    amount_value = data.get("amount")
+    if currency == "CNY" or amount_value in (None, ""):
+        return
+    try:
+        amount = money(amount_value)
+        rate_value = data.get("fx_rate_cny_per_unit")
+        base_value = data.get("base_amount_cny")
+        rate = float(rate_value) if rate_value not in (None, "") else None
+        base = money(base_value) if base_value not in (None, "") else None
+        if rate is None and base is not None and amount:
+            rate = float(Decimal(str(base)) / Decimal(str(amount)))
+        if base is None and rate is not None:
+            base = multiply_money(amount, rate)
+        if rate is None or rate <= 0:
+            rate = 1.0
+        if base is None:
+            base = multiply_money(amount, rate)
+        data["fx_rate_cny_per_unit"] = rate
+        data["base_amount_cny"] = base
+    except (ArithmeticError, TypeError, ValueError, FxRateError) as exc:
+        raise HTTPException(status_code=400, detail="历史外币请款的汇率信息无效，请先更正币种") from exc
 
 
 def insert_request(
