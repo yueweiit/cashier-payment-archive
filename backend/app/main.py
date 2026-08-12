@@ -171,6 +171,13 @@ class CurrencyConversionIn(BaseModel):
     expected_updated_at: Optional[str] = None
 
 
+class ForeignAmountCorrectionIn(BaseModel):
+    amount: float = Field(gt=0)
+    rate_date: str
+    reason: Optional[str] = None
+    expected_updated_at: Optional[str] = None
+
+
 class RequestGridPreferenceIn(BaseModel):
     order: list[str] = Field(default_factory=list)
     hidden: list[str] = Field(default_factory=list)
@@ -1765,6 +1772,152 @@ def require_currency_conversion_permission(batch, user: Dict[str, Any], reason: 
         raise HTTPException(status_code=403, detail="归档批次只能由总经理或管理员更正币种")
     if batch["status"] == "archived" and not str(reason or "").strip():
         raise HTTPException(status_code=400, detail="归档后换算必须填写更正原因")
+
+
+def foreign_amount_correction_preview_data(
+    request_row: Dict[str, Any],
+    payments: list[Dict[str, Any]],
+    target_rate: Dict[str, Any],
+    target_amount: float,
+) -> Dict[str, Any]:
+    currency = normalize_currency(request_row.get("currency"), default="CNY") or "CNY"
+    if currency == "CNY":
+        raise HTTPException(status_code=400, detail="人民币应付金额可直接修改，无需汇率确认")
+    if str(target_rate.get("currency") or "") != currency:
+        raise HTTPException(status_code=400, detail="汇率币种与请款币种不一致")
+    try:
+        amount = money(target_amount)
+    except FxRateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="应付金额必须大于 0")
+    paid_amount = money(sum(float(payment.get("amount") or 0) for payment in payments))
+    if paid_amount > amount + 0.000001:
+        raise HTTPException(status_code=400, detail=f"应付金额不能低于累计已支付金额 {paid_amount:.2f}")
+    rate = float(target_rate["cny_per_unit"])
+    return {
+        "request_id": int(request_row["id"]),
+        "currency": currency,
+        "requested_rate_date": target_rate["requested_date"],
+        "actual_rate_date": target_rate["actual_date"],
+        "used_previous_rate": bool(target_rate.get("fallback")),
+        "rate": rate,
+        "before_base_amount_cny": request_cny_anchor(request_row),
+        "base_amount_cny": multiply_money(amount, rate),
+        "payment_count": len(payments),
+        "before": {
+            "amount": money(request_row.get("amount") or 0),
+            "paid_amount": money(request_row.get("paid_amount") or paid_amount),
+            "pending_amount": money(request_row.get("pending_amount") or 0),
+        },
+        "after": {
+            "amount": amount,
+            "paid_amount": paid_amount,
+            "pending_amount": money(amount - paid_amount),
+        },
+    }
+
+
+@app.post("/api/batches/{batch_id}/requests/{request_id}/amount-correction/preview")
+def preview_foreign_request_amount_correction(
+    batch_id: int,
+    request_id: int,
+    payload: ForeignAmountCorrectionIn,
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
+    requested_date = parse_fx_rate_date(payload.rate_date)
+    with connect() as conn:
+        batch = require_batch(conn, batch_id)
+        require_currency_conversion_permission(batch, user, payload.reason)
+        request_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
+        currency = normalize_currency(request_row.get("currency"), default="CNY") or "CNY"
+        payments = rows_to_dicts(
+            conn.execute("SELECT * FROM payment_records WHERE request_id = ? ORDER BY id", (request_id,)).fetchall()
+        )
+    try:
+        target_rate = fetch_rates(requested_date, [currency])[currency]
+    except FxRateError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"preview": foreign_amount_correction_preview_data(request_row, payments, target_rate, payload.amount)}
+
+
+@app.post("/api/batches/{batch_id}/requests/{request_id}/amount-correction/apply")
+def apply_foreign_request_amount_correction(
+    batch_id: int,
+    request_id: int,
+    payload: ForeignAmountCorrectionIn,
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
+    requested_date = parse_fx_rate_date(payload.rate_date)
+    with connect() as conn:
+        initial_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
+        currency = normalize_currency(initial_row.get("currency"), default="CNY") or "CNY"
+    try:
+        target_rate = fetch_rates(requested_date, [currency])[currency]
+    except FxRateError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        batch = require_batch(conn, batch_id)
+        require_currency_conversion_permission(batch, user, payload.reason)
+        request_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
+        if payload.expected_updated_at and request_row.get("updated_at") != payload.expected_updated_at:
+            raise HTTPException(status_code=409, detail="请款已被其他用户修改，请刷新后重新更正金额")
+        current_currency = normalize_currency(request_row.get("currency"), default="CNY") or "CNY"
+        if current_currency != currency:
+            raise HTTPException(status_code=409, detail="请款币种已发生变化，请刷新后重试")
+        payments = rows_to_dicts(
+            conn.execute("SELECT * FROM payment_records WHERE request_id = ? ORDER BY id", (request_id,)).fetchall()
+        )
+        preview = foreign_amount_correction_preview_data(request_row, payments, target_rate, payload.amount)
+        timestamp = now_iso()
+        conn.execute(
+            """
+            UPDATE payment_requests
+            SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
+                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                preview["after"]["amount"],
+                preview["base_amount_cny"],
+                preview["rate"],
+                preview["requested_rate_date"],
+                preview["actual_rate_date"],
+                user["id"],
+                timestamp,
+                request_id,
+            ),
+        )
+        refresh_payment_summaries(conn, request_id)
+        updated = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
+        conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
+        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        write_audit(
+            conn,
+            user["id"],
+            "request.amount_correct",
+            "payment_request",
+            request_id,
+            batch_id=batch_id,
+            old_value={
+                "currency": currency,
+                "amount": request_row.get("amount"),
+                "base_amount_cny": request_row.get("base_amount_cny"),
+            },
+            new_value={
+                "currency": currency,
+                "amount": preview["after"]["amount"],
+                "base_amount_cny": preview["base_amount_cny"],
+                "rate_date": preview["requested_rate_date"],
+                "actual_rate_date": preview["actual_rate_date"],
+                "rate": preview["rate"],
+                "payment_count": preview["payment_count"],
+            },
+            reason=payload.reason,
+        )
+    return {"status": "ok", "preview": preview, "request": updated}
 
 
 @app.post("/api/batches/{batch_id}/requests/{request_id}/currency-conversion/preview")
@@ -6022,19 +6175,25 @@ def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int
             next_amount = round(float(payload["amount"]), 2) if payload["amount"] not in (None, "") else None
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="应付金额无效") from exc
-        paid_amount = float(
-            conn.execute(
-                "SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_records WHERE request_id = ?",
-                (request_id,),
-            ).fetchone()["amount"]
-            or 0
-        )
-        if next_amount is not None and paid_amount > next_amount + 0.000001:
-            raise HTTPException(status_code=400, detail=f"应付金额不能低于累计已支付金额 {paid_amount:.2f}")
-        if normalize_currency(existing.get("currency"), default="CNY") != "CNY":
-            raise HTTPException(status_code=400, detail="外币应付金额请通过币种换算功能调整")
-        payload["base_amount_cny"] = next_amount
-        payload["fx_rate_cny_per_unit"] = 1.0
+        if request_values_equal(next_amount, existing.get("amount")):
+            payload.pop("amount", None)
+            next_amount = None
+        if "amount" not in payload:
+            next_amount = None
+        else:
+            paid_amount = float(
+                conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) AS amount FROM payment_records WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()["amount"]
+                or 0
+            )
+            if next_amount is not None and paid_amount > next_amount + 0.000001:
+                raise HTTPException(status_code=400, detail=f"应付金额不能低于累计已支付金额 {paid_amount:.2f}")
+            if normalize_currency(existing.get("currency"), default="CNY") != "CNY":
+                raise HTTPException(status_code=400, detail="外币应付金额请通过汇率确认功能调整")
+            payload["base_amount_cny"] = next_amount
+            payload["fx_rate_cny_per_unit"] = 1.0
     merged = {**existing, **payload}
     normalize_request_business_fields(merged)
     for key in (

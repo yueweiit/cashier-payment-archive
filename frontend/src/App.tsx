@@ -38,6 +38,7 @@ import {
   Batch,
   CurrencyCode,
   CurrencyConversionPreview,
+  ForeignAmountCorrectionPreview,
   HistoricalCurrencyRestorePreview,
   DingtalkWorkflow,
   EmployeeDepartmentImportResult,
@@ -3213,6 +3214,114 @@ function CurrencyConversionDialog({
   );
 }
 
+function ForeignAmountCorrectionDialog({
+  batch,
+  request,
+  amount,
+  reason,
+  language,
+  onClose,
+  onApplied,
+}: {
+  batch: Batch;
+  request: PaymentRequest;
+  amount: number;
+  reason: string;
+  language: GridHeaderLanguage;
+  onClose: () => void;
+  onApplied: (request: PaymentRequest) => Promise<void> | void;
+}) {
+  const [rateDate, setRateDate] = useState(localIsoDate(new Date()));
+  const [preview, setPreview] = useState<ForeignAmountCorrectionPreview | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const maxDate = localIsoDate(new Date());
+  const es = language === "es";
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    setPreview(null);
+    api.previewForeignAmountCorrection(batch.id, request.id, {
+      amount,
+      rate_date: rateDate,
+      reason,
+      expected_updated_at: request.updated_at,
+    })
+      .then((result) => active && setPreview(result.preview))
+      .catch((err) => active && setError((err as Error).message))
+      .finally(() => active && setLoading(false));
+    return () => { active = false; };
+  }, [amount, batch.id, rateDate, reason, request.id, request.updated_at]);
+
+  async function applyCorrection() {
+    if (!preview || applying) return;
+    setApplying(true);
+    setError("");
+    try {
+      const result = await api.applyForeignAmountCorrection(batch.id, request.id, {
+        amount,
+        rate_date: rateDate,
+        reason,
+        expected_updated_at: request.updated_at,
+      });
+      await onApplied(result.request);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  return (
+    <Modal title={es ? "Confirmar corrección del importe" : "确认外币应付金额"} onClose={applying ? () => undefined : onClose} className="currency-conversion-modal">
+      <div className="currency-conversion-route">
+        <strong>{formatMoney(Number(request.amount || 0), request.currency)}</strong>
+        <ArrowRight size={18} />
+        <strong>{formatMoney(amount, request.currency)}</strong>
+      </div>
+      <label className="currency-rate-date">
+        {es ? "Fecha del tipo de cambio" : "汇率日期"}
+        <input type="date" value={rateDate} max={maxDate} onChange={(event) => setRateDate(event.target.value)} disabled={applying} />
+      </label>
+      {loading && <div className="editor-info-banner">{es ? "Consultando el tipo de cambio…" : "正在读取汇率…"}</div>}
+      {error && <p className="error-text" role="alert">{error}</p>}
+      {preview && (
+        <>
+          <div className="currency-rate-summary">
+            <div><span>{es ? "Tipo de cambio" : "采用汇率"}</span><strong>1 {preview.currency} = ¥{Number(preview.rate).toFixed(6)}</strong></div>
+            <div><span>{es ? "Fecha seleccionada" : "选择日期"}</span><strong>{preview.requested_rate_date}</strong></div>
+            <div><span>{es ? "Fecha aplicada" : "实际命中日期"}</span><strong>{preview.actual_rate_date}{preview.used_previous_rate ? (es ? " (fecha anterior más cercana)" : "（使用此前最近汇率）") : ""}</strong></div>
+          </div>
+          <div className="currency-amount-comparison">
+            <div className="currency-comparison-head"><span>{es ? "Concepto" : "项目"}</span><span>{es ? "Antes" : "修改前"}</span><span>{es ? "Después" : "修改后"}</span></div>
+            {(["amount", "paid_amount", "pending_amount"] as const).map((field) => (
+              <div key={field}>
+                <span>{es ? { amount: "A pagar", paid_amount: "Pagado", pending_amount: "Pendiente" }[field] : { amount: "应付", paid_amount: "已付", pending_amount: "待付" }[field]}</span>
+                <strong>{formatMoney(preview.before[field], preview.currency)}</strong>
+                <strong>{formatMoney(preview.after[field], preview.currency)}</strong>
+              </div>
+            ))}
+          </div>
+          <p className="currency-anchor-note">
+            {es
+              ? `El equivalente en CNY se actualizará de ${formatMoney(preview.before_base_amount_cny)} a ${formatMoney(preview.base_amount_cny)}. Los ${preview.payment_count} pagos existentes no cambiarán.`
+              : `人民币折算值将从 ${formatMoney(preview.before_base_amount_cny)} 更新为 ${formatMoney(preview.base_amount_cny)}；已有 ${preview.payment_count} 笔付款金额保持不变。`}
+          </p>
+        </>
+      )}
+      <div className="modal-actions">
+        <button className="ghost-button" type="button" onClick={onClose} disabled={applying}>{es ? "Cancelar" : "取消"}</button>
+        <button className="primary-button" type="button" onClick={applyCorrection} disabled={!preview || loading || applying}>
+          {applying ? (es ? "Guardando" : "处理中") : (es ? "Confirmar y guardar" : "确认并保存")}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 function HistoricalCurrencyRestoreDialog({ batch, onClose, onApplied }: { batch: Batch; onClose: () => void; onApplied: (count: number) => Promise<void> | void }) {
   const [preview, setPreview] = useState<HistoricalCurrencyRestorePreview | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -3862,6 +3971,7 @@ function RequestEditor({
   canEditField: (field: keyof PaymentRequest) => boolean;
   onCurrencyChange: (request: Partial<PaymentRequest>, target: string) => void;
 }) {
+  const { language } = useLanguage();
   const [form, setForm] = useState<Partial<PaymentRequest>>(request);
   const [activeTab, setActiveTab] = useState<RequestEditorTab>(initialTab);
   const [attachments, setAttachments] = useState<AttachmentLink[]>([]);
@@ -3876,6 +3986,7 @@ function RequestEditor({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [previewImages, setPreviewImages] = useState<{ images: AttachmentLink[]; index: number } | null>(null);
+  const [foreignAmountCorrection, setForeignAmountCorrection] = useState<number | null>(null);
   const fields: Array<keyof PaymentRequest> = [
     "dingding_id",
     "applicant",
@@ -3919,6 +4030,7 @@ function RequestEditor({
     setAttachmentMode(null);
     setSaveError("");
     setPreviewImages(null);
+    setForeignAmountCorrection(null);
   }, [request]);
 
   useEffect(() => {
@@ -3964,11 +4076,11 @@ function RequestEditor({
 
   useEffect(() => {
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape" && !previewImages && !confirmationOpen) onCancel();
+      if (event.key === "Escape" && !previewImages && foreignAmountCorrection === null && !confirmationOpen) onCancel();
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [confirmationOpen, onCancel, previewImages]);
+  }, [confirmationOpen, foreignAmountCorrection, onCancel, previewImages]);
 
   async function addAttachment() {
     if (!form.id || !canEditAttachments || !attachmentForm.url_path.trim()) return;
@@ -4011,7 +4123,7 @@ function RequestEditor({
   function renderField(field: keyof PaymentRequest, options: { span?: boolean } = {}) {
     const fieldEditable = canEditField(field)
       && !(requestDingTalkTerminated(form) && generalManagerControlledFields.has(field))
-      && !(field === "amount" && currencyCode(form.currency) !== "CNY");
+      && !(field === "amount" && currencyCode(form.currency) !== "CNY" && !["finance", "general_manager", "admin"].includes(user.role));
     const className = options.span ? "editor-field span-2" : "editor-field";
     const label = fieldLabels[field] || field;
     const value = field === "applicant" ? requestApplicantName(form) : form[field];
@@ -4068,6 +4180,22 @@ function RequestEditor({
 
   async function saveRequestForm() {
     if (!isDirty || saving) return;
+    const amountChanged = Boolean(form.id)
+      && currencyCode(form.currency) !== "CNY"
+      && Math.abs(Number(form.amount || 0) - Number(request.amount || 0)) > 0.000001;
+    if (amountChanged) {
+      if (Number(form.amount || 0) <= 0) {
+        setSaveError("应付金额必须大于 0");
+        return;
+      }
+      if (Number(form.amount || 0) + 0.000001 < Number(form.paid_amount || 0)) {
+        setSaveError(`应付金额不能低于累计已支付金额 ${formatMoney(Number(form.paid_amount || 0), form.currency)}`);
+        return;
+      }
+      setSaveError("");
+      setForeignAmountCorrection(Number(form.amount));
+      return;
+    }
     setSaving(true);
     setSaveError("");
     try {
@@ -4379,6 +4507,42 @@ function RequestEditor({
           index={previewImages.index}
           onIndexChange={(index) => setPreviewImages({ ...previewImages, index })}
           onClose={() => setPreviewImages(null)}
+        />
+      )}
+      {foreignAmountCorrection !== null && request.id && (
+        <ForeignAmountCorrectionDialog
+          batch={batch}
+          request={request as PaymentRequest}
+          amount={foreignAmountCorrection}
+          reason={reason}
+          language={language}
+          onClose={() => setForeignAmountCorrection(null)}
+          onApplied={async (updatedRequest) => {
+            setForeignAmountCorrection(null);
+            const correctedForm: Partial<PaymentRequest> = {
+              ...form,
+              amount: updatedRequest.amount,
+              paid_amount: updatedRequest.paid_amount,
+              pending_amount: updatedRequest.pending_amount,
+              finance_review: updatedRequest.finance_review,
+              base_amount_cny: updatedRequest.base_amount_cny,
+              fx_rate_cny_per_unit: updatedRequest.fx_rate_cny_per_unit,
+              fx_rate_date: updatedRequest.fx_rate_date,
+              fx_rate_actual_date: updatedRequest.fx_rate_actual_date,
+              updated_at: updatedRequest.updated_at,
+            };
+            setSaving(true);
+            setSaveError("");
+            try {
+              const savedRequest = await onSave(correctedForm);
+              if (savedRequest) setForm(savedRequest);
+            } catch (err) {
+              setForm(correctedForm);
+              setSaveError(`应付金额已更正，但其他字段保存失败：${(err as Error).message}`);
+            } finally {
+              setSaving(false);
+            }
+          }}
         />
       )}
     </div>

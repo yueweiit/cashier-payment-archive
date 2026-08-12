@@ -403,6 +403,20 @@ export type CurrencyConversionPreview = {
   request_updated_at?: string;
 };
 
+export type ForeignAmountCorrectionPreview = {
+  request_id: number;
+  currency: CurrencyCode;
+  requested_rate_date: string;
+  actual_rate_date: string;
+  used_previous_rate: boolean;
+  rate: number;
+  before_base_amount_cny: number;
+  base_amount_cny: number;
+  payment_count: number;
+  before: { amount: number; paid_amount: number; pending_amount: number };
+  after: { amount: number; paid_amount: number; pending_amount: number };
+};
+
 export type RequestGridPreference = {
   version: number;
   order: string[];
@@ -576,6 +590,10 @@ export const api = {
     request<{ preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/preview`, { method: "POST", body: JSON.stringify(payload) }),
   applyCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; mode?: "convert" | "correct"; reason?: string; expected_updated_at?: string }) =>
     request<{ status: string; request: PaymentRequest; preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/apply`, { method: "POST", body: JSON.stringify(payload) }),
+  previewForeignAmountCorrection: (batchId: number, requestId: number, payload: { amount: number; rate_date: string; reason?: string; expected_updated_at?: string }) =>
+    request<{ preview: ForeignAmountCorrectionPreview }>(`/api/batches/${batchId}/requests/${requestId}/amount-correction/preview`, { method: "POST", body: JSON.stringify(payload) }),
+  applyForeignAmountCorrection: (batchId: number, requestId: number, payload: { amount: number; rate_date: string; reason?: string; expected_updated_at?: string }) =>
+    request<{ status: string; request: PaymentRequest; preview: ForeignAmountCorrectionPreview }>(`/api/batches/${batchId}/requests/${requestId}/amount-correction/apply`, { method: "POST", body: JSON.stringify(payload) }),
   previewHistoricalCurrencyRestore: (batchId: number) =>
     request<HistoricalCurrencyRestorePreview>(`/api/batches/${batchId}/historical-currency-restore/preview`),
   applyHistoricalCurrencyRestore: (batchId: number, payload: { request_ids: number[]; reason?: string }) =>

@@ -3255,6 +3255,89 @@ def test_currency_correction_keeps_numeric_amounts_and_updates_cny_value(monkeyp
             assert json.loads(audit["new_value_json"])["mode"] == "correct"
 
 
+def test_foreign_amount_correction_uses_confirmed_rate_and_keeps_payments(monkeypatch):
+    def fake_rates(selected_date, currencies):
+        values = {"CNY": 1.0, "USD": 6.8, "MXN": 0.4}
+        return {
+            currency: {
+                "currency": currency,
+                "cny_per_unit": values[currency],
+                "requested_date": selected_date.isoformat(),
+                "actual_date": selected_date.isoformat(),
+                "fallback": False,
+            }
+            for currency in currencies
+        }
+
+    monkeypatch.setattr(main_module, "fetch_rates", fake_rates)
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "foreign-amount-correction", "start_date": "2026-08-01", "end_date": "2026-08-10"},
+        ).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"amount": 680, "currency": "CNY", "source_sheet": "汇率测试"},
+        ).json()["request"]
+        payment = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/payments",
+            json={"amount": 340, "payment_date": "2026-08-08"},
+        )
+        assert payment.status_code == 200
+        current = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"][0]
+        converted_response = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/currency-conversion/apply",
+            json={"target_currency": "USD", "rate_date": "2026-08-08", "expected_updated_at": current["updated_at"]},
+        )
+        assert converted_response.status_code == 200, converted_response.text
+        converted = converted_response.json()["request"]
+        assert converted["amount"] == 100
+        assert converted["paid_amount"] == 50
+
+        preview_response = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/amount-correction/preview",
+            json={"amount": 120, "rate_date": "2026-08-09", "expected_updated_at": converted["updated_at"]},
+        )
+        assert preview_response.status_code == 200, preview_response.text
+        preview = preview_response.json()["preview"]
+        assert preview["before"] == {"amount": 100.0, "paid_amount": 50.0, "pending_amount": 50.0}
+        assert preview["after"] == {"amount": 120.0, "paid_amount": 50.0, "pending_amount": 70.0}
+        assert preview["base_amount_cny"] == 816.0
+
+        applied_response = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/amount-correction/apply",
+            json={"amount": 120, "rate_date": "2026-08-09", "expected_updated_at": converted["updated_at"]},
+        )
+        assert applied_response.status_code == 200, applied_response.text
+        corrected = applied_response.json()["request"]
+        assert corrected["currency"] == "USD"
+        assert corrected["amount"] == 120
+        assert corrected["paid_amount"] == 50
+        assert corrected["pending_amount"] == 70
+        assert corrected["base_amount_cny"] == 816
+
+        unchanged_patch = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request['id']}",
+            json={"amount": 120, "summary": "其他字段同时保存"},
+        )
+        assert unchanged_patch.status_code == 200, unchanged_patch.text
+        assert unchanged_patch.json()["request"]["summary"] == "其他字段同时保存"
+
+        too_low = client.post(
+            f"/api/batches/{batch['id']}/requests/{request['id']}/amount-correction/preview",
+            json={"amount": 40, "rate_date": "2026-08-09"},
+        )
+        assert too_low.status_code == 400
+        assert "累计已支付" in too_low.json()["detail"]
+        with connect() as conn:
+            audit = conn.execute(
+                "SELECT action FROM audit_logs WHERE entity_id = ? AND action = 'request.amount_correct' ORDER BY id DESC LIMIT 1",
+                (request["id"],),
+            ).fetchone()
+            assert audit is not None
+
+
 def test_historical_currency_restore_can_be_rolled_back():
     with TestClient(app) as client:
         login(client)
