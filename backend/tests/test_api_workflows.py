@@ -26,6 +26,7 @@ from backend.app.external_expenses import (
     _parse_workflow_events,
     _preview_conditions,
     approval_result_is_disallowed,
+    execution_region_is_allowed,
     applicant_name_from_title,
     classify_dingtalk_payment_event,
     map_monthly_payment,
@@ -1985,6 +1986,36 @@ def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
     assert "审批已拒绝、作废或终止，默认不导入" in refused["errors"]
     assert refused["applicant"] == "Operador Uno"
 
+    mexico = map_external_expense(
+        {
+            "source_type": "operation",
+            "source_id": "602",
+            "effective_date": date(2026, 8, 12),
+            "approval_no": "OP-MX-602",
+            "creator_name": "mx-user",
+            "applicant_department": "原始墨西哥部门",
+            "approval_title": "Solicitud enviado por Mario Gomez",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "墨西哥México",
+            "beneficiary": "Proveedor MX",
+            "expense_type": "Gastos administrativos",
+            "summary": "Prueba México",
+            "source_currency": "MXN",
+            "source_amount": Decimal("1000"),
+            "base_currency_amount": Decimal("400"),
+            "raw_data": {},
+        }
+    )
+    assert mexico["errors"] == []
+    assert mexico["request_data"]["currency"] == "MXN"
+    assert mexico["request_data"]["amount"] == 1000
+
+    assert execution_region_is_allowed("中国China")
+    assert execution_region_is_allowed("墨西哥Mexico")
+    assert execution_region_is_allowed("México")
+    assert not execution_region_is_allowed("美国USA")
+
     for result in ("refuse", "REJECTED", "cancelled", "revoked", "voided", "已作废", "审批已拒绝", "已撤回"):
         assert approval_result_is_disallowed(result)
     for result in ("", "agree", "approved", "同意"):
@@ -2095,6 +2126,8 @@ def test_external_expense_exact_approval_number_ignores_dates():
     assert "effective_date" not in exact_sql
     assert "BTRIM(approval_no) = %s" in exact_sql
     assert "base_currency_amount <> 0" in exact_sql
+    assert "execution_region" in exact_sql
+    assert exact_params[-3] == r"(中国|china|墨西哥|m[eé]xico)"
     assert "!~* %s" in exact_sql
     assert exact_params[-1] == "202607071704000140246"
 

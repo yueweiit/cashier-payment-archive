@@ -26,6 +26,7 @@ ALLOWED_SOURCE_TYPES = ("operation", "purchase", "monthly")
 STANDARD_SOURCE_TYPES = ("operation", "purchase")
 MONTHLY_PAYMENT_PROCESS_CODE = "PROC-EE85EDD4-5CF2-4C08-B948-1690A6ACC51C"
 ALLOWED_APPROVAL_STATUSES = ("COMPLETED", "RUNNING")
+ALLOWED_EXECUTION_REGION_PATTERN = r"(中国|china|墨西哥|m[eé]xico)"
 DISALLOWED_APPROVAL_RESULT_PATTERN = r"(refus|reject|cancel|terminat|revok|void|abort|作废|拒绝|撤销|撤回|取消|终止)"
 DISALLOWED_APPROVAL_RESULT_RE = re.compile(DISALLOWED_APPROVAL_RESULT_PATTERN, re.IGNORECASE)
 SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出", "monthly": "月结付款"}
@@ -603,13 +604,14 @@ def _preview_conditions(
     conditions = [
         "source_type = ANY(%s)",
         "UPPER(BTRIM(COALESCE(approval_status, ''))) = ANY(%s)",
-        "(execution_region ILIKE '%%中国%%' OR execution_region ILIKE '%%china%%')",
+        "COALESCE(execution_region, '') ~* %s",
         "COALESCE(approval_result, '') !~* %s",
         "(base_currency_amount IS NULL OR base_currency_amount <> 0)",
     ]
     params: list[Any] = [
         normalized_sources,
         list(ALLOWED_APPROVAL_STATUSES),
+        ALLOWED_EXECUTION_REGION_PATTERN,
         DISALLOWED_APPROVAL_RESULT_PATTERN,
     ]
     normalized_approval_no = approval_no.strip()
@@ -1278,8 +1280,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         errors.append("缺少应付金额")
     elif base_amount < 0:
         errors.append("应付金额不能为负数")
-    if "中国" not in execution_region and "china" not in execution_region.lower():
-        errors.append("执行地区不是中国")
+    if not execution_region_is_allowed(execution_region):
+        errors.append("执行地区仅允许中国或墨西哥")
     if approval_status not in ALLOWED_APPROVAL_STATUSES:
         errors.append("审批状态不允许导入")
     if approval_result_is_disallowed(approval_result):
@@ -1361,6 +1363,10 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
 
 def approval_result_is_disallowed(value: Any) -> bool:
     return bool(DISALLOWED_APPROVAL_RESULT_RE.search(_text(value) or ""))
+
+
+def execution_region_is_allowed(value: Any) -> bool:
+    return bool(re.search(ALLOWED_EXECUTION_REGION_PATTERN, _text(value) or "", re.IGNORECASE))
 
 
 def applicant_name_from_title(value: Any) -> str:
