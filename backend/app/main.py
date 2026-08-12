@@ -4174,7 +4174,17 @@ def preview_external_expense_rows(
     approval_counts = Counter(row.get("approval_no") for row in rows if row.get("approval_no"))
     conflict_approval_nos = {approval_no for approval_no, count in approval_counts.items() if count > 1}
     with connect() as conn:
-        duplicates = external_expense_duplicate_map(conn, [row.get("approval_no") for row in rows])
+        duplicates = external_expense_duplicate_map(
+            conn,
+            [
+                *[row.get("approval_no") for row in rows],
+                *[
+                    approval_no
+                    for row in rows
+                    for approval_no in (row.get("related_approval_nos") or [])
+                ],
+            ],
+        )
         for source_row in rows:
             mapped, mapping, _ = apply_employee_department_mapping(conn, dict(source_row.get("request_data") or {}))
             if mapping:
@@ -4202,6 +4212,13 @@ def preview_external_expense_rows(
             row["source_conflict"] = True
             if "同一钉钉单号存在多条来源记录" not in row["errors"]:
                 row["errors"].append("同一钉钉单号存在多条来源记录")
+        related_existing = [
+            related_no
+            for related_no in (row.get("related_approval_nos") or [])
+            if related_no in duplicates
+        ]
+        if related_existing:
+            row["warnings"].append(f"关联审批已存在：{'、'.join(related_existing)}")
         row["duplicate"] = duplicates.get(approval_no)
         row["importable"] = not row["errors"] and row["duplicate"] is None
         public_rows.append(row)

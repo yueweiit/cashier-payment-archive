@@ -19,17 +19,20 @@ from dotenv import dotenv_values
 from psycopg.rows import dict_row
 
 from .db import ROOT_DIR
-from .fx_rates import normalize_currency
+from .fx_rates import FxRateError, fetch_rates, multiply_money, normalize_currency
 
 
-ALLOWED_SOURCE_TYPES = ("operation", "purchase")
+ALLOWED_SOURCE_TYPES = ("operation", "purchase", "monthly")
+STANDARD_SOURCE_TYPES = ("operation", "purchase")
+MONTHLY_PAYMENT_PROCESS_CODE = "PROC-EE85EDD4-5CF2-4C08-B948-1690A6ACC51C"
 ALLOWED_APPROVAL_STATUSES = ("COMPLETED", "RUNNING")
 DISALLOWED_APPROVAL_RESULT_PATTERN = r"(refus|reject|cancel|terminat|revok|void|abort|作废|拒绝|撤销|撤回|取消|终止)"
 DISALLOWED_APPROVAL_RESULT_RE = re.compile(DISALLOWED_APPROVAL_RESULT_PATTERN, re.IGNORECASE)
-SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出"}
+SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出", "monthly": "月结付款"}
 SOURCE_TABLES = {
     "operation": "approval_expense_operation",
     "purchase": "approval_expense_purchase",
+    "monthly": "ding_approval_instance",
 }
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 FINANCE_STAGE_RE = re.compile(r"(财务|出纳|会计|付款|financ|cajer|tesorer|contab)", re.IGNORECASE)
@@ -287,6 +290,308 @@ def source_connection(dbname: Optional[str] = None) -> Iterator[psycopg.Connecti
         raise ExternalExpenseError("无法读取支出中间表，请检查数据库配置或网络连接") from exc
 
 
+def _monthly_payment_query(
+    *,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    approval_no: str = "",
+    applicant_ids: Optional[Iterable[str]] = None,
+    source_ids: Optional[Iterable[str]] = None,
+    include_inactive: bool = False,
+) -> list[Dict[str, Any]]:
+    conditions = ["deleted_at IS NULL", "process_code = %s"]
+    params: list[Any] = [MONTHLY_PAYMENT_PROCESS_CODE]
+    normalized_approval_no = approval_no.strip()
+    normalized_source_ids = sorted({str(value).strip() for value in source_ids or [] if str(value).strip()})
+    if normalized_source_ids:
+        conditions.append("id::text = ANY(%s)")
+        params.append(normalized_source_ids)
+    elif normalized_approval_no:
+        conditions.append("BTRIM(raw_payload->>'businessId') = %s")
+        params.append(normalized_approval_no)
+    elif date_from is not None and date_to is not None:
+        conditions.append("(create_time AT TIME ZONE 'Asia/Shanghai')::date BETWEEN %s AND %s")
+        params.extend([date_from, date_to])
+    else:
+        raise ExternalExpenseError("查询条件缺少申请日期")
+    normalized_applicant_ids = sorted({str(value).strip() for value in applicant_ids or [] if str(value).strip()})
+    if normalized_applicant_ids:
+        conditions.append("BTRIM(COALESCE(raw_payload->>'originatorUserId', '')) = ANY(%s)")
+        params.append(normalized_applicant_ids)
+    if not include_inactive:
+        conditions.extend([
+            "UPPER(BTRIM(COALESCE(status, ''))) = ANY(%s)",
+            "COALESCE(result, '') !~* %s",
+        ])
+        params.extend([list(ALLOWED_APPROVAL_STATUSES), DISALLOWED_APPROVAL_RESULT_PATTERN])
+    config = source_database_config()
+    with source_connection(config.user_dbname) as conn:
+        return conn.execute(
+            f"""
+            SELECT id::text AS source_id,
+                   process_instance_id,
+                   process_code,
+                   create_time,
+                   updated_at,
+                   status,
+                   result,
+                   title,
+                   raw_payload
+            FROM public.ding_approval_instance
+            WHERE {' AND '.join(conditions)}
+            ORDER BY create_time DESC NULLS LAST, id DESC
+            """,
+            params,
+        ).fetchall()
+
+
+def _decoded_component_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "[{\"":
+        return value
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value
+
+
+def _display_component_value(value: Any) -> Optional[str]:
+    decoded = _decoded_component_value(value)
+    if isinstance(decoded, list):
+        parts = [_display_component_value(item) for item in decoded]
+        return " / ".join(part for part in parts if part) or None
+    if isinstance(decoded, dict):
+        return _first_text(decoded.get("name"), decoded.get("label"), decoded.get("value"), decoded.get("text"))
+    return _text(decoded)
+
+
+def _monthly_component(form_values: Iterable[Dict[str, Any]], *prefixes: str) -> Optional[str]:
+    for item in form_values:
+        name = _text(item.get("name")) or ""
+        if any(name.startswith(prefix) for prefix in prefixes):
+            value = _display_component_value(item.get("value"))
+            if value:
+                return value
+    return None
+
+
+def _monthly_money(value: Any) -> Optional[float]:
+    text = _display_component_value(value)
+    if not text:
+        return None
+    match = re.search(r"-?[0-9][0-9,]*(?:\.\d+)?", text)
+    return _number(match.group(0).replace(",", "")) if match else None
+
+
+def _monthly_payment_details(form_values: Iterable[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    table_value: Any = None
+    for item in form_values:
+        if (_text(item.get("name")) or "").startswith("申请付款明细"):
+            table_value = _decoded_component_value(item.get("value"))
+            break
+    if not isinstance(table_value, list):
+        return []
+    details: list[Dict[str, Any]] = []
+    for index, raw_row in enumerate(table_value, start=1):
+        if not isinstance(raw_row, dict):
+            continue
+        cells = raw_row.get("rowValue")
+        if not isinstance(cells, list):
+            cells = raw_row.get("values") if isinstance(raw_row.get("values"), list) else []
+        fields: Dict[str, Any] = {}
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            label = _text(cell.get("label")) or _text(cell.get("name")) or ""
+            if label:
+                fields[label] = _decoded_component_value(cell.get("value"))
+        payment_date = next(
+            (_date_text(value) for label, value in fields.items() if "日期" in label and _date_text(value)),
+            None,
+        )
+        amount = next(
+            (_monthly_money(value) for label, value in fields.items() if "金额" in label and _monthly_money(value) is not None),
+            None,
+        )
+        description = next(
+            (_display_component_value(value) for label, value in fields.items() if any(word in label for word in ("说明", "事由", "摘要", "备注")) and _display_component_value(value)),
+            None,
+        )
+        details.append({
+            "row_no": index,
+            "payment_date": payment_date,
+            "amount": amount,
+            "description": description,
+            "fields": fields,
+        })
+    return details
+
+
+def _related_approval_nos(form_values: Iterable[Dict[str, Any]]) -> list[str]:
+    values: list[str] = []
+    for item in form_values:
+        if "关联审批" not in (_text(item.get("name")) or ""):
+            continue
+        decoded = _decoded_component_value(item.get("value"))
+        stack = [decoded]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                for key in ("businessId", "business_id", "approvalNo", "approval_no"):
+                    candidate = _text(current.get(key))
+                    if candidate:
+                        values.extend(APPROVAL_REFERENCE_RE.findall(candidate))
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+            else:
+                values.extend(APPROVAL_REFERENCE_RE.findall(_text(current) or ""))
+    return sorted(set(values))
+
+
+def _attachment_objects(value: Any) -> list[Dict[str, Any]]:
+    decoded = _decoded_component_value(value)
+    found: list[Dict[str, Any]] = []
+    stack = [decoded]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str):
+            decoded_current = _decoded_component_value(current)
+            if decoded_current is not current:
+                stack.append(decoded_current)
+            continue
+        if isinstance(current, dict):
+            if current.get("fileId") or current.get("file_id"):
+                found.append(current)
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return found
+
+
+def _monthly_attachments(instance: Dict[str, Any]) -> list[Dict[str, Any]]:
+    raw_payload = _json_object(instance.get("raw_payload"))
+    approval_no = _text(raw_payload.get("businessId")) or ""
+    process_instance_id = _text(instance.get("process_instance_id")) or ""
+    source_id = _text(instance.get("source_id")) or ""
+    objects: list[Dict[str, Any]] = []
+    for component in _form_values(raw_payload):
+        objects.extend(_attachment_objects(component.get("value")))
+    unique: Dict[str, Dict[str, Any]] = {}
+    for attachment in objects:
+        file_id = _text(attachment.get("fileId")) or _text(attachment.get("file_id")) or ""
+        if not file_id:
+            continue
+        stable_id = f"monthly-{process_instance_id or source_id}-{file_id}"
+        try:
+            file_size = int(attachment.get("fileSize")) if attachment.get("fileSize") is not None else None
+        except (TypeError, ValueError):
+            file_size = None
+        unique.setdefault(stable_id, {
+            "source_type": "monthly",
+            "source_id": source_id,
+            "approval_no": approval_no,
+            "attachment_id": stable_id,
+            "row_no": None,
+            "file_id": file_id,
+            "file_name": _first_text(attachment.get("fileName"), attachment.get("name")) or f"月结附件-{file_id}",
+            "file_type": (_first_text(attachment.get("fileType"), attachment.get("type")) or "").lower(),
+            "file_size": file_size,
+            "created_at": _workflow_event_time(instance.get("create_time")),
+        })
+    return list(unique.values())
+
+
+def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    raw_payload = _json_object(instance.get("raw_payload"))
+    form_values = _form_values(raw_payload)
+    details = _monthly_payment_details(form_values)
+    declared_total = _monthly_money(_monthly_component(form_values, "合计总额", "总计"))
+    detail_amounts = [detail["amount"] for detail in details if detail.get("amount") is not None]
+    calculated_total = round(sum(detail_amounts), 2) if detail_amounts else None
+    total = declared_total if declared_total is not None else calculated_total
+    application_time = _workflow_event_time(instance.get("create_time"))
+    application_date = application_time[:10] if application_time else None
+    currency_text = _monthly_component(form_values, "币种", "货币", "Currency", "Moneda")
+    currency = normalize_currency(currency_text)
+    base_amount: Optional[float] = total if currency == "CNY" else None
+    fx_rate: Optional[float] = 1.0 if currency == "CNY" else None
+    fx_actual_date = application_date
+    rate_error: Optional[str] = None
+    if total is not None and total > 0 and currency in {"USD", "MXN"} and application_date:
+        try:
+            rate = fetch_rates(date.fromisoformat(application_date), [currency])[currency]
+            fx_rate = float(rate["cny_per_unit"])
+            fx_actual_date = str(rate["actual_date"])
+            base_amount = multiply_money(total, fx_rate)
+        except (FxRateError, ValueError) as exc:
+            rate_error = str(exc)
+    applicant_id = _text(raw_payload.get("originatorUserId")) or ""
+    raw_row = {
+        "source_type": "monthly",
+        "source_id": _text(instance.get("source_id")) or "",
+        "effective_date": application_date,
+        "approval_no": _text(raw_payload.get("businessId")) or "",
+        "creator_name": applicant_id,
+        "applicant_department": _text(raw_payload.get("originatorDeptName")),
+        "approval_title": _first_text(instance.get("title"), raw_payload.get("title")),
+        "approval_status": instance.get("status"),
+        "approval_result": instance.get("result"),
+        "execution_region": "中国China",
+        "beneficiary": _monthly_component(form_values, "收款账户信息", "收款信息", "收款账户"),
+        "expense_type": _monthly_component(form_values, "付款分类", "费用性质"),
+        "summary": _monthly_component(form_values, "申请事由", "付款事由") or next((detail.get("description") for detail in details if detail.get("description")), None),
+        "project": None,
+        "needed_payment_date": min((detail["payment_date"] for detail in details if detail.get("payment_date")), default=None),
+        "source_currency": currency_text,
+        "source_amount": total,
+        "base_currency_amount": base_amount,
+        "source_created_at": instance.get("create_time"),
+        "source_updated_at": instance.get("updated_at"),
+        "raw_data": raw_payload,
+    }
+    mapped = map_external_expense(raw_row, user_names)
+    if rate_error:
+        mapped["errors"] = [message for message in mapped["errors"] if message != "缺少应付金额"]
+        mapped["errors"].append(f"找不到月结付款汇率：{rate_error}")
+        mapped["amount"] = total
+        mapped["currency"] = currency
+        mapped["request_data"]["amount"] = total
+        mapped["request_data"]["currency"] = currency
+    if declared_total is not None and calculated_total is not None and abs(declared_total - calculated_total) > 0.01:
+        mapped["warnings"].append("月结合计金额与付款明细合计不一致，请核对")
+    if len(details) > 1:
+        mapped["warnings"].append(f"月结包含 {len(details)} 行付款明细，已按合计金额生成一条请款")
+        detail_summaries = [
+            str(detail.get("description") or "").strip()
+            for detail in details
+            if str(detail.get("description") or "").strip()
+        ]
+        if detail_summaries:
+            concise_details = "；".join(dict.fromkeys(detail_summaries))
+            mapped["summary"] = f"{mapped['summary']}｜{concise_details}"[:500]
+            mapped["request_data"]["summary"] = mapped["summary"]
+    if currency not in {"CNY", "USD", "MXN"}:
+        mapped["errors"].append("月结付款缺少或无法识别币种")
+    related = _related_approval_nos(form_values)
+    external_source = mapped["request_data"]["raw_extra"]["external_source"]
+    external_source.update({
+        "system": "dingtalk_monthly_payment",
+        "process_code": MONTHLY_PAYMENT_PROCESS_CODE,
+        "process_instance_id": _text(instance.get("process_instance_id")),
+        "monthly_payment_details": details,
+        "related_approval_nos": related,
+        "fx_rate_actual_date": fx_actual_date,
+    })
+    mapped["request_data"]["payment_account"] = _monthly_component(form_values, "付款账户类型", "付款账户")
+    mapped["request_data"]["fx_rate_cny_per_unit"] = fx_rate
+    mapped["request_data"]["fx_rate_actual_date"] = fx_actual_date
+    mapped["related_approval_nos"] = related
+    return mapped
+
+
 def _preview_conditions(
     date_from: Optional[date],
     date_to: Optional[date],
@@ -331,29 +636,69 @@ def preview_external_expenses(
     approval_no: str = "",
     applicant_ids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
-    condition_sql, params = _preview_conditions(date_from, date_to, source_types, approval_no, applicant_ids)
-    option_sql, option_params = _preview_conditions(date_from, date_to, source_types, approval_no, [])
-    query = f"""
-        {SOURCE_ROWS_CTE}
-        SELECT * FROM source_rows
-        WHERE {condition_sql}
-        ORDER BY effective_date DESC, approval_no DESC, source_type, source_id
-    """
-    option_query = f"""
-        {SOURCE_ROWS_CTE}
-        SELECT creator_name, applicant_department, approval_title, COUNT(*) AS count FROM source_rows
-        WHERE {option_sql} AND creator_name IS NOT NULL AND BTRIM(creator_name) <> ''
-        GROUP BY creator_name, applicant_department, approval_title
-        ORDER BY creator_name, count DESC
-    """
-    with source_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
-        applicant_rows = conn.execute(option_query, option_params).fetchall()
+    normalized_sources = [source for source in source_types if source in ALLOWED_SOURCE_TYPES]
+    standard_sources = [source for source in normalized_sources if source in STANDARD_SOURCE_TYPES]
+    rows: list[Dict[str, Any]] = []
+    applicant_rows: list[Dict[str, Any]] = []
+    if standard_sources:
+        condition_sql, params = _preview_conditions(date_from, date_to, standard_sources, approval_no, applicant_ids)
+        option_sql, option_params = _preview_conditions(date_from, date_to, standard_sources, approval_no, [])
+        query = f"""
+            {SOURCE_ROWS_CTE}
+            SELECT * FROM source_rows
+            WHERE {condition_sql}
+            ORDER BY effective_date DESC, approval_no DESC, source_type, source_id
+        """
+        option_query = f"""
+            {SOURCE_ROWS_CTE}
+            SELECT creator_name, applicant_department, approval_title, COUNT(*) AS count FROM source_rows
+            WHERE {option_sql} AND creator_name IS NOT NULL AND BTRIM(creator_name) <> ''
+            GROUP BY creator_name, applicant_department, approval_title
+            ORDER BY creator_name, count DESC
+        """
+        with source_connection() as conn:
+            rows.extend(conn.execute(query, params).fetchall())
+            applicant_rows.extend(conn.execute(option_query, option_params).fetchall())
+    monthly_rows: list[Dict[str, Any]] = []
+    monthly_option_rows: list[Dict[str, Any]] = []
+    if "monthly" in normalized_sources:
+        monthly_rows = _monthly_payment_query(
+            date_from=date_from,
+            date_to=date_to,
+            approval_no=approval_no,
+            applicant_ids=applicant_ids,
+        )
+        monthly_option_rows = monthly_rows if not list(applicant_ids or []) else _monthly_payment_query(
+            date_from=date_from,
+            date_to=date_to,
+            approval_no=approval_no,
+            applicant_ids=[],
+        )
+        for instance in monthly_option_rows:
+            raw_payload = _json_object(instance.get("raw_payload"))
+            applicant_rows.append({
+                "creator_name": _text(raw_payload.get("originatorUserId")),
+                "applicant_department": _text(raw_payload.get("originatorDeptName")),
+                "approval_title": _first_text(instance.get("title"), raw_payload.get("title")),
+                "count": 1,
+            })
     user_names = fetch_dingtalk_user_names(
-        [row.get("creator_name") for row in [*rows, *applicant_rows]]
+        [
+            *[row.get("creator_name") for row in [*rows, *applicant_rows]],
+            *[
+                _text(_json_object(instance.get("raw_payload")).get("originatorUserId"))
+                for instance in monthly_rows
+            ],
+        ]
+    )
+    mapped_rows = [map_external_expense(row, user_names) for row in rows]
+    mapped_rows.extend(map_monthly_payment(instance, user_names) for instance in monthly_rows)
+    mapped_rows.sort(
+        key=lambda row: (row.get("application_date") or "", row.get("approval_no") or "", row.get("source_type") or ""),
+        reverse=True,
     )
     return {
-        "rows": [map_external_expense(row, user_names) for row in rows],
+        "rows": mapped_rows,
         "applicant_options": _applicant_options(applicant_rows, user_names),
     }
 
@@ -373,10 +718,47 @@ def fetch_external_expense_metadata(approval_nos: Iterable[str]) -> list[Dict[st
                 ORDER BY approval_no, source_updated_at DESC NULLS LAST, source_type, source_id
             """
             source_rows.extend(conn.execute(query, [chunk]).fetchall())
-    user_names = fetch_dingtalk_user_names(row.get("creator_name") for row in source_rows)
+    monthly_rows: list[Dict[str, Any]] = []
+    config = source_database_config()
+    with source_connection(config.user_dbname) as conn:
+        for start in range(0, len(normalized), 500):
+            chunk = normalized[start : start + 500]
+            monthly_rows.extend(
+                conn.execute(
+                    """
+                    SELECT id::text AS source_id, process_instance_id, process_code,
+                           create_time, updated_at, status, result, title,
+                           raw_payload
+                    FROM public.ding_approval_instance
+                    WHERE deleted_at IS NULL
+                      AND process_code = %s
+                      AND BTRIM(raw_payload->>'businessId') = ANY(%s)
+                    ORDER BY BTRIM(raw_payload->>'businessId'), updated_at DESC NULLS LAST, id DESC
+                    """,
+                    [MONTHLY_PAYMENT_PROCESS_CODE, chunk],
+                ).fetchall()
+            )
+    monthly_user_ids = [
+        _text(_json_object(row.get("raw_payload")).get("originatorUserId"))
+        for row in monthly_rows
+    ]
+    user_names = fetch_dingtalk_user_names([
+        *[row.get("creator_name") for row in source_rows],
+        *monthly_user_ids,
+    ])
     metadata: list[Dict[str, Any]] = []
     for source_row in source_rows:
         mapped = map_external_expense(source_row, user_names)
+        external_source = mapped["request_data"]["raw_extra"]["external_source"]
+        metadata.append({
+            "approval_no": mapped["approval_no"],
+            "source_type": mapped["source_type"],
+            "source_label": mapped["source_label"],
+            "source_id": mapped["source_id"],
+            **external_source,
+        })
+    for monthly_row in monthly_rows:
+        mapped = map_monthly_payment(monthly_row, user_names)
         external_source = mapped["request_data"]["raw_extra"]["external_source"]
         metadata.append({
             "approval_no": mapped["approval_no"],
@@ -468,6 +850,26 @@ def fetch_external_expense_attachments(approval_nos: Iterable[str]) -> list[Dict
                 "created_at": _datetime_text(row.get("created_at")),
             }
         )
+    config = source_database_config()
+    monthly_rows: list[Dict[str, Any]] = []
+    with source_connection(config.user_dbname) as conn:
+        for start in range(0, len(normalized), 500):
+            chunk = normalized[start : start + 500]
+            monthly_rows.extend(
+                conn.execute(
+                    """
+                    SELECT id::text AS source_id, process_instance_id, create_time, raw_payload
+                    FROM public.ding_approval_instance
+                    WHERE deleted_at IS NULL
+                      AND process_code = %s
+                      AND BTRIM(raw_payload->>'businessId') = ANY(%s)
+                    ORDER BY BTRIM(raw_payload->>'businessId'), updated_at DESC NULLS LAST, id DESC
+                    """,
+                    [MONTHLY_PAYMENT_PROCESS_CODE, chunk],
+                ).fetchall()
+            )
+    for monthly_row in monthly_rows:
+        attachments.extend(_monthly_attachments(monthly_row))
     return attachments
 
 
@@ -772,7 +1174,8 @@ def fetch_external_expenses(items: Iterable[Dict[str, str]]) -> list[Dict[str, A
     keys = {(str(item.get("source_type") or ""), str(item.get("source_id") or "")) for item in items}
     operation_ids = sorted(source_id for source_type, source_id in keys if source_type == "operation" and source_id.isdigit())
     purchase_ids = sorted(source_id for source_type, source_id in keys if source_type == "purchase" and source_id.isdigit())
-    if not operation_ids and not purchase_ids:
+    monthly_ids = sorted(source_id for source_type, source_id in keys if source_type == "monthly" and source_id.isdigit())
+    if not operation_ids and not purchase_ids and not monthly_ids:
         return []
     key_conditions: list[str] = []
     params: list[Any] = []
@@ -782,37 +1185,33 @@ def fetch_external_expenses(items: Iterable[Dict[str, str]]) -> list[Dict[str, A
     if purchase_ids:
         key_conditions.append("(source_type = 'purchase' AND source_id = ANY(%s))")
         params.append(purchase_ids)
-    query = f"""
-        {SOURCE_ROWS_CTE}
-        SELECT * FROM source_rows
-        WHERE {' OR '.join(key_conditions)}
-        ORDER BY source_type, source_id
-    """
-    with source_connection() as conn:
-        source_rows = conn.execute(query, params).fetchall()
-        approval_nos = sorted({str(row.get("approval_no") or "").strip() for row in source_rows if str(row.get("approval_no") or "").strip()})
-        conflicts: set[str] = set()
-        if approval_nos:
-            conflict_query = f"""
-                {SOURCE_ROWS_CTE}
-                SELECT BTRIM(approval_no) AS approval_no, COUNT(*) AS count
-                FROM source_rows
-                WHERE BTRIM(approval_no) = ANY(%s)
-                  AND UPPER(BTRIM(COALESCE(approval_status, ''))) = ANY(%s)
-                  AND (execution_region ILIKE '%%中国%%' OR execution_region ILIKE '%%china%%')
-                  AND COALESCE(approval_result, '') !~* %s
-                GROUP BY BTRIM(approval_no)
-                HAVING COUNT(*) > 1
-            """
-            conflicts = {
-                str(row["approval_no"])
-                for row in conn.execute(
-                    conflict_query,
-                    [approval_nos, list(ALLOWED_APPROVAL_STATUSES), DISALLOWED_APPROVAL_RESULT_PATTERN],
-                ).fetchall()
-            }
-    user_names = fetch_dingtalk_user_names(row.get("creator_name") for row in source_rows)
+    source_rows: list[Dict[str, Any]] = []
+    if key_conditions:
+        query = f"""
+            {SOURCE_ROWS_CTE}
+            SELECT * FROM source_rows
+            WHERE {' OR '.join(key_conditions)}
+            ORDER BY source_type, source_id
+        """
+        with source_connection() as conn:
+            source_rows = conn.execute(query, params).fetchall()
+    monthly_rows = _monthly_payment_query(source_ids=monthly_ids) if monthly_ids else []
+    monthly_user_ids = [
+        _text(_json_object(row.get("raw_payload")).get("originatorUserId"))
+        for row in monthly_rows
+    ]
+    user_names = fetch_dingtalk_user_names([
+        *[row.get("creator_name") for row in source_rows],
+        *monthly_user_ids,
+    ])
     rows = [map_external_expense(row, user_names) for row in source_rows]
+    rows.extend(map_monthly_payment(row, user_names) for row in monthly_rows)
+    approval_nos = sorted({str(row.get("approval_no") or "").strip() for row in rows if str(row.get("approval_no") or "").strip()})
+    conflicts: set[str] = set()
+    if approval_nos:
+        metadata = fetch_external_expense_metadata(approval_nos)
+        metadata_counts = Counter(str(row.get("approval_no") or "").strip() for row in metadata)
+        conflicts = {approval_no for approval_no, count in metadata_counts.items() if approval_no and count > 1}
     for row in rows:
         if row.get("approval_no") in conflicts:
             row["errors"].append("同一钉钉单号存在多条来源记录")

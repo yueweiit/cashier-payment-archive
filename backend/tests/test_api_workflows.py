@@ -28,7 +28,9 @@ from backend.app.external_expenses import (
     approval_result_is_disallowed,
     applicant_name_from_title,
     classify_dingtalk_payment_event,
+    map_monthly_payment,
     map_external_expense,
+    _monthly_attachments,
     valid_applicant_name,
 )
 from backend.app.excel_io import export_workbook
@@ -1987,6 +1989,71 @@ def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
         assert approval_result_is_disallowed(result)
     for result in ("", "agree", "approved", "同意"):
         assert not approval_result_is_disallowed(result)
+
+
+def test_monthly_payment_mapping_aggregates_details_and_extracts_attachments():
+    table_value = json.dumps([
+        {"rowValue": [
+            {"label": "付款日期", "value": "2026-08-12"},
+            {"label": "付款金额", "value": "1000"},
+            {"label": "付款说明", "value": "第二笔"},
+            {"label": "合同附件", "value": json.dumps([{"fileId": "detail-file", "fileName": "明细合同.pdf"}])},
+        ]},
+        {"rowValue": [
+            {"label": "付款日期", "value": "2026-08-11"},
+            {"label": "付款金额", "value": "1820"},
+            {"label": "付款说明", "value": "第一笔"},
+        ]},
+    ], ensure_ascii=False)
+    raw_payload = {
+        "businessId": "202608101140000516846",
+        "originatorUserId": "03413943004221481424",
+        "originatorDeptName": "原部门",
+        "formComponentValues": [
+            {"name": "申请事由", "value": "电脑租赁月结"},
+            {"name": "付款分类", "value": "办公用品采购付款"},
+            {"name": "付款账户类型", "value": "公账付款"},
+            {"name": "币种", "value": '["人民币"]'},
+            {"name": "收款账户信息", "value": "测试公司 账号123"},
+            {"name": "申请付款明细", "value": table_value},
+            {"name": "合计总额（元）", "value": "2820"},
+            {"name": "附件 Annex", "value": json.dumps([
+                {"fileId": "231753805378", "fileName": "20260507电脑租赁合同.pdf", "fileSize": 516944}
+            ], ensure_ascii=False)},
+            {"name": "关联审批单", "value": '[{"businessId":"202608091234000000001"}]'},
+        ],
+    }
+    instance = {
+        "source_id": "35",
+        "process_instance_id": "proc-monthly-35",
+        "process_code": "PROC-EE85EDD4-5CF2-4C08-B948-1690A6ACC51C",
+        "create_time": datetime.fromisoformat("2026-08-10T03:40:00+00:00"),
+        "updated_at": datetime.fromisoformat("2026-08-10T04:00:00+00:00"),
+        "status": "RUNNING",
+        "result": "agree",
+        "title": "施鸣坤提交的月结付款",
+        "originator_user_id": "03413943004221481424",
+        "raw_payload": raw_payload,
+    }
+    mapped = map_monthly_payment(instance, {"03413943004221481424": "施鸣坤"})
+    assert mapped["source_type"] == "monthly"
+    assert mapped["source_label"] == "月结付款"
+    assert mapped["approval_no"] == "202608101140000516846"
+    assert mapped["applicant"] == "施鸣坤"
+    assert mapped["amount"] == 2820
+    assert mapped["currency"] == "CNY"
+    assert mapped["needed_payment_date"] == "2026-08-11"
+    assert mapped["beneficiary"] == "测试公司 账号123"
+    assert mapped["request_data"]["payment_account"] == "公账付款"
+    assert mapped["request_data"]["raw_extra"]["external_source"]["monthly_payment_details"][0]["amount"] == 1000
+    assert mapped["related_approval_nos"] == ["202608091234000000001"]
+    assert "月结包含 2 行付款明细" in "；".join(mapped["warnings"])
+
+    attachments = _monthly_attachments(instance)
+    assert {attachment["file_id"] for attachment in attachments} == {"231753805378", "detail-file"}
+    contract = next(attachment for attachment in attachments if attachment["file_id"] == "231753805378")
+    assert contract["file_name"] == "20260507电脑租赁合同.pdf"
+    assert contract["file_size"] == 516944
 
 
 def test_external_expense_applicant_title_patterns():

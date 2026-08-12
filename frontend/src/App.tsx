@@ -1174,7 +1174,7 @@ function ExternalExpenseImportDialog({
   const defaultDates = externalImportDefaultDates(batch);
   const [dateFrom, setDateFrom] = useState(defaultDates.dateFrom);
   const [dateTo, setDateTo] = useState(defaultDates.dateTo);
-  const [sourceTypes, setSourceTypes] = useState<ExternalExpenseSourceType[]>(["operation", "purchase"]);
+  const [sourceTypes, setSourceTypes] = useState<ExternalExpenseSourceType[]>(["operation", "purchase", "monthly"]);
   const [approvalNo, setApprovalNo] = useState("");
   const [applicantIds, setApplicantIds] = useState<string[]>([]);
   const [applicantQuery, setApplicantQuery] = useState("");
@@ -1336,6 +1336,7 @@ function ExternalExpenseImportDialog({
           <span>支出来源</span>
           <label><input type="checkbox" checked={sourceTypes.includes("operation")} onChange={() => toggleSource("operation")} />运营支出</label>
           <label><input type="checkbox" checked={sourceTypes.includes("purchase")} onChange={() => toggleSource("purchase")} />采购支出</label>
+          <label><input type="checkbox" checked={sourceTypes.includes("monthly")} onChange={() => toggleSource("monthly")} />月结付款</label>
         </div>
         <label title={approvalNo.trim() ? "已按钉钉单号精确查询，日期范围不参与筛选" : undefined}>申请开始日期<input type="date" value={dateFrom} disabled={Boolean(approvalNo.trim())} onChange={(event) => setDateFrom(event.target.value)} /></label>
         <label title={approvalNo.trim() ? "已按钉钉单号精确查询，日期范围不参与筛选" : undefined}>申请结束日期<input type="date" value={dateTo} disabled={Boolean(approvalNo.trim())} onChange={(event) => setDateTo(event.target.value)} /></label>

@@ -98,7 +98,7 @@ export type ExternalSourceSnapshot = {
   base_currency_amount?: number;
 };
 
-export type ExternalExpenseSourceType = "operation" | "purchase";
+export type ExternalExpenseSourceType = "operation" | "purchase" | "monthly";
 export type ExternalExpenseResultFilter = "matched" | "importable" | "duplicates" | "warnings" | "invalid";
 
 export type ExternalExpensePreviewRow = {
@@ -119,6 +119,7 @@ export type ExternalExpensePreviewRow = {
   base_amount_cny?: number;
   beneficiary: string;
   needed_payment_date?: string;
+  related_approval_nos?: string[];
   warnings: string[];
   errors: string[];
   source_conflict: boolean;
