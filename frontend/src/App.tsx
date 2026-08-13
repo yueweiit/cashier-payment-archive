@@ -599,6 +599,7 @@ function TopbarImportActions({
   const [mappingOpen, setMappingOpen] = useState(false);
   const [externalImportOpen, setExternalImportOpen] = useState(false);
   const [mergePreview, setMergePreview] = useState<WeeklyMergePreview | null>(null);
+  const [importToolsOpen, setImportToolsOpen] = useState(false);
   const [busyAction, setBusyAction] = useState<"weekly" | "weekly-merge" | "dingtalk" | "employee-departments" | "sync-metadata" | "rollback" | null>(null);
   const [weeklyInputKey, setWeeklyInputKey] = useState(0);
   const [dingtalkInputKey, setDingtalkInputKey] = useState(0);
@@ -743,12 +744,45 @@ function TopbarImportActions({
 
   return (
     <>
-      <section className="import-toolbar-panel" aria-label="数据导入">
-        <div className="import-toolbar-title">
-          <strong>数据导入</strong>
-          <small>导入本批次数据</small>
+      <section className={`import-toolbar-panel${importToolsOpen ? " expanded" : ""}`} aria-label="数据导入与同步">
+        <div className="import-toolbar-summary">
+          <div className="import-toolbar-title">
+            <strong>数据导入与同步</strong>
+            <small>常用同步直接执行，文件导入按需展开</small>
+          </div>
+          <div className="import-toolbar-quick-actions">
+            <button
+              className="ghost-button compact-import-button"
+              type="button"
+              onClick={() => setExternalImportOpen(true)}
+              disabled={!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
+              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能向草稿批次导入" : "从钉钉支出中间表拉取"}
+            >
+              <Database size={15} />
+              从中间表拉取
+            </button>
+            <button
+              className="ghost-button compact-import-button"
+              type="button"
+              onClick={() => void syncExternalMetadata(false)}
+              disabled={!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
+              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能同步草稿批次" : "刷新审批状态、流程评论和可信付款证据"}
+            >
+              <RefreshCcw size={15} />
+              {busyAction === "sync-metadata" ? "同步中" : "同步钉钉流程"}
+            </button>
+            <button
+              className={importToolsOpen ? "ghost-button active-toggle compact-import-button" : "ghost-button compact-import-button"}
+              type="button"
+              aria-expanded={importToolsOpen}
+              onClick={() => setImportToolsOpen((open) => !open)}
+            >
+              <FileSpreadsheet size={15} />
+              {importToolsOpen ? "收起文件导入" : "文件导入与归组"}
+            </button>
+          </div>
         </div>
-        <div className="topbar-import">
+        {importToolsOpen && <div className="topbar-import">
           <div className="topbar-import-group">
             <label className="compact-file-button">
               <FileSpreadsheet size={15} />
@@ -797,28 +831,6 @@ function TopbarImportActions({
               {busyAction === "dingtalk" ? "处理中" : "识别"}
             </button>
           </div>
-          <div className="topbar-import-group external-source-import-group">
-            <button
-              className="ghost-button compact-import-button"
-              type="button"
-              onClick={() => setExternalImportOpen(true)}
-              disabled={!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
-              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能向草稿批次导入" : "从钉钉支出中间表拉取"}
-            >
-              <Database size={15} />
-              从中间表拉取
-            </button>
-            <button
-              className="ghost-button compact-import-button"
-              type="button"
-              onClick={() => void syncExternalMetadata(false)}
-              disabled={!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
-              title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能同步草稿批次" : "刷新审批状态、流程评论和可信付款证据"}
-            >
-              <RefreshCcw size={15} />
-              {busyAction === "sync-metadata" ? "同步中" : "同步钉钉流程"}
-            </button>
-          </div>
           <div className="topbar-import-group employee-department-import-group">
             <label className="compact-file-button">
               <Users size={15} />
@@ -848,7 +860,7 @@ function TopbarImportActions({
               {busyAction === "rollback" ? "撤回中" : "撤回最近导入"}
             </button>
           </div>
-        </div>
+        </div>}
       </section>
       {mappingOpen && mapping && (
         <Modal title="钉钉字段映射" onClose={() => setMappingOpen(false)}>
@@ -1508,6 +1520,7 @@ function Workspace({
   const [mobileViewOverride, setMobileViewOverride] = useState<MobileViewOverride>(null);
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
   const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
   const [currencyConversion, setCurrencyConversion] = useState<{ request: PaymentRequest; target: CurrencyCode } | null>(null);
   const [historicalCurrencyOpen, setHistoricalCurrencyOpen] = useState(false);
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false);
@@ -1610,6 +1623,7 @@ function Workspace({
     }),
     [visibleActiveRows],
   );
+  const showFilteredAmounts = hasActiveExportFilter;
   const mobileQuickFilter: MobileQuickFilter = filters.general_manager_approval === GENERAL_MANAGER_EMPTY_FILTER
     ? "pending_approval"
     : filters.finance_review === "未付款"
@@ -2379,15 +2393,18 @@ function Workspace({
           </div>
         </div>
         {!!selectedBatch.currency_totals?.length && (
-          <div className="batch-currency-subtotals" aria-label="批次各币种小计">
-            {selectedBatch.currency_totals.map((subtotal) => (
-              <span key={subtotal.currency}>
-                {language === "es"
-                  ? `${subtotal.currency}: a pagar ${formatMoney(subtotal.amount, subtotal.currency)} · pagado ${formatMoney(subtotal.paid_amount, subtotal.currency)} · pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}`
-                  : `${subtotal.currency}：应付 ${formatMoney(subtotal.amount, subtotal.currency)} · 已付 ${formatMoney(subtotal.paid_amount, subtotal.currency)} · 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}
-              </span>
-            ))}
-          </div>
+          <details className="batch-currency-details">
+            <summary>{language === "es" ? "Ver desglose por moneda" : "查看各币种明细"}</summary>
+            <div className="batch-currency-subtotals" aria-label="批次各币种小计">
+              {selectedBatch.currency_totals.map((subtotal) => (
+                <span key={subtotal.currency}>
+                  {language === "es"
+                    ? `${subtotal.currency}: a pagar ${formatMoney(subtotal.amount, subtotal.currency)} · pagado ${formatMoney(subtotal.paid_amount, subtotal.currency)} · pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}`
+                    : `${subtotal.currency}：应付 ${formatMoney(subtotal.amount, subtotal.currency)} · 已付 ${formatMoney(subtotal.paid_amount, subtotal.currency)} · 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}
+                </span>
+              ))}
+            </div>
+          </details>
         )}
       </section>
       {isSmallScreen && canManageBatchOperations && (
@@ -2485,138 +2502,104 @@ function Workspace({
               <button className="ghost-button" type="button" onClick={() => setMobileFiltersOpen(false)}>关闭</button>
             </div>
           )}
-          <div className="search-box desktop-toolbar-search">
-            <Search size={16} />
-            <input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} placeholder="搜索单号、申请人、摘要、收款方、项目" />
-          </div>
-          <input value={filters.payment_account} onChange={(event) => setFilters({ ...filters, payment_account: event.target.value })} placeholder="付款账户" />
-          <input value={filters.invoice_status} onChange={(event) => setFilters({ ...filters, invoice_status: event.target.value })} placeholder="开票情况" />
-          <div className="pending-amount-filter" aria-label="待付金额（折合人民币）区间">
-            <span>待付金额（折合人民币）</span>
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={filters.pending_amount_min}
-              onChange={(event) => setFilters({ ...filters, pending_amount_min: event.target.value })}
-              placeholder="最低"
-              aria-label="最低待付金额"
-            />
-            <span>—</span>
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={filters.pending_amount_max}
-              onChange={(event) => setFilters({ ...filters, pending_amount_max: event.target.value })}
-              placeholder="最高"
-              aria-label="最高待付金额"
-            />
-          </div>
-          <select value={filters.finance_review} onChange={(event) => setFilters({ ...filters, finance_review: event.target.value })} aria-label="财务审批">
-            <option value="">全部财务审批</option>
-            {financeApprovalOptions.map((option) => (
-              <option key={option} value={option}>{option}</option>
-            ))}
-          </select>
-          <select value={filters.general_manager_approval} onChange={(event) => setFilters({ ...filters, general_manager_approval: event.target.value })} aria-label="总经理审批">
-            <option value="">全部总经理审批</option>
-            <option value={GENERAL_MANAGER_EMPTY_FILTER}>未选择</option>
-            {generalManagerApprovalFilterOptions.map((option) => (
-              <option key={option} value={option}>{option}</option>
-            ))}
-          </select>
-          {user.role !== "business" && (
-            <select
-              value={filters.dingtalk_lifecycle}
-              onChange={(event) => setFilters({ ...filters, dingtalk_lifecycle: event.target.value })}
-              aria-label="钉钉流程范围"
-              disabled={hasUnsavedChanges || editorDirty}
-              title={hasUnsavedChanges || editorDirty ? "请先保存或放弃未保存修改" : "选择是否查看已终止或已拒绝的钉钉流程"}
-            >
-              <option value="active">正常流程</option>
-              <option value="inactive">已终止/已拒绝</option>
-              <option value="all">全部流程</option>
+          <div className="workspace-filter-row">
+            <div className="search-box desktop-toolbar-search">
+              <Search size={16} />
+              <input value={filters.q} onChange={(event) => setFilters({ ...filters, q: event.target.value })} placeholder="搜索单号、申请人、摘要、收款方、项目" />
+            </div>
+            <div className="pending-amount-filter" aria-label="待付金额（折合人民币）区间">
+              <span>待付金额</span>
+              <input type="number" min="0" step="0.01" value={filters.pending_amount_min} onChange={(event) => setFilters({ ...filters, pending_amount_min: event.target.value })} placeholder="最低" aria-label="最低待付金额" />
+              <span>—</span>
+              <input type="number" min="0" step="0.01" value={filters.pending_amount_max} onChange={(event) => setFilters({ ...filters, pending_amount_max: event.target.value })} placeholder="最高" aria-label="最高待付金额" />
+            </div>
+            <select value={filters.finance_review} onChange={(event) => setFilters({ ...filters, finance_review: event.target.value })} aria-label="财务审批">
+              <option value="">全部财务审批</option>
+              {financeApprovalOptions.map((option) => <option key={option} value={option}>{option}</option>)}
             </select>
+            <select value={filters.general_manager_approval} onChange={(event) => setFilters({ ...filters, general_manager_approval: event.target.value })} aria-label="总经理审批">
+              <option value="">全部总经理审批</option>
+              <option value={GENERAL_MANAGER_EMPTY_FILTER}>未选择</option>
+              {generalManagerApprovalFilterOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+            </select>
+            {!showMobileCards && (
+              <button className={advancedFiltersOpen ? "ghost-button active-toggle" : "ghost-button"} type="button" aria-expanded={advancedFiltersOpen} onClick={() => setAdvancedFiltersOpen((open) => !open)}>
+                <SlidersHorizontal size={16} />
+                更多筛选
+              </button>
+            )}
+          </div>
+          {(advancedFiltersOpen || showMobileCards) && (
+            <div className="workspace-advanced-filter-row">
+              <input value={filters.payment_account} onChange={(event) => setFilters({ ...filters, payment_account: event.target.value })} placeholder="付款账户" />
+              <input value={filters.invoice_status} onChange={(event) => setFilters({ ...filters, invoice_status: event.target.value })} placeholder="开票情况" />
+              {user.role !== "business" && (
+                <select value={filters.dingtalk_lifecycle} onChange={(event) => setFilters({ ...filters, dingtalk_lifecycle: event.target.value })} aria-label="钉钉流程范围" disabled={hasUnsavedChanges || editorDirty} title={hasUnsavedChanges || editorDirty ? "请先保存或放弃未保存修改" : "选择是否查看已终止或已拒绝的钉钉流程"}>
+                  <option value="active">正常流程</option>
+                  <option value="inactive">已终止/已拒绝</option>
+                  <option value="all">全部流程</option>
+                </select>
+              )}
+              <button className="ghost-button" onClick={() => { setMessage("筛选已应用"); setMobileFiltersOpen(false); }} onKeyDown={(event) => activateButtonByKeyboard(event, () => { setMessage("筛选已应用"); setMobileFiltersOpen(false); })}>
+                <Filter size={16} />应用筛选
+              </button>
+            </div>
           )}
-          <button className="ghost-button" onClick={() => { setMessage("筛选已应用"); setMobileFiltersOpen(false); }} onKeyDown={(event) => activateButtonByKeyboard(event, () => { setMessage("筛选已应用"); setMobileFiltersOpen(false); })}>
-            <Filter size={16} />
-            筛选
-          </button>
-          <button
-            className="ghost-button"
-            type="button"
-            onClick={exportCurrentResults}
-            onKeyDown={(event) => activateButtonByKeyboard(event, exportCurrentResults)}
-            disabled={hasUnsavedChanges || editorDirty || visibleActiveRows.length === 0}
-            title={
-              hasUnsavedChanges || editorDirty
-                ? "请先保存或放弃未保存修改"
-                : hasActiveExportFilter
-                  ? `导出当前筛选的 ${visibleActiveRows.length} 条记录`
-                  : `导出全部 ${visibleActiveRows.length} 条记录`
-            }
-          >
-            <Download size={16} />
-            {hasActiveExportFilter ? "导出筛选结果" : "导出全部"}
-          </button>
-          {canCreateRequests && (
-            <>
+          <div className="workspace-action-row">
+            <button className="ghost-button" type="button" onClick={exportCurrentResults} onKeyDown={(event) => activateButtonByKeyboard(event, exportCurrentResults)} disabled={hasUnsavedChanges || editorDirty || visibleActiveRows.length === 0} title={hasUnsavedChanges || editorDirty ? "请先保存或放弃未保存修改" : hasActiveExportFilter ? `导出当前筛选的 ${visibleActiveRows.length} 条记录` : `导出全部 ${visibleActiveRows.length} 条记录`}>
+              <Download size={16} />{hasActiveExportFilter ? "导出筛选结果" : "导出全部"}
+            </button>
+            <button className="ghost-button" type="button" onClick={() => setColumnSettingsOpen(true)}>
+              <SlidersHorizontal size={16} />列设置
+            </button>
+            {canCreateRequests && (
+              <button className="ghost-button" type="button" onClick={addBlankRow} onKeyDown={(event) => activateButtonByKeyboard(event, addBlankRow)}>
+                <Plus size={16} />插入空行
+              </button>
+            )}
+            <button
+              className={wrapText ? "ghost-button active-toggle" : "ghost-button"}
+              type="button"
+              onClick={() => setWrapText(!wrapText)}
+              onKeyDown={(event) => activateButtonByKeyboard(event, () => setWrapText(!wrapText))}
+              aria-pressed={wrapText}
+            >
+              <AlignLeft size={16} />{wrapText ? "取消换行" : "换行"}
+            </button>
+            {canCreateRequests && (
               <button className="primary-button" onClick={() => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet })} onKeyDown={(event) => activateButtonByKeyboard(event, () => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet }))}>
-                <Plus size={16} />
-                新增
+                <Plus size={16} />新增请款
               </button>
-              <button className="ghost-button" onClick={addBlankRow} onKeyDown={(event) => activateButtonByKeyboard(event, addBlankRow)}>
-                <Plus size={16} />
-                插入空行
+            )}
+            {hasUnsavedChanges && (
+              <button className="primary-button" onClick={saveGridChanges} onKeyDown={(event) => activateButtonByKeyboard(event, saveGridChanges)}>
+                <Save size={16} />保存更改
               </button>
-            </>
-          )}
-          <button
-            className={wrapText ? "ghost-button active-toggle" : "ghost-button"}
-            onClick={() => setWrapText(!wrapText)}
-            onKeyDown={(event) => activateButtonByKeyboard(event, () => setWrapText(!wrapText))}
-            aria-pressed={wrapText}
-          >
-            <AlignLeft size={16} />
-            {wrapText ? "取消换行" : "换行"}
-          </button>
-          <button className="ghost-button" type="button" onClick={() => setColumnSettingsOpen(true)}>
-            <SlidersHorizontal size={16} />
-            列设置
-          </button>
-          <button className="primary-button" onClick={saveGridChanges} onKeyDown={(event) => activateButtonByKeyboard(event, saveGridChanges)} disabled={!hasUnsavedChanges}>
-            <Save size={16} />
-            保存更改
-          </button>
-          <button className="ghost-button" onClick={discardUnsavedChanges} onKeyDown={(event) => activateButtonByKeyboard(event, discardUnsavedChanges)} disabled={!hasUnsavedChanges && !editorDirty}>
-            <Undo2 size={16} />
-            放弃未保存修改
-          </button>
+            )}
+            {(hasUnsavedChanges || editorDirty) && (
+              <button className="ghost-button" onClick={discardUnsavedChanges} onKeyDown={(event) => activateButtonByKeyboard(event, discardUnsavedChanges)}>
+                <Undo2 size={16} />放弃修改
+              </button>
+            )}
+          </div>
         </div>
         <div className="filtered-summary-bar" aria-label="当前筛选结果">
           <div className="filtered-summary-count">
             <span>当前筛选</span>
             <strong>{language === "es" ? `${visibleTotals.count} registro(s)` : `${visibleTotals.count} 条`}</strong>
           </div>
-          <div className="filtered-summary-amounts">
+          {showFilteredAmounts && <div className="filtered-summary-amounts">
             <span>折合人民币应付 <strong>{formatMoney(visibleTotals.amount)}</strong></span>
             <span>已付 <strong>{formatMoney(visibleTotals.paidAmount)}</strong></span>
             <span>待付 <strong>{formatMoney(visibleTotals.pendingAmount)}</strong></span>
-          </div>
-          <div className="currency-subtotals" aria-label="各币种小计">
-            {visibleCurrencyTotals.map((subtotal) => (
-              <span key={subtotal.currency}>
-                {language === "es"
-                  ? `${subtotal.currency}: a pagar ${formatMoney(subtotal.amount, subtotal.currency)} / pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}`
-                  : `${subtotal.currency}：应付 ${formatMoney(subtotal.amount, subtotal.currency)} / 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}
-              </span>
-            ))}
-          </div>
+          </div>}
+          {showFilteredAmounts && <div className="currency-subtotals" aria-label="各币种小计">
+            {visibleCurrencyTotals.map((subtotal) => <span key={subtotal.currency}>{language === "es" ? `${subtotal.currency}: a pagar ${formatMoney(subtotal.amount, subtotal.currency)} / pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}` : `${subtotal.currency}：应付 ${formatMoney(subtotal.amount, subtotal.currency)} / 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}</span>)}
+          </div>}
           <div className="filtered-summary-statuses">
-            <span className="summary-status paid">{language === "es" ? `Pagado ${financeReviewCounts.paid} solicitud(es)` : `已付款 ${financeReviewCounts.paid} 单`}</span>
-            <span className="summary-status partial">{language === "es" ? `Pago parcial ${financeReviewCounts.partial} solicitud(es)` : `部分付款 ${financeReviewCounts.partial} 单`}</span>
-            <span className="summary-status unpaid">{language === "es" ? `No pagado ${financeReviewCounts.unpaid} solicitud(es)` : `未付款 ${financeReviewCounts.unpaid} 单`}</span>
+            <button className={`summary-status paid${filters.finance_review === "已付款" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "已付款" ? "" : "已付款" })}>{language === "es" ? `Pagado ${financeReviewCounts.paid}` : `已付款 ${financeReviewCounts.paid} 单`}</button>
+            <button className={`summary-status partial${filters.finance_review === "部分付款" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "部分付款" ? "" : "部分付款" })}>{language === "es" ? `Pago parcial ${financeReviewCounts.partial}` : `部分付款 ${financeReviewCounts.partial} 单`}</button>
+            <button className={`summary-status unpaid${filters.finance_review === "未付款" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "未付款" ? "" : "未付款" })}>{language === "es" ? `No pagado ${financeReviewCounts.unpaid}` : `未付款 ${financeReviewCounts.unpaid} 单`}</button>
           </div>
         </div>
         <div className="sheet-tabs" role="tablist" aria-label="Sheet 分页">
