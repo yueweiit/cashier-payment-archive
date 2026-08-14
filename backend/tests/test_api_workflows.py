@@ -3639,3 +3639,43 @@ def test_execution_region_filter_and_legacy_mexico_currency_restore():
         assert candidates["REGION-MX"]["source_currency"] == "MXN"
         assert candidates["REGION-MX"]["currency_source"] == "execution_region_legacy"
         assert candidates["REGION-MX-CNY"]["status"] == "already_restored"
+
+
+def test_historical_currency_restore_uses_explicit_peso_total_in_summary():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "summary-peso-restore", "start_date": "2026-08-11", "end_date": "2026-08-14"},
+        ).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={
+                "dingding_id": "SUMMARY-MXN",
+                "summary": "本地购买货架，合计76,800比索（不含税）",
+                "amount": 29952,
+                "currency": "CNY",
+                "source_sheet": "UV IMPRESION MX彩印",
+            },
+        ).json()["request"]
+        with connect() as conn:
+            conn.execute(
+                "UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?",
+                (json.dumps({"external_source": {
+                    "system": "dingtalk_expense_database",
+                    "execution_region": "墨西哥 México",
+                    "source_currency": "CNY",
+                    "source_amount": 29952,
+                    "base_currency_amount": 29952,
+                    "application_date": "2026-08-11",
+                }}), request["id"]),
+            )
+
+        preview = client.get(f"/api/batches/{batch['id']}/historical-currency-restore/preview")
+        assert preview.status_code == 200, preview.text
+        candidate = next(row for row in preview.json()["rows"] if row["request_id"] == request["id"])
+        assert candidate["status"] == "recoverable"
+        assert candidate["source_currency"] == "MXN"
+        assert candidate["source_amount"] == 76800
+        assert candidate["base_amount_cny"] == 29952
+        assert candidate["currency_source"] == "summary_text"

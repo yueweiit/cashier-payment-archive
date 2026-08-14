@@ -443,6 +443,43 @@ def currency_from_summary_text(value: Any) -> Optional[str]:
     return None
 
 
+def currency_amount_from_summary_text(value: Any, currency: Optional[str] = None) -> Optional[float]:
+    """Extract an explicitly stated total in the named currency.
+
+    This is intentionally conservative and only accepts amounts adjacent to a
+    currency name, preferring totals such as ``合计 76,800 比索``.  It is used
+    to repair legacy imports whose source table stored only the converted CNY
+    amount while the approval summary retained the original amount.
+    """
+    text = _text(value) or ""
+    normalized_currency = normalize_currency(currency) or currency_from_summary_text(text)
+    tokens = {
+        "MXN": r"(?:\bMXN\b|MX\$|墨西哥比索|比索|(?<![A-Za-z])PESOS?(?![A-Za-z]))",
+        "USD": r"(?:\bUSD\b|US\$|美元|美金|(?<![A-Za-z])D[ÓO]LARES?(?![A-Za-z]))",
+        "CNY": r"(?:\bCNY\b|\bRMB\b|人民币(?:元)?)",
+    }
+    currency_token = tokens.get(str(normalized_currency or ""))
+    if not currency_token:
+        return None
+    number = r"(?P<amount>\d+(?:[\s,，]\d{3})*(?:\.\d+)?)"
+    total_prefix = r"(?:合计|总计|总额|总金额|monto\s+total|importe\s+total|total)"
+    patterns = (
+        rf"{total_prefix}[^\d]{{0,12}}{number}\s*{currency_token}",
+        rf"{total_prefix}[^\d]{{0,12}}{currency_token}\s*[:：]?\s*{number}",
+        rf"{number}\s*{currency_token}",
+        rf"{currency_token}\s*[:：]?\s*{number}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            return float(match.group("amount").replace(" ", "").replace(",", "").replace("，", ""))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def resolve_approval_currency(currency_value: Any, execution_region: Any) -> tuple[Optional[str], Optional[str]]:
     currency_text = _text(currency_value)
     if currency_text:

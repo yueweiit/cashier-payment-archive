@@ -49,7 +49,9 @@ from .external_expenses import (
     DingtalkAttachmentClient,
     ExternalExpenseError,
     classify_dingtalk_payment_event,
+    currency_amount_from_summary_text,
     currency_from_execution_region,
+    currency_from_summary_text,
     dingtalk_auto_payment_mode,
     fetch_dingtalk_workflows,
     fetch_external_expense_attachments,
@@ -2104,9 +2106,14 @@ def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
         execution_region = str(external.get("execution_region") or "").strip()
         explicit_currency = normalize_currency(source_currency_raw)
         region_currency = currency_from_execution_region(execution_region)
+        summary_currency = currency_from_summary_text(row.get("summary"))
+        summary_source_amount = currency_amount_from_summary_text(row.get("summary"), summary_currency)
         if explicit_currency:
             source_currency = explicit_currency
             currency_source = currency_source or "approval_currency"
+        elif summary_currency:
+            source_currency = summary_currency
+            currency_source = "summary_text"
         elif currency_source == "execution_region" and region_currency:
             source_currency = region_currency
         elif not currency_source and region_currency == "MXN":
@@ -2115,7 +2122,7 @@ def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
             # the only safe signal available for restoring those Mexico records.
             source_currency = "MXN"
             currency_source = "execution_region_legacy"
-        source_amount = external.get("source_amount")
+        source_amount = summary_source_amount if summary_source_amount is not None else external.get("source_amount")
         base_amount = external.get("base_currency_amount")
         if base_amount in (None, ""):
             base_amount = row.get("base_amount_cny") if row.get("base_amount_cny") is not None else row.get("amount")
