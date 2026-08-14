@@ -1495,6 +1495,7 @@ function Workspace({
     finance_review: "",
     general_manager_approval: "",
     dingtalk_lifecycle: "active",
+    execution_region: "",
   });
   const [activeSheet, setActiveSheet] = useState(ALL_SHEET);
   const [editingSheet, setEditingSheet] = useState<{ key: string; value: string } | null>(null);
@@ -1931,6 +1932,7 @@ function Workspace({
       finance_review: filters.finance_review.trim(),
       general_manager_approval: filters.general_manager_approval.trim(),
       dingtalk_lifecycle: filters.dingtalk_lifecycle,
+      execution_region: filters.execution_region,
     };
     Object.entries(exportFilters).forEach(([key, value]) => {
       if (value) params.set(key, value);
@@ -2069,6 +2071,7 @@ function Workspace({
         finance_review: "",
         general_manager_approval: "",
         dingtalk_lifecycle: "active",
+        execution_region: "",
       });
       setActiveSheet(name);
       await reloadBatches();
@@ -2533,6 +2536,11 @@ function Workspace({
             <div className="workspace-advanced-filter-row">
               <input value={filters.payment_account} onChange={(event) => setFilters({ ...filters, payment_account: event.target.value })} placeholder="付款账户" />
               <input value={filters.invoice_status} onChange={(event) => setFilters({ ...filters, invoice_status: event.target.value })} placeholder="开票情况" />
+              <select value={filters.execution_region} onChange={(event) => setFilters({ ...filters, execution_region: event.target.value })} aria-label={gridHeaderLanguage === "es" ? "Región de ejecución" : "执行地区"}>
+                <option value="">{gridHeaderLanguage === "es" ? "Todas las regiones" : "全部地区"}</option>
+                <option value="china">{gridHeaderLanguage === "es" ? "China" : "中国"}</option>
+                <option value="mexico">{gridHeaderLanguage === "es" ? "México" : "墨西哥"}</option>
+              </select>
               {user.role !== "business" && (
                 <select value={filters.dingtalk_lifecycle} onChange={(event) => setFilters({ ...filters, dingtalk_lifecycle: event.target.value })} aria-label="钉钉流程范围" disabled={hasUnsavedChanges || editorDirty} title={hasUnsavedChanges || editorDirty ? "请先保存或放弃未保存修改" : "选择是否查看已终止或已拒绝的钉钉流程"}>
                   <option value="active">正常流程</option>
@@ -5622,6 +5630,7 @@ function rowMatchesFilters(
     pending_amount_max: string;
     finance_review: string;
     general_manager_approval: string;
+    execution_region: string;
   },
   activeSheet: string,
 ) {
@@ -5646,6 +5655,7 @@ function rowMatchesFilters(
   }
   if (filters.payment_account.trim() && !String(row.payment_account || "").includes(filters.payment_account.trim())) return false;
   if (filters.invoice_status.trim() && !String(row.invoice_status || "").includes(filters.invoice_status.trim())) return false;
+  if (filters.execution_region && requestExecutionRegion(row) !== filters.execution_region) return false;
   const pendingAmount = requestAmountCny(row, "pending_amount");
   const pendingAmountMin = optionalNumber(filters.pending_amount_min);
   const pendingAmountMax = optionalNumber(filters.pending_amount_max);
@@ -5666,6 +5676,15 @@ function rowMatchesFilters(
     && String(row.general_manager_approval || "") !== filters.general_manager_approval.trim()
   ) return false;
   return true;
+}
+
+function requestExecutionRegion(row: Partial<PaymentRequest>): "china" | "mexico" | "unknown" {
+  const external = row.raw_extra?.external_source;
+  const region = String(external?.execution_region || "").trim().toLowerCase();
+  if (region.includes("中国") || region.includes("china")) return "china";
+  if (region.includes("墨西哥") || region.includes("mexico") || region.includes("méxico")) return "mexico";
+  if (String(row.currency || external?.source_currency || "").trim().toUpperCase() === "MXN") return "mexico";
+  return "unknown";
 }
 
 function newLocalId() {

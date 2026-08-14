@@ -3515,3 +3515,74 @@ def test_historical_currency_restore_can_be_rolled_back():
         assert restored["currency"] == "CNY"
         assert restored["amount"] == 680
         assert restored["paid_amount"] == 340
+
+
+def test_execution_region_filter_and_legacy_mexico_currency_restore():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "execution-region-filter", "start_date": "2026-08-11", "end_date": "2026-08-14"},
+        ).json()["batch"]
+        china = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": "REGION-CN", "amount": 100, "currency": "CNY", "source_sheet": "中国公司"},
+        ).json()["request"]
+        mexico = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": "REGION-MX", "amount": 400, "currency": "CNY", "source_sheet": "墨西哥公司"},
+        ).json()["request"]
+        explicit_cny = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": "REGION-MX-CNY", "amount": 400, "currency": "CNY", "source_sheet": "墨西哥公司"},
+        ).json()["request"]
+        with connect() as conn:
+            conn.execute(
+                "UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?",
+                (json.dumps({"external_source": {
+                    "system": "dingtalk_expense_database",
+                    "execution_region": "中国China",
+                    "source_currency": "CNY",
+                    "source_amount": 100,
+                    "base_currency_amount": 100,
+                }}), china["id"]),
+            )
+            conn.execute(
+                "UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?",
+                (json.dumps({"external_source": {
+                    "system": "dingtalk_expense_database",
+                    "execution_region": "墨西哥 México",
+                    "source_currency": "CNY",
+                    "source_amount": 1000,
+                    "base_currency_amount": 400,
+                    "application_date": "2026-08-12",
+                }}), mexico["id"]),
+            )
+            conn.execute(
+                "UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?",
+                (json.dumps({"external_source": {
+                    "system": "dingtalk_expense_database",
+                    "execution_region": "墨西哥 México",
+                    "source_currency": "CNY",
+                    "source_currency_raw": "CNY",
+                    "currency_source": "approval_currency",
+                    "source_amount": 400,
+                    "base_currency_amount": 400,
+                }}), explicit_cny["id"]),
+            )
+
+        mexico_rows = client.get(f"/api/batches/{batch['id']}/requests?execution_region=mexico")
+        assert mexico_rows.status_code == 200, mexico_rows.text
+        assert {row["dingding_id"] for row in mexico_rows.json()["requests"]} == {"REGION-MX", "REGION-MX-CNY"}
+        china_rows = client.get(f"/api/batches/{batch['id']}/requests?execution_region=china")
+        assert china_rows.status_code == 200, china_rows.text
+        assert [row["dingding_id"] for row in china_rows.json()["requests"]] == ["REGION-CN"]
+        assert client.get(f"/api/batches/{batch['id']}/requests?execution_region=other").status_code == 400
+
+        preview = client.get(f"/api/batches/{batch['id']}/historical-currency-restore/preview")
+        assert preview.status_code == 200, preview.text
+        candidates = {row["dingding_id"]: row for row in preview.json()["rows"]}
+        assert candidates["REGION-MX"]["status"] == "recoverable"
+        assert candidates["REGION-MX"]["source_currency"] == "MXN"
+        assert candidates["REGION-MX"]["currency_source"] == "execution_region_legacy"
+        assert candidates["REGION-MX-CNY"]["status"] == "already_restored"

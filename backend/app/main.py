@@ -49,6 +49,7 @@ from .external_expenses import (
     DingtalkAttachmentClient,
     ExternalExpenseError,
     classify_dingtalk_payment_event,
+    currency_from_execution_region,
     dingtalk_auto_payment_mode,
     fetch_dingtalk_workflows,
     fetch_external_expense_attachments,
@@ -1382,6 +1383,14 @@ def dingtalk_inactive_sql(raw_extra_column: str = "raw_extra_json") -> str:
     return f"(({status}) = 'TERMINATED' OR ({result}) = 'refuse')"
 
 
+def dingtalk_execution_region_sql(raw_extra_column: str = "raw_extra_json") -> str:
+    return (
+        f"CASE WHEN json_valid(COALESCE({raw_extra_column}, '')) "
+        f"THEN TRIM(COALESCE(json_extract({raw_extra_column}, '$.external_source.execution_region'), '')) "
+        "ELSE '' END"
+    )
+
+
 def request_lifecycle_for_user(user: Dict[str, Any], requested: str) -> str:
     lifecycle = str(requested or "active").strip().lower() or "active"
     if lifecycle not in {"active", "inactive", "all"}:
@@ -1403,6 +1412,7 @@ def payment_request_filter_parts(
     payment_status: str = "",
     source_sheet: str = "",
     dingtalk_lifecycle: str = "active",
+    execution_region: str = "",
 ) -> tuple[list[str], list[Any]]:
     q = q.strip()
     payment_account = payment_account.strip()
@@ -1411,6 +1421,9 @@ def payment_request_filter_parts(
     general_manager_approval = general_manager_approval.strip()
     payment_status = payment_status.strip()
     source_sheet = canonical_sheet_name(source_sheet) if source_sheet.strip() else ""
+    execution_region = execution_region.strip().lower()
+    if execution_region not in {"", "china", "mexico"}:
+        raise HTTPException(status_code=400, detail="执行地区筛选值无效")
     conditions = ["batch_id = ?"]
     params: list[Any] = [batch_id]
     inactive_condition = dingtalk_inactive_sql()
@@ -1456,6 +1469,17 @@ def payment_request_filter_parts(
     if source_sheet:
         conditions.append("source_sheet = ?")
         params.append(source_sheet)
+    if execution_region:
+        region_sql = dingtalk_execution_region_sql()
+        if execution_region == "china":
+            conditions.append(f"(({region_sql}) LIKE '%中国%' OR LOWER({region_sql}) LIKE '%china%')")
+        else:
+            conditions.append(
+                f"(({region_sql}) LIKE '%墨西哥%' "
+                f"OR LOWER({region_sql}) LIKE '%mexico%' "
+                f"OR LOWER({region_sql}) LIKE '%méxico%' "
+                f"OR (({region_sql}) = '' AND UPPER(TRIM(COALESCE(currency, ''))) = 'MXN'))"
+            )
     return conditions, params
 
 
@@ -1472,6 +1496,7 @@ def list_requests(
     payment_status: str = "",
     source_sheet: str = "",
     dingtalk_lifecycle: str = "active",
+    execution_region: str = "",
     user: Dict[str, Any] = Depends(current_user),
 ) -> Dict[str, Any]:
     resolved_lifecycle = request_lifecycle_for_user(user, dingtalk_lifecycle)
@@ -1487,6 +1512,7 @@ def list_requests(
         payment_status=payment_status,
         source_sheet=source_sheet,
         dingtalk_lifecycle=resolved_lifecycle,
+        execution_region=execution_region,
     )
     with connect() as conn:
         require_batch(conn, batch_id)
@@ -2073,6 +2099,22 @@ def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
     for row in rows:
         external = (row.get("raw_extra") or {}).get("external_source") or {}
         source_currency = normalize_currency(external.get("source_currency"))
+        source_currency_raw = str(external.get("source_currency_raw") or "").strip()
+        currency_source = str(external.get("currency_source") or "").strip()
+        execution_region = str(external.get("execution_region") or "").strip()
+        explicit_currency = normalize_currency(source_currency_raw)
+        region_currency = currency_from_execution_region(execution_region)
+        if explicit_currency:
+            source_currency = explicit_currency
+            currency_source = currency_source or "approval_currency"
+        elif currency_source == "execution_region" and region_currency:
+            source_currency = region_currency
+        elif not currency_source and region_currency == "MXN":
+            # Older imports defaulted every unrecognised currency to CNY and did not
+            # preserve provenance. A freshly synced execution region is therefore
+            # the only safe signal available for restoring those Mexico records.
+            source_currency = "MXN"
+            currency_source = "execution_region_legacy"
         source_amount = external.get("source_amount")
         base_amount = external.get("base_currency_amount")
         if base_amount in (None, ""):
@@ -2118,6 +2160,9 @@ def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
                 "current_currency": current_currency,
                 "current_amount": row.get("amount"),
                 "source_currency": source_currency,
+                "source_currency_raw": source_currency_raw or None,
+                "currency_source": currency_source or None,
+                "execution_region": execution_region or None,
                 "source_amount": source_amount_number or None,
                 "base_amount_cny": base_amount_number or None,
                 "implied_rate": (
@@ -5400,6 +5445,7 @@ def export_batch(
     general_manager_approval: str = "",
     source_sheet: str = "",
     dingtalk_lifecycle: str = "active",
+    execution_region: str = "",
     user: Dict[str, Any] = Depends(current_user),
 ) -> StreamingResponse:
     with connect() as conn:
@@ -5417,6 +5463,7 @@ def export_batch(
                 general_manager_approval=general_manager_approval,
                 source_sheet=source_sheet,
                 dingtalk_lifecycle=resolved_lifecycle,
+                execution_region=execution_region,
             )
         else:
             conditions, params = payment_request_filter_parts(

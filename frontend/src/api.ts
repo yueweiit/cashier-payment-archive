@@ -94,6 +94,9 @@ export type ExternalSourceSnapshot = {
   source_created_at?: string;
   source_updated_at?: string;
   source_currency?: string;
+  source_currency_raw?: string;
+  currency_source?: string;
+  execution_region?: string;
   source_amount?: number;
   base_currency_amount?: number;
 };
@@ -430,6 +433,9 @@ export type HistoricalCurrencyRestoreRow = {
   source_sheet?: string;
   current_currency: string;
   source_currency?: CurrencyCode;
+  source_currency_raw?: string;
+  currency_source?: string;
+  execution_region?: string;
   source_amount?: number;
   base_amount_cny?: number;
   payment_count: number;
