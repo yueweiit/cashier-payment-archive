@@ -4175,11 +4175,45 @@ textarea {
 }
 .currency-subtotals,
 .batch-currency-subtotals {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 14px;
-  color: #71838d;
+  display: grid;
+  gap: 7px;
   font-size: 12px;
+}
+
+.currency-detail-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 5px 10px 5px 7px;
+  border-left: 3px solid currentColor;
+  border-radius: 5px;
+  background: color-mix(in srgb, currentColor 7%, white);
+  color: #60727c;
+}
+
+.currency-detail-row .currency-code {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: currentColor;
+}
+
+.currency-detail-row > span {
+  color: #52646e;
+}
+
+.currency-detail-row.currency-cny {
+  color: #237d70;
+}
+
+.currency-detail-row.currency-mxn {
+  color: #b57420;
+}
+
+.currency-detail-row.currency-usd {
+  color: #3d69a5;
 }
 
 .filtered-summary-bar .currency-subtotals {

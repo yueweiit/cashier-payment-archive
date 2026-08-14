@@ -2400,11 +2400,17 @@ function Workspace({
             <summary>{language === "es" ? "Ver desglose por moneda" : "查看各币种明细"}</summary>
             <div className="batch-currency-subtotals" aria-label="批次各币种小计">
               {selectedBatch.currency_totals.map((subtotal) => (
-                <span key={subtotal.currency}>
-                  {language === "es"
-                    ? `${subtotal.currency}: a pagar ${formatMoney(subtotal.amount, subtotal.currency)} · pagado ${formatMoney(subtotal.paid_amount, subtotal.currency)} · pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}`
-                    : `${subtotal.currency}：应付 ${formatMoney(subtotal.amount, subtotal.currency)} · 已付 ${formatMoney(subtotal.paid_amount, subtotal.currency)} · 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}
-                </span>
+                <div
+                  className={`currency-detail-row currency-${subtotal.currency.toLowerCase()}`}
+                  key={subtotal.currency}
+                >
+                  <strong className="currency-code">{subtotal.currency}</strong>
+                  <span>
+                    {language === "es"
+                      ? `A pagar ${formatMoney(subtotal.amount, subtotal.currency)} · Pagado ${formatMoney(subtotal.paid_amount, subtotal.currency)} · Pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}`
+                      : `应付 ${formatMoney(subtotal.amount, subtotal.currency)} · 已付 ${formatMoney(subtotal.paid_amount, subtotal.currency)} · 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}
+                  </span>
+                </div>
               ))}
             </div>
           </details>
@@ -2602,7 +2608,12 @@ function Workspace({
             <span>待付 <strong>{formatMoney(visibleTotals.pendingAmount)}</strong></span>
           </div>}
           {showFilteredAmounts && <div className="currency-subtotals" aria-label="各币种小计">
-            {visibleCurrencyTotals.map((subtotal) => <span key={subtotal.currency}>{language === "es" ? `${subtotal.currency}: a pagar ${formatMoney(subtotal.amount, subtotal.currency)} / pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}` : `${subtotal.currency}：应付 ${formatMoney(subtotal.amount, subtotal.currency)} / 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}</span>)}
+            {visibleCurrencyTotals.map((subtotal) => (
+              <div className={`currency-detail-row currency-${subtotal.currency.toLowerCase()}`} key={subtotal.currency}>
+                <strong className="currency-code">{subtotal.currency}</strong>
+                <span>{language === "es" ? `A pagar ${formatMoney(subtotal.amount, subtotal.currency)} / Pendiente ${formatMoney(subtotal.pending_amount, subtotal.currency)}` : `应付 ${formatMoney(subtotal.amount, subtotal.currency)} / 待付 ${formatMoney(subtotal.pending_amount, subtotal.currency)}`}</span>
+              </div>
+            ))}
           </div>}
           <div className="filtered-summary-statuses">
             <button className={`summary-status paid${filters.finance_review === "已付款" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "已付款" ? "" : "已付款" })}>{language === "es" ? `Pagado ${financeReviewCounts.paid}` : `已付款 ${financeReviewCounts.paid} 单`}</button>
