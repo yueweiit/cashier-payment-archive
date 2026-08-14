@@ -3665,6 +3665,8 @@ def test_historical_currency_restore_uses_explicit_peso_total_in_summary():
                     "system": "legacy_excel_import",
                     "execution_region": "墨西哥 México",
                     "source_currency": "CNY",
+                    "source_currency_raw": "CNY",
+                    "currency_source": "approval_currency",
                     "source_amount": 29952,
                     "base_currency_amount": 29952,
                     "application_date": "2026-08-11",

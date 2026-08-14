@@ -2108,12 +2108,12 @@ def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
         region_currency = currency_from_execution_region(execution_region)
         summary_currency = currency_from_summary_text(row.get("summary"))
         summary_source_amount = currency_amount_from_summary_text(row.get("summary"), summary_currency)
-        if explicit_currency:
-            source_currency = explicit_currency
-            currency_source = currency_source or "approval_currency"
-        elif summary_currency:
+        if summary_currency and summary_source_amount is not None:
             source_currency = summary_currency
             currency_source = "summary_text"
+        elif explicit_currency:
+            source_currency = explicit_currency
+            currency_source = currency_source or "approval_currency"
         elif currency_source == "execution_region" and region_currency:
             source_currency = region_currency
         elif not currency_source and region_currency == "MXN":
