@@ -3662,7 +3662,7 @@ def test_historical_currency_restore_uses_explicit_peso_total_in_summary():
             conn.execute(
                 "UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?",
                 (json.dumps({"external_source": {
-                    "system": "dingtalk_expense_database",
+                    "system": "legacy_excel_import",
                     "execution_region": "墨西哥 México",
                     "source_currency": "CNY",
                     "source_amount": 29952,

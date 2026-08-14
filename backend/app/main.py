@@ -2128,7 +2128,8 @@ def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
             base_amount = row.get("base_amount_cny") if row.get("base_amount_cny") is not None else row.get("amount")
         reasons: list[str] = []
         status = "recoverable"
-        if external.get("system") != "dingtalk_expense_database":
+        has_explicit_summary_amount = summary_currency in {"USD", "MXN"} and summary_source_amount is not None
+        if external.get("system") != "dingtalk_expense_database" and not has_explicit_summary_amount:
             status = "undetermined"
             reasons.append("不是可验证的钉钉直连来源")
         if source_currency not in {"USD", "MXN"}:
