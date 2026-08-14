@@ -2061,6 +2061,59 @@ def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
     assert explicit_currency_wins["request_data"]["amount"] == 100
     assert explicit_currency_wins["request_data"]["raw_extra"]["external_source"]["currency_source"] == "approval_currency"
 
+    legacy_mexico_cny_default = map_external_expense(
+        {
+            "source_type": "operation",
+            "source_id": "605",
+            "effective_date": date(2026, 8, 12),
+            "approval_no": "OP-MX-PESO-605",
+            "creator_name": "mx-user",
+            "applicant_department": "Impresión UV",
+            "approval_title": "Solicitud enviado por Mario Gomez",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "墨西哥 México",
+            "beneficiary": "Proveedor MX",
+            "expense_type": "Compra",
+            "summary": "本地采购货架，合计76800比索（不含税）",
+            "source_currency": "CNY",
+            "source_amount": Decimal("76800"),
+            "base_currency_amount": Decimal("29952"),
+            "raw_data": {},
+        }
+    )
+    assert legacy_mexico_cny_default["errors"] == []
+    assert legacy_mexico_cny_default["request_data"]["currency"] == "MXN"
+    assert legacy_mexico_cny_default["request_data"]["amount"] == 76800
+    assert legacy_mexico_cny_default["request_data"]["raw_extra"]["external_source"]["currency_source"] == "summary_text"
+    assert legacy_mexico_cny_default["request_data"]["raw_extra"]["external_source"]["source_currency_table"] == "CNY"
+
+    form_currency_overrides_region = map_external_expense(
+        {
+            "source_type": "operation",
+            "source_id": "606",
+            "effective_date": date(2026, 8, 12),
+            "approval_no": "OP-MX-USD-606",
+            "creator_name": "mx-user",
+            "applicant_department": "México",
+            "approval_title": "Solicitud enviado por Mario Gomez",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "墨西哥 México",
+            "beneficiary": "Proveedor USD",
+            "expense_type": "Compra",
+            "summary": "Pago de servicio",
+            "source_currency": "CNY",
+            "source_amount": Decimal("100"),
+            "base_currency_amount": Decimal("680"),
+            "raw_data": {"formComponentValues": [{"name": "币种", "value": "USD"}]},
+        }
+    )
+    assert form_currency_overrides_region["errors"] == []
+    assert form_currency_overrides_region["request_data"]["currency"] == "USD"
+    assert form_currency_overrides_region["request_data"]["amount"] == 100
+    assert form_currency_overrides_region["request_data"]["raw_extra"]["external_source"]["currency_source"] == "approval_currency"
+
     assert execution_region_is_allowed("中国China")
     assert execution_region_is_allowed("墨西哥Mexico")
     assert execution_region_is_allowed("México")

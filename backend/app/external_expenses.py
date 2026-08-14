@@ -30,6 +30,18 @@ ALLOWED_EXECUTION_REGION_PATTERN = r"(中国|china|墨西哥|m[eé]xico)"
 CHINA_EXECUTION_REGION_RE = re.compile(r"(中国|china)", re.IGNORECASE)
 MEXICO_EXECUTION_REGION_RE = re.compile(r"(墨西哥|m[eé]xico)", re.IGNORECASE)
 CURRENCY_COMPONENT_PREFIXES = ("币种", "货币", "currency", "moneda", "tipo de moneda")
+SUMMARY_MXN_CURRENCY_RE = re.compile(
+    r"(?:\bMXN\b|MX\$|墨西哥比索|比索|(?<![A-Za-z])PESOS?(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+SUMMARY_USD_CURRENCY_RE = re.compile(
+    r"(?:\bUSD\b|US\$|美元|美金|(?<![A-Za-z])D[ÓO]LARES?(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+SUMMARY_CNY_CURRENCY_RE = re.compile(
+    r"(?:\bCNY\b|\bRMB\b|人民币(?:元)?)",
+    re.IGNORECASE,
+)
 EXECUTION_REGION_COMPONENT_PREFIXES = (
     "执行地区",
     "执行区域",
@@ -409,6 +421,24 @@ def currency_from_execution_region(value: Any) -> Optional[str]:
     if MEXICO_EXECUTION_REGION_RE.search(region):
         return "MXN"
     if CHINA_EXECUTION_REGION_RE.search(region):
+        return "CNY"
+    return None
+
+
+def currency_from_summary_text(value: Any) -> Optional[str]:
+    """Return only currencies that are explicitly named in business text.
+
+    A bare ``$`` is deliberately not accepted because it is ambiguous in
+    Mexico.  This helper is primarily a recovery path for legacy DingTalk
+    approvals whose source-table ``currency`` column was defaulted to CNY
+    even though the approval text and original amount were in pesos.
+    """
+    text = _text(value) or ""
+    if SUMMARY_MXN_CURRENCY_RE.search(text):
+        return "MXN"
+    if SUMMARY_USD_CURRENCY_RE.search(text):
+        return "USD"
+    if SUMMARY_CNY_CURRENCY_RE.search(text):
         return "CNY"
     return None
 
@@ -1278,13 +1308,11 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         summary = detail_values[0] if detail_values else _first_text(row.get("product_name"), row.get("order_name"), row.get("project"), row.get("expense_type"))
         payment_date_values = _component_values(form_values, "付款日期")
         needed_payment_date = _date_text(payment_date_values[0]) if payment_date_values else None
-        source_currency_text = _form_component_value(form_values, *CURRENCY_COMPONENT_PREFIXES) or row.get("source_currency")
     else:
         beneficiary = _text(row.get("beneficiary")) or ""
         beneficiary_values = [beneficiary] if beneficiary else []
         summary = _text(row.get("summary"))
         needed_payment_date = _date_text(row.get("needed_payment_date"))
-        source_currency_text = row.get("source_currency")
 
     approval_no = _text(row.get("approval_no")) or ""
     approval_status = (_text(row.get("approval_status")) or "").upper()
@@ -1296,7 +1324,33 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
     )
     base_amount = _number(row.get("base_currency_amount"))
     source_amount = _number(row.get("source_amount"))
-    source_currency, currency_source = resolve_approval_currency(source_currency_text, execution_region)
+    form_currency_text = _form_component_value(form_values, *CURRENCY_COMPONENT_PREFIXES)
+    table_currency_text = row.get("source_currency")
+    table_currency = normalize_currency(table_currency_text)
+    summary_currency = currency_from_summary_text(summary)
+    region_currency = currency_from_execution_region(execution_region)
+    source_currency_raw: Optional[str] = None
+    if _text(form_currency_text):
+        source_currency = normalize_currency(form_currency_text)
+        currency_source = "approval_currency"
+        source_currency_raw = _text(form_currency_text)
+    elif summary_currency:
+        source_currency = summary_currency
+        currency_source = "summary_text"
+    elif table_currency in {"USD", "MXN"}:
+        # USD/MXN in the source column represents a meaningful original
+        # currency.  CNY, however, is a known default on legacy Mexico rows,
+        # so execution region must take precedence over that fallback.
+        source_currency = table_currency
+        currency_source = "approval_currency"
+        source_currency_raw = _text(table_currency_text)
+    elif region_currency:
+        source_currency = region_currency
+        currency_source = "execution_region"
+    else:
+        source_currency = table_currency
+        currency_source = "source_table_currency" if table_currency else None
+        source_currency_raw = _text(table_currency_text)
     warnings: list[str] = []
     errors: list[str] = []
     if source_currency in {"USD", "MXN"}:
@@ -1314,7 +1368,7 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
     else:
         amount = base_amount
         fx_rate = None
-        if _text(source_currency_text):
+        if _text(form_currency_text) or _text(table_currency_text):
             errors.append("钉钉审批中的币种无法识别，仅支持 CNY、USD 和 MXN")
         else:
             errors.append("审批未填写币种，且无法根据执行地区判断币种")
@@ -1382,7 +1436,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 "source_created_at": _datetime_text(row.get("source_created_at")),
                 "source_updated_at": _datetime_text(row.get("source_updated_at")),
                 "source_currency": source_currency,
-                "source_currency_raw": _text(source_currency_text),
+                "source_currency_raw": source_currency_raw,
+                "source_currency_table": _text(table_currency_text),
                 "currency_source": currency_source,
                 "execution_region": execution_region or None,
                 "source_amount": source_amount,
