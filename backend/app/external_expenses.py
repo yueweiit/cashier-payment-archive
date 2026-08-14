@@ -27,6 +27,20 @@ STANDARD_SOURCE_TYPES = ("operation", "purchase")
 MONTHLY_PAYMENT_PROCESS_CODE = "PROC-EE85EDD4-5CF2-4C08-B948-1690A6ACC51C"
 ALLOWED_APPROVAL_STATUSES = ("COMPLETED", "RUNNING")
 ALLOWED_EXECUTION_REGION_PATTERN = r"(中国|china|墨西哥|m[eé]xico)"
+CHINA_EXECUTION_REGION_RE = re.compile(r"(中国|china)", re.IGNORECASE)
+MEXICO_EXECUTION_REGION_RE = re.compile(r"(墨西哥|m[eé]xico)", re.IGNORECASE)
+CURRENCY_COMPONENT_PREFIXES = ("币种", "货币", "currency", "moneda", "tipo de moneda")
+EXECUTION_REGION_COMPONENT_PREFIXES = (
+    "执行地区",
+    "执行区域",
+    "地区",
+    "国家",
+    "execution region",
+    "region",
+    "región",
+    "país",
+    "pais",
+)
 DISALLOWED_APPROVAL_RESULT_PATTERN = r"(refus|reject|cancel|terminat|revok|void|abort|作废|拒绝|撤销|撤回|取消|终止)"
 DISALLOWED_APPROVAL_RESULT_RE = re.compile(DISALLOWED_APPROVAL_RESULT_PATTERN, re.IGNORECASE)
 SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出", "monthly": "月结付款"}
@@ -378,6 +392,35 @@ def _monthly_component(form_values: Iterable[Dict[str, Any]], *prefixes: str) ->
     return None
 
 
+def _form_component_value(form_values: Iterable[Dict[str, Any]], *prefixes: str) -> Optional[str]:
+    normalized_prefixes = tuple(prefix.casefold() for prefix in prefixes)
+    for item in form_values:
+        name = _first_text(item.get("name"), item.get("label")) or ""
+        if not name.casefold().startswith(normalized_prefixes):
+            continue
+        value = _display_component_value(item.get("value"))
+        if value:
+            return value
+    return None
+
+
+def currency_from_execution_region(value: Any) -> Optional[str]:
+    region = _text(value) or ""
+    if MEXICO_EXECUTION_REGION_RE.search(region):
+        return "MXN"
+    if CHINA_EXECUTION_REGION_RE.search(region):
+        return "CNY"
+    return None
+
+
+def resolve_approval_currency(currency_value: Any, execution_region: Any) -> tuple[Optional[str], Optional[str]]:
+    currency_text = _text(currency_value)
+    if currency_text:
+        return normalize_currency(currency_text), "approval_currency"
+    inferred = currency_from_execution_region(execution_region)
+    return inferred, "execution_region" if inferred else None
+
+
 def _monthly_money(value: Any) -> Optional[float]:
     text = _display_component_value(value)
     if not text:
@@ -515,8 +558,9 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
     total = declared_total if declared_total is not None else calculated_total
     application_time = _workflow_event_time(instance.get("create_time"))
     application_date = application_time[:10] if application_time else None
-    currency_text = _monthly_component(form_values, "币种", "货币", "Currency", "Moneda")
-    currency = normalize_currency(currency_text)
+    currency_text = _form_component_value(form_values, *CURRENCY_COMPONENT_PREFIXES)
+    execution_region = _form_component_value(form_values, *EXECUTION_REGION_COMPONENT_PREFIXES)
+    currency, _ = resolve_approval_currency(currency_text, execution_region)
     base_amount: Optional[float] = total if currency == "CNY" else None
     fx_rate: Optional[float] = 1.0 if currency == "CNY" else None
     fx_actual_date = application_date
@@ -540,7 +584,7 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
         "approval_title": _first_text(instance.get("title"), raw_payload.get("title")),
         "approval_status": instance.get("status"),
         "approval_result": instance.get("result"),
-        "execution_region": "中国China",
+        "execution_region": execution_region,
         "beneficiary": _monthly_component(form_values, "收款账户信息", "收款信息", "收款账户"),
         "expense_type": _monthly_component(form_values, "付款分类", "费用性质"),
         "summary": _monthly_component(form_values, "申请事由", "付款事由") or next((detail.get("description") for detail in details if detail.get("description")), None),
@@ -604,7 +648,7 @@ def _preview_conditions(
     conditions = [
         "source_type = ANY(%s)",
         "UPPER(BTRIM(COALESCE(approval_status, ''))) = ANY(%s)",
-        "COALESCE(execution_region, '') ~* %s",
+        "(BTRIM(COALESCE(execution_region, '')) = '' OR COALESCE(execution_region, '') ~* %s)",
         "COALESCE(approval_result, '') !~* %s",
         "(base_currency_amount IS NULL OR base_currency_amount <> 0)",
     ]
@@ -1234,13 +1278,7 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         summary = detail_values[0] if detail_values else _first_text(row.get("product_name"), row.get("order_name"), row.get("project"), row.get("expense_type"))
         payment_date_values = _component_values(form_values, "付款日期")
         needed_payment_date = _date_text(payment_date_values[0]) if payment_date_values else None
-        currency_values = (
-            _component_values(form_values, "币种")
-            or _component_values(form_values, "货币")
-            or _component_values(form_values, "Currency")
-            or _component_values(form_values, "Moneda")
-        )
-        source_currency_text = currency_values[0] if currency_values else row.get("source_currency")
+        source_currency_text = _form_component_value(form_values, *CURRENCY_COMPONENT_PREFIXES) or row.get("source_currency")
     else:
         beneficiary = _text(row.get("beneficiary")) or ""
         beneficiary_values = [beneficiary] if beneficiary else []
@@ -1251,23 +1289,35 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
     approval_no = _text(row.get("approval_no")) or ""
     approval_status = (_text(row.get("approval_status")) or "").upper()
     approval_result = (_text(row.get("approval_result")) or "").lower()
-    execution_region = _text(row.get("execution_region")) or ""
+    execution_region = (
+        _text(row.get("execution_region"))
+        or _form_component_value(form_values, *EXECUTION_REGION_COMPONENT_PREFIXES)
+        or ""
+    )
     base_amount = _number(row.get("base_currency_amount"))
     source_amount = _number(row.get("source_amount"))
-    source_currency = normalize_currency(source_currency_text)
+    source_currency, currency_source = resolve_approval_currency(source_currency_text, execution_region)
     warnings: list[str] = []
     errors: list[str] = []
-    if source_currency in {"USD", "MXN"} and source_amount is not None and source_amount > 0 and base_amount is not None:
+    if source_currency in {"USD", "MXN"}:
         amount = source_amount
-        fx_rate = float(Decimal(str(base_amount)) / Decimal(str(source_amount)))
-    else:
+        fx_rate = None
+        if source_amount is None:
+            errors.append("缺少原币应付金额")
+        elif source_amount <= 0:
+            errors.append("原币应付金额必须大于 0")
+        elif base_amount is not None:
+            fx_rate = float(Decimal(str(base_amount)) / Decimal(str(source_amount)))
+    elif source_currency == "CNY":
         amount = base_amount
         fx_rate = 1.0
-        if source_currency not in {None, "CNY"}:
-            warnings.append("来源币种无法识别，已按 CNY 导入")
-        elif source_type == "purchase" and not source_currency:
-            warnings.append("采购支出未识别到币种，已按 CNY 导入")
-        source_currency = "CNY"
+    else:
+        amount = base_amount
+        fx_rate = None
+        if _text(source_currency_text):
+            errors.append("钉钉审批中的币种无法识别，仅支持 CNY、USD 和 MXN")
+        else:
+            errors.append("审批未填写币种，且无法根据执行地区判断币种")
     if not beneficiary:
         warnings.append("缺少收款信息")
     if len(beneficiary_values) > 1:
@@ -1280,7 +1330,7 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         errors.append("缺少应付金额")
     elif base_amount < 0:
         errors.append("应付金额不能为负数")
-    if not execution_region_is_allowed(execution_region):
+    if execution_region and not execution_region_is_allowed(execution_region):
         errors.append("执行地区仅允许中国或墨西哥")
     if approval_status not in ALLOWED_APPROVAL_STATUSES:
         errors.append("审批状态不允许导入")
@@ -1332,6 +1382,9 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 "source_created_at": _datetime_text(row.get("source_created_at")),
                 "source_updated_at": _datetime_text(row.get("source_updated_at")),
                 "source_currency": source_currency,
+                "source_currency_raw": _text(source_currency_text),
+                "currency_source": currency_source,
+                "execution_region": execution_region or None,
                 "source_amount": source_amount,
                 "base_currency_amount": base_amount,
             }

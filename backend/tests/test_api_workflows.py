@@ -2011,6 +2011,56 @@ def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
     assert mexico["request_data"]["currency"] == "MXN"
     assert mexico["request_data"]["amount"] == 1000
 
+    mexico_from_region = map_external_expense(
+        {
+            "source_type": "purchase",
+            "source_id": "603",
+            "effective_date": date(2026, 8, 12),
+            "approval_no": "PURCHASE-MX-603",
+            "creator_name": "mx-user",
+            "applicant_department": "Compras",
+            "approval_title": "Solicitud enviado por Mario Gomez",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "墨西哥 México",
+            "beneficiary": None,
+            "expense_type": "Compra",
+            "source_currency": None,
+            "source_amount": Decimal("2500"),
+            "base_currency_amount": Decimal("1000"),
+            "raw_data": {"formComponentValues": [{"name": "收款人", "value": "Proveedor MX"}]},
+        }
+    )
+    assert mexico_from_region["errors"] == []
+    assert mexico_from_region["request_data"]["currency"] == "MXN"
+    assert mexico_from_region["request_data"]["amount"] == 2500
+    assert mexico_from_region["request_data"]["raw_extra"]["external_source"]["currency_source"] == "execution_region"
+
+    explicit_currency_wins = map_external_expense(
+        {
+            "source_type": "operation",
+            "source_id": "604",
+            "effective_date": date(2026, 8, 12),
+            "approval_no": "OP-MX-USD-604",
+            "creator_name": "mx-user",
+            "applicant_department": "México",
+            "approval_title": "Solicitud enviado por Mario Gomez",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "墨西哥 México",
+            "beneficiary": "Proveedor USD",
+            "expense_type": "Compra",
+            "source_currency": "美元 USD",
+            "source_amount": Decimal("100"),
+            "base_currency_amount": Decimal("680"),
+            "raw_data": {},
+        }
+    )
+    assert explicit_currency_wins["errors"] == []
+    assert explicit_currency_wins["request_data"]["currency"] == "USD"
+    assert explicit_currency_wins["request_data"]["amount"] == 100
+    assert explicit_currency_wins["request_data"]["raw_extra"]["external_source"]["currency_source"] == "approval_currency"
+
     assert execution_region_is_allowed("中国China")
     assert execution_region_is_allowed("墨西哥Mexico")
     assert execution_region_is_allowed("México")
@@ -2087,6 +2137,50 @@ def test_monthly_payment_mapping_aggregates_details_and_extracts_attachments():
     assert contract["file_size"] == 516944
 
 
+def test_monthly_payment_infers_mxn_from_execution_region(monkeypatch):
+    def fake_fetch_rates(selected_date, currencies):
+        assert selected_date == date(2026, 8, 10)
+        assert currencies == ["MXN"]
+        return {
+            "MXN": {
+                "currency": "MXN",
+                "cny_per_unit": 0.4,
+                "requested_date": "2026-08-10",
+                "actual_date": "2026-08-08",
+                "fallback": True,
+            }
+        }
+
+    monkeypatch.setattr("backend.app.external_expenses.fetch_rates", fake_fetch_rates)
+    instance = {
+        "source_id": "36",
+        "process_instance_id": "proc-monthly-36",
+        "create_time": datetime.fromisoformat("2026-08-10T03:40:00+00:00"),
+        "updated_at": datetime.fromisoformat("2026-08-10T04:00:00+00:00"),
+        "status": "RUNNING",
+        "result": "agree",
+        "title": "Mario提交的月结付款",
+        "raw_payload": {
+            "businessId": "202608101140000516847",
+            "originatorUserId": "mx-monthly-user",
+            "originatorDeptName": "México",
+            "formComponentValues": [
+                {"name": "执行地区 Región de ejecución", "value": "墨西哥 México"},
+                {"name": "合计总额", "value": "2500"},
+                {"name": "收款账户信息", "value": "Proveedor MX"},
+            ],
+        },
+    }
+
+    mapped = map_monthly_payment(instance, {"mx-monthly-user": "Mario"})
+    assert mapped["errors"] == []
+    assert mapped["currency"] == "MXN"
+    assert mapped["amount"] == 2500
+    assert mapped["request_data"]["base_amount_cny"] == 1000
+    assert mapped["request_data"]["fx_rate_actual_date"] == "2026-08-08"
+    assert mapped["request_data"]["raw_extra"]["external_source"]["currency_source"] == "execution_region"
+
+
 def test_external_expense_applicant_title_patterns():
     assert applicant_name_from_title("张三提交的运营支出") == "张三"
     assert applicant_name_from_title("Solicitud enviado por Zhang San") == "Zhang San"
@@ -2127,6 +2221,7 @@ def test_external_expense_exact_approval_number_ignores_dates():
     assert "BTRIM(approval_no) = %s" in exact_sql
     assert "base_currency_amount <> 0" in exact_sql
     assert "execution_region" in exact_sql
+    assert "BTRIM(COALESCE(execution_region, '')) = ''" in exact_sql
     assert exact_params[-3] == r"(中国|china|墨西哥|m[eé]xico)"
     assert "!~* %s" in exact_sql
     assert exact_params[-1] == "202607071704000140246"
