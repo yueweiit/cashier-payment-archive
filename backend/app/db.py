@@ -4,9 +4,10 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Union
 
 from .security import hash_password
 from .sheet_names import canonical_sheet_name, canonical_sheet_order
@@ -25,15 +26,45 @@ LEGACY_ROLE_MAP = {
 
 
 def now_iso() -> str:
-    return datetime.now().replace(microsecond=0).isoformat()
+    return datetime.now().isoformat(timespec="microseconds")
 
 
 def connect() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 15000")
+    conn.execute("PRAGMA synchronous = FULL")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def backup_database(destination: Union[Path, str]) -> Dict[str, Any]:
+    """Create and verify a consistent SQLite backup, including committed WAL pages."""
+    target = Path(destination).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with connect() as source, sqlite3.connect(temporary) as backup:
+            source.backup(backup)
+            backup.execute("PRAGMA journal_mode = DELETE")
+            backup.execute("PRAGMA synchronous = FULL")
+            result = backup.execute("PRAGMA integrity_check").fetchone()
+            if not result or str(result[0]).lower() != "ok":
+                raise RuntimeError(f"SQLite 备份完整性校验失败: {result[0] if result else '无结果'}")
+        digest = hashlib.sha256()
+        with temporary.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        os.replace(temporary, target)
+        return {
+            "path": str(target),
+            "sha256": digest.hexdigest(),
+            "size": target.stat().st_size,
+            "created_at": now_iso(),
+        }
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -53,6 +84,7 @@ def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[Dict[str, Any]]:
 
 def init_db() -> None:
     with connect() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -124,7 +156,8 @@ def init_db() -> None:
                 archived_by INTEGER REFERENCES users(id),
                 archived_at TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS payment_requests (
@@ -170,7 +203,8 @@ def init_db() -> None:
                 created_by INTEGER REFERENCES users(id),
                 updated_by INTEGER REFERENCES users(id),
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE INDEX IF NOT EXISTS idx_payment_batch ON payment_requests(batch_id);
@@ -197,7 +231,8 @@ def init_db() -> None:
                 created_by INTEGER REFERENCES users(id),
                 updated_by INTEGER REFERENCES users(id),
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE INDEX IF NOT EXISTS idx_payment_records_request ON payment_records(request_id);
@@ -326,6 +361,28 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS batch_operations (
+                id TEXT PRIMARY KEY,
+                batch_id INTEGER NOT NULL REFERENCES request_batches(id) ON DELETE CASCADE,
+                operation_type TEXT NOT NULL,
+                actor_id INTEGER REFERENCES users(id),
+                status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','interrupted')),
+                lease_expires_at TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                finished_at TEXT,
+                result_json TEXT,
+                failure_reason TEXT,
+                import_job_id INTEGER REFERENCES import_jobs(id) ON DELETE SET NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_operations_one_running
+            ON batch_operations(batch_id)
+            WHERE status = 'running';
+
+            CREATE INDEX IF NOT EXISTS idx_batch_operations_batch_started
+            ON batch_operations(batch_id, started_at DESC);
             """
         )
         migrate_schema(conn)
@@ -351,7 +408,9 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_column(conn, "request_batches", "parent_batch_id", "INTEGER REFERENCES request_batches(id) ON DELETE SET NULL")
     ensure_column(conn, "request_batches", "sheet_order_json", "TEXT")
+    ensure_column(conn, "request_batches", "version", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "payment_requests", "copied_from_request_id", "INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL")
+    ensure_column(conn, "payment_requests", "version", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "payment_requests", "applicant", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_approval_date", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_opinion", "TEXT")
@@ -378,6 +437,8 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_batch_snapshots_table(conn)
     migrate_approval_date_values(conn)
     ensure_payment_detail_tables(conn)
+    ensure_column(conn, "payment_records", "version", "INTEGER NOT NULL DEFAULT 1")
+    ensure_batch_operations_table(conn)
     migrate_currency_amount_anchors(conn)
     ensure_dingtalk_workflow_events_table(conn)
     migrate_payment_summaries_to_details(conn)
@@ -576,7 +637,8 @@ def ensure_payment_detail_tables(conn: sqlite3.Connection) -> None:
             created_by INTEGER REFERENCES users(id),
             updated_by INTEGER REFERENCES users(id),
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE INDEX IF NOT EXISTS idx_payment_records_request ON payment_records(request_id);
@@ -607,6 +669,35 @@ def ensure_payment_detail_tables(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "payment_records", "fx_rate_cny_per_unit", "REAL")
     ensure_column(conn, "payment_records", "fx_rate_date", "TEXT")
     ensure_column(conn, "payment_records", "fx_rate_actual_date", "TEXT")
+    ensure_column(conn, "payment_records", "version", "INTEGER NOT NULL DEFAULT 1")
+
+
+def ensure_batch_operations_table(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS batch_operations (
+            id TEXT PRIMARY KEY,
+            batch_id INTEGER NOT NULL REFERENCES request_batches(id) ON DELETE CASCADE,
+            operation_type TEXT NOT NULL,
+            actor_id INTEGER REFERENCES users(id),
+            status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed','interrupted')),
+            lease_expires_at TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            finished_at TEXT,
+            result_json TEXT,
+            failure_reason TEXT,
+            import_job_id INTEGER REFERENCES import_jobs(id) ON DELETE SET NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_operations_one_running
+        ON batch_operations(batch_id)
+        WHERE status = 'running';
+
+        CREATE INDEX IF NOT EXISTS idx_batch_operations_batch_started
+        ON batch_operations(batch_id, started_at DESC);
+        """
+    )
 
 
 def migrate_currency_amount_anchors(conn: sqlite3.Connection) -> None:
@@ -757,11 +848,17 @@ def migrate_payment_summaries_to_details(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO schema_migrations (key, applied_at) VALUES (?, ?)", (migration_key, now_iso()))
 
 
-def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int] = None) -> None:
+def refresh_payment_summaries(
+    conn: sqlite3.Connection,
+    request_id: Optional[int] = None,
+    *,
+    bump_version: bool = True,
+) -> None:
     if request_id is None:
         requests = conn.execute(
             """
-            SELECT id, amount, general_manager_approval, raw_extra_json
+            SELECT id, amount, paid_amount, pending_amount, finance_review, payment_status,
+                   actual_payment_date, payer, general_manager_approval, raw_extra_json
             FROM payment_requests
             ORDER BY id
             """
@@ -769,7 +866,8 @@ def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int
     else:
         requests = conn.execute(
             """
-            SELECT id, amount, general_manager_approval, raw_extra_json
+            SELECT id, amount, paid_amount, pending_amount, finance_review, payment_status,
+                   actual_payment_date, payer, general_manager_approval, raw_extra_json
             FROM payment_requests
             WHERE id = ?
             """,
@@ -813,24 +911,30 @@ def refresh_payment_summaries(conn: sqlite3.Connection, request_id: Optional[int
                 manager_approval = None
             if finance_review == "已付款" and not manager_approval:
                 manager_approval = "同意付款"
+        latest_date = latest["payment_date"] if latest else None
+        latest_payer = latest["payer"] if latest else None
+        next_values = (paid, pending, finance_review, finance_review, latest_date, latest_payer, manager_approval)
+        current_values = (
+            request["paid_amount"], request["pending_amount"], request["finance_review"],
+            request["payment_status"], request["actual_payment_date"], request["payer"],
+            request["general_manager_approval"],
+        )
+        if current_values == next_values:
+            continue
+        version_sql = ", version = version + 1, updated_at = ?" if bump_version else ""
+        values: list[Any] = [*next_values]
+        if bump_version:
+            values.append(now_iso())
+        values.append(request["id"])
         conn.execute(
-            """
+            f"""
             UPDATE payment_requests
             SET paid_amount = ?, pending_amount = ?, finance_review = ?,
                 payment_status = ?, actual_payment_date = ?, payer = ?,
-                general_manager_approval = ?
+                general_manager_approval = ?{version_sql}
             WHERE id = ?
             """,
-            (
-                paid,
-                pending,
-                finance_review,
-                finance_review,
-                latest["payment_date"] if latest else None,
-                latest["payer"] if latest else None,
-                manager_approval,
-                request["id"],
-            ),
+            values,
         )
 
 

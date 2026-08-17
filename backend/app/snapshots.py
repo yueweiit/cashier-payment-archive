@@ -145,6 +145,18 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
             (batch_id,),
         ).fetchall()
     }
+    current_payment_versions = {
+        int(row["id"]): int(row["version"] or 1)
+        for row in conn.execute(
+            """
+            SELECT payment_records.id, payment_records.version
+            FROM payment_records
+            JOIN payment_requests ON payment_requests.id = payment_records.request_id
+            WHERE payment_requests.batch_id = ?
+            """,
+            (batch_id,),
+        ).fetchall()
+    }
     baseline_payment_ids = {
         int(row["id"])
         for row in (baseline_payments or [])
@@ -156,6 +168,13 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
     current_request_ids = {
         int(row["id"])
         for row in conn.execute("SELECT id FROM payment_requests WHERE batch_id = ?", (batch_id,)).fetchall()
+    }
+    current_request_versions = {
+        int(row["id"]): int(row["version"] or 1)
+        for row in conn.execute(
+            "SELECT id, version FROM payment_requests WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchall()
     }
     baseline_requests = payload.get("requests", [])
     baseline_request_ids = {int(row["id"]) for row in baseline_requests if row.get("id") is not None}
@@ -175,12 +194,16 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         values["id"] = request_id
         values["batch_id"] = batch_id
         if request_id in current_request_ids:
+            values["version"] = current_request_versions[request_id] + 1
+            values["updated_at"] = now_iso()
             update_columns = [column for column in request_columns if column != "id" and column in values]
             conn.execute(
                 f"UPDATE payment_requests SET {', '.join(f'{column} = ?' for column in update_columns)} WHERE id = ?",
                 [values[column] for column in update_columns] + [request_id],
             )
         else:
+            if "version" in request_columns:
+                values["version"] = max(int(values.get("version") or 1), 1)
             insert_columns = [column for column in request_columns if column in values]
             placeholders = ", ".join("?" for _ in insert_columns)
             conn.execute(
@@ -193,12 +216,16 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         payment_id = int(payment["id"])
         values = {column: payment.get(column) for column in payment_columns if column in payment}
         if payment_id in current_payment_ids:
+            values["version"] = current_payment_versions[payment_id] + 1
+            values["updated_at"] = now_iso()
             update_columns = [column for column in payment_columns if column != "id" and column in values]
             conn.execute(
                 f"UPDATE payment_records SET {', '.join(f'{column} = ?' for column in update_columns)} WHERE id = ?",
                 [values[column] for column in update_columns] + [payment_id],
             )
         else:
+            if "version" in payment_columns:
+                values["version"] = max(int(values.get("version") or 1), 1)
             insert_columns = [column for column in payment_columns if column in values]
             placeholders = ", ".join("?" for _ in insert_columns)
             conn.execute(
@@ -233,7 +260,7 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         )
 
     for request_id in baseline_request_ids:
-        refresh_payment_summaries(conn, request_id)
+        refresh_payment_summaries(conn, request_id, bump_version=False)
         request = conn.execute(
             "SELECT * FROM payment_requests WHERE id = ?",
             (request_id,),

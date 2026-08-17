@@ -33,6 +33,7 @@ import {
 } from "lucide-react";
 import {
   api,
+  isApiError,
   AttachmentLink,
   AuditLog,
   Batch,
@@ -1696,7 +1697,7 @@ function Workspace({
     setSheetOrder(nextOrder);
     setSheetOrderSaving(true);
     try {
-      await api.updateSheetOrder(selectedBatch.id, nextOrder);
+      await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
       await reloadBatches();
       setMessage("Sheet 顺序已保存");
     } catch (error) {
@@ -1753,7 +1754,11 @@ function Workspace({
     const writablePayload = withoutDerivedPaymentFields(payload);
     let savedRequest: PaymentRequest;
     if (payload.id) {
-      const result = await api.updateRequest(selectedBatch.id, payload.id, { ...writablePayload, reason });
+      const result = await api.updateRequest(selectedBatch.id, payload.id, {
+        ...writablePayload,
+        expected_version: Number(payload.version || 1),
+        reason,
+      });
       savedRequest = result.request;
     } else {
       const result = await api.createRequest(selectedBatch.id, writablePayload);
@@ -1767,6 +1772,22 @@ function Workspace({
     await reloadBatches();
     setMessage("已保存");
     return savedRequest;
+  }
+
+  async function reloadEditingRequest(requestId: number) {
+    if (!selectedBatch) return undefined;
+    const result = await api.requests(selectedBatch.id, { dingtalk_lifecycle: "all" });
+    const latest = result.requests.find((item) => item.id === requestId);
+    if (!latest) {
+      setMessage("该请款已不存在，可能已被其他用户删除");
+      return undefined;
+    }
+    setEditing(latest);
+    setEditorDraft(null);
+    setEditorDirty(false);
+    await loadRequests();
+    await reloadBatches();
+    return latest;
   }
 
   function requestCurrencyConversion(request: Partial<PaymentRequest>, target: string) {
@@ -1872,25 +1893,38 @@ function Workspace({
       .map(stripGridRow);
     const updates = gridRows
       .filter((row) => row.id && dirtyRowIds(dirtyCells).has(row.__localId) && !row.__deleted)
-      .map((row) => ({ id: row.id!, ...stripGridRow(row) }));
+      .map((row) => ({ id: row.id!, expected_version: Number(row.version || 1), ...stripGridRow(row) }));
     const deletes = Array.from(deletedLocalIds)
-      .map((localId) => gridRows.find((row) => row.__localId === localId)?.id)
-      .filter((id): id is number => Boolean(id));
-    if (creates.length || updates.length || deletes.length) {
-      await api.bulkSaveRequests(selectedBatch.id, { creates, updates, deletes, reason });
+      .map((localId) => gridRows.find((row) => row.__localId === localId))
+      .filter((row): row is GridRow & { id: number } => Boolean(row?.id))
+      .map((row) => ({ id: row.id, expected_version: Number(row.version || 1) }));
+    try {
+      let batchVersion = selectedBatch.version;
+      if (creates.length || updates.length || deletes.length) {
+        await api.bulkSaveRequests(selectedBatch.id, { creates, updates, deletes, reason });
+        batchVersion = (await api.batch(selectedBatch.id)).batch.version;
+      }
+      const savedSheetOrder = getSheetTabs(gridRows, sheetOrder, deletedSheetNames)
+        .filter((tab) => tab.key !== ALL_SHEET && !deletedSheetNames.has(tab.key))
+        .map((tab) => tab.key);
+      if (canManageSheets) {
+        await api.updateSheetOrder(selectedBatch.id, savedSheetOrder, batchVersion);
+        setSheetOrder(savedSheetOrder);
+      }
+      setReason("");
+      setDeletedSheetNames(new Set());
+      await loadRequests();
+      await reloadBatches();
+      setMessage("表格更改已保存");
+    } catch (error) {
+      if (isApiError(error, "VERSION_CONFLICT")) {
+        await loadRequests();
+        await reloadBatches();
+        setMessage(`${writeErrorMessage(error)}，服务端最新数据已重新加载`);
+        return;
+      }
+      setMessage(writeErrorMessage(error));
     }
-    const savedSheetOrder = getSheetTabs(gridRows, sheetOrder, deletedSheetNames)
-      .filter((tab) => tab.key !== ALL_SHEET && !deletedSheetNames.has(tab.key))
-      .map((tab) => tab.key);
-    if (canManageSheets) {
-      await api.updateSheetOrder(selectedBatch.id, savedSheetOrder);
-      setSheetOrder(savedSheetOrder);
-    }
-    setReason("");
-    setDeletedSheetNames(new Set());
-    await loadRequests();
-    await reloadBatches();
-    setMessage("表格更改已保存");
   }
 
   async function discardUnsavedChanges() {
@@ -1948,7 +1982,7 @@ function Workspace({
         `确定将草稿“${selectedBatch.name}”还原到初始状态吗？\n\n当前已经保存的新增、修改、删除、付款和附件变更都会被撤回；页面上未保存的修改也会被放弃。系统会先保留一份还原前快照。`,
       )
     ) return;
-    await api.restoreBatchBaseline(selectedBatch.id);
+    await api.restoreBatchBaseline(selectedBatch.id, selectedBatch.version);
     setEditingSheet(null);
     setNewSheetName(null);
     setEditing(null);
@@ -1967,14 +2001,15 @@ function Workspace({
       return;
     }
     if (!window.confirm(`确定把草稿“${selectedBatch.name}”当前状态设为新的还原点吗？之后一键还原会回到现在。`)) return;
-    await api.setBatchBaseline(selectedBatch.id);
+    await api.setBatchBaseline(selectedBatch.id, selectedBatch.version);
+    await reloadBatches();
     setMessage("当前草稿状态已设为还原点");
   }
 
   async function deleteCurrentDraft() {
     if (!selectedBatch || !canManageDraftState) return;
     if (!window.confirm(`确定删除草稿批次“${selectedBatch.name}”吗？删除后该批次下的请款、付款明细和附件凭证也会删除。`)) return;
-    await api.deleteBatch(selectedBatch.id);
+    await api.deleteBatch(selectedBatch.id, selectedBatch.version);
     setEditing(null);
     setEditorDraft(null);
     setEditorDirty(false);
@@ -1991,7 +2026,7 @@ function Workspace({
       setMessage("请先保存表格更改，再修改批次状态");
       return;
     }
-    await api.archive(selectedBatch.id);
+    await api.archive(selectedBatch.id, selectedBatch.version);
     await reloadBatches();
     setMessage("批次已归档");
   }
@@ -2002,7 +2037,7 @@ function Workspace({
       setMessage("请先保存表格更改，再修改批次状态");
       return;
     }
-    await api.unarchive(selectedBatch.id);
+    await api.unarchive(selectedBatch.id, selectedBatch.version);
     await reloadBatches();
     setMessage("批次已恢复为草稿");
   }
@@ -2060,7 +2095,7 @@ function Workspace({
     const nextOrder = [...sheetTabs.filter((tab) => tab.key !== ALL_SHEET).map((tab) => tab.key), name];
     setSheetOrderSaving(true);
     try {
-      await api.updateSheetOrder(selectedBatch.id, nextOrder);
+      await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
       setSheetOrder(nextOrder);
       setFilters({
         q: "",
@@ -2130,7 +2165,7 @@ function Workspace({
       const nextOrder = sheetOrder.map((name) => name === oldName ? newName : name);
       setSheetOrderSaving(true);
       try {
-        await api.updateSheetOrder(selectedBatch.id, nextOrder);
+        await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
         setSheetOrder(nextOrder);
         setActiveSheet(newName);
         await reloadBatches();
@@ -2816,6 +2851,7 @@ function Workspace({
           setReason={setReason}
           onCancel={closeRequestEditor}
           onSave={saveRequest}
+          onReloadRequest={reloadEditingRequest}
           onDraftChange={setEditorDraft}
           onDirtyChange={setEditorDirty}
           onAttachmentsChanged={refreshAttachmentCounts}
@@ -2838,6 +2874,13 @@ function Workspace({
           language={gridHeaderLanguage}
           onClose={() => setCurrencyConversion(null)}
           onApplied={currencyConversionApplied}
+          onConflict={async () => {
+            const latest = await reloadEditingRequest(currencyConversion.request.id);
+            if (latest) {
+              setCurrencyConversion((current) => current ? { ...current, request: latest } : current);
+            }
+            return latest;
+          }}
         />
       )}
       {columnSettingsOpen && (
@@ -3104,6 +3147,7 @@ function CurrencyConversionDialog({
   language,
   onClose,
   onApplied,
+  onConflict,
 }: {
   batch: Batch;
   request: PaymentRequest;
@@ -3112,6 +3156,7 @@ function CurrencyConversionDialog({
   language: GridHeaderLanguage;
   onClose: () => void;
   onApplied: (request: PaymentRequest) => Promise<void> | void;
+  onConflict?: () => Promise<PaymentRequest | undefined>;
 }) {
   const [mode, setMode] = useState<"convert" | "correct">("convert");
   const [rateDate, setRateDate] = useState(localIsoDate(new Date()));
@@ -3131,13 +3176,14 @@ function CurrencyConversionDialog({
       rate_date: rateDate,
       mode,
       reason,
+      expected_version: request.version,
       expected_updated_at: request.updated_at,
     })
       .then((result) => active && setPreview(result.preview))
-      .catch((err) => active && setError((err as Error).message))
+      .catch((err) => active && setError(writeErrorMessage(err)))
       .finally(() => active && setLoading(false));
     return () => { active = false; };
-  }, [batch.id, mode, rateDate, reason, request.id, request.updated_at, targetCurrency]);
+  }, [batch.id, mode, rateDate, reason, request.id, request.updated_at, request.version, targetCurrency]);
 
   async function applyConversion() {
     if (!preview || applying) return;
@@ -3149,11 +3195,18 @@ function CurrencyConversionDialog({
         rate_date: rateDate,
         mode,
         reason,
+        expected_version: preview.request_version || request.version,
         expected_updated_at: request.updated_at,
       });
       await onApplied(result.request);
     } catch (err) {
-      setError((err as Error).message);
+      if (isApiError(err, "VERSION_CONFLICT")) {
+        const latest = await onConflict?.();
+        setPreview(null);
+        setError(`${writeErrorMessage(err)}${latest ? "；已刷新最新金额和版本，请重新确认" : ""}`);
+      } else {
+        setError(writeErrorMessage(err));
+      }
     } finally {
       setApplying(false);
     }
@@ -3224,6 +3277,7 @@ function ForeignAmountCorrectionDialog({
   language,
   onClose,
   onApplied,
+  onConflict,
 }: {
   batch: Batch;
   request: PaymentRequest;
@@ -3232,6 +3286,7 @@ function ForeignAmountCorrectionDialog({
   language: GridHeaderLanguage;
   onClose: () => void;
   onApplied: (request: PaymentRequest) => Promise<void> | void;
+  onConflict?: () => Promise<PaymentRequest | undefined>;
 }) {
   const [rateDate, setRateDate] = useState(localIsoDate(new Date()));
   const [preview, setPreview] = useState<ForeignAmountCorrectionPreview | null>(null);
@@ -3250,13 +3305,14 @@ function ForeignAmountCorrectionDialog({
       amount,
       rate_date: rateDate,
       reason,
+      expected_version: request.version,
       expected_updated_at: request.updated_at,
     })
       .then((result) => active && setPreview(result.preview))
-      .catch((err) => active && setError((err as Error).message))
+      .catch((err) => active && setError(writeErrorMessage(err)))
       .finally(() => active && setLoading(false));
     return () => { active = false; };
-  }, [amount, batch.id, rateDate, reason, request.id, request.updated_at]);
+  }, [amount, batch.id, rateDate, reason, request.id, request.updated_at, request.version]);
 
   async function applyCorrection() {
     if (!preview || applying) return;
@@ -3267,11 +3323,18 @@ function ForeignAmountCorrectionDialog({
         amount,
         rate_date: rateDate,
         reason,
+        expected_version: preview.request_version || request.version,
         expected_updated_at: request.updated_at,
       });
       await onApplied(result.request);
     } catch (err) {
-      setError((err as Error).message);
+      if (isApiError(err, "VERSION_CONFLICT")) {
+        const latest = await onConflict?.();
+        setPreview(null);
+        setError(`${writeErrorMessage(err)}${latest ? "；已刷新最新金额和版本，请重新确认" : ""}`);
+      } else {
+        setError(writeErrorMessage(err));
+      }
     } finally {
       setApplying(false);
     }
@@ -3345,7 +3408,11 @@ function HistoricalCurrencyRestoreDialog({ batch, onClose, onApplied }: { batch:
     setBusy(true);
     setError("");
     try {
-      const result = await api.applyHistoricalCurrencyRestore(batch.id, { request_ids: Array.from(selected), reason });
+      const result = await api.applyHistoricalCurrencyRestore(batch.id, {
+        request_ids: Array.from(selected),
+        reason,
+        expected_batch_version: batch.version,
+      });
       await onApplied(result.count);
     } catch (err) {
       setError((err as Error).message);
@@ -3423,7 +3490,15 @@ function RolloverPanel({
     setRolloverError("");
     setCopyingMode(copyMode);
     try {
-      const res = await api.rolloverBatch(Number(sourceBatchId), { name, start_date: startDate, end_date: endDate, copy_mode: copyMode });
+      const sourceBatch = batches.find((batch) => batch.id === Number(sourceBatchId));
+      if (!sourceBatch) throw new Error("来源批次不存在，请刷新后重试");
+      const res = await api.rolloverBatch(Number(sourceBatchId), {
+        name,
+        start_date: startDate,
+        end_date: endDate,
+        copy_mode: copyMode,
+        expected_batch_version: sourceBatch.version,
+      });
       setName("");
       setStartDate("");
       setEndDate("");
@@ -3948,6 +4023,7 @@ function RequestEditor({
   setReason,
   onCancel,
   onSave,
+  onReloadRequest,
   onDraftChange,
   onDirtyChange,
   onAttachmentsChanged,
@@ -3965,6 +4041,7 @@ function RequestEditor({
   setReason: (value: string) => void;
   onCancel: () => void;
   onSave: (request: Partial<PaymentRequest>) => Promise<PaymentRequest | undefined>;
+  onReloadRequest: (requestId: number) => Promise<PaymentRequest | undefined>;
   onDraftChange?: (request: Partial<PaymentRequest> | null) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onAttachmentsChanged?: () => Promise<void> | void;
@@ -3987,6 +4064,7 @@ function RequestEditor({
   const [uploadingImage, setUploadingImage] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [saveConflict, setSaveConflict] = useState(false);
   const [previewImages, setPreviewImages] = useState<{ images: AttachmentLink[]; index: number } | null>(null);
   const [foreignAmountCorrection, setForeignAmountCorrection] = useState<number | null>(null);
   const fields: Array<keyof PaymentRequest> = [
@@ -4023,6 +4101,7 @@ function RequestEditor({
 
   useEffect(() => {
     setForm(request);
+    setSaveConflict(false);
     setAttachments([]);
     setWorkflow(null);
     setWorkflowError("");
@@ -4200,11 +4279,13 @@ function RequestEditor({
     }
     setSaving(true);
     setSaveError("");
+    setSaveConflict(false);
     try {
       const savedRequest = await onSave(form);
       if (savedRequest) setForm(savedRequest);
     } catch (err) {
-      setSaveError((err as Error).message);
+      setSaveConflict(isApiError(err, "VERSION_CONFLICT"));
+      setSaveError(writeErrorMessage(err));
     } finally {
       setSaving(false);
     }
@@ -4213,6 +4294,33 @@ function RequestEditor({
   function discardRequestChanges() {
     setForm(request);
     setSaveError("");
+    setSaveConflict(false);
+  }
+
+  async function copyConflictDraft() {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(withoutDerivedPaymentFields(form), null, 2));
+      setSaveError("当前修改已复制，可刷新最新数据后重新填写");
+    } catch {
+      setSaveError("浏览器未允许复制，请先不要关闭抽屉，手工保留当前修改");
+    }
+  }
+
+  async function refreshAfterConflict() {
+    if (!form.id || saving) return;
+    setSaving(true);
+    try {
+      const latest = await onReloadRequest(form.id);
+      if (latest) {
+        setForm(latest);
+        setSaveConflict(false);
+        setSaveError("");
+      }
+    } catch (err) {
+      setSaveError(writeErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
   }
 
   const editorTabs: Array<{ key: RequestEditorTab; label: string; disabled?: boolean }> = [
@@ -4332,6 +4440,11 @@ function RequestEditor({
               onRequestChanged={async (updatedRequest) => {
                 setForm((current) => ({ ...current, ...updatedRequest }));
                 await onPaymentsChanged?.(updatedRequest);
+              }}
+              onRefreshRequest={async () => {
+                const latest = await onReloadRequest(form.id!);
+                if (latest) setForm(latest);
+                return latest;
               }}
             />
           </div>
@@ -4490,6 +4603,12 @@ function RequestEditor({
           </label>
         )}
         {saveError && <p className="error-text editor-save-error">{saveError}</p>}
+        {saveConflict && (
+          <div className="editor-conflict-actions">
+            <button className="ghost-button" type="button" onClick={copyConflictDraft} disabled={saving}>复制当前修改</button>
+            <button className="ghost-button" type="button" onClick={refreshAfterConflict} disabled={saving}>刷新后重新编辑</button>
+          </div>
+        )}
         <div className="request-editor-actions">
           <div className={isDirty ? "editor-save-state dirty" : "editor-save-state"}>
             <strong>{isDirty ? "有未保存修改" : "已保存"}</strong>
@@ -4514,11 +4633,17 @@ function RequestEditor({
       {foreignAmountCorrection !== null && request.id && (
         <ForeignAmountCorrectionDialog
           batch={batch}
-          request={request as PaymentRequest}
+          request={form as PaymentRequest}
           amount={foreignAmountCorrection}
           reason={reason}
           language={language}
           onClose={() => setForeignAmountCorrection(null)}
+          onConflict={async () => {
+            const result = await api.requests(batch.id, { dingtalk_lifecycle: "all" });
+            const latest = result.requests.find((item) => item.id === request.id);
+            if (latest) setForm(latest);
+            return latest;
+          }}
           onApplied={async (updatedRequest) => {
             setForeignAmountCorrection(null);
             const correctedForm: Partial<PaymentRequest> = {
@@ -4531,6 +4656,7 @@ function RequestEditor({
               fx_rate_cny_per_unit: updatedRequest.fx_rate_cny_per_unit,
               fx_rate_date: updatedRequest.fx_rate_date,
               fx_rate_actual_date: updatedRequest.fx_rate_actual_date,
+              version: updatedRequest.version,
               updated_at: updatedRequest.updated_at,
             };
             setSaving(true);
@@ -4566,12 +4692,14 @@ function PaymentDetailsPanel({
   reason,
   canManage,
   onRequestChanged,
+  onRefreshRequest,
 }: {
   batch: Batch;
   request: PaymentRequest;
   reason: string;
   canManage: boolean;
   onRequestChanged: (request: PaymentRequest) => Promise<void> | void;
+  onRefreshRequest?: () => Promise<PaymentRequest | undefined>;
 }) {
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [summary, setSummary] = useState<PaymentSummary>({
@@ -4600,7 +4728,7 @@ function PaymentDetailsPanel({
     setPaymentForm({ ...emptyPaymentForm, payment_account: request.payment_account || "" });
     setEditingPaymentId(null);
     setPaymentFormOpen(false);
-    loadPayments().catch((err) => setError((err as Error).message));
+    loadPayments().catch((err) => setError(writeErrorMessage(err)));
   }, [batch.id, request.id]);
 
   useEffect(() => {
@@ -4657,15 +4785,28 @@ function PaymentDetailsPanel({
     setBusy(true);
     setError("");
     try {
-      const payload = { ...paymentForm, reason };
+      const payload = {
+        ...paymentForm,
+        reason,
+        expected_request_version: request.version,
+      };
       const result = editingPaymentId
-        ? await api.updatePayment(batch.id, request.id, editingPaymentId, payload)
+        ? await api.updatePayment(batch.id, request.id, editingPaymentId, {
+            ...payload,
+            expected_payment_version: Number(editingPayment?.version || 1),
+          })
         : await api.createPayment(batch.id, request.id, payload);
       resetPaymentForm();
       await loadPayments();
       await onRequestChanged(result.request);
     } catch (err) {
-      setError((err as Error).message);
+      if (isApiError(err, "VERSION_CONFLICT")) {
+        await onRefreshRequest?.();
+        await loadPayments();
+        setError(`${writeErrorMessage(err)}；已刷新最新金额，当前付款表单已保留，请重新确认`);
+      } else {
+        setError(writeErrorMessage(err));
+      }
     } finally {
       setBusy(false);
     }
@@ -4680,12 +4821,25 @@ function PaymentDetailsPanel({
     setBusy(true);
     setError("");
     try {
-      const result = await api.deletePayment(batch.id, request.id, payment.id, reason);
+      const result = await api.deletePayment(
+        batch.id,
+        request.id,
+        payment.id,
+        request.version,
+        payment.version,
+        reason,
+      );
       if (editingPaymentId === payment.id) resetPaymentForm();
       await loadPayments();
       await onRequestChanged(result.request);
     } catch (err) {
-      setError((err as Error).message);
+      if (isApiError(err, "VERSION_CONFLICT")) {
+        await onRefreshRequest?.();
+        await loadPayments();
+        setError(`${writeErrorMessage(err)}；已刷新付款明细，请重新确认`);
+      } else {
+        setError(writeErrorMessage(err));
+      }
     } finally {
       setBusy(false);
     }
@@ -4701,7 +4855,7 @@ function PaymentDetailsPanel({
       }
       await loadPayments();
     } catch (err) {
-      setError((err as Error).message);
+      setError(writeErrorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -4715,7 +4869,7 @@ function PaymentDetailsPanel({
       await api.deletePaymentVoucher(batch.id, request.id, payment.id, voucher.id, reason);
       await loadPayments();
     } catch (err) {
-      setError((err as Error).message);
+      setError(writeErrorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -4944,7 +5098,8 @@ function ArchiveView({
 
   async function archive() {
     if (!selectedBatch) return;
-    await api.archive(selectedBatch.id);
+    await api.archive(selectedBatch.id, selectedBatch.version);
+    await reloadBatches();
     setMessage("批次已归档");
   }
 
@@ -4958,7 +5113,7 @@ function ArchiveView({
   async function deleteDraft(batch: Batch) {
     if (batch.status !== "draft") return;
     if (!window.confirm(`确定删除草稿批次“${batch.name}”吗？删除后该批次下的请款、付款明细和附件凭证也会删除。`)) return;
-    await api.deleteBatch(batch.id);
+    await api.deleteBatch(batch.id, batch.version);
     if (selectedBatch?.id === batch.id) setLogs([]);
     await reloadBatches();
     setMessage("草稿批次已删除");
@@ -5727,10 +5882,29 @@ function stripGridRow(row: GridRow): Partial<PaymentRequest> {
 function withoutDerivedPaymentFields(request: Partial<PaymentRequest>): Partial<PaymentRequest> {
   const output: Partial<PaymentRequest> = {};
   Object.entries(request).forEach(([key, value]) => {
-    if (key === "id" || calculatedRequestFields.has(key as keyof PaymentRequest)) return;
+    if (key === "id" || key === "version" || key === "updated_at" || calculatedRequestFields.has(key as keyof PaymentRequest)) return;
     output[key as keyof PaymentRequest] = value as never;
   });
   return output;
+}
+
+function writeErrorMessage(error: unknown): string {
+  if (isApiError(error, "VERSION_CONFLICT")) {
+    const target = error.payload.entity_type === "payment_request"
+      ? `请款 ${error.payload.entity_id || ""}`
+      : error.payload.entity_type === "payment_record"
+        ? `付款记录 ${error.payload.entity_id || ""}`
+        : error.payload.entity_type === "request_batch"
+          ? `批次 ${error.payload.entity_id || ""}`
+          : "数据";
+    return `${target}已被其他操作修改（当前版本 ${error.payload.current_version ?? "未知"}），请刷新后重新确认`;
+  }
+  if (isApiError(error, "BATCH_OPERATION_IN_PROGRESS")) {
+    const operation = String(error.payload.operation_type || "后台任务");
+    return `当前批次正在执行 ${operation}，请等待完成后再操作`;
+  }
+  if (isApiError(error, "DATABASE_BUSY")) return "数据库正忙，请稍后重试";
+  return (error as Error)?.message || "操作失败";
 }
 
 function paymentSourceLabel(sourceType: string) {

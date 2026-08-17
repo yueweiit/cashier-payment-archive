@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import sqlite3
 import shutil
 import sys
 import tempfile
@@ -11,16 +12,19 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import unquote
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 TEST_DIR = Path(tempfile.mkdtemp(prefix="cashier-payment-tests-"))
 os.environ["PAYMENT_APP_DATA_DIR"] = str(TEST_DIR / "data")
 os.environ["PAYMENT_APP_DB"] = str(TEST_DIR / "app.db")
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
-from backend.app.db import connect, migrate_sheet_registry_and_names, now_iso
+from backend.app.db import backup_database, connect, migrate_sheet_registry_and_names, now_iso
 from backend.app.external_expenses import (
     ExternalExpenseError,
     _parse_workflow_events,
@@ -47,6 +51,265 @@ SAMPLE = Path("/Users/smk/Downloads/20260626~20260707请款明细.xlsx")
 def login(client: TestClient, username: str = "admin", password: str = "admin123") -> None:
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200
+
+
+def test_sqlite_concurrency_pragmas_and_version_columns_are_enabled():
+    with TestClient(app):
+        with connect() as conn:
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 15000
+            assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+            assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            for table in ("request_batches", "payment_requests", "payment_records"):
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                assert "version" in columns
+
+
+def test_sqlite_backup_api_creates_verified_consistent_copy(tmp_path):
+    with TestClient(app):
+        with connect() as conn:
+            expected_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        target = tmp_path / "app-backup.db"
+        result = backup_database(target)
+        assert result["path"] == str(target)
+        assert result["sha256"]
+        assert result["size"] > 0
+        with sqlite3.connect(target) as backup:
+            assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert backup.execute("SELECT COUNT(*) FROM users").fetchone()[0] == expected_users
+
+
+def test_stale_request_update_returns_structured_version_conflict():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "请款乐观锁", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        created = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "初始", "amount": 100},
+        ).json()["request"]
+        assert created["version"] == 1
+
+        first = client.patch(
+            f"/api/batches/{batch['id']}/requests/{created['id']}",
+            json={"summary": "用户甲", "expected_version": created["version"]},
+        )
+        assert first.status_code == 200
+        assert first.json()["request"]["version"] == 2
+
+        stale = client.patch(
+            f"/api/batches/{batch['id']}/requests/{created['id']}",
+            json={"summary": "用户乙", "expected_version": created["version"]},
+        )
+        assert stale.status_code == 409
+        detail = stale.json()["detail"]
+        assert detail["code"] == "VERSION_CONFLICT"
+        assert detail["entity_type"] == "payment_request"
+        assert detail["entity_id"] == created["id"]
+        assert detail["current_version"] == 2
+
+
+def test_bulk_save_rolls_back_when_any_request_version_is_stale():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "批量乐观锁", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        first = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "第一条", "amount": 100},
+        ).json()["request"]
+        second = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "第二条", "amount": 200},
+        ).json()["request"]
+        updated_first = client.patch(
+            f"/api/batches/{batch['id']}/requests/{first['id']}",
+            json={"summary": "已被别人修改", "expected_version": first["version"]},
+        ).json()["request"]
+
+        response = client.patch(
+            f"/api/batches/{batch['id']}/requests/bulk",
+            json={
+                "creates": [],
+                "updates": [
+                    {"id": first["id"], "summary": "过期覆盖", "expected_version": first["version"]},
+                    {"id": second["id"], "summary": "本不应保存", "expected_version": second["version"]},
+                ],
+                "deletes": [],
+            },
+        )
+        assert response.status_code == 409
+        rows = {
+            row["id"]: row
+            for row in client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+        }
+        assert rows[first["id"]]["summary"] == updated_first["summary"]
+        assert rows[second["id"]]["summary"] == "第二条"
+        assert rows[second["id"]]["version"] == second["version"]
+
+
+def test_payment_mutation_checks_payment_and_request_versions():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "付款乐观锁", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        request_row = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "付款", "amount": 100},
+        ).json()["request"]
+        created_payment = client.post(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}/payments",
+            json={
+                "amount": 20,
+                "payment_date": "2026-08-17",
+                "expected_request_version": request_row["version"],
+            },
+        )
+        assert created_payment.status_code == 200
+        payment = created_payment.json()["payment"]
+        request_after_create = created_payment.json()["request"]
+        assert payment["version"] == 1
+        assert request_after_create["version"] == request_row["version"] + 1
+
+        changed = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}/payments/{payment['id']}",
+            json={
+                "amount": 30,
+                "expected_request_version": request_after_create["version"],
+                "expected_payment_version": payment["version"],
+            },
+        )
+        assert changed.status_code == 200
+
+        stale = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}/payments/{payment['id']}",
+            json={
+                "amount": 40,
+                "expected_request_version": request_after_create["version"],
+                "expected_payment_version": payment["version"],
+            },
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "VERSION_CONFLICT"
+
+
+def test_stale_batch_structure_update_is_rejected():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "批次乐观锁", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        assert batch["version"] == 1
+        first = client.put(
+            f"/api/batches/{batch['id']}/sheet-order",
+            json={"sheet_order": ["财务"], "expected_batch_version": batch["version"]},
+        )
+        assert first.status_code == 200
+        assert first.json()["batch"]["version"] == 2
+        stale = client.put(
+            f"/api/batches/{batch['id']}/sheet-order",
+            json={"sheet_order": ["采购"], "expected_batch_version": batch["version"]},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "VERSION_CONFLICT"
+
+
+def test_batch_operation_lease_prevents_duplicate_long_tasks_and_recovers_expired_lease():
+    from backend.app.batch_operations import (
+        acquire_batch_operation,
+        complete_batch_operation,
+    )
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "长任务互斥", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        with connect() as conn:
+            actor = conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()["id"]
+
+        first = acquire_batch_operation(batch["id"], "dingtalk-sync", actor)
+        with pytest.raises(HTTPException) as conflict:
+            acquire_batch_operation(batch["id"], "weekly-excel", actor)
+        assert conflict.value.status_code == 409
+        assert conflict.value.detail["code"] == "BATCH_OPERATION_IN_PROGRESS"
+        assert conflict.value.detail["operation_id"] == first["id"]
+
+        with connect() as conn:
+            conn.execute(
+                "UPDATE batch_operations SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00.000000", first["id"]),
+            )
+        recovered = acquire_batch_operation(batch["id"], "weekly-excel", actor)
+        with connect() as conn:
+            interrupted = conn.execute(
+                "SELECT status FROM batch_operations WHERE id = ?",
+                (first["id"],),
+            ).fetchone()
+        assert interrupted["status"] == "interrupted"
+        complete_batch_operation(recovered["id"], {"imported": 3})
+        with connect() as conn:
+            finished = conn.execute(
+                "SELECT status, result_json FROM batch_operations WHERE id = ?",
+                (recovered["id"],),
+            ).fetchone()
+        assert finished["status"] == "succeeded"
+        assert json.loads(finished["result_json"])["imported"] == 3
+
+
+def test_batch_structure_and_ordinary_writes_respect_versions_and_active_operation():
+    from backend.app.batch_operations import acquire_batch_operation, complete_batch_operation
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "批次写入互斥", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        request_row = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "初始", "amount": 100},
+        ).json()["request"]
+        latest_batch = client.get(f"/api/batches/{batch['id']}").json()["batch"]
+
+        archived = client.post(
+            f"/api/batches/{batch['id']}/archive",
+            params={"expected_batch_version": latest_batch["version"]},
+        )
+        assert archived.status_code == 200
+        assert archived.json()["batch"]["version"] == latest_batch["version"] + 1
+        stale = client.post(
+            f"/api/batches/{batch['id']}/unarchive",
+            params={"expected_batch_version": latest_batch["version"]},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "VERSION_CONFLICT"
+
+        current = archived.json()["batch"]
+        restored = client.post(
+            f"/api/batches/{batch['id']}/unarchive",
+            params={"expected_batch_version": current["version"]},
+        )
+        assert restored.status_code == 200
+
+        with connect() as conn:
+            actor = conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()["id"]
+        operation = acquire_batch_operation(batch["id"], "dingtalk-sync", actor)
+        blocked = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}",
+            json={"summary": "不应写入", "expected_version": request_row["version"]},
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["code"] == "BATCH_OPERATION_IN_PROGRESS"
+        complete_batch_operation(operation["id"], {"status": "ok"})
 
 
 def test_sheet_order_is_saved_and_inherited_by_rollover():

@@ -4,6 +4,7 @@ import json
 import hashlib
 import mimetypes
 import shutil
+import sqlite3
 import uuid
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -14,11 +15,13 @@ from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from .attachment_io import save_embedded_image_attachments, save_embedded_payment_vouchers
+from .batch_operations import ensure_batch_operation_available, leased_batch_operation
 from .db import (
     DATA_DIR,
     ROOT_DIR,
@@ -96,6 +99,26 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(sqlite3.OperationalError)
+async def handle_sqlite_operational_error(_: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+    message = str(exc).lower()
+    if "locked" in message or "busy" in message:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": "DATABASE_BUSY",
+                    "message": "数据库正在处理其他写入，请稍后重试",
+                }
+            },
+            headers={"Retry-After": "1"},
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": {"code": "DATABASE_ERROR", "message": "数据库操作失败"}},
+    )
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -118,10 +141,12 @@ class RolloverIn(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     copy_mode: str = "unfinished"
+    expected_batch_version: Optional[int] = None
 
 
 class SheetOrderIn(BaseModel):
     sheet_order: list[str] = Field(default_factory=list)
+    expected_batch_version: Optional[int] = None
 
 
 class RequestIn(BaseModel):
@@ -164,6 +189,7 @@ class RequestIn(BaseModel):
 
 class RequestPatch(RequestIn):
     reason: Optional[str] = None
+    expected_version: Optional[int] = None
 
 
 class CurrencyConversionIn(BaseModel):
@@ -171,6 +197,7 @@ class CurrencyConversionIn(BaseModel):
     rate_date: str
     mode: str = "convert"
     reason: Optional[str] = None
+    expected_version: Optional[int] = None
     expected_updated_at: Optional[str] = None
 
 
@@ -178,6 +205,7 @@ class ForeignAmountCorrectionIn(BaseModel):
     amount: float = Field(gt=0)
     rate_date: str
     reason: Optional[str] = None
+    expected_version: Optional[int] = None
     expected_updated_at: Optional[str] = None
 
 
@@ -189,18 +217,20 @@ class RequestGridPreferenceIn(BaseModel):
 class HistoricalCurrencyRestoreIn(BaseModel):
     request_ids: list[int] = Field(default_factory=list)
     reason: Optional[str] = None
+    expected_batch_version: Optional[int] = None
 
 
 class CorrectionIn(BaseModel):
     request_id: int
     changes: Dict[str, Any]
     reason: str
+    expected_version: Optional[int] = None
 
 
 class BulkRequestsIn(BaseModel):
     creates: list[Dict[str, Any]] = Field(default_factory=list)
     updates: list[Dict[str, Any]] = Field(default_factory=list)
-    deletes: list[int] = Field(default_factory=list)
+    deletes: list[Any] = Field(default_factory=list)
     reason: Optional[str] = None
 
 
@@ -273,6 +303,7 @@ class PaymentRecordIn(BaseModel):
     bank_reference: Optional[str] = None
     remark: Optional[str] = None
     reason: Optional[str] = None
+    expected_request_version: Optional[int] = None
 
 
 class PaymentRecordPatch(BaseModel):
@@ -283,6 +314,8 @@ class PaymentRecordPatch(BaseModel):
     bank_reference: Optional[str] = None
     remark: Optional[str] = None
     reason: Optional[str] = None
+    expected_request_version: Optional[int] = None
+    expected_payment_version: Optional[int] = None
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -1055,7 +1088,15 @@ def rollover_batch(
     operation_id = uuid.uuid4().hex
     timestamp = now_iso()
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, source_batch_id)
         source = require_batch(conn, source_batch_id)
+        checked_expected_version(
+            source,
+            payload.expected_batch_version,
+            "request_batch",
+            source_batch_id,
+        )
         source_sheet_order = canonical_sheet_order(batch_sheet_order(row_to_dict(source)))
         cursor = conn.execute(
             """
@@ -1108,6 +1149,7 @@ def rollover_batch(
                 "created_at",
                 "updated_at",
                 "content_hash",
+                "version",
             ]:
                 source_data.pop(key, None)
             source_data["copied_from_request_id"] = copied_from_request_id
@@ -1191,7 +1233,14 @@ def update_batch_sheet_order(
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
+        current_version = checked_expected_version(
+            batch,
+            payload.expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理调整 Sheet 顺序")
         row_backed_names = {
@@ -1209,10 +1258,17 @@ def update_batch_sheet_order(
         final_order.extend(sorted(row_backed_names - set(final_order)))
         old_order = batch_sheet_order(row_to_dict(batch))
         timestamp = now_iso()
-        conn.execute(
-            "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(final_order, ensure_ascii=False), timestamp, batch_id),
+        cursor = conn.execute(
+            """
+            UPDATE request_batches
+            SET sheet_order_json = ?, updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ?
+            """,
+            (json.dumps(final_order, ensure_ascii=False), timestamp, batch_id, current_version),
         )
+        if cursor.rowcount != 1:
+            current = require_batch(conn, batch_id)
+            raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
         updated = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
         write_audit(
             conn,
@@ -1228,48 +1284,86 @@ def update_batch_sheet_order(
 
 
 @app.post("/api/batches/{batch_id}/archive")
-def archive_batch(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES))) -> Dict[str, Any]:
+def archive_batch(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="批次不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
+        row = require_batch(conn, batch_id)
+        current_version = checked_expected_version(row, expected_batch_version, "request_batch", batch_id)
         if row["status"] == "archived":
             return {"batch": row_to_dict(row)}
         old_value = row_to_dict(row)
-        conn.execute(
-            "UPDATE request_batches SET status = 'archived', archived_by = ?, archived_at = ?, updated_at = ? WHERE id = ?",
-            (user["id"], now_iso(), now_iso(), batch_id),
+        cursor = conn.execute(
+            """
+            UPDATE request_batches
+            SET status = 'archived', archived_by = ?, archived_at = ?, updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ?
+            """,
+            (user["id"], now_iso(), now_iso(), batch_id, current_version),
         )
+        if cursor.rowcount != 1:
+            current = require_batch(conn, batch_id)
+            raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
         new_row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
         write_audit(conn, user["id"], "batch.archive", "batch", batch_id, batch_id, old_value, row_to_dict(new_row))
     return {"batch": row_to_dict(new_row)}
 
 
 @app.post("/api/batches/{batch_id}/unarchive")
-def unarchive_batch(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
+def unarchive_batch(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="批次不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
+        row = require_batch(conn, batch_id)
+        current_version = checked_expected_version(row, expected_batch_version, "request_batch", batch_id)
         if row["status"] == "draft":
             return {"batch": row_to_dict(row)}
         old_value = row_to_dict(row)
-        conn.execute(
-            "UPDATE request_batches SET status = 'draft', archived_by = NULL, archived_at = NULL, updated_at = ? WHERE id = ?",
-            (now_iso(), batch_id),
+        cursor = conn.execute(
+            """
+            UPDATE request_batches
+            SET status = 'draft', archived_by = NULL, archived_at = NULL,
+                updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ?
+            """,
+            (now_iso(), batch_id, current_version),
         )
+        if cursor.rowcount != 1:
+            current = require_batch(conn, batch_id)
+            raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
         new_row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
         write_audit(conn, user["id"], "batch.unarchive", "batch", batch_id, batch_id, old_value, row_to_dict(new_row))
     return {"batch": row_to_dict(new_row)}
 
 
 @app.post("/api/batches/{batch_id}/snapshots/baseline")
-def set_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
+def set_batch_baseline(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
+        current_version = checked_expected_version(
+            batch,
+            expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只有草稿批次可以设置还原点")
         snapshot = create_batch_snapshot(conn, batch_id, "baseline", user["id"], replace_existing=True)
+        touch_batch(conn, batch_id, expected_version=current_version)
         write_audit(
             conn,
             user["id"],
@@ -1284,8 +1378,21 @@ def set_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require_rol
 
 
 @app.post("/api/batches/{batch_id}/restore-baseline")
-def restore_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
+def restore_batch_baseline(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
+        batch = require_batch(conn, batch_id)
+        current_version = checked_expected_version(
+            batch,
+            expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         try:
             result = restore_batch_from_baseline(conn, batch_id, user["id"])
         except LookupError as exc:
@@ -1294,6 +1401,13 @@ def restore_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # A snapshot may contain an older batch version. The restore itself is a
+        # new structural write, so its version must advance from the pre-restore
+        # value instead of moving backwards with the snapshot.
+        conn.execute(
+            "UPDATE request_batches SET version = ?, updated_at = ? WHERE id = ?",
+            (current_version + 1, now_iso(), batch_id),
+        )
         write_audit(
             conn,
             user["id"],
@@ -1315,11 +1429,21 @@ def restore_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require
 
 
 @app.delete("/api/batches/{batch_id}")
-def delete_draft_batch(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, str]:
+def delete_draft_batch(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES)),
+) -> Dict[str, str]:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="批次不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
+        row = require_batch(conn, batch_id)
+        current_version = checked_expected_version(
+            row,
+            expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         if row["status"] != "draft":
             raise HTTPException(status_code=400, detail="已归档批次不能删除，请先恢复草稿后再删除")
         old_value = row_to_dict(row)
@@ -1329,7 +1453,13 @@ def delete_draft_batch(batch_id: int, user: Dict[str, Any] = Depends(require_rol
         ]
         file_paths = request_owned_file_paths(conn, request_ids)
         write_audit(conn, user["id"], "batch.delete_draft", "batch", batch_id, batch_id=batch_id, old_value=old_value)
-        conn.execute("DELETE FROM request_batches WHERE id = ?", (batch_id,))
+        cursor = conn.execute(
+            "DELETE FROM request_batches WHERE id = ? AND version = ?",
+            (batch_id, current_version),
+        )
+        if cursor.rowcount != 1:
+            current = require_batch(conn, batch_id)
+            raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
         for file_path in set(file_paths):
             delete_file_if_unreferenced(conn, file_path)
         cleanup_batch_snapshot_files(batch_id)
@@ -1345,6 +1475,8 @@ def correct_archived_request(
     if not payload.reason.strip():
         raise HTTPException(status_code=400, detail="归档后更正必须填写原因")
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         if batch["status"] != "archived":
             raise HTTPException(status_code=400, detail="只有归档批次需要走更正入口")
@@ -1354,9 +1486,17 @@ def correct_archived_request(
         ).fetchone()
         if not old_row:
             raise HTTPException(status_code=404, detail="请款记录不存在")
-        changed = update_request_row(conn, payload.request_id, payload.changes, user["id"], user["role"])
+        changed = update_request_row(
+            conn,
+            payload.request_id,
+            payload.changes,
+            user["id"],
+            user["role"],
+            expected_version=payload.expected_version,
+        )
         new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (payload.request_id,)).fetchone()
         if changed:
+            touch_batch(conn, batch_id)
             write_audit(
                 conn,
                 user["id"],
@@ -1551,6 +1691,8 @@ def create_request(
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_editable(batch, user)
         data = payload.dict(exclude_unset=True)
@@ -1570,11 +1712,31 @@ def bulk_save_requests(
 ) -> Dict[str, Any]:
     operation_id = uuid.uuid4().hex
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_bulk_editable(batch, user, payload.reason)
         created: list[int] = []
         updated: list[int] = []
         deleted: list[int] = []
+
+        # Validate every optimistic-lock token before applying any part of the batch.
+        for item in payload.updates:
+            request_id = item.get("id")
+            if not request_id:
+                raise HTTPException(status_code=400, detail="批量更新缺少记录 id")
+            row = require_accessible_request(conn, batch_id, int(request_id), user)
+            checked_expected_version(
+                row,
+                item.get("expected_version"),
+                "payment_request",
+                int(request_id),
+            )
+        normalized_deletes = [bulk_delete_target(item) for item in payload.deletes]
+        for request_id, expected_version in normalized_deletes:
+            row = require_accessible_request(conn, batch_id, request_id, user)
+            checked_expected_version(row, expected_version, "payment_request", request_id)
+
         for item in payload.creates:
             ensure_business_can_create_in_sheet(conn, user, batch_id, item.get("source_sheet"))
             reject_direct_payment_summary_changes(item, creating=True)
@@ -1597,13 +1759,21 @@ def bulk_save_requests(
             if not request_id:
                 raise HTTPException(status_code=400, detail="批量更新缺少记录 id")
             old_row = require_accessible_request(conn, batch_id, int(request_id), user)
-            changes = {key: value for key, value in item.items() if key != "id"}
+            expected_version = item.get("expected_version")
+            changes = {key: value for key, value in item.items() if key not in {"id", "expected_version"}}
             ensure_business_sheet_unchanged(user, row_to_dict(old_row), changes)
             if "source_sheet" in changes:
                 ensure_sheet_access(conn, user, changes.get("source_sheet"))
             if not changes:
                 continue
-            if not update_request_row(conn, int(request_id), changes, user["id"], user["role"]):
+            if not update_request_row(
+                conn,
+                int(request_id),
+                changes,
+                user["id"],
+                user["role"],
+                expected_version=expected_version,
+            ):
                 continue
             new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
             write_audit(
@@ -1619,11 +1789,25 @@ def bulk_save_requests(
                 operation_id,
             )
             updated.append(int(request_id))
-        for request_id in payload.deletes:
-            old_row = require_accessible_request(conn, batch_id, int(request_id), user)
-            ensure_can_delete_request_with_payments(conn, int(request_id), user)
-            file_paths = request_owned_file_paths(conn, [int(request_id)])
-            conn.execute("DELETE FROM payment_requests WHERE id = ?", (request_id,))
+        for request_id, expected_version in normalized_deletes:
+            old_row = require_accessible_request(conn, batch_id, request_id, user)
+            current_version = checked_expected_version(
+                old_row,
+                expected_version,
+                "payment_request",
+                request_id,
+            )
+            ensure_can_delete_request_with_payments(conn, request_id, user)
+            file_paths = request_owned_file_paths(conn, [request_id])
+            cursor = conn.execute(
+                "DELETE FROM payment_requests WHERE id = ? AND version = ?",
+                (request_id, current_version),
+            )
+            if cursor.rowcount != 1:
+                current = conn.execute("SELECT version FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+                if current:
+                    raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
+                raise HTTPException(status_code=404, detail="请款记录不存在")
             for file_path in file_paths:
                 delete_file_if_unreferenced(conn, file_path)
             write_audit(
@@ -1639,7 +1823,8 @@ def bulk_save_requests(
                 operation_id,
             )
             deleted.append(int(request_id))
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (now_iso(), batch_id))
+        if updated or deleted:
+            touch_batch(conn, batch_id)
     return {
         "operation_id": operation_id,
         "created": created,
@@ -1657,6 +1842,8 @@ def update_request(
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         old_row = require_accessible_request(conn, batch_id, request_id, user)
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
@@ -1665,12 +1852,21 @@ def update_request(
             raise HTTPException(status_code=400, detail="归档后更正必须填写原因")
         data = payload.dict(exclude_unset=True)
         reason = data.pop("reason", None)
+        expected_version = data.pop("expected_version", None)
         ensure_business_sheet_unchanged(user, row_to_dict(old_row), data)
         if "source_sheet" in data:
             ensure_sheet_access(conn, user, data.get("source_sheet"))
-        changed = update_request_row(conn, request_id, data, user["id"], user["role"])
+        changed = update_request_row(
+            conn,
+            request_id,
+            data,
+            user["id"],
+            user["role"],
+            expected_version=expected_version,
+        )
         new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         if changed:
+            touch_batch(conn, batch_id)
             write_audit(
                 conn,
                 user["id"],
@@ -1768,6 +1964,7 @@ def currency_conversion_preview_data(
         raise HTTPException(status_code=400, detail="换算后累计已付超过应付金额")
     return {
         "request_id": int(request_row["id"]),
+        "request_version": int(request_row.get("version") or 1),
         "mode": mode,
         "source_currency": source_currency,
         "target_currency": target_currency,
@@ -1825,6 +2022,7 @@ def foreign_amount_correction_preview_data(
     rate = float(target_rate["cny_per_unit"])
     return {
         "request_id": int(request_row["id"]),
+        "request_version": int(request_row.get("version") or 1),
         "currency": currency,
         "requested_rate_date": target_rate["requested_date"],
         "actual_rate_date": target_rate["actual_date"],
@@ -1887,11 +2085,16 @@ def apply_foreign_request_amount_correction(
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         require_currency_conversion_permission(batch, user, payload.reason)
         request_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
-        if payload.expected_updated_at and request_row.get("updated_at") != payload.expected_updated_at:
-            raise HTTPException(status_code=409, detail="请款已被其他用户修改，请刷新后重新更正金额")
+        current_version = checked_expected_version(
+            request_row,
+            payload.expected_version,
+            "payment_request",
+            request_id,
+        )
         current_currency = normalize_currency(request_row.get("currency"), default="CNY") or "CNY"
         if current_currency != currency:
             raise HTTPException(status_code=409, detail="请款币种已发生变化，请刷新后重试")
@@ -1900,12 +2103,13 @@ def apply_foreign_request_amount_correction(
         )
         preview = foreign_amount_correction_preview_data(request_row, payments, target_rate, payload.amount)
         timestamp = now_iso()
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE payment_requests
             SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
-                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
-            WHERE id = ?
+                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?,
+                version = version + 1
+            WHERE id = ? AND version = ?
             """,
             (
                 preview["after"]["amount"],
@@ -1916,12 +2120,16 @@ def apply_foreign_request_amount_correction(
                 user["id"],
                 timestamp,
                 request_id,
+                current_version,
             ),
         )
-        refresh_payment_summaries(conn, request_id)
+        if cursor.rowcount != 1:
+            current = require_accessible_request(conn, batch_id, request_id, user)
+            raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
+        refresh_payment_summaries(conn, request_id, bump_version=False)
         updated = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
         conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        touch_batch(conn, batch_id)
         write_audit(
             conn,
             user["id"],
@@ -1999,11 +2207,16 @@ def apply_request_currency_conversion(
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         require_currency_conversion_permission(batch, user, payload.reason)
         request_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
-        if payload.expected_updated_at and request_row.get("updated_at") != payload.expected_updated_at:
-            raise HTTPException(status_code=409, detail="请款已被其他用户修改，请刷新后重新换算")
+        current_version = checked_expected_version(
+            request_row,
+            payload.expected_version,
+            "payment_request",
+            request_id,
+        )
         if normalize_currency(request_row.get("currency"), default="CNY") == target_currency:
             raise HTTPException(status_code=400, detail="目标币种与当前币种相同")
         payments = rows_to_dicts(
@@ -2011,12 +2224,13 @@ def apply_request_currency_conversion(
         )
         preview = currency_conversion_preview_data(request_row, payments, target_rate, mode)
         timestamp = now_iso()
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE payment_requests
             SET currency = ?, amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
-                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
-            WHERE id = ?
+                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?,
+                version = version + 1
+            WHERE id = ? AND version = ?
             """,
             (
                 target_currency,
@@ -2028,8 +2242,12 @@ def apply_request_currency_conversion(
                 user["id"],
                 timestamp,
                 request_id,
+                current_version,
             ),
         )
+        if cursor.rowcount != 1:
+            current = require_accessible_request(conn, batch_id, request_id, user)
+            raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
         for converted in preview["payments"]:
             old_payment = next(item for item in payments if int(item["id"]) == int(converted["id"]))
             new_hash = payment_record_hash(
@@ -2044,7 +2262,7 @@ def apply_request_currency_conversion(
                 UPDATE payment_records
                 SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
                     fx_rate_date = ?, fx_rate_actual_date = ?, content_hash = ?,
-                    updated_by = ?, updated_at = ?
+                    updated_by = ?, updated_at = ?, version = version + 1
                 WHERE id = ? AND request_id = ?
                 """,
                 (
@@ -2060,11 +2278,11 @@ def apply_request_currency_conversion(
                     request_id,
                 ),
             )
-        refresh_payment_summaries(conn, request_id)
+        refresh_payment_summaries(conn, request_id, bump_version=False)
         updated_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         updated = row_to_dict(updated_row)
         conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        touch_batch(conn, batch_id)
         write_audit(
             conn,
             user["id"],
@@ -2202,6 +2420,7 @@ def preview_historical_currency_restore(
 
 
 @app.post("/api/batches/{batch_id}/historical-currency-restore/apply")
+@leased_batch_operation("historical-currency-restore", lambda arguments: arguments["batch_id"])
 def apply_historical_currency_restore(
     batch_id: int,
     payload: HistoricalCurrencyRestoreIn,
@@ -2214,7 +2433,14 @@ def apply_historical_currency_restore(
     restored: list[int] = []
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
+        checked_expected_version(
+            batch,
+            payload.expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         original_sheet_order = batch_sheet_order(row_to_dict(batch))
         if batch["status"] == "archived" and not str(payload.reason or "").strip():
             raise HTTPException(status_code=400, detail="归档批次恢复历史币种必须填写原因")
@@ -2258,7 +2484,8 @@ def apply_historical_currency_restore(
                 """
                 UPDATE payment_requests
                 SET currency = ?, amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
-                    fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
+                    fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?,
+                    version = version + 1
                 WHERE id = ?
                 """,
                 (
@@ -2271,12 +2498,13 @@ def apply_historical_currency_restore(
                     """
                     UPDATE payment_records
                     SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
-                        fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
+                        fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?,
+                        version = version + 1
                     WHERE id = ?
                     """,
                     (converted_amount, base_payment, rate, request_date, request_date, user["id"], timestamp, payment["id"]),
                 )
-            refresh_payment_summaries(conn, request_id)
+            refresh_payment_summaries(conn, request_id, bump_version=False)
             updated = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
             conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
             write_audit(
@@ -2286,7 +2514,7 @@ def apply_historical_currency_restore(
                 reason=payload.reason, operation_id=operation_id,
             )
             restored.append(request_id)
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        touch_batch(conn, batch_id)
         manifest["request_post_versions"] = {
             str(request_id): table_row_snapshot(conn, "payment_requests", request_id).get("updated_at")
             for request_id in restored
@@ -2315,7 +2543,7 @@ def apply_historical_currency_restore(
             str(payment_id): merge_related_rows_signature(conn, "payment_vouchers", "payment_id", payment_id)
             for payment_id in restored_payment_ids
         }
-        manifest["batch_post_updated_at"] = timestamp
+        manifest["batch_post_updated_at"] = require_batch(conn, batch_id)["updated_at"]
         write_import_job(
             conn,
             "historical-currency-restore",
@@ -2340,18 +2568,36 @@ def delete_request(
     batch_id: int,
     request_id: int,
     reason: str = Query(""),
+    expected_version: Optional[int] = Query(None),
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, str]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         old_row = require_accessible_request(conn, batch_id, request_id, user)
+        current_version = checked_expected_version(
+            old_row,
+            expected_version,
+            "payment_request",
+            request_id,
+        )
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理更正")
         if batch["status"] == "archived" and not reason.strip():
             raise HTTPException(status_code=400, detail="归档后删除必须填写原因")
         ensure_can_delete_request_with_payments(conn, request_id, user)
         file_paths = request_owned_file_paths(conn, [request_id])
-        conn.execute("DELETE FROM payment_requests WHERE id = ?", (request_id,))
+        cursor = conn.execute(
+            "DELETE FROM payment_requests WHERE id = ? AND version = ?",
+            (request_id, current_version),
+        )
+        if cursor.rowcount != 1:
+            current = conn.execute("SELECT version FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+            if current:
+                raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
+            raise HTTPException(status_code=404, detail="请款记录不存在")
+        touch_batch(conn, batch_id)
         for file_path in file_paths:
             delete_file_if_unreferenced(conn, file_path)
         write_audit(
@@ -2377,7 +2623,7 @@ def list_request_payments(
     with connect() as conn:
         require_batch(conn, batch_id)
         require_accessible_request(conn, batch_id, request_id, user)
-        refresh_payment_summaries(conn, request_id)
+        refresh_payment_summaries(conn, request_id, bump_version=False)
         request_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         payments = payment_records_public(conn, request_id)
     return {
@@ -2464,9 +2710,16 @@ def create_request_payment(
 ) -> Dict[str, Any]:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_can_manage_payments(batch, user, payload.reason)
         request_row = require_accessible_request(conn, batch_id, request_id, user)
+        checked_expected_version(
+            request_row,
+            payload.expected_request_version,
+            "payment_request",
+            request_id,
+        )
         payment_id = insert_payment_record_internal(
             conn,
             request_id,
@@ -2498,6 +2751,7 @@ def create_request_payment(
             reason=payload.reason,
         )
         request_after = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        touch_batch(conn, batch_id)
         payment = payment_record_public(conn, row)
     return {"payment": payment, "request": row_to_dict(request_after)}
 
@@ -2512,12 +2766,27 @@ def update_request_payment(
 ) -> Dict[str, Any]:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         data = payload.dict(exclude_unset=True)
         reason = data.pop("reason", None)
+        expected_request_version = data.pop("expected_request_version", None)
+        expected_payment_version = data.pop("expected_payment_version", None)
         ensure_can_manage_payments(batch, user, reason)
-        require_accessible_request(conn, batch_id, request_id, user)
+        request_row = require_accessible_request(conn, batch_id, request_id, user)
+        checked_expected_version(
+            request_row,
+            expected_request_version,
+            "payment_request",
+            request_id,
+        )
         old = require_payment_record(conn, request_id, payment_id)
+        current_payment_version = checked_expected_version(
+            old,
+            expected_payment_version,
+            "payment_record",
+            payment_id,
+        )
         if payment_record_is_inherited(row_to_dict(old)):
             raise HTTPException(status_code=400, detail="结转继承的付款明细只读")
         amount = payment_record_amount(data.get("amount", old["amount"]))
@@ -2544,14 +2813,14 @@ def update_request_payment(
         ).fetchone()
         payment_rate = float(request_currency["fx_rate_cny_per_unit"] or 1)
         payment_base_amount = multiply_money(merged["amount"], payment_rate)
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE payment_records
             SET amount = ?, payment_date = ?, payer = ?, payment_account = ?,
                 bank_reference = ?, remark = ?, content_hash = ?,
                 base_amount_cny = ?, fx_rate_cny_per_unit = ?, fx_rate_date = ?, fx_rate_actual_date = ?,
-                updated_by = ?, updated_at = ?
-            WHERE id = ?
+                updated_by = ?, updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ?
             """,
             (
                 merged["amount"],
@@ -2568,8 +2837,12 @@ def update_request_payment(
                 user["id"],
                 now_iso(),
                 payment_id,
+                current_payment_version,
             ),
         )
+        if cursor.rowcount != 1:
+            current = require_payment_record(conn, request_id, payment_id)
+            raise_version_conflict("payment_record", payment_id, int(current["version"] or 1))
         refresh_payment_summaries(conn, request_id)
         row = conn.execute(
             """
@@ -2591,6 +2864,7 @@ def update_request_payment(
             reason=reason,
         )
         request_after = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        touch_batch(conn, batch_id)
         payment = payment_record_public(conn, row)
     return {"payment": payment, "request": row_to_dict(request_after)}
 
@@ -2601,18 +2875,39 @@ def delete_request_payment(
     request_id: int,
     payment_id: int,
     reason: str = Query(""),
+    expected_request_version: Optional[int] = Query(None),
+    expected_payment_version: Optional[int] = Query(None),
     user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_can_manage_payments(batch, user, reason)
-        require_accessible_request(conn, batch_id, request_id, user)
+        request_row = require_accessible_request(conn, batch_id, request_id, user)
+        checked_expected_version(
+            request_row,
+            expected_request_version,
+            "payment_request",
+            request_id,
+        )
         old = require_payment_record(conn, request_id, payment_id)
+        current_payment_version = checked_expected_version(
+            old,
+            expected_payment_version,
+            "payment_record",
+            payment_id,
+        )
         if payment_record_is_inherited(row_to_dict(old)):
             raise HTTPException(status_code=400, detail="结转继承的付款明细只读")
         vouchers = rows_to_dicts(conn.execute("SELECT * FROM payment_vouchers WHERE payment_id = ?", (payment_id,)).fetchall())
-        conn.execute("DELETE FROM payment_records WHERE id = ?", (payment_id,))
+        cursor = conn.execute(
+            "DELETE FROM payment_records WHERE id = ? AND version = ?",
+            (payment_id, current_payment_version),
+        )
+        if cursor.rowcount != 1:
+            current = require_payment_record(conn, request_id, payment_id)
+            raise_version_conflict("payment_record", payment_id, int(current["version"] or 1))
         refresh_payment_summaries(conn, request_id)
         write_audit(
             conn,
@@ -2625,6 +2920,7 @@ def delete_request_payment(
             reason=reason or None,
         )
         request_after = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        touch_batch(conn, batch_id)
         for voucher in vouchers:
             delete_payment_voucher_file_if_unused(conn, voucher)
     return {"status": "ok", "request": row_to_dict(request_after)}
@@ -3549,7 +3845,7 @@ async def preview_weekly_excel_merge(
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     try:
-        rows, meta = parse_weekly_excel(saved_path)
+        rows, meta = await run_in_threadpool(parse_weekly_excel, saved_path)
         canonicalize_import_sheet_names(rows, meta)
     except Exception as exc:
         saved_path.unlink(missing_ok=True)
@@ -3692,7 +3988,7 @@ def update_payment_from_merge(
     payload["updated_at"] = now_iso()
     columns = list(payload)
     conn.execute(
-        f"UPDATE payment_records SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",
+        f"UPDATE payment_records SET {', '.join(f'{column} = ?' for column in columns)}, version = version + 1 WHERE id = ?",
         [payload[column] for column in columns] + [payment_id],
     )
 
@@ -3718,7 +4014,20 @@ def request_payment_signature(conn, request_id: int) -> str:
     ).hexdigest()
 
 
+def merge_job_batch_id(arguments: Dict[str, Any]) -> int:
+    job_id = int(arguments["job_id"])
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT batch_id FROM import_jobs WHERE id = ? AND kind = 'weekly-excel-merge'",
+            (job_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="合并预览任务不存在")
+    return int(row["batch_id"])
+
+
 @app.post("/api/import-jobs/{job_id}/apply-merge")
+@leased_batch_operation("weekly-excel-merge-apply", merge_job_batch_id)
 def apply_weekly_excel_merge(
     job_id: int,
     payload: WeeklyMergeApplyIn,
@@ -3729,6 +4038,37 @@ def apply_weekly_excel_merge(
         for item in payload.resolutions
     }
     created_file_paths: set[str] = set()
+    # Parse and build the candidate plan before acquiring SQLite's write lock.
+    # The transaction below revalidates every captured version/signature before
+    # applying the already-built plan.
+    with connect() as preview_conn:
+        preview_job = preview_conn.execute(
+            "SELECT * FROM import_jobs WHERE id = ? AND kind = 'weekly-excel-merge'",
+            (job_id,),
+        ).fetchone()
+        if not preview_job:
+            raise HTTPException(status_code=404, detail="合并预览任务不存在")
+        try:
+            preview_meta = json.loads(preview_job["mapping_json"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=409, detail="合并预览任务数据损坏，请重新预览") from exc
+        preview_source_copy = preview_meta.get("source_copy")
+        if not preview_source_copy:
+            raise HTTPException(status_code=409, detail="合并源文件不存在，请重新预览")
+        preview_source_path = resolve_data_file(preview_source_copy)
+        if not preview_source_path.exists():
+            raise HTTPException(status_code=409, detail="合并源文件已变化或丢失，请重新预览")
+        parsed_rows, parsed_meta = parse_weekly_excel(preview_source_path)
+        canonicalize_import_sheet_names(parsed_rows, parsed_meta)
+        prepared_plan = build_weekly_merge_plan(
+            preview_conn,
+            int(preview_job["batch_id"]),
+            parsed_rows,
+            parsed_meta,
+            resolutions,
+            payload.payment_dates,
+        )
+        prepared_file_sha256 = merge_file_sha256(preview_source_path)
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         job = conn.execute(
@@ -3753,7 +4093,7 @@ def apply_weekly_excel_merge(
         if not source_copy:
             raise HTTPException(status_code=409, detail="合并源文件不存在，请重新预览")
         source_path = resolve_data_file(source_copy)
-        if not source_path.exists() or merge_file_sha256(source_path) != job_meta.get("file_sha256"):
+        if not source_path.exists() or prepared_file_sha256 != job_meta.get("file_sha256"):
             raise HTTPException(status_code=409, detail="合并源文件已变化或丢失，请重新预览")
         batch_id = int(job["batch_id"])
         batch = require_batch(conn, batch_id)
@@ -3790,9 +4130,7 @@ def apply_weekly_excel_merge(
                 job_meta.get("payment_voucher_signatures") or {}
             ).get(payment_id):
                 raise HTTPException(status_code=409, detail=f"预览后付款 {payment_id} 的凭证已变化，请重新预览")
-        rows, meta = parse_weekly_excel(source_path)
-        canonicalize_import_sheet_names(rows, meta)
-        plan = build_weekly_merge_plan(conn, batch_id, rows, meta, resolutions, payload.payment_dates)
+        plan = prepared_plan
         if not plan["can_apply"]:
             unresolved = [
                 *[
@@ -3986,7 +4324,7 @@ def apply_weekly_excel_merge(
             timestamp = now_iso()
             next_sheet_order = canonical_sheet_order(plan["sheet_order"]["new"])
             conn.execute(
-                "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+                "UPDATE request_batches SET sheet_order_json = ?, updated_at = ?, version = version + 1 WHERE id = ?",
                 (json.dumps(next_sheet_order, ensure_ascii=False), timestamp, batch_id),
             )
             touched_request_ids = {
@@ -4073,13 +4411,14 @@ def apply_weekly_excel_merge(
 
 
 @app.post("/api/import/weekly-excel")
+@leased_batch_operation("weekly-excel-import", lambda arguments: arguments.get("batch_id"))
 async def import_weekly_excel(
     file: UploadFile = File(...),
     batch_id: Optional[int] = Form(None),
     user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
-    rows, meta = parse_weekly_excel(saved_path)
+    rows, meta = await run_in_threadpool(parse_weekly_excel, saved_path)
     canonicalize_import_sheet_names(rows, meta)
     payment_details = meta.pop("payment_details", [])
     payment_detail_sheet_present = bool(meta.get("payment_detail_sheet_present"))
@@ -4160,6 +4499,7 @@ async def import_weekly_excel(
 
 
 @app.post("/api/import/dingtalk")
+@leased_batch_operation("dingtalk-file-import", lambda arguments: arguments.get("batch_id"))
 async def import_dingtalk(
     file: UploadFile = File(...),
     batch_id: Optional[int] = Form(None),
@@ -4168,7 +4508,7 @@ async def import_dingtalk(
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     if not mapping_json:
-        headers, preview = detect_table_headers(saved_path)
+        headers, preview = await run_in_threadpool(detect_table_headers, saved_path)
         return {
             "status": "needs_mapping",
             "headers": headers,
@@ -4177,7 +4517,7 @@ async def import_dingtalk(
             "preview": preview,
         }
     mapping = json.loads(mapping_json)
-    rows, meta = parse_dingtalk_file(saved_path, mapping)
+    rows, meta = await run_in_threadpool(parse_dingtalk_file, saved_path, mapping)
     canonicalize_import_sheet_names(rows, meta)
     if any(float(row.get("paid_amount") or 0) > 0 for row in rows) and user["role"] not in FINANCE_FIELD_ROLES:
         raise HTTPException(status_code=403, detail="包含付款数据的文件只能由财务、总经理或管理员导入")
@@ -4222,6 +4562,7 @@ async def import_dingtalk(
 
 
 @app.post("/api/batches/{batch_id}/employee-departments/import")
+@leased_batch_operation("employee-department-grouping", lambda arguments: arguments["batch_id"])
 async def import_employee_departments(
     batch_id: int,
     file: UploadFile = File(...),
@@ -4229,7 +4570,11 @@ async def import_employee_departments(
 ) -> Dict[str, Any]:
     content = await file.read()
     try:
-        parsed = parse_employee_department_workbook(content, file.filename or "员工信息.xls")
+        parsed = await run_in_threadpool(
+            parse_employee_department_workbook,
+            content,
+            file.filename or "员工信息.xls",
+        )
     except EmployeeDepartmentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -4284,7 +4629,8 @@ async def import_employee_departments(
             conn.execute(
                 """
                 UPDATE payment_requests
-                SET source_sheet = ?, raw_extra_json = ?, updated_by = ?, updated_at = ?
+                SET source_sheet = ?, raw_extra_json = ?, updated_by = ?, updated_at = ?,
+                    version = version + 1
                 WHERE id = ?
                 """,
                 (new_sheet, raw_extra_json, user["id"], timestamp, current["id"]),
@@ -4317,7 +4663,7 @@ async def import_employee_departments(
             + after_nonempty_order
         )
         conn.execute(
-            "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+            "UPDATE request_batches SET sheet_order_json = ?, updated_at = ?, version = version + 1 WHERE id = ?",
             (json.dumps(final_order, ensure_ascii=False), timestamp, batch_id),
         )
         result = {
@@ -4466,6 +4812,7 @@ def preview_external_expense_rows(
 
 
 @app.post("/api/batches/{batch_id}/imports/external-expenses")
+@leased_batch_operation("external-expense-import", lambda arguments: arguments["batch_id"])
 def import_external_expense_rows(
     batch_id: int,
     payload: ExternalExpenseImportIn,
@@ -4613,6 +4960,7 @@ def import_external_expense_rows(
 
 
 @app.post("/api/batches/{batch_id}/external-expenses/sync-metadata")
+@leased_batch_operation("dingtalk-workflow-sync", lambda arguments: arguments["batch_id"])
 def sync_external_expense_metadata(
     batch_id: int,
     only_if_stale_seconds: int = Query(default=0, ge=0, le=86400),
@@ -4857,7 +5205,7 @@ def sync_external_expense_metadata(
             conn.execute(
                 """
                 UPDATE payment_requests
-                SET raw_extra_json = ?, updated_by = ?, updated_at = ?
+                SET raw_extra_json = ?, updated_by = ?, updated_at = ?, version = version + 1
                 WHERE id = ? AND batch_id = ?
                 """,
                 (json.dumps(raw_extra, ensure_ascii=False, default=str), user["id"], timestamp, request_id, batch_id),
@@ -5108,6 +5456,8 @@ def sync_external_expense_metadata(
             "attachment_failed": attachment_failed,
             "attachment_errors": attachment_errors[:50],
         }
+        if updated_requests or attachment_synced or auto_payments:
+            touch_batch(conn, batch_id)
         write_audit(
             conn,
             user["id"],
@@ -5133,6 +5483,7 @@ def get_import_job(
 
 
 def restore_table_snapshot(conn, table: str, snapshot: Dict[str, Any]) -> None:
+    current = conn.execute(f"SELECT version FROM {table} WHERE id = ?", (snapshot["id"],)).fetchone()
     columns = [
         row["name"]
         for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -5141,6 +5492,10 @@ def restore_table_snapshot(conn, table: str, snapshot: Dict[str, Any]) -> None:
     payload = {column: snapshot.get(column) for column in columns}
     if table == "payment_requests" and "source_sheet" in payload:
         payload["source_sheet"] = canonical_sheet_name(payload["source_sheet"])
+    if "version" in payload:
+        payload["version"] = max(int(payload.get("version") or 1), int(current["version"] or 1)) + 1
+    if "updated_at" in payload:
+        payload["updated_at"] = now_iso()
     conn.execute(
         f"UPDATE {table} SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",
         [payload[column] for column in columns] + [snapshot["id"]],
@@ -5235,7 +5590,7 @@ def rollback_weekly_merge_job(
     timestamp = now_iso()
     restored_sheet_order = canonical_sheet_order(manifest.get("old_sheet_order") or [])
     conn.execute(
-        "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+        "UPDATE request_batches SET sheet_order_json = ?, updated_at = ?, version = version + 1 WHERE id = ?",
         (json.dumps(restored_sheet_order, ensure_ascii=False), timestamp, batch_id),
     )
     conn.execute(
@@ -5287,6 +5642,7 @@ def rollback_weekly_merge_job(
 
 
 @app.post("/api/batches/{batch_id}/imports/latest/rollback")
+@leased_batch_operation("import-rollback", lambda arguments: arguments["batch_id"])
 def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES))) -> Dict[str, Any]:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
@@ -5398,7 +5754,10 @@ def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require
         for surviving_request_id in surviving_request_ids:
             refresh_payment_summaries(conn, surviving_request_id)
         conn.execute("UPDATE import_jobs SET status = 'rolled_back', imported_rows = 0 WHERE id = ?", (job["id"],))
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (now_iso(), batch_id))
+        conn.execute(
+            "UPDATE request_batches SET updated_at = ?, version = version + 1 WHERE id = ?",
+            (now_iso(), batch_id),
+        )
         removed_files = 0
         for file_path in owned_file_paths:
             before = resolve_data_file(file_path)
@@ -5724,6 +6083,69 @@ def update_dictionary(dictionary_id: int, payload: DictionaryIn, user: Dict[str,
         row = conn.execute("SELECT * FROM dictionaries WHERE id = ?", (dictionary_id,)).fetchone()
         write_audit(conn, user["id"], "dictionary.update", "dictionary", dictionary_id, old_value=row_to_dict(old), new_value=row_to_dict(row))
     return {"dictionary": row_to_dict(row)}
+
+
+def raise_version_conflict(entity_type: str, entity_id: int, current_version: int) -> None:
+    labels = {
+        "payment_request": "请款",
+        "payment_record": "付款明细",
+        "request_batch": "批次",
+    }
+    label = labels.get(entity_type, "记录")
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "VERSION_CONFLICT",
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "current_version": int(current_version),
+            "message": f"{label}已被其他操作修改，请刷新后重试",
+        },
+    )
+
+
+def checked_expected_version(
+    row: Any,
+    expected_version: Optional[int],
+    entity_type: str,
+    entity_id: int,
+) -> int:
+    current_version = int(row["version"] or 1)
+    # One-release compatibility for older API clients. The web client always sends a version.
+    if expected_version is None:
+        return current_version
+    if int(expected_version) != current_version:
+        raise_version_conflict(entity_type, entity_id, current_version)
+    return current_version
+
+
+def touch_batch(conn, batch_id: int, *, expected_version: Optional[int] = None) -> int:
+    row = require_batch(conn, batch_id)
+    current_version = checked_expected_version(row, expected_version, "request_batch", batch_id)
+    cursor = conn.execute(
+        """
+        UPDATE request_batches
+        SET updated_at = ?, version = version + 1
+        WHERE id = ? AND version = ?
+        """,
+        (now_iso(), batch_id, current_version),
+    )
+    if cursor.rowcount != 1:
+        current = require_batch(conn, batch_id)
+        raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
+    return current_version + 1
+
+
+def bulk_delete_target(item: Any) -> tuple[int, Optional[int]]:
+    if isinstance(item, dict):
+        request_id = item.get("id")
+        expected_version = item.get("expected_version")
+    else:
+        request_id = item
+        expected_version = None
+    if not request_id:
+        raise HTTPException(status_code=400, detail="批量删除缺少记录 id")
+    return int(request_id), int(expected_version) if expected_version is not None else None
 
 
 def require_batch(conn, batch_id: int):
@@ -6146,8 +6568,11 @@ def insert_request(
             validate_total=True,
         )
     else:
-        refresh_payment_summaries(conn, request_id)
-    conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        refresh_payment_summaries(conn, request_id, bump_version=False)
+    conn.execute(
+        "UPDATE request_batches SET updated_at = ?, version = version + 1 WHERE id = ?",
+        (timestamp, batch_id),
+    )
     return request_id
 
 
@@ -6190,7 +6615,15 @@ def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int, user_role: str = ROLE_GENERAL_MANAGER) -> bool:
+def update_request_row(
+    conn,
+    request_id: int,
+    data: Dict[str, Any],
+    user_id: int,
+    user_role: str = ROLE_GENERAL_MANAGER,
+    *,
+    expected_version: Optional[int] = None,
+) -> bool:
     allowed = REQUEST_WRITE_FIELDS - {"content_hash"}
     payload = {key: value for key, value in data.items() if key in allowed}
     if "source_sheet" in payload:
@@ -6203,6 +6636,12 @@ def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int
     if not existing_row:
         raise HTTPException(status_code=404, detail="请款记录不存在")
     existing = row_to_dict(existing_row)
+    current_version = checked_expected_version(
+        existing_row,
+        expected_version,
+        "payment_request",
+        request_id,
+    )
     if "currency" in payload:
         requested_currency = normalize_currency(payload.get("currency"), default="CNY")
         existing_currency = normalize_currency(existing.get("currency"), default="CNY")
@@ -6269,13 +6708,22 @@ def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int
     changed_payload["updated_by"] = user_id
     changed_payload["updated_at"] = now_iso()
     columns = list(changed_payload.keys())
-    conn.execute(
-        f"UPDATE payment_requests SET {', '.join(f'{col} = ?' for col in columns)} WHERE id = ?",
-        [changed_payload[col] for col in columns] + [request_id],
+    cursor = conn.execute(
+        f"""
+        UPDATE payment_requests
+        SET {', '.join(f'{col} = ?' for col in columns)}, version = version + 1
+        WHERE id = ? AND version = ?
+        """,
+        [changed_payload[col] for col in columns] + [request_id, current_version],
     )
+    if cursor.rowcount != 1:
+        current = conn.execute("SELECT version FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="请款记录不存在")
+        raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
     if "source_sheet" in changed_payload:
         register_batch_sheet(conn, int(existing["batch_id"]), changed_payload["source_sheet"])
-    refresh_payment_summaries(conn, request_id)
+    refresh_payment_summaries(conn, request_id, bump_version=False)
     row = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
     conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(row), request_id))
     return True
