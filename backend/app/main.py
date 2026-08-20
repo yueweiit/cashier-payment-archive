@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import uuid
 from collections import Counter
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -21,7 +22,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from .attachment_io import save_embedded_image_attachments, save_embedded_payment_vouchers
-from .batch_operations import ensure_batch_operation_available, leased_batch_operation
+from .batch_operations import BatchOperationLease, ensure_batch_operation_available, leased_batch_operation
 from .db import (
     DATA_DIR,
     ROOT_DIR,
@@ -1138,8 +1139,21 @@ def rollover_batch(
                 (source_batch_id,),
             ).fetchall()
         copied_count = 0
+        skipped_duplicate_rows = 0
+        seen_request_keys: set[tuple[str, str, str]] = set()
         for source_row in source_rows:
             source_data = row_to_dict(source_row)
+            approval_no = str(source_data.get("dingding_id") or "").strip()
+            duplicate_key = (
+                approval_no,
+                normalize_currency(source_data.get("currency")),
+                content_hash(source_data),
+            ) if approval_no else None
+            if duplicate_key and duplicate_key in seen_request_keys:
+                skipped_duplicate_rows += 1
+                continue
+            if duplicate_key:
+                seen_request_keys.add(duplicate_key)
             copied_from_request_id = source_data["id"]
             for key in [
                 "id",
@@ -1174,11 +1188,22 @@ def rollover_batch(
             target_batch_id,
             target_batch_id,
             old_value={"source_batch_id": source_batch_id, "source_name": source["name"]},
-            new_value={"target_batch_id": target_batch_id, "copied_count": copied_count, "copy_mode": payload.copy_mode},
+            new_value={
+                "target_batch_id": target_batch_id,
+                "copied_count": copied_count,
+                "skipped_duplicate_rows": skipped_duplicate_rows,
+                "copy_mode": payload.copy_mode,
+            },
             operation_id=operation_id,
         )
         create_batch_snapshot(conn, int(target_batch_id), "baseline", user["id"], replace_existing=True)
-    return {"batch": row_to_dict(target), "copied_count": copied_count, "copy_mode": payload.copy_mode, "operation_id": operation_id}
+    return {
+        "batch": row_to_dict(target),
+        "copied_count": copied_count,
+        "skipped_duplicate_rows": skipped_duplicate_rows,
+        "copy_mode": payload.copy_mode,
+        "operation_id": operation_id,
+    }
 
 
 @app.get("/api/batches/{batch_id}")
@@ -4812,7 +4837,6 @@ def preview_external_expense_rows(
 
 
 @app.post("/api/batches/{batch_id}/imports/external-expenses")
-@leased_batch_operation("external-expense-import", lambda arguments: arguments["batch_id"])
 def import_external_expense_rows(
     batch_id: int,
     payload: ExternalExpenseImportIn,
@@ -4833,6 +4857,11 @@ def import_external_expense_rows(
         if key not in seen_keys:
             seen_keys.add(key)
             keys.append({"source_type": source_type, "source_id": source_id})
+    with connect() as conn:
+        initial_batch = require_batch(conn, batch_id)
+        if initial_batch["status"] != "draft":
+            raise HTTPException(status_code=400, detail="只能向草稿批次导入中间表数据")
+        initial_batch_version = int(initial_batch["version"] or 1)
     try:
         source_rows = fetch_external_expenses(keys)
     except ExternalExpenseError as exc:
@@ -4846,11 +4875,13 @@ def import_external_expense_rows(
     imported_rows: list[Dict[str, Any]] = []
     skipped_duplicates: list[Dict[str, Any]] = []
 
-    with connect() as conn:
+    with BatchOperationLease(batch_id, "external-expense-import", user.get("id")) as operation, connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只能向草稿批次导入中间表数据")
-        conn.execute("BEGIN IMMEDIATE")
+        checked_expected_version(batch, initial_batch_version, "request_batch", batch_id)
         existing_request_count = conn.execute(
             "SELECT COUNT(*) AS count FROM payment_requests WHERE batch_id = ?",
             (batch_id,),
@@ -4940,27 +4971,52 @@ def import_external_expense_rows(
             if existing_request_count == 0:
                 create_batch_snapshot(conn, batch_id, "baseline", user["id"], replace_existing=True)
 
-    return {
-        "status": "imported",
-        "job_id": job_id,
-        "batch_id": batch_id,
-        "imported_rows": len(imported_ids),
-        "duplicate_rows": len(skipped_duplicates),
-        "invalid_rows": len(invalid_rows) + len(missing_keys),
-        "warnings": sum(1 for row in imported_rows if row["warnings"]),
-        "duplicates": skipped_duplicates,
-        "errors": [
-            {"source_type": row["source_type"], "source_id": row["source_id"], "messages": row["errors"]}
-            for row in invalid_rows
-        ] + [
-            {"source_type": source_type, "source_id": source_id, "messages": ["来源记录不存在"]}
-            for source_type, source_id in missing_keys
-        ],
-    }
+        response_payload = {
+            "status": "imported",
+            "job_id": job_id,
+            "batch_id": batch_id,
+            "imported_rows": len(imported_ids),
+            "duplicate_rows": len(skipped_duplicates),
+            "invalid_rows": len(invalid_rows) + len(missing_keys),
+            "warnings": sum(1 for row in imported_rows if row["warnings"]),
+            "duplicates": skipped_duplicates,
+            "errors": [
+                {"source_type": row["source_type"], "source_id": row["source_id"], "messages": row["errors"]}
+                for row in invalid_rows
+            ] + [
+                {"source_type": source_type, "source_id": source_id, "messages": ["来源记录不存在"]}
+                for source_type, source_id in missing_keys
+            ],
+        }
+        operation.set_result(response_payload)
+
+    return response_payload
+
+
+@contextmanager
+def cleanup_downloaded_dingtalk_files_on_error(downloaded_attachments: list[Dict[str, Any]]):
+    """Remove files downloaded for a sync that fails before their links commit."""
+
+    try:
+        yield
+    except BaseException:
+        relative_paths = {
+            str(attachment.get("relative_path") or "").strip()
+            for attachment in downloaded_attachments
+            if str(attachment.get("relative_path") or "").strip()
+        }
+        if relative_paths:
+            try:
+                with connect() as cleanup_conn:
+                    for relative_path in relative_paths:
+                        delete_file_if_unreferenced(cleanup_conn, relative_path)
+            except Exception:
+                # Preserve the original sync failure; orphan cleanup can be retried later.
+                pass
+        raise
 
 
 @app.post("/api/batches/{batch_id}/external-expenses/sync-metadata")
-@leased_batch_operation("dingtalk-workflow-sync", lambda arguments: arguments["batch_id"])
 def sync_external_expense_metadata(
     batch_id: int,
     only_if_stale_seconds: int = Query(default=0, ge=0, le=86400),
@@ -4968,6 +5024,7 @@ def sync_external_expense_metadata(
 ) -> Dict[str, Any]:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
+        initial_batch_version = int(batch["version"] or 1)
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉流程")
         if only_if_stale_seconds:
@@ -4997,7 +5054,7 @@ def sync_external_expense_metadata(
                     pass
         initial_rows = conn.execute(
             """
-            SELECT id, dingding_id
+            SELECT id, dingding_id, version
             FROM payment_requests
             WHERE batch_id = ? AND TRIM(COALESCE(dingding_id, '')) <> ''
             ORDER BY id
@@ -5007,6 +5064,11 @@ def sync_external_expense_metadata(
 
     initial_approval_by_request = {
         int(row["id"]): str(row["dingding_id"] or "").strip()
+        for row in initial_rows
+        if str(row["dingding_id"] or "").strip()
+    }
+    initial_version_by_request = {
+        int(row["id"]): int(row["version"] or 1)
         for row in initial_rows
         if str(row["dingding_id"] or "").strip()
     }
@@ -5156,8 +5218,13 @@ def sync_external_expense_metadata(
     skipped = 0
     attachment_synced = 0
     candidate_request_ids: set[int] = set()
-    with connect() as conn:
+    with (
+        cleanup_downloaded_dingtalk_files_on_error(downloaded_attachments),
+        BatchOperationLease(batch_id, "dingtalk-workflow-sync", user.get("id")) as operation,
+        connect() as conn,
+    ):
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉状态")
@@ -5165,6 +5232,23 @@ def sync_external_expense_metadata(
             "SELECT * FROM payment_requests WHERE batch_id = ? ORDER BY id",
             (batch_id,),
         ).fetchall()
+        current_sync_rows = {
+            int(row["id"]): row
+            for row in current_rows
+            if str(row["dingding_id"] or "").strip()
+        }
+        if set(current_sync_rows) != set(initial_version_by_request):
+            raise_version_conflict("request_batch", batch_id, int(batch["version"] or 1))
+        for request_id, row in current_sync_rows.items():
+            current_version = int(row["version"] or 1)
+            current_approval_no = str(row["dingding_id"] or "").strip()
+            if (
+                current_version != initial_version_by_request[request_id]
+                or current_approval_no != initial_approval_by_request[request_id]
+            ):
+                raise_version_conflict("payment_request", request_id, current_version)
+        if int(batch["version"] or 1) != initial_batch_version:
+            raise_version_conflict("request_batch", batch_id, int(batch["version"] or 1))
         for row in current_rows:
             request_id = int(row["id"])
             approval_no = str(row["dingding_id"] or "").strip()
@@ -5457,7 +5541,7 @@ def sync_external_expense_metadata(
             "attachment_errors": attachment_errors[:50],
         }
         if updated_requests or attachment_synced or auto_payments:
-            touch_batch(conn, batch_id)
+            touch_batch(conn, batch_id, expected_version=initial_batch_version)
         write_audit(
             conn,
             user["id"],
@@ -5467,6 +5551,7 @@ def sync_external_expense_metadata(
             batch_id=batch_id,
             new_value=summary,
         )
+        operation.set_result({"status": "synced", "batch_id": batch_id, **summary})
     return {"status": "synced", "batch_id": batch_id, **summary}
 
 

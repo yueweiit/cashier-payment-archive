@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier, Event
 from urllib.parse import unquote
 
 import pytest
@@ -310,6 +311,117 @@ def test_batch_structure_and_ordinary_writes_respect_versions_and_active_operati
         assert blocked.status_code == 409
         assert blocked.json()["detail"]["code"] == "BATCH_OPERATION_IN_PROGRESS"
         complete_batch_operation(operation["id"], {"status": "ok"})
+
+
+def test_dingtalk_sync_allows_edits_during_external_fetch_and_rejects_stale_commit(monkeypatch):
+    approval_no = "SYNC-CONCURRENT-EDIT"
+    fetch_started = Event()
+    release_fetch = Event()
+
+    def delayed_metadata(approval_nos):
+        assert approval_nos == [approval_no]
+        fetch_started.set()
+        assert release_fetch.wait(timeout=10)
+        return [{
+            "approval_no": approval_no,
+            "source_type": "operation",
+            "source_label": "运营支出",
+            "source_id": "concurrent-edit-1",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "applicant_id": "user-concurrent",
+            "applicant": "并发申请人",
+            "applicant_department": "并发测试部",
+        }]
+
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", delayed_metadata)
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda approval_nos: [])
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda approval_nos: [])
+
+    with TestClient(app) as setup_client:
+        login(setup_client)
+        batch = setup_client.post("/api/batches", json={"name": "同步外部查询不锁编辑"}).json()["batch"]
+        request_row = setup_client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": approval_no, "summary": "同步前", "amount": 100},
+        ).json()["request"]
+
+    def run_sync():
+        with TestClient(app) as sync_client:
+            login(sync_client)
+            return sync_client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_sync)
+        assert fetch_started.wait(timeout=10)
+        with TestClient(app) as edit_client:
+            login(edit_client)
+            edited = edit_client.patch(
+                f"/api/batches/{batch['id']}/requests/{request_row['id']}",
+                json={"summary": "外部查询期间已编辑", "expected_version": request_row["version"]},
+            )
+        release_fetch.set()
+        synced = future.result(timeout=15)
+
+    assert edited.status_code == 200
+    assert synced.status_code == 409
+    assert synced.json()["detail"]["code"] == "VERSION_CONFLICT"
+    assert synced.json()["detail"]["entity_type"] == "payment_request"
+    with TestClient(app) as verify_client:
+        login(verify_client)
+        current = verify_client.get(f"/api/batches/{batch['id']}/requests").json()["requests"][0]
+    assert current["summary"] == "外部查询期间已编辑"
+    assert "external_source" not in current["raw_extra"]
+
+
+def test_external_import_fetch_does_not_lock_batch_and_stale_plan_is_rejected(monkeypatch):
+    fetch_started = Event()
+    release_fetch = Event()
+
+    def delayed_fetch(keys):
+        fetch_started.set()
+        assert release_fetch.wait(timeout=10)
+        return [external_expense_test_row("IMPORT-CONCURRENT-1", "9001")]
+
+    monkeypatch.setattr(main_module, "fetch_external_expenses", delayed_fetch)
+
+    with TestClient(app) as setup_client:
+        login(setup_client)
+        batch = setup_client.post("/api/batches", json={"name": "外部导入查询不锁编辑"}).json()["batch"]
+        request_row = setup_client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"summary": "原内容", "amount": 100},
+        ).json()["request"]
+
+    def run_import():
+        with TestClient(app) as import_client:
+            login(import_client)
+            return import_client.post(
+                f"/api/batches/{batch['id']}/imports/external-expenses",
+                json={"items": [{"source_type": "operation", "source_id": "9001"}]},
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_import)
+        assert fetch_started.wait(timeout=10)
+        with TestClient(app) as edit_client:
+            login(edit_client)
+            edited = edit_client.patch(
+                f"/api/batches/{batch['id']}/requests/{request_row['id']}",
+                json={"summary": "导入查询期间已编辑", "expected_version": request_row["version"]},
+            )
+        release_fetch.set()
+        imported = future.result(timeout=15)
+
+    assert edited.status_code == 200
+    assert imported.status_code == 409
+    assert imported.json()["detail"]["code"] == "VERSION_CONFLICT"
+    assert imported.json()["detail"]["entity_type"] == "request_batch"
+    with TestClient(app) as verify_client:
+        login(verify_client)
+        rows = verify_client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+    assert len(rows) == 1
+    assert rows[0]["summary"] == "导入查询期间已编辑"
 
 
 def test_sheet_order_is_saved_and_inherited_by_rollover():
@@ -983,6 +1095,57 @@ def test_rollover_copies_only_unfinished_rows():
         all_attachments = client.get(f"/api/batches/{target_all_batch_id}/attachments")
         assert all_attachments.status_code == 200
         assert len(all_attachments.json()["attachments"]) == 9
+
+
+def test_rollover_skips_exact_dingtalk_duplicates_but_keeps_legitimate_split_rows():
+    approval_no = "202607071243000115462"
+    with TestClient(app) as client:
+        login(client)
+        source = client.post(
+            "/api/batches",
+            json={"name": "重复治理来源", "start_date": "2026-08-01", "end_date": "2026-08-07"},
+        ).json()["batch"]
+        exact_duplicate = {
+            "dingding_id": approval_no,
+            "source_sheet": "凌翔产品&开发",
+            "summary": "2026年1份接收模具订单，超队2个型号",
+            "amount": 21000,
+            "currency": "CNY",
+            "payee_account": "供应商收款账户",
+        }
+        first = client.post(f"/api/batches/{source['id']}/requests", json=exact_duplicate)
+        second = client.post(
+            f"/api/batches/{source['id']}/requests",
+            json={**exact_duplicate, "source_sheet": "历史重组后 Sheet"},
+        )
+        split = client.post(
+            f"/api/batches/{source['id']}/requests",
+            json={**exact_duplicate, "summary": "同一审批拆分的第二笔请款", "amount": 5000},
+        )
+        assert first.status_code == second.status_code == split.status_code == 200
+
+        latest_batch = client.get(f"/api/batches/{source['id']}").json()["batch"]
+        rolled = client.post(
+            f"/api/batches/{source['id']}/rollover",
+            json={
+                "name": "重复治理目标",
+                "start_date": "2026-08-08",
+                "end_date": "2026-08-14",
+                "copy_mode": "all",
+                "expected_batch_version": latest_batch["version"],
+            },
+        )
+
+        assert rolled.status_code == 200
+        assert rolled.json()["copied_count"] == 2
+        assert rolled.json()["skipped_duplicate_rows"] == 1
+        copied = client.get(
+            f"/api/batches/{rolled.json()['batch']['id']}/requests",
+            params={"dingtalk_lifecycle": "all"},
+        ).json()["requests"]
+        assert len(copied) == 2
+        assert sorted(row["amount"] for row in copied) == [5000, 21000]
+        assert {row["dingding_id"] for row in copied} == {approval_no}
 
 
 def test_rollover_preserves_legacy_foreign_currency_rows_without_rate_anchor():
@@ -2704,7 +2867,13 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
 
 def test_external_expense_concurrent_dedupe_and_source_failure_are_atomic(monkeypatch):
     concurrent_row = external_expense_test_row("EXT-CONCURRENT", "801")
-    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda items: [concurrent_row])
+    fetch_barrier = Barrier(2)
+
+    def concurrent_fetch(items):
+        fetch_barrier.wait(timeout=10)
+        return [concurrent_row]
+
+    monkeypatch.setattr(main_module, "fetch_external_expenses", concurrent_fetch)
 
     with TestClient(app) as client:
         login(client)
@@ -2717,12 +2886,18 @@ def test_external_expense_concurrent_dedupe_and_source_failure_are_atomic(monkey
                 f"/api/batches/{batch['id']}/imports/external-expenses",
                 json={"items": [{"source_type": "operation", "source_id": "801"}]},
             )
-            assert response.status_code == 200
-            return response.json()["imported_rows"]
+            return response
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        imported_counts = sorted(executor.map(lambda _: submit_import(), range(2)))
-    assert imported_counts == [0, 1]
+        responses = list(executor.map(lambda _: submit_import(), range(2)))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    successful = next(response for response in responses if response.status_code == 200)
+    conflicted = next(response for response in responses if response.status_code == 409)
+    assert successful.json()["imported_rows"] == 1
+    assert conflicted.json()["detail"]["code"] in {
+        "BATCH_OPERATION_IN_PROGRESS",
+        "VERSION_CONFLICT",
+    }
     with connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS count FROM payment_requests WHERE TRIM(dingding_id) = 'EXT-CONCURRENT'").fetchone()["count"] == 1
 
