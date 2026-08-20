@@ -11,6 +11,7 @@ export type User = {
 
 export type Batch = {
   id: number;
+  version: number;
   parent_batch_id?: number;
   name: string;
   start_date?: string;
@@ -28,6 +29,7 @@ export type Batch = {
 
 export type PaymentRequest = {
   id: number;
+  version: number;
   batch_id: number;
   copied_from_request_id?: number;
   dingding_id?: string;
@@ -223,7 +225,31 @@ export type ExternalMetadataSyncResult = {
     file_name?: string;
     message: string;
   }>;
+  timings?: Record<string, number>;
 };
+
+export type BatchOperation = {
+  id: string;
+  batch_id: number;
+  operation_type: string;
+  status: "running" | "succeeded" | "failed" | "interrupted" | string;
+  stage: string;
+  progress_current: number;
+  progress_total: number;
+  progress_message?: string;
+  started_at: string;
+  heartbeat_at: string;
+  finished_at?: string;
+  failure_reason?: string;
+  blocks_writes: boolean;
+  timings: Record<string, number>;
+  partial_result: Partial<ExternalMetadataSyncResult> & { status_committed?: boolean };
+  result: Partial<ExternalMetadataSyncResult>;
+};
+
+export type ExternalMetadataSyncTaskResult =
+  | ExternalMetadataSyncResult
+  | { status: "running"; reused: boolean; operation: BatchOperation };
 
 export type DingtalkWorkflowEvent = {
   id: number;
@@ -356,6 +382,7 @@ export type PaymentVoucher = {
 
 export type PaymentRecord = {
   id: number;
+  version: number;
   request_id: number;
   copied_from_payment_id?: number;
   root_payment_id?: number;
@@ -390,6 +417,7 @@ export type CurrencySubtotal = {
 
 export type CurrencyConversionPreview = {
   request_id: number;
+  request_version?: number;
   mode: "convert" | "correct";
   source_currency: CurrencyCode;
   target_currency: CurrencyCode;
@@ -408,6 +436,7 @@ export type CurrencyConversionPreview = {
 
 export type ForeignAmountCorrectionPreview = {
   request_id: number;
+  request_version?: number;
   currency: CurrencyCode;
   requested_rate_date: string;
   actual_rate_date: string;
@@ -456,6 +485,8 @@ export type PaymentRecordPayload = {
   bank_reference?: string;
   remark?: string;
   reason?: string;
+  expected_request_version?: number;
+  expected_payment_version?: number;
 };
 
 export type PaymentSummary = {
@@ -532,7 +563,37 @@ export type RolloverPayload = Pick<Batch, "name"> & {
   start_date?: string;
   end_date?: string;
   copy_mode?: RolloverCopyMode;
+  expected_batch_version: number;
 };
+
+export type ApiErrorPayload = {
+  code?: string;
+  message?: string;
+  entity_type?: string;
+  entity_id?: number;
+  current_version?: number;
+  operation_type?: string;
+  [key: string]: unknown;
+};
+
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+  payload: ApiErrorPayload;
+
+  constructor(status: number, payload: ApiErrorPayload, fallback: string) {
+    const rawMessage = payload.message || fallback;
+    super(translateKnownError(rawMessage));
+    this.name = "ApiError";
+    this.status = status;
+    this.code = payload.code;
+    this.payload = payload;
+  }
+}
+
+export function isApiError(error: unknown, code?: string): error is ApiError {
+  return error instanceof ApiError && (!code || error.code === code);
+}
 
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(url, {
@@ -543,7 +604,12 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(translateKnownError(data.detail || "请求失败"));
+    const detail = data?.detail;
+    const payload: ApiErrorPayload =
+      detail && typeof detail === "object"
+        ? detail
+        : { message: typeof detail === "string" ? detail : "请求失败" };
+    throw new ApiError(response.status, payload, "请求失败");
   }
   return data as T;
 }
@@ -557,26 +623,27 @@ export const api = {
     request<{ status: string; signed_out_sessions: number }>("/api/auth/change-password", { method: "POST", body: JSON.stringify(payload) }),
   batches: () => request<{ batches: Batch[] }>("/api/batches"),
   createBatch: (payload: Partial<Batch>) => request<{ batch: Batch }>("/api/batches", { method: "POST", body: JSON.stringify(payload) }),
-  deleteBatch: (id: number) => request<{ status: string }>(`/api/batches/${id}`, { method: "DELETE" }),
+  deleteBatch: (id: number, expectedBatchVersion: number) =>
+    request<{ status: string }>(`/api/batches/${id}?expected_batch_version=${expectedBatchVersion}`, { method: "DELETE" }),
   rolloverBatch: (sourceBatchId: number, payload: RolloverPayload) =>
     request<{ batch: Batch; copied_count: number; copy_mode: RolloverCopyMode; operation_id: string }>(`/api/batches/${sourceBatchId}/rollover`, { method: "POST", body: JSON.stringify(payload) }),
   batch: (id: number) => request<{ batch: Batch; stats: Array<Record<string, unknown>> }>(`/api/batches/${id}`),
-  updateSheetOrder: (id: number, sheetOrder: string[]) =>
+  updateSheetOrder: (id: number, sheetOrder: string[], expectedBatchVersion: number) =>
     request<{ batch: Batch }>(`/api/batches/${id}/sheet-order`, {
       method: "PUT",
-      body: JSON.stringify({ sheet_order: sheetOrder }),
+      body: JSON.stringify({ sheet_order: sheetOrder, expected_batch_version: expectedBatchVersion }),
     }),
-  archive: (id: number) => request<{ batch: Batch }>(`/api/batches/${id}/archive`, { method: "POST" }),
-  unarchive: (id: number) => request<{ batch: Batch }>(`/api/batches/${id}/unarchive`, { method: "POST" }),
-  setBatchBaseline: (id: number) => request<{ snapshot: BatchSnapshot }>(`/api/batches/${id}/snapshots/baseline`, { method: "POST" }),
-  restoreBatchBaseline: (id: number) =>
+  archive: (id: number, expectedBatchVersion: number) => request<{ batch: Batch }>(`/api/batches/${id}/archive?expected_batch_version=${expectedBatchVersion}`, { method: "POST" }),
+  unarchive: (id: number, expectedBatchVersion: number) => request<{ batch: Batch }>(`/api/batches/${id}/unarchive?expected_batch_version=${expectedBatchVersion}`, { method: "POST" }),
+  setBatchBaseline: (id: number, expectedBatchVersion: number) => request<{ snapshot: BatchSnapshot }>(`/api/batches/${id}/snapshots/baseline?expected_batch_version=${expectedBatchVersion}`, { method: "POST" }),
+  restoreBatchBaseline: (id: number, expectedBatchVersion: number) =>
     request<{
       status: string;
       snapshot_id: number;
       pre_restore_snapshot_id: number;
       before: { requests: number; attachments: number; payments: number; payment_vouchers: number; amount: number };
       after: { requests: number; attachments: number; payments: number; payment_vouchers: number; amount: number };
-    }>(`/api/batches/${id}/restore-baseline`, { method: "POST" }),
+    }>(`/api/batches/${id}/restore-baseline?expected_batch_version=${expectedBatchVersion}`, { method: "POST" }),
   requests: (batchId: number, params: Record<string, string>) => {
     const query = new URLSearchParams(params);
     return request<{ requests: PaymentRequest[]; totals: { count: number; amount: number; paid_amount: number; pending_amount: number } }>(`/api/batches/${batchId}/requests?${query}`);
@@ -590,26 +657,26 @@ export const api = {
     }),
   createRequest: (batchId: number, payload: Partial<PaymentRequest>) =>
     request<{ request: PaymentRequest }>(`/api/batches/${batchId}/requests`, { method: "POST", body: JSON.stringify(payload) }),
-  updateRequest: (batchId: number, requestId: number, payload: Partial<PaymentRequest> & { reason?: string }) =>
+  updateRequest: (batchId: number, requestId: number, payload: Partial<PaymentRequest> & { expected_version: number; reason?: string }) =>
     request<{ request: PaymentRequest }>(`/api/batches/${batchId}/requests/${requestId}`, { method: "PATCH", body: JSON.stringify(payload) }),
-  previewCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; mode?: "convert" | "correct"; reason?: string; expected_updated_at?: string }) =>
+  previewCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; mode?: "convert" | "correct"; reason?: string; expected_version: number; expected_updated_at?: string }) =>
     request<{ preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/preview`, { method: "POST", body: JSON.stringify(payload) }),
-  applyCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; mode?: "convert" | "correct"; reason?: string; expected_updated_at?: string }) =>
+  applyCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; mode?: "convert" | "correct"; reason?: string; expected_version: number; expected_updated_at?: string }) =>
     request<{ status: string; request: PaymentRequest; preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/apply`, { method: "POST", body: JSON.stringify(payload) }),
-  previewForeignAmountCorrection: (batchId: number, requestId: number, payload: { amount: number; rate_date: string; reason?: string; expected_updated_at?: string }) =>
+  previewForeignAmountCorrection: (batchId: number, requestId: number, payload: { amount: number; rate_date: string; reason?: string; expected_version: number; expected_updated_at?: string }) =>
     request<{ preview: ForeignAmountCorrectionPreview }>(`/api/batches/${batchId}/requests/${requestId}/amount-correction/preview`, { method: "POST", body: JSON.stringify(payload) }),
-  applyForeignAmountCorrection: (batchId: number, requestId: number, payload: { amount: number; rate_date: string; reason?: string; expected_updated_at?: string }) =>
+  applyForeignAmountCorrection: (batchId: number, requestId: number, payload: { amount: number; rate_date: string; reason?: string; expected_version: number; expected_updated_at?: string }) =>
     request<{ status: string; request: PaymentRequest; preview: ForeignAmountCorrectionPreview }>(`/api/batches/${batchId}/requests/${requestId}/amount-correction/apply`, { method: "POST", body: JSON.stringify(payload) }),
   previewHistoricalCurrencyRestore: (batchId: number) =>
     request<HistoricalCurrencyRestorePreview>(`/api/batches/${batchId}/historical-currency-restore/preview`),
-  applyHistoricalCurrencyRestore: (batchId: number, payload: { request_ids: number[]; reason?: string }) =>
+  applyHistoricalCurrencyRestore: (batchId: number, payload: { request_ids: number[]; reason?: string; expected_batch_version: number }) =>
     request<{ status: string; operation_id: string; restored_request_ids: number[]; count: number }>(`/api/batches/${batchId}/historical-currency-restore/apply`, { method: "POST", body: JSON.stringify(payload) }),
   bulkSaveRequests: (
     batchId: number,
     payload: {
       creates: Array<Partial<PaymentRequest>>;
-      updates: Array<Partial<PaymentRequest> & { id: number }>;
-      deletes: number[];
+      updates: Array<Partial<PaymentRequest> & { id: number; expected_version: number }>;
+      deletes: Array<{ id: number; expected_version: number }>;
       reason?: string;
     },
   ) =>
@@ -617,23 +684,23 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
-  deleteRequest: (batchId: number, requestId: number, reason = "") =>
-    request<{ status: string }>(`/api/batches/${batchId}/requests/${requestId}?reason=${encodeURIComponent(reason)}`, { method: "DELETE" }),
+  deleteRequest: (batchId: number, requestId: number, expectedVersion: number, reason = "") =>
+    request<{ status: string }>(`/api/batches/${batchId}/requests/${requestId}?reason=${encodeURIComponent(reason)}&expected_version=${expectedVersion}`, { method: "DELETE" }),
   payments: (batchId: number, requestId: number) =>
     request<{ payments: PaymentRecord[]; summary: PaymentSummary }>(`/api/batches/${batchId}/requests/${requestId}/payments`),
-  createPayment: (batchId: number, requestId: number, payload: PaymentRecordPayload) =>
+  createPayment: (batchId: number, requestId: number, payload: PaymentRecordPayload & { expected_request_version: number }) =>
     request<{ payment: PaymentRecord; request: PaymentRequest }>(`/api/batches/${batchId}/requests/${requestId}/payments`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  updatePayment: (batchId: number, requestId: number, paymentId: number, payload: Partial<PaymentRecordPayload>) =>
+  updatePayment: (batchId: number, requestId: number, paymentId: number, payload: Partial<PaymentRecordPayload> & { expected_request_version: number; expected_payment_version: number }) =>
     request<{ payment: PaymentRecord; request: PaymentRequest }>(`/api/batches/${batchId}/requests/${requestId}/payments/${paymentId}`, {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
-  deletePayment: (batchId: number, requestId: number, paymentId: number, reason = "") =>
+  deletePayment: (batchId: number, requestId: number, paymentId: number, expectedRequestVersion: number, expectedPaymentVersion: number, reason = "") =>
     request<{ status: string; request: PaymentRequest }>(
-      `/api/batches/${batchId}/requests/${requestId}/payments/${paymentId}?reason=${encodeURIComponent(reason)}`,
+      `/api/batches/${batchId}/requests/${requestId}/payments/${paymentId}?reason=${encodeURIComponent(reason)}&expected_request_version=${expectedRequestVersion}&expected_payment_version=${expectedPaymentVersion}`,
       { method: "DELETE" },
     ),
   uploadPaymentVoucher: (batchId: number, requestId: number, paymentId: number, file: File, label?: string, reason?: string) => {
@@ -715,10 +782,12 @@ export const api = {
       body,
     });
   },
-  syncExternalExpenseMetadata: (batchId: number, onlyIfStaleSeconds = 0) =>
-    request<ExternalMetadataSyncResult>(`/api/batches/${batchId}/external-expenses/sync-metadata?only_if_stale_seconds=${onlyIfStaleSeconds}`, {
+  syncExternalExpenseMetadata: (batchId: number, onlyIfStaleSeconds = 0, taskMode = true) =>
+    request<ExternalMetadataSyncTaskResult>(`/api/batches/${batchId}/external-expenses/sync-metadata?only_if_stale_seconds=${onlyIfStaleSeconds}&task_mode=${taskMode ? "true" : "false"}`, {
       method: "POST",
     }),
+  batchOperation: (operationId: string) =>
+    request<{ operation: BatchOperation }>(`/api/batch-operations/${operationId}`),
   dingtalkWorkflow: (batchId: number, requestId: number) =>
     request<DingtalkWorkflow>(`/api/batches/${batchId}/requests/${requestId}/dingtalk-workflow`),
   rollbackLatestImport: (batchId: number) =>

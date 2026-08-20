@@ -391,6 +391,61 @@ textarea {
   font-size: 12px;
 }
 
+.sync-task-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(140px, 260px);
+  align-items: center;
+  gap: 12px;
+  padding: 9px 11px;
+  border: 1px solid #cfe5e0;
+  border-radius: 8px;
+  background: #f3faf8;
+  color: #315b56;
+}
+
+.sync-task-progress-copy {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.sync-task-progress-copy strong {
+  flex: 0 0 auto;
+  font-size: 13px;
+}
+
+.sync-task-progress-copy span {
+  overflow: hidden;
+  color: #68817d;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-task-progress-meter {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dce9e7;
+}
+
+.sync-task-progress-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #278679;
+  transition: width 180ms ease;
+}
+
+.sync-progress-spinner {
+  animation: sync-progress-spin 1s linear infinite;
+}
+
+@keyframes sync-progress-spin {
+  to { transform: rotate(360deg); }
+}
+
 .topbar-import {
   min-width: 0;
   display: grid;
@@ -3790,6 +3845,20 @@ textarea {
     flex: 1 1 180px;
   }
 
+  .sync-task-progress {
+    grid-template-columns: 1fr;
+  }
+
+  .sync-task-progress-copy {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .sync-task-progress-copy span {
+    white-space: normal;
+  }
+
   .rollback-import-group {
     grid-column: auto;
     justify-content: flex-start;
@@ -4381,6 +4450,13 @@ textarea {
   display: grid;
   gap: 6px;
   margin-bottom: 12px;
+}
+
+.editor-conflict-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 0;
 }
 
 .currency-rate-summary {

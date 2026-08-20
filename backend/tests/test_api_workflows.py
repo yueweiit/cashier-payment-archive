@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import sqlite3
 import shutil
 import sys
 import tempfile
@@ -9,18 +10,24 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier, Event, Lock
+from time import sleep
 from urllib.parse import unquote
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 TEST_DIR = Path(tempfile.mkdtemp(prefix="cashier-payment-tests-"))
 os.environ["PAYMENT_APP_DATA_DIR"] = str(TEST_DIR / "data")
 os.environ["PAYMENT_APP_DB"] = str(TEST_DIR / "app.db")
+os.environ["PAYMENT_ATTACHMENT_STORAGE_DIR"] = str(TEST_DIR / "attachment-storage")
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
-from backend.app.db import connect, migrate_sheet_registry_and_names, now_iso
+from backend.app.db import backup_database, connect, migrate_sheet_registry_and_names, now_iso
 from backend.app.external_expenses import (
     ExternalExpenseError,
     _parse_workflow_events,
@@ -47,6 +54,635 @@ SAMPLE = Path("/Users/smk/Downloads/20260626~20260707请款明细.xlsx")
 def login(client: TestClient, username: str = "admin", password: str = "admin123") -> None:
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200
+
+
+def test_sqlite_concurrency_pragmas_and_version_columns_are_enabled():
+    with TestClient(app):
+        with connect() as conn:
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 15000
+            assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+            assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            for table in ("request_batches", "payment_requests", "payment_records"):
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                assert "version" in columns
+
+
+def test_sqlite_backup_api_creates_verified_consistent_copy(tmp_path):
+    with TestClient(app):
+        with connect() as conn:
+            expected_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        target = tmp_path / "app-backup.db"
+        result = backup_database(target)
+        assert result["path"] == str(target)
+        assert result["sha256"]
+        assert result["size"] > 0
+        with sqlite3.connect(target) as backup:
+            assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert backup.execute("SELECT COUNT(*) FROM users").fetchone()[0] == expected_users
+
+
+def test_stale_request_update_returns_structured_version_conflict():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "请款乐观锁", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        created = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "初始", "amount": 100},
+        ).json()["request"]
+        assert created["version"] == 1
+
+        first = client.patch(
+            f"/api/batches/{batch['id']}/requests/{created['id']}",
+            json={"summary": "用户甲", "expected_version": created["version"]},
+        )
+        assert first.status_code == 200
+        assert first.json()["request"]["version"] == 2
+
+        stale = client.patch(
+            f"/api/batches/{batch['id']}/requests/{created['id']}",
+            json={"summary": "用户乙", "expected_version": created["version"]},
+        )
+        assert stale.status_code == 409
+        detail = stale.json()["detail"]
+        assert detail["code"] == "VERSION_CONFLICT"
+        assert detail["entity_type"] == "payment_request"
+        assert detail["entity_id"] == created["id"]
+        assert detail["current_version"] == 2
+
+
+def test_bulk_save_rolls_back_when_any_request_version_is_stale():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "批量乐观锁", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        first = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "第一条", "amount": 100},
+        ).json()["request"]
+        second = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "第二条", "amount": 200},
+        ).json()["request"]
+        updated_first = client.patch(
+            f"/api/batches/{batch['id']}/requests/{first['id']}",
+            json={"summary": "已被别人修改", "expected_version": first["version"]},
+        ).json()["request"]
+
+        response = client.patch(
+            f"/api/batches/{batch['id']}/requests/bulk",
+            json={
+                "creates": [],
+                "updates": [
+                    {"id": first["id"], "summary": "过期覆盖", "expected_version": first["version"]},
+                    {"id": second["id"], "summary": "本不应保存", "expected_version": second["version"]},
+                ],
+                "deletes": [],
+            },
+        )
+        assert response.status_code == 409
+        rows = {
+            row["id"]: row
+            for row in client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+        }
+        assert rows[first["id"]]["summary"] == updated_first["summary"]
+        assert rows[second["id"]]["summary"] == "第二条"
+        assert rows[second["id"]]["version"] == second["version"]
+
+
+def test_payment_mutation_checks_payment_and_request_versions():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "付款乐观锁", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        request_row = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "付款", "amount": 100},
+        ).json()["request"]
+        created_payment = client.post(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}/payments",
+            json={
+                "amount": 20,
+                "payment_date": "2026-08-17",
+                "expected_request_version": request_row["version"],
+            },
+        )
+        assert created_payment.status_code == 200
+        payment = created_payment.json()["payment"]
+        request_after_create = created_payment.json()["request"]
+        assert payment["version"] == 1
+        assert request_after_create["version"] == request_row["version"] + 1
+
+        changed = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}/payments/{payment['id']}",
+            json={
+                "amount": 30,
+                "expected_request_version": request_after_create["version"],
+                "expected_payment_version": payment["version"],
+            },
+        )
+        assert changed.status_code == 200
+
+        stale = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}/payments/{payment['id']}",
+            json={
+                "amount": 40,
+                "expected_request_version": request_after_create["version"],
+                "expected_payment_version": payment["version"],
+            },
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "VERSION_CONFLICT"
+
+
+def test_stale_batch_structure_update_is_rejected():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "批次乐观锁", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        assert batch["version"] == 1
+        first = client.put(
+            f"/api/batches/{batch['id']}/sheet-order",
+            json={"sheet_order": ["财务"], "expected_batch_version": batch["version"]},
+        )
+        assert first.status_code == 200
+        assert first.json()["batch"]["version"] == 2
+        stale = client.put(
+            f"/api/batches/{batch['id']}/sheet-order",
+            json={"sheet_order": ["采购"], "expected_batch_version": batch["version"]},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "VERSION_CONFLICT"
+
+
+def test_batch_operation_lease_prevents_duplicate_long_tasks_and_recovers_expired_lease():
+    from backend.app.batch_operations import (
+        acquire_batch_operation,
+        complete_batch_operation,
+    )
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "长任务互斥", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        with connect() as conn:
+            actor = conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()["id"]
+
+        first = acquire_batch_operation(batch["id"], "dingtalk-sync", actor)
+        with pytest.raises(HTTPException) as conflict:
+            acquire_batch_operation(batch["id"], "weekly-excel", actor)
+        assert conflict.value.status_code == 409
+        assert conflict.value.detail["code"] == "BATCH_OPERATION_IN_PROGRESS"
+        assert conflict.value.detail["operation_id"] == first["id"]
+
+        with connect() as conn:
+            conn.execute(
+                "UPDATE batch_operations SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00.000000", first["id"]),
+            )
+        recovered = acquire_batch_operation(batch["id"], "weekly-excel", actor)
+        with connect() as conn:
+            interrupted = conn.execute(
+                "SELECT status FROM batch_operations WHERE id = ?",
+                (first["id"],),
+            ).fetchone()
+        assert interrupted["status"] == "interrupted"
+        complete_batch_operation(recovered["id"], {"imported": 3})
+        with connect() as conn:
+            finished = conn.execute(
+                "SELECT status, result_json FROM batch_operations WHERE id = ?",
+                (recovered["id"],),
+            ).fetchone()
+        assert finished["status"] == "succeeded"
+        assert json.loads(finished["result_json"])["imported"] == 3
+
+
+def test_nonblocking_batch_operation_is_reused_and_exposes_progress():
+    from backend.app.batch_operations import (
+        acquire_or_reuse_batch_operation,
+        complete_batch_operation,
+        get_batch_operation,
+        update_batch_operation_progress,
+    )
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "同步任务复用", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        request_row = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "初始", "amount": 100},
+        ).json()["request"]
+        with connect() as conn:
+            actor = conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()["id"]
+
+        first, first_reused = acquire_or_reuse_batch_operation(
+            batch["id"],
+            "dingtalk-workflow-sync",
+            actor,
+            blocks_writes=False,
+        )
+        second, second_reused = acquire_or_reuse_batch_operation(
+            batch["id"],
+            "dingtalk-workflow-sync",
+            actor,
+            blocks_writes=False,
+        )
+        assert first_reused is False
+        assert second_reused is True
+        assert second["id"] == first["id"]
+
+        update_batch_operation_progress(
+            first["id"],
+            stage="attachment_download",
+            progress_current=8,
+            progress_total=32,
+            progress_message="正在同步 8/32 个附件",
+            timings={"metadata_query_ms": 125.4, "workflow_query_ms": 248.1},
+            partial_result={"status_committed": True, "updated_requests": 4},
+        )
+        current = get_batch_operation(first["id"])
+        assert current["stage"] == "attachment_download"
+        assert current["progress_current"] == 8
+        assert current["progress_total"] == 32
+        assert current["timings"]["metadata_query_ms"] == 125.4
+        assert current["partial_result"]["status_committed"] is True
+
+        edited = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}",
+            json={"summary": "同步期间仍可编辑", "expected_version": request_row["version"]},
+        )
+        assert edited.status_code == 200
+        complete_batch_operation(first["id"], {"status": "synced"})
+
+
+def test_dingtalk_task_start_reuses_running_operation_and_can_be_polled(monkeypatch):
+    worker_started = Event()
+    release_worker = Event()
+    worker_calls = []
+
+    def blocked_worker(operation_id, batch_id, user):
+        worker_calls.append((operation_id, batch_id, user["id"]))
+        worker_started.set()
+        assert release_worker.wait(timeout=10)
+
+    monkeypatch.setattr(main_module, "run_dingtalk_sync_task", blocked_worker)
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "后台钉钉任务"}).json()["batch"]
+        first = client.post(
+            f"/api/batches/{batch['id']}/external-expenses/sync-metadata",
+            params={"task_mode": "true"},
+        )
+        assert first.status_code == 202
+        first_operation = first.json()["operation"]
+        assert first_operation["status"] == "running"
+        assert worker_started.wait(timeout=10)
+
+        second = client.post(
+            f"/api/batches/{batch['id']}/external-expenses/sync-metadata",
+            params={"task_mode": "true"},
+        )
+        assert second.status_code == 202
+        assert second.json()["reused"] is True
+        assert second.json()["operation"]["id"] == first_operation["id"]
+        assert len(worker_calls) == 1
+
+        polled = client.get(f"/api/batch-operations/{first_operation['id']}")
+        assert polled.status_code == 200
+        assert polled.json()["operation"]["id"] == first_operation["id"]
+        release_worker.set()
+
+
+def test_dingtalk_task_commits_status_before_slow_attachment_inventory(monkeypatch):
+    approval_no = "SYNC-STATUS-FIRST"
+    attachment_query_started = Event()
+    release_attachment_query = Event()
+
+    monkeypatch.setattr(
+        main_module,
+        "fetch_external_expense_metadata",
+        lambda approval_nos: [{
+            "approval_no": approval_no,
+            "source_type": "operation",
+            "source_label": "运营支出",
+            "source_id": "status-first-1",
+            "approval_status": "COMPLETED",
+            "approval_result": "agree",
+            "applicant_id": "status-first-user",
+            "applicant": "状态优先申请人",
+            "applicant_department": "状态优先部门",
+        }],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "fetch_dingtalk_workflows",
+        lambda approval_nos: [{
+            "approval_no": approval_no,
+            "process_instance_id": "PROC-STATUS-FIRST",
+            "status": "COMPLETED",
+            "result": "agree",
+            "events": [],
+        }],
+    )
+
+    def delayed_attachments(approval_nos):
+        attachment_query_started.set()
+        assert release_attachment_query.wait(timeout=10)
+        return []
+
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", delayed_attachments)
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "状态优先于附件"}).json()["batch"]
+        request_row = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": approval_no, "summary": "同步前", "amount": 100},
+        ).json()["request"]
+        started = client.post(
+            f"/api/batches/{batch['id']}/external-expenses/sync-metadata",
+            params={"task_mode": "true"},
+        )
+        assert started.status_code == 202
+        operation_id = started.json()["operation"]["id"]
+        assert attachment_query_started.wait(timeout=10)
+
+        status_row = next(
+            row for row in client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+            if row["id"] == request_row["id"]
+        )
+        assert status_row["raw_extra"]["external_source"]["approval_status"] == "COMPLETED"
+        operation = client.get(f"/api/batch-operations/{operation_id}").json()["operation"]
+        assert operation["partial_result"]["status_committed"] is True
+        assert operation["stage"] == "attachment_inventory"
+
+        edited = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}",
+            json={"summary": "附件查询期间仍可编辑", "expected_version": status_row["version"]},
+        )
+        assert edited.status_code == 200
+        release_attachment_query.set()
+
+        for _ in range(100):
+            operation = client.get(f"/api/batch-operations/{operation_id}").json()["operation"]
+            if operation["status"] != "running":
+                break
+            sleep(0.02)
+        assert operation["status"] == "succeeded"
+        current = next(
+            row for row in client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+            if row["id"] == request_row["id"]
+        )
+        assert current["summary"] == "附件查询期间仍可编辑"
+        with connect() as conn:
+            timing_audit = conn.execute(
+                "SELECT new_value_json FROM audit_logs WHERE batch_id = ? AND action = 'external_expenses.sync_timing'",
+                (batch["id"],),
+            ).fetchone()
+        assert timing_audit is not None
+        timing_payload = json.loads(timing_audit["new_value_json"])
+        assert timing_payload["operation_id"] == operation_id
+        assert {
+            "metadata_query_ms",
+            "workflow_query_ms",
+            "status_commit_ms",
+            "attachment_query_ms",
+            "attachment_commit_ms",
+            "total_ms",
+        }.issubset(timing_payload["timings"])
+
+
+def test_dingtalk_attachment_downloads_use_bounded_parallelism(monkeypatch):
+    state_lock = Lock()
+    active = 0
+    maximum_active = 0
+    progress = []
+
+    class FakeAttachmentClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return None
+
+        def download(self, process_instance_id, file_id):
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            sleep(0.04)
+            with state_lock:
+                active -= 1
+            return file_id.encode(), "application/pdf"
+
+    monkeypatch.setattr(main_module, "DingtalkAttachmentClient", FakeAttachmentClient)
+    monkeypatch.setattr(
+        main_module,
+        "save_dingtalk_attachment_file",
+        lambda attachment, content, content_type: {
+            "relative_path": f"attachments/{attachment['file_id']}.pdf",
+            "file_name": f"{attachment['file_id']}.pdf",
+            "attachment_type": "pdf",
+            "mime_type": content_type,
+            "file_size": len(content),
+        },
+    )
+    candidates = [
+        {
+            "approval_no": f"A-{index}",
+            "attachment_id": f"ATT-{index}",
+            "file_id": f"FILE-{index}",
+            "file_name": f"file-{index}.pdf",
+            "process_instance_id": f"PROC-{index}",
+            "request_ids": [index],
+        }
+        for index in range(10)
+    ]
+
+    downloaded, failed, errors = main_module.download_dingtalk_attachment_candidates(
+        candidates,
+        max_workers=4,
+        progress_callback=lambda current, total: progress.append((current, total)),
+    )
+
+    assert len(downloaded) == 10
+    assert failed == 0
+    assert errors == []
+    assert 2 <= maximum_active <= 4
+    assert progress[-1] == (10, 10)
+
+
+def test_batch_structure_and_ordinary_writes_respect_versions_and_active_operation():
+    from backend.app.batch_operations import acquire_batch_operation, complete_batch_operation
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={"name": "批次写入互斥", "start_date": "2026-08-17", "end_date": "2026-08-23"},
+        ).json()["batch"]
+        request_row = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"source_sheet": "并发", "summary": "初始", "amount": 100},
+        ).json()["request"]
+        latest_batch = client.get(f"/api/batches/{batch['id']}").json()["batch"]
+
+        archived = client.post(
+            f"/api/batches/{batch['id']}/archive",
+            params={"expected_batch_version": latest_batch["version"]},
+        )
+        assert archived.status_code == 200
+        assert archived.json()["batch"]["version"] == latest_batch["version"] + 1
+        stale = client.post(
+            f"/api/batches/{batch['id']}/unarchive",
+            params={"expected_batch_version": latest_batch["version"]},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "VERSION_CONFLICT"
+
+        current = archived.json()["batch"]
+        restored = client.post(
+            f"/api/batches/{batch['id']}/unarchive",
+            params={"expected_batch_version": current["version"]},
+        )
+        assert restored.status_code == 200
+
+        with connect() as conn:
+            actor = conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()["id"]
+        operation = acquire_batch_operation(batch["id"], "dingtalk-sync", actor)
+        blocked = client.patch(
+            f"/api/batches/{batch['id']}/requests/{request_row['id']}",
+            json={"summary": "不应写入", "expected_version": request_row["version"]},
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["code"] == "BATCH_OPERATION_IN_PROGRESS"
+        complete_batch_operation(operation["id"], {"status": "ok"})
+
+
+def test_dingtalk_sync_allows_edits_during_external_fetch_and_rejects_stale_commit(monkeypatch):
+    approval_no = "SYNC-CONCURRENT-EDIT"
+    fetch_started = Event()
+    release_fetch = Event()
+
+    def delayed_metadata(approval_nos):
+        assert approval_nos == [approval_no]
+        fetch_started.set()
+        assert release_fetch.wait(timeout=10)
+        return [{
+            "approval_no": approval_no,
+            "source_type": "operation",
+            "source_label": "运营支出",
+            "source_id": "concurrent-edit-1",
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "applicant_id": "user-concurrent",
+            "applicant": "并发申请人",
+            "applicant_department": "并发测试部",
+        }]
+
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", delayed_metadata)
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda approval_nos: [])
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda approval_nos: [])
+
+    with TestClient(app) as setup_client:
+        login(setup_client)
+        batch = setup_client.post("/api/batches", json={"name": "同步外部查询不锁编辑"}).json()["batch"]
+        request_row = setup_client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": approval_no, "summary": "同步前", "amount": 100},
+        ).json()["request"]
+
+    def run_sync():
+        with TestClient(app) as sync_client:
+            login(sync_client)
+            return sync_client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_sync)
+        assert fetch_started.wait(timeout=10)
+        with TestClient(app) as edit_client:
+            login(edit_client)
+            edited = edit_client.patch(
+                f"/api/batches/{batch['id']}/requests/{request_row['id']}",
+                json={"summary": "外部查询期间已编辑", "expected_version": request_row["version"]},
+            )
+        release_fetch.set()
+        synced = future.result(timeout=15)
+
+    assert edited.status_code == 200
+    assert synced.status_code == 409
+    assert synced.json()["detail"]["code"] == "VERSION_CONFLICT"
+    assert synced.json()["detail"]["entity_type"] == "payment_request"
+    with TestClient(app) as verify_client:
+        login(verify_client)
+        current = verify_client.get(f"/api/batches/{batch['id']}/requests").json()["requests"][0]
+    assert current["summary"] == "外部查询期间已编辑"
+    assert "external_source" not in current["raw_extra"]
+
+
+def test_external_import_fetch_does_not_lock_batch_and_stale_plan_is_rejected(monkeypatch):
+    fetch_started = Event()
+    release_fetch = Event()
+
+    def delayed_fetch(keys):
+        fetch_started.set()
+        assert release_fetch.wait(timeout=10)
+        return [external_expense_test_row("IMPORT-CONCURRENT-1", "9001")]
+
+    monkeypatch.setattr(main_module, "fetch_external_expenses", delayed_fetch)
+
+    with TestClient(app) as setup_client:
+        login(setup_client)
+        batch = setup_client.post("/api/batches", json={"name": "外部导入查询不锁编辑"}).json()["batch"]
+        request_row = setup_client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"summary": "原内容", "amount": 100},
+        ).json()["request"]
+
+    def run_import():
+        with TestClient(app) as import_client:
+            login(import_client)
+            return import_client.post(
+                f"/api/batches/{batch['id']}/imports/external-expenses",
+                json={"items": [{"source_type": "operation", "source_id": "9001"}]},
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_import)
+        assert fetch_started.wait(timeout=10)
+        with TestClient(app) as edit_client:
+            login(edit_client)
+            edited = edit_client.patch(
+                f"/api/batches/{batch['id']}/requests/{request_row['id']}",
+                json={"summary": "导入查询期间已编辑", "expected_version": request_row["version"]},
+            )
+        release_fetch.set()
+        imported = future.result(timeout=15)
+
+    assert edited.status_code == 200
+    assert imported.status_code == 409
+    assert imported.json()["detail"]["code"] == "VERSION_CONFLICT"
+    assert imported.json()["detail"]["entity_type"] == "request_batch"
+    with TestClient(app) as verify_client:
+        login(verify_client)
+        rows = verify_client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+    assert len(rows) == 1
+    assert rows[0]["summary"] == "导入查询期间已编辑"
 
 
 def test_sheet_order_is_saved_and_inherited_by_rollover():
@@ -722,6 +1358,57 @@ def test_rollover_copies_only_unfinished_rows():
         assert len(all_attachments.json()["attachments"]) == 9
 
 
+def test_rollover_skips_exact_dingtalk_duplicates_but_keeps_legitimate_split_rows():
+    approval_no = "202607071243000115462"
+    with TestClient(app) as client:
+        login(client)
+        source = client.post(
+            "/api/batches",
+            json={"name": "重复治理来源", "start_date": "2026-08-01", "end_date": "2026-08-07"},
+        ).json()["batch"]
+        exact_duplicate = {
+            "dingding_id": approval_no,
+            "source_sheet": "凌翔产品&开发",
+            "summary": "2026年1份接收模具订单，超队2个型号",
+            "amount": 21000,
+            "currency": "CNY",
+            "payee_account": "供应商收款账户",
+        }
+        first = client.post(f"/api/batches/{source['id']}/requests", json=exact_duplicate)
+        second = client.post(
+            f"/api/batches/{source['id']}/requests",
+            json={**exact_duplicate, "source_sheet": "历史重组后 Sheet"},
+        )
+        split = client.post(
+            f"/api/batches/{source['id']}/requests",
+            json={**exact_duplicate, "summary": "同一审批拆分的第二笔请款", "amount": 5000},
+        )
+        assert first.status_code == second.status_code == split.status_code == 200
+
+        latest_batch = client.get(f"/api/batches/{source['id']}").json()["batch"]
+        rolled = client.post(
+            f"/api/batches/{source['id']}/rollover",
+            json={
+                "name": "重复治理目标",
+                "start_date": "2026-08-08",
+                "end_date": "2026-08-14",
+                "copy_mode": "all",
+                "expected_batch_version": latest_batch["version"],
+            },
+        )
+
+        assert rolled.status_code == 200
+        assert rolled.json()["copied_count"] == 2
+        assert rolled.json()["skipped_duplicate_rows"] == 1
+        copied = client.get(
+            f"/api/batches/{rolled.json()['batch']['id']}/requests",
+            params={"dingtalk_lifecycle": "all"},
+        ).json()["requests"]
+        assert len(copied) == 2
+        assert sorted(row["amount"] for row in copied) == [5000, 21000]
+        assert {row["dingding_id"] for row in copied} == {approval_no}
+
+
 def test_rollover_preserves_legacy_foreign_currency_rows_without_rate_anchor():
     with TestClient(app) as client:
         login(client)
@@ -1283,6 +1970,19 @@ def test_business_users_are_strictly_isolated_by_sheet_permissions():
             files={"file": ("voucher.png", io.BytesIO(png_bytes), "image/png")},
         ).json()["voucher"]
 
+        with connect() as conn:
+            attachment_objects = conn.execute(
+                "SELECT file_object_id FROM attachment_links WHERE id IN (?, ?) ORDER BY id",
+                (attachment_a["id"], attachment_b["id"]),
+            ).fetchall()
+            voucher_object = conn.execute(
+                "SELECT file_object_id FROM payment_vouchers WHERE id = ?",
+                (voucher_b["id"],),
+            ).fetchone()
+        referenced_object_ids = {row["file_object_id"] for row in attachment_objects}
+        referenced_object_ids.add(voucher_object["file_object_id"])
+        assert len(referenced_object_ids) == 1
+
         created_user = admin_client.post(
             "/api/admin/users",
             json={
@@ -1433,7 +2133,7 @@ def test_restore_draft_baseline_restores_saved_rows_and_attachments():
         )
         assert uploaded.status_code == 200
         baseline_attachment = uploaded.json()["attachment"]
-        baseline_file_path = TEST_DIR / "data" / baseline_attachment["file_path"]
+        baseline_file_path = TEST_DIR / "attachment-storage" / baseline_attachment["file_path"]
         assert baseline_file_path.exists()
         baseline = client.post(f"/api/batches/{batch_id}/snapshots/baseline")
         assert baseline.status_code == 200
@@ -1456,11 +2156,12 @@ def test_restore_draft_baseline_restores_saved_rows_and_attachments():
             files={"file": ("extra.png", io.BytesIO(second_png_bytes), "image/png")},
         )
         assert second_attachment.status_code == 200
-        extra_file_path = TEST_DIR / "data" / second_attachment.json()["attachment"]["file_path"]
+        extra_file_path = TEST_DIR / "attachment-storage" / second_attachment.json()["attachment"]["file_path"]
         assert extra_file_path.exists()
         deleted_attachment = client.delete(f"/api/batches/{batch_id}/requests/{request_id}/attachments/{baseline_attachment['id']}")
         assert deleted_attachment.status_code == 200
-        assert not baseline_file_path.exists()
+        # Removing a logical relationship must not eagerly delete a shared hash object.
+        assert baseline_file_path.exists()
 
         restored = client.post(f"/api/batches/{batch_id}/restore-baseline")
         assert restored.status_code == 200
@@ -1476,7 +2177,7 @@ def test_restore_draft_baseline_restores_saved_rows_and_attachments():
         assert len(attachments) == 1
         assert attachments[0]["id"] == baseline_attachment["id"]
         assert baseline_file_path.exists()
-        assert not extra_file_path.exists()
+        assert extra_file_path.exists()
         downloaded = client.get(attachments[0]["file_url"])
         assert downloaded.status_code == 200
         assert downloaded.content == png_bytes
@@ -1705,12 +2406,13 @@ def test_delete_draft_batch_and_keep_archived_batches():
             files={"file": ("proof.png", io.BytesIO(png_bytes), "image/png")},
         )
         assert uploaded.status_code == 200
-        file_path = TEST_DIR / "data" / uploaded.json()["attachment"]["file_path"]
+        file_path = TEST_DIR / "attachment-storage" / uploaded.json()["attachment"]["file_path"]
         assert file_path.exists()
         deleted = client.delete(f"/api/batches/{batch_id}")
         assert deleted.status_code == 200
         assert client.get(f"/api/batches/{batch_id}").status_code == 404
-        assert not file_path.exists()
+        # Content-addressed blobs are retained until an explicit verified cleanup.
+        assert file_path.exists()
 
         archived = client.post("/api/batches", json={"name": "keep-me", "start_date": "2026-07-08", "end_date": "2026-07-14"}).json()["batch"]
         archived_id = archived["id"]
@@ -2441,7 +3143,13 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
 
 def test_external_expense_concurrent_dedupe_and_source_failure_are_atomic(monkeypatch):
     concurrent_row = external_expense_test_row("EXT-CONCURRENT", "801")
-    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda items: [concurrent_row])
+    fetch_barrier = Barrier(2)
+
+    def concurrent_fetch(items):
+        fetch_barrier.wait(timeout=10)
+        return [concurrent_row]
+
+    monkeypatch.setattr(main_module, "fetch_external_expenses", concurrent_fetch)
 
     with TestClient(app) as client:
         login(client)
@@ -2454,12 +3162,18 @@ def test_external_expense_concurrent_dedupe_and_source_failure_are_atomic(monkey
                 f"/api/batches/{batch['id']}/imports/external-expenses",
                 json={"items": [{"source_type": "operation", "source_id": "801"}]},
             )
-            assert response.status_code == 200
-            return response.json()["imported_rows"]
+            return response
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        imported_counts = sorted(executor.map(lambda _: submit_import(), range(2)))
-    assert imported_counts == [0, 1]
+        responses = list(executor.map(lambda _: submit_import(), range(2)))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    successful = next(response for response in responses if response.status_code == 200)
+    conflicted = next(response for response in responses if response.status_code == 409)
+    assert successful.json()["imported_rows"] == 1
+    assert conflicted.json()["detail"]["code"] in {
+        "BATCH_OPERATION_IN_PROGRESS",
+        "VERSION_CONFLICT",
+    }
     with connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS count FROM payment_requests WHERE TRIM(dingding_id) = 'EXT-CONCURRENT'").fetchone()["count"] == 1
 
@@ -2550,7 +3264,11 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
 
         synced = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
         assert synced.status_code == 200
-        assert synced.json() == {
+        synced_payload = synced.json()
+        timings = synced_payload.pop("timings")
+        assert set(timings) == {"metadata_query_ms", "workflow_query_ms", "attachment_query_ms", "commit_ms"}
+        assert all(value >= 0 for value in timings.values())
+        assert synced_payload == {
             "status": "synced",
             "batch_id": batch_id,
             "unique_approval_nos": 4,
@@ -2617,7 +3335,14 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
                 (batch_id,),
             ).fetchone()
             assert audit_row is not None
-            assert json.loads(audit_row["new_value_json"]) == {
+            audit_payload = json.loads(audit_row["new_value_json"])
+            audit_timings = audit_payload.pop("timings")
+            assert set(audit_timings) == {
+                "metadata_query_ms",
+                "workflow_query_ms",
+                "attachment_query_ms",
+            }
+            assert json.loads(json.dumps(audit_payload)) == {
                 "unique_approval_nos": 4,
                 "matched": 2,
                 "unmatched": 1,
@@ -2821,9 +3546,16 @@ def test_dingtalk_metadata_sync_adds_only_unsynced_request_attachments(monkeypat
         assert len(attachments) == 1
         attachment = attachments[0]
         assert attachment["source_system"] == "dingtalk_expense_database"
-        assert attachment["source_attachment_id"] == "501"
+        assert attachment["source_attachment_id"] == "file-501"
         assert attachment["attachment_type"] == "file"
         assert attachment["original_filename"] == "付款凭证.pdf"
+        with main_module.connect() as conn:
+            stored = conn.execute(
+                "SELECT file_object_id, source_instance_id FROM attachment_links WHERE id = ?",
+                (attachment["id"],),
+            ).fetchone()
+            assert stored["file_object_id"] is not None
+            assert stored["source_instance_id"] == "process-attachment"
         downloaded = client.get(attachment["file_url"])
         assert downloaded.status_code == 200
         assert downloaded.content == content
@@ -2834,6 +3566,10 @@ def test_dingtalk_metadata_sync_adds_only_unsynced_request_attachments(monkeypat
         )
         assert rejected_delete.status_code == 400
 
+        # The middle table may regenerate its own row id.  The DingTalk fileId is
+        # the stable identity and must prevent another download/link.
+        source_attachments[0]["attachment_id"] = "999"
+        source_attachments.append({**source_attachments[0], "attachment_id": "1000"})
         second = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
         assert second.status_code == 200
         assert second.json()["attachment_downloaded"] == 0

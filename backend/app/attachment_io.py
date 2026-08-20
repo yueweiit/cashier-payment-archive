@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import io
 import re
-import uuid
 from pathlib import Path
 from sqlite3 import Connection
 from typing import Any, Dict, Optional, Tuple
 
-from .db import DATA_DIR, now_iso
+from .db import now_iso
+from .file_storage import store_stream
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -41,30 +42,28 @@ def save_embedded_image_attachment(
     if not isinstance(data, bytes) or not data or len(data) > MAX_IMAGE_BYTES:
         return None
     extension = normalize_image_extension(image)
-    directory = DATA_DIR / "uploads" / "attachments" / str(batch_id)
-    directory.mkdir(parents=True, exist_ok=True)
     original_filename = clean_filename(str(image.get("filename") or f"excel_image{extension}"))
     if Path(original_filename).suffix.lower() not in IMAGE_EXTENSIONS:
         original_filename = f"{original_filename}{extension}"
-    target = directory / f"{uuid.uuid4().hex}{extension}"
-    target.write_bytes(data)
-    relative_path = target.relative_to(DATA_DIR)
+    mime_type = image.get("mime_type") or "image/png"
+    file_object = store_stream(conn, io.BytesIO(data), mime_type=mime_type)
     cursor = conn.execute(
         """
         INSERT INTO attachment_links (
             request_id, label, url_path, attachment_type, file_path,
-            original_filename, mime_type, file_size, created_by, created_at
+            original_filename, mime_type, file_size, file_object_id, created_by, created_at
         )
-        VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             request_id,
             image.get("label"),
-            str(relative_path),
-            str(relative_path),
+            file_object["storage_path"],
+            file_object["storage_path"],
             original_filename,
-            image.get("mime_type") or "image/png",
+            mime_type,
             len(data),
+            file_object["id"],
             user_id,
             now_iso(),
         ),
@@ -104,28 +103,26 @@ def save_embedded_payment_vouchers(
             skipped += 1
             continue
         extension = normalize_image_extension(image)
-        directory = DATA_DIR / "uploads" / "payment-vouchers" / str(batch_id) / str(payment_id)
-        directory.mkdir(parents=True, exist_ok=True)
         original_filename = clean_filename(str(image.get("filename") or f"excel_payment_voucher{extension}"))
         if Path(original_filename).suffix.lower() not in IMAGE_EXTENSIONS:
             original_filename = f"{original_filename}{extension}"
-        target = directory / f"{uuid.uuid4().hex}{extension}"
-        target.write_bytes(data)
-        relative_path = target.relative_to(DATA_DIR)
+        mime_type = image.get("mime_type") or "image/png"
+        file_object = store_stream(conn, io.BytesIO(data), mime_type=mime_type)
         conn.execute(
             """
             INSERT INTO payment_vouchers (
                 payment_id, label, file_path, original_filename, mime_type,
-                file_size, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                file_size, file_object_id, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payment_id,
                 image.get("label"),
-                str(relative_path),
+                file_object["storage_path"],
                 original_filename,
-                image.get("mime_type") or "image/png",
+                mime_type,
                 len(data),
+                file_object["id"],
                 user_id,
                 now_iso(),
             ),

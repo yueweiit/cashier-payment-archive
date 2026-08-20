@@ -117,7 +117,11 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         """,
         (batch_id,),
     ).fetchall()
-    old_file_paths = {row["file_path"] for row in current_attachment_rows if row["file_path"]}
+    old_file_paths = {
+        row["file_path"]
+        for row in current_attachment_rows
+        if row["file_path"] and not row["file_object_id"]
+    }
     current_attachment_ids = [int(row["id"]) for row in current_attachment_rows]
     delete_ids(conn, "attachment_links", current_attachment_ids)
 
@@ -130,7 +134,11 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         """,
         (batch_id,),
     ).fetchall()
-    old_file_paths.update(row["file_path"] for row in current_voucher_rows if row["file_path"])
+    old_file_paths.update(
+        row["file_path"]
+        for row in current_voucher_rows
+        if row["file_path"] and not row["file_object_id"]
+    )
     delete_ids(conn, "payment_vouchers", [int(row["id"]) for row in current_voucher_rows])
 
     baseline_payments = payload.get("payments")
@@ -139,6 +147,18 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         for row in conn.execute(
             """
             SELECT payment_records.id FROM payment_records
+            JOIN payment_requests ON payment_requests.id = payment_records.request_id
+            WHERE payment_requests.batch_id = ?
+            """,
+            (batch_id,),
+        ).fetchall()
+    }
+    current_payment_versions = {
+        int(row["id"]): int(row["version"] or 1)
+        for row in conn.execute(
+            """
+            SELECT payment_records.id, payment_records.version
+            FROM payment_records
             JOIN payment_requests ON payment_requests.id = payment_records.request_id
             WHERE payment_requests.batch_id = ?
             """,
@@ -156,6 +176,13 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
     current_request_ids = {
         int(row["id"])
         for row in conn.execute("SELECT id FROM payment_requests WHERE batch_id = ?", (batch_id,)).fetchall()
+    }
+    current_request_versions = {
+        int(row["id"]): int(row["version"] or 1)
+        for row in conn.execute(
+            "SELECT id, version FROM payment_requests WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchall()
     }
     baseline_requests = payload.get("requests", [])
     baseline_request_ids = {int(row["id"]) for row in baseline_requests if row.get("id") is not None}
@@ -175,12 +202,16 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         values["id"] = request_id
         values["batch_id"] = batch_id
         if request_id in current_request_ids:
+            values["version"] = current_request_versions[request_id] + 1
+            values["updated_at"] = now_iso()
             update_columns = [column for column in request_columns if column != "id" and column in values]
             conn.execute(
                 f"UPDATE payment_requests SET {', '.join(f'{column} = ?' for column in update_columns)} WHERE id = ?",
                 [values[column] for column in update_columns] + [request_id],
             )
         else:
+            if "version" in request_columns:
+                values["version"] = max(int(values.get("version") or 1), 1)
             insert_columns = [column for column in request_columns if column in values]
             placeholders = ", ".join("?" for _ in insert_columns)
             conn.execute(
@@ -193,12 +224,16 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         payment_id = int(payment["id"])
         values = {column: payment.get(column) for column in payment_columns if column in payment}
         if payment_id in current_payment_ids:
+            values["version"] = current_payment_versions[payment_id] + 1
+            values["updated_at"] = now_iso()
             update_columns = [column for column in payment_columns if column != "id" and column in values]
             conn.execute(
                 f"UPDATE payment_records SET {', '.join(f'{column} = ?' for column in update_columns)} WHERE id = ?",
                 [values[column] for column in update_columns] + [payment_id],
             )
         else:
+            if "version" in payment_columns:
+                values["version"] = max(int(values.get("version") or 1), 1)
             insert_columns = [column for column in payment_columns if column in values]
             placeholders = ", ".join("?" for _ in insert_columns)
             conn.execute(
@@ -233,7 +268,7 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         )
 
     for request_id in baseline_request_ids:
-        refresh_payment_summaries(conn, request_id)
+        refresh_payment_summaries(conn, request_id, bump_version=False)
         request = conn.execute(
             "SELECT * FROM payment_requests WHERE id = ?",
             (request_id,),
@@ -320,6 +355,10 @@ def copy_attachment_files_for_snapshot(
 ) -> None:
     files_dir = DATA_DIR / "snapshots" / str(batch_id) / token / "files"
     for attachment in attachments:
+        # Content-addressed objects are immutable and shared.  A snapshot only
+        # needs to keep the relationship's file_object_id, not another copy.
+        if attachment.get("file_object_id"):
+            continue
         file_path = attachment.get("file_path")
         if not file_path:
             continue
@@ -333,6 +372,8 @@ def copy_attachment_files_for_snapshot(
 
 
 def restore_attachment_file(attachment: Dict[str, Any]) -> None:
+    if attachment.get("file_object_id"):
+        return
     file_path = attachment.get("file_path")
     snapshot_file_path = attachment.get("_snapshot_file_path")
     if not file_path or not snapshot_file_path:

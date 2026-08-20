@@ -2,23 +2,41 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import mimetypes
+import os
 import shutil
+import sqlite3
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
+from time import perf_counter
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from .attachment_io import save_embedded_image_attachments, save_embedded_payment_vouchers
+from .batch_operations import (
+    BatchOperationLease,
+    acquire_or_reuse_batch_operation,
+    complete_batch_operation,
+    ensure_batch_operation_available,
+    fail_batch_operation,
+    get_batch_operation,
+    leased_batch_operation,
+    update_batch_operation_progress,
+)
 from .db import (
     DATA_DIR,
     ROOT_DIR,
@@ -68,6 +86,7 @@ from .fx_rates import (
     multiply_money,
     normalize_currency,
 )
+from .file_storage import register_file_object, resolve_attachment_path, write_stream
 from .employee_departments import (
     EmployeeDepartmentError,
     apply_employee_department_mapping,
@@ -87,6 +106,10 @@ from .snapshots import (
 
 app = FastAPI(title="出纳请款明细系统")
 
+_DINGTALK_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dingtalk-sync")
+_DINGTALK_SYNC_FUTURES: Dict[str, Any] = {}
+_DINGTALK_SYNC_FUTURES_LOCK = Lock()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -94,6 +117,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def handle_sqlite_operational_error(_: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+    message = str(exc).lower()
+    if "locked" in message or "busy" in message:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": {
+                    "code": "DATABASE_BUSY",
+                    "message": "数据库正在处理其他写入，请稍后重试",
+                }
+            },
+            headers={"Retry-After": "1"},
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": {"code": "DATABASE_ERROR", "message": "数据库操作失败"}},
+    )
 
 
 class LoginIn(BaseModel):
@@ -118,10 +161,12 @@ class RolloverIn(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     copy_mode: str = "unfinished"
+    expected_batch_version: Optional[int] = None
 
 
 class SheetOrderIn(BaseModel):
     sheet_order: list[str] = Field(default_factory=list)
+    expected_batch_version: Optional[int] = None
 
 
 class RequestIn(BaseModel):
@@ -164,6 +209,7 @@ class RequestIn(BaseModel):
 
 class RequestPatch(RequestIn):
     reason: Optional[str] = None
+    expected_version: Optional[int] = None
 
 
 class CurrencyConversionIn(BaseModel):
@@ -171,6 +217,7 @@ class CurrencyConversionIn(BaseModel):
     rate_date: str
     mode: str = "convert"
     reason: Optional[str] = None
+    expected_version: Optional[int] = None
     expected_updated_at: Optional[str] = None
 
 
@@ -178,6 +225,7 @@ class ForeignAmountCorrectionIn(BaseModel):
     amount: float = Field(gt=0)
     rate_date: str
     reason: Optional[str] = None
+    expected_version: Optional[int] = None
     expected_updated_at: Optional[str] = None
 
 
@@ -189,18 +237,20 @@ class RequestGridPreferenceIn(BaseModel):
 class HistoricalCurrencyRestoreIn(BaseModel):
     request_ids: list[int] = Field(default_factory=list)
     reason: Optional[str] = None
+    expected_batch_version: Optional[int] = None
 
 
 class CorrectionIn(BaseModel):
     request_id: int
     changes: Dict[str, Any]
     reason: str
+    expected_version: Optional[int] = None
 
 
 class BulkRequestsIn(BaseModel):
     creates: list[Dict[str, Any]] = Field(default_factory=list)
     updates: list[Dict[str, Any]] = Field(default_factory=list)
-    deletes: list[int] = Field(default_factory=list)
+    deletes: list[Any] = Field(default_factory=list)
     reason: Optional[str] = None
 
 
@@ -273,6 +323,7 @@ class PaymentRecordIn(BaseModel):
     bank_reference: Optional[str] = None
     remark: Optional[str] = None
     reason: Optional[str] = None
+    expected_request_version: Optional[int] = None
 
 
 class PaymentRecordPatch(BaseModel):
@@ -283,6 +334,8 @@ class PaymentRecordPatch(BaseModel):
     bank_reference: Optional[str] = None
     remark: Optional[str] = None
     reason: Optional[str] = None
+    expected_request_version: Optional[int] = None
+    expected_payment_version: Optional[int] = None
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -1055,7 +1108,15 @@ def rollover_batch(
     operation_id = uuid.uuid4().hex
     timestamp = now_iso()
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, source_batch_id)
         source = require_batch(conn, source_batch_id)
+        checked_expected_version(
+            source,
+            payload.expected_batch_version,
+            "request_batch",
+            source_batch_id,
+        )
         source_sheet_order = canonical_sheet_order(batch_sheet_order(row_to_dict(source)))
         cursor = conn.execute(
             """
@@ -1097,8 +1158,21 @@ def rollover_batch(
                 (source_batch_id,),
             ).fetchall()
         copied_count = 0
+        skipped_duplicate_rows = 0
+        seen_request_keys: set[tuple[str, str, str]] = set()
         for source_row in source_rows:
             source_data = row_to_dict(source_row)
+            approval_no = str(source_data.get("dingding_id") or "").strip()
+            duplicate_key = (
+                approval_no,
+                normalize_currency(source_data.get("currency")),
+                content_hash(source_data),
+            ) if approval_no else None
+            if duplicate_key and duplicate_key in seen_request_keys:
+                skipped_duplicate_rows += 1
+                continue
+            if duplicate_key:
+                seen_request_keys.add(duplicate_key)
             copied_from_request_id = source_data["id"]
             for key in [
                 "id",
@@ -1108,6 +1182,7 @@ def rollover_batch(
                 "created_at",
                 "updated_at",
                 "content_hash",
+                "version",
             ]:
                 source_data.pop(key, None)
             source_data["copied_from_request_id"] = copied_from_request_id
@@ -1132,11 +1207,22 @@ def rollover_batch(
             target_batch_id,
             target_batch_id,
             old_value={"source_batch_id": source_batch_id, "source_name": source["name"]},
-            new_value={"target_batch_id": target_batch_id, "copied_count": copied_count, "copy_mode": payload.copy_mode},
+            new_value={
+                "target_batch_id": target_batch_id,
+                "copied_count": copied_count,
+                "skipped_duplicate_rows": skipped_duplicate_rows,
+                "copy_mode": payload.copy_mode,
+            },
             operation_id=operation_id,
         )
         create_batch_snapshot(conn, int(target_batch_id), "baseline", user["id"], replace_existing=True)
-    return {"batch": row_to_dict(target), "copied_count": copied_count, "copy_mode": payload.copy_mode, "operation_id": operation_id}
+    return {
+        "batch": row_to_dict(target),
+        "copied_count": copied_count,
+        "skipped_duplicate_rows": skipped_duplicate_rows,
+        "copy_mode": payload.copy_mode,
+        "operation_id": operation_id,
+    }
 
 
 @app.get("/api/batches/{batch_id}")
@@ -1191,7 +1277,14 @@ def update_batch_sheet_order(
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
+        current_version = checked_expected_version(
+            batch,
+            payload.expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理调整 Sheet 顺序")
         row_backed_names = {
@@ -1209,10 +1302,17 @@ def update_batch_sheet_order(
         final_order.extend(sorted(row_backed_names - set(final_order)))
         old_order = batch_sheet_order(row_to_dict(batch))
         timestamp = now_iso()
-        conn.execute(
-            "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(final_order, ensure_ascii=False), timestamp, batch_id),
+        cursor = conn.execute(
+            """
+            UPDATE request_batches
+            SET sheet_order_json = ?, updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ?
+            """,
+            (json.dumps(final_order, ensure_ascii=False), timestamp, batch_id, current_version),
         )
+        if cursor.rowcount != 1:
+            current = require_batch(conn, batch_id)
+            raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
         updated = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
         write_audit(
             conn,
@@ -1228,48 +1328,86 @@ def update_batch_sheet_order(
 
 
 @app.post("/api/batches/{batch_id}/archive")
-def archive_batch(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES))) -> Dict[str, Any]:
+def archive_batch(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="批次不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
+        row = require_batch(conn, batch_id)
+        current_version = checked_expected_version(row, expected_batch_version, "request_batch", batch_id)
         if row["status"] == "archived":
             return {"batch": row_to_dict(row)}
         old_value = row_to_dict(row)
-        conn.execute(
-            "UPDATE request_batches SET status = 'archived', archived_by = ?, archived_at = ?, updated_at = ? WHERE id = ?",
-            (user["id"], now_iso(), now_iso(), batch_id),
+        cursor = conn.execute(
+            """
+            UPDATE request_batches
+            SET status = 'archived', archived_by = ?, archived_at = ?, updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ?
+            """,
+            (user["id"], now_iso(), now_iso(), batch_id, current_version),
         )
+        if cursor.rowcount != 1:
+            current = require_batch(conn, batch_id)
+            raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
         new_row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
         write_audit(conn, user["id"], "batch.archive", "batch", batch_id, batch_id, old_value, row_to_dict(new_row))
     return {"batch": row_to_dict(new_row)}
 
 
 @app.post("/api/batches/{batch_id}/unarchive")
-def unarchive_batch(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
+def unarchive_batch(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="批次不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
+        row = require_batch(conn, batch_id)
+        current_version = checked_expected_version(row, expected_batch_version, "request_batch", batch_id)
         if row["status"] == "draft":
             return {"batch": row_to_dict(row)}
         old_value = row_to_dict(row)
-        conn.execute(
-            "UPDATE request_batches SET status = 'draft', archived_by = NULL, archived_at = NULL, updated_at = ? WHERE id = ?",
-            (now_iso(), batch_id),
+        cursor = conn.execute(
+            """
+            UPDATE request_batches
+            SET status = 'draft', archived_by = NULL, archived_at = NULL,
+                updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ?
+            """,
+            (now_iso(), batch_id, current_version),
         )
+        if cursor.rowcount != 1:
+            current = require_batch(conn, batch_id)
+            raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
         new_row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
         write_audit(conn, user["id"], "batch.unarchive", "batch", batch_id, batch_id, old_value, row_to_dict(new_row))
     return {"batch": row_to_dict(new_row)}
 
 
 @app.post("/api/batches/{batch_id}/snapshots/baseline")
-def set_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
+def set_batch_baseline(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
+        current_version = checked_expected_version(
+            batch,
+            expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只有草稿批次可以设置还原点")
         snapshot = create_batch_snapshot(conn, batch_id, "baseline", user["id"], replace_existing=True)
+        touch_batch(conn, batch_id, expected_version=current_version)
         write_audit(
             conn,
             user["id"],
@@ -1284,8 +1422,21 @@ def set_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require_rol
 
 
 @app.post("/api/batches/{batch_id}/restore-baseline")
-def restore_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
+def restore_batch_baseline(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES)),
+) -> Dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
+        batch = require_batch(conn, batch_id)
+        current_version = checked_expected_version(
+            batch,
+            expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         try:
             result = restore_batch_from_baseline(conn, batch_id, user["id"])
         except LookupError as exc:
@@ -1294,6 +1445,13 @@ def restore_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # A snapshot may contain an older batch version. The restore itself is a
+        # new structural write, so its version must advance from the pre-restore
+        # value instead of moving backwards with the snapshot.
+        conn.execute(
+            "UPDATE request_batches SET version = ?, updated_at = ? WHERE id = ?",
+            (current_version + 1, now_iso(), batch_id),
+        )
         write_audit(
             conn,
             user["id"],
@@ -1315,11 +1473,21 @@ def restore_batch_baseline(batch_id: int, user: Dict[str, Any] = Depends(require
 
 
 @app.delete("/api/batches/{batch_id}")
-def delete_draft_batch(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, str]:
+def delete_draft_batch(
+    batch_id: int,
+    expected_batch_version: Optional[int] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES)),
+) -> Dict[str, str]:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM request_batches WHERE id = ?", (batch_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="批次不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
+        row = require_batch(conn, batch_id)
+        current_version = checked_expected_version(
+            row,
+            expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         if row["status"] != "draft":
             raise HTTPException(status_code=400, detail="已归档批次不能删除，请先恢复草稿后再删除")
         old_value = row_to_dict(row)
@@ -1329,7 +1497,13 @@ def delete_draft_batch(batch_id: int, user: Dict[str, Any] = Depends(require_rol
         ]
         file_paths = request_owned_file_paths(conn, request_ids)
         write_audit(conn, user["id"], "batch.delete_draft", "batch", batch_id, batch_id=batch_id, old_value=old_value)
-        conn.execute("DELETE FROM request_batches WHERE id = ?", (batch_id,))
+        cursor = conn.execute(
+            "DELETE FROM request_batches WHERE id = ? AND version = ?",
+            (batch_id, current_version),
+        )
+        if cursor.rowcount != 1:
+            current = require_batch(conn, batch_id)
+            raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
         for file_path in set(file_paths):
             delete_file_if_unreferenced(conn, file_path)
         cleanup_batch_snapshot_files(batch_id)
@@ -1345,6 +1519,8 @@ def correct_archived_request(
     if not payload.reason.strip():
         raise HTTPException(status_code=400, detail="归档后更正必须填写原因")
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         if batch["status"] != "archived":
             raise HTTPException(status_code=400, detail="只有归档批次需要走更正入口")
@@ -1354,9 +1530,17 @@ def correct_archived_request(
         ).fetchone()
         if not old_row:
             raise HTTPException(status_code=404, detail="请款记录不存在")
-        changed = update_request_row(conn, payload.request_id, payload.changes, user["id"], user["role"])
+        changed = update_request_row(
+            conn,
+            payload.request_id,
+            payload.changes,
+            user["id"],
+            user["role"],
+            expected_version=payload.expected_version,
+        )
         new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (payload.request_id,)).fetchone()
         if changed:
+            touch_batch(conn, batch_id)
             write_audit(
                 conn,
                 user["id"],
@@ -1551,6 +1735,8 @@ def create_request(
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_editable(batch, user)
         data = payload.dict(exclude_unset=True)
@@ -1570,11 +1756,31 @@ def bulk_save_requests(
 ) -> Dict[str, Any]:
     operation_id = uuid.uuid4().hex
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_bulk_editable(batch, user, payload.reason)
         created: list[int] = []
         updated: list[int] = []
         deleted: list[int] = []
+
+        # Validate every optimistic-lock token before applying any part of the batch.
+        for item in payload.updates:
+            request_id = item.get("id")
+            if not request_id:
+                raise HTTPException(status_code=400, detail="批量更新缺少记录 id")
+            row = require_accessible_request(conn, batch_id, int(request_id), user)
+            checked_expected_version(
+                row,
+                item.get("expected_version"),
+                "payment_request",
+                int(request_id),
+            )
+        normalized_deletes = [bulk_delete_target(item) for item in payload.deletes]
+        for request_id, expected_version in normalized_deletes:
+            row = require_accessible_request(conn, batch_id, request_id, user)
+            checked_expected_version(row, expected_version, "payment_request", request_id)
+
         for item in payload.creates:
             ensure_business_can_create_in_sheet(conn, user, batch_id, item.get("source_sheet"))
             reject_direct_payment_summary_changes(item, creating=True)
@@ -1597,13 +1803,21 @@ def bulk_save_requests(
             if not request_id:
                 raise HTTPException(status_code=400, detail="批量更新缺少记录 id")
             old_row = require_accessible_request(conn, batch_id, int(request_id), user)
-            changes = {key: value for key, value in item.items() if key != "id"}
+            expected_version = item.get("expected_version")
+            changes = {key: value for key, value in item.items() if key not in {"id", "expected_version"}}
             ensure_business_sheet_unchanged(user, row_to_dict(old_row), changes)
             if "source_sheet" in changes:
                 ensure_sheet_access(conn, user, changes.get("source_sheet"))
             if not changes:
                 continue
-            if not update_request_row(conn, int(request_id), changes, user["id"], user["role"]):
+            if not update_request_row(
+                conn,
+                int(request_id),
+                changes,
+                user["id"],
+                user["role"],
+                expected_version=expected_version,
+            ):
                 continue
             new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
             write_audit(
@@ -1619,11 +1833,25 @@ def bulk_save_requests(
                 operation_id,
             )
             updated.append(int(request_id))
-        for request_id in payload.deletes:
-            old_row = require_accessible_request(conn, batch_id, int(request_id), user)
-            ensure_can_delete_request_with_payments(conn, int(request_id), user)
-            file_paths = request_owned_file_paths(conn, [int(request_id)])
-            conn.execute("DELETE FROM payment_requests WHERE id = ?", (request_id,))
+        for request_id, expected_version in normalized_deletes:
+            old_row = require_accessible_request(conn, batch_id, request_id, user)
+            current_version = checked_expected_version(
+                old_row,
+                expected_version,
+                "payment_request",
+                request_id,
+            )
+            ensure_can_delete_request_with_payments(conn, request_id, user)
+            file_paths = request_owned_file_paths(conn, [request_id])
+            cursor = conn.execute(
+                "DELETE FROM payment_requests WHERE id = ? AND version = ?",
+                (request_id, current_version),
+            )
+            if cursor.rowcount != 1:
+                current = conn.execute("SELECT version FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+                if current:
+                    raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
+                raise HTTPException(status_code=404, detail="请款记录不存在")
             for file_path in file_paths:
                 delete_file_if_unreferenced(conn, file_path)
             write_audit(
@@ -1639,7 +1867,8 @@ def bulk_save_requests(
                 operation_id,
             )
             deleted.append(int(request_id))
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (now_iso(), batch_id))
+        if updated or deleted:
+            touch_batch(conn, batch_id)
     return {
         "operation_id": operation_id,
         "created": created,
@@ -1657,6 +1886,8 @@ def update_request(
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         old_row = require_accessible_request(conn, batch_id, request_id, user)
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
@@ -1665,12 +1896,21 @@ def update_request(
             raise HTTPException(status_code=400, detail="归档后更正必须填写原因")
         data = payload.dict(exclude_unset=True)
         reason = data.pop("reason", None)
+        expected_version = data.pop("expected_version", None)
         ensure_business_sheet_unchanged(user, row_to_dict(old_row), data)
         if "source_sheet" in data:
             ensure_sheet_access(conn, user, data.get("source_sheet"))
-        changed = update_request_row(conn, request_id, data, user["id"], user["role"])
+        changed = update_request_row(
+            conn,
+            request_id,
+            data,
+            user["id"],
+            user["role"],
+            expected_version=expected_version,
+        )
         new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         if changed:
+            touch_batch(conn, batch_id)
             write_audit(
                 conn,
                 user["id"],
@@ -1768,6 +2008,7 @@ def currency_conversion_preview_data(
         raise HTTPException(status_code=400, detail="换算后累计已付超过应付金额")
     return {
         "request_id": int(request_row["id"]),
+        "request_version": int(request_row.get("version") or 1),
         "mode": mode,
         "source_currency": source_currency,
         "target_currency": target_currency,
@@ -1825,6 +2066,7 @@ def foreign_amount_correction_preview_data(
     rate = float(target_rate["cny_per_unit"])
     return {
         "request_id": int(request_row["id"]),
+        "request_version": int(request_row.get("version") or 1),
         "currency": currency,
         "requested_rate_date": target_rate["requested_date"],
         "actual_rate_date": target_rate["actual_date"],
@@ -1887,11 +2129,16 @@ def apply_foreign_request_amount_correction(
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         require_currency_conversion_permission(batch, user, payload.reason)
         request_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
-        if payload.expected_updated_at and request_row.get("updated_at") != payload.expected_updated_at:
-            raise HTTPException(status_code=409, detail="请款已被其他用户修改，请刷新后重新更正金额")
+        current_version = checked_expected_version(
+            request_row,
+            payload.expected_version,
+            "payment_request",
+            request_id,
+        )
         current_currency = normalize_currency(request_row.get("currency"), default="CNY") or "CNY"
         if current_currency != currency:
             raise HTTPException(status_code=409, detail="请款币种已发生变化，请刷新后重试")
@@ -1900,12 +2147,13 @@ def apply_foreign_request_amount_correction(
         )
         preview = foreign_amount_correction_preview_data(request_row, payments, target_rate, payload.amount)
         timestamp = now_iso()
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE payment_requests
             SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
-                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
-            WHERE id = ?
+                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?,
+                version = version + 1
+            WHERE id = ? AND version = ?
             """,
             (
                 preview["after"]["amount"],
@@ -1916,12 +2164,16 @@ def apply_foreign_request_amount_correction(
                 user["id"],
                 timestamp,
                 request_id,
+                current_version,
             ),
         )
-        refresh_payment_summaries(conn, request_id)
+        if cursor.rowcount != 1:
+            current = require_accessible_request(conn, batch_id, request_id, user)
+            raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
+        refresh_payment_summaries(conn, request_id, bump_version=False)
         updated = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
         conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        touch_batch(conn, batch_id)
         write_audit(
             conn,
             user["id"],
@@ -1999,11 +2251,16 @@ def apply_request_currency_conversion(
 
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         require_currency_conversion_permission(batch, user, payload.reason)
         request_row = row_to_dict(require_accessible_request(conn, batch_id, request_id, user))
-        if payload.expected_updated_at and request_row.get("updated_at") != payload.expected_updated_at:
-            raise HTTPException(status_code=409, detail="请款已被其他用户修改，请刷新后重新换算")
+        current_version = checked_expected_version(
+            request_row,
+            payload.expected_version,
+            "payment_request",
+            request_id,
+        )
         if normalize_currency(request_row.get("currency"), default="CNY") == target_currency:
             raise HTTPException(status_code=400, detail="目标币种与当前币种相同")
         payments = rows_to_dicts(
@@ -2011,12 +2268,13 @@ def apply_request_currency_conversion(
         )
         preview = currency_conversion_preview_data(request_row, payments, target_rate, mode)
         timestamp = now_iso()
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE payment_requests
             SET currency = ?, amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
-                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
-            WHERE id = ?
+                fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?,
+                version = version + 1
+            WHERE id = ? AND version = ?
             """,
             (
                 target_currency,
@@ -2028,8 +2286,12 @@ def apply_request_currency_conversion(
                 user["id"],
                 timestamp,
                 request_id,
+                current_version,
             ),
         )
+        if cursor.rowcount != 1:
+            current = require_accessible_request(conn, batch_id, request_id, user)
+            raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
         for converted in preview["payments"]:
             old_payment = next(item for item in payments if int(item["id"]) == int(converted["id"]))
             new_hash = payment_record_hash(
@@ -2044,7 +2306,7 @@ def apply_request_currency_conversion(
                 UPDATE payment_records
                 SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
                     fx_rate_date = ?, fx_rate_actual_date = ?, content_hash = ?,
-                    updated_by = ?, updated_at = ?
+                    updated_by = ?, updated_at = ?, version = version + 1
                 WHERE id = ? AND request_id = ?
                 """,
                 (
@@ -2060,11 +2322,11 @@ def apply_request_currency_conversion(
                     request_id,
                 ),
             )
-        refresh_payment_summaries(conn, request_id)
+        refresh_payment_summaries(conn, request_id, bump_version=False)
         updated_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         updated = row_to_dict(updated_row)
         conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        touch_batch(conn, batch_id)
         write_audit(
             conn,
             user["id"],
@@ -2202,6 +2464,7 @@ def preview_historical_currency_restore(
 
 
 @app.post("/api/batches/{batch_id}/historical-currency-restore/apply")
+@leased_batch_operation("historical-currency-restore", lambda arguments: arguments["batch_id"])
 def apply_historical_currency_restore(
     batch_id: int,
     payload: HistoricalCurrencyRestoreIn,
@@ -2214,7 +2477,14 @@ def apply_historical_currency_restore(
     restored: list[int] = []
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
+        checked_expected_version(
+            batch,
+            payload.expected_batch_version,
+            "request_batch",
+            batch_id,
+        )
         original_sheet_order = batch_sheet_order(row_to_dict(batch))
         if batch["status"] == "archived" and not str(payload.reason or "").strip():
             raise HTTPException(status_code=400, detail="归档批次恢复历史币种必须填写原因")
@@ -2258,7 +2528,8 @@ def apply_historical_currency_restore(
                 """
                 UPDATE payment_requests
                 SET currency = ?, amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
-                    fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
+                    fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?,
+                    version = version + 1
                 WHERE id = ?
                 """,
                 (
@@ -2271,12 +2542,13 @@ def apply_historical_currency_restore(
                     """
                     UPDATE payment_records
                     SET amount = ?, base_amount_cny = ?, fx_rate_cny_per_unit = ?,
-                        fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?
+                        fx_rate_date = ?, fx_rate_actual_date = ?, updated_by = ?, updated_at = ?,
+                        version = version + 1
                     WHERE id = ?
                     """,
                     (converted_amount, base_payment, rate, request_date, request_date, user["id"], timestamp, payment["id"]),
                 )
-            refresh_payment_summaries(conn, request_id)
+            refresh_payment_summaries(conn, request_id, bump_version=False)
             updated = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
             conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
             write_audit(
@@ -2286,7 +2558,7 @@ def apply_historical_currency_restore(
                 reason=payload.reason, operation_id=operation_id,
             )
             restored.append(request_id)
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        touch_batch(conn, batch_id)
         manifest["request_post_versions"] = {
             str(request_id): table_row_snapshot(conn, "payment_requests", request_id).get("updated_at")
             for request_id in restored
@@ -2315,7 +2587,7 @@ def apply_historical_currency_restore(
             str(payment_id): merge_related_rows_signature(conn, "payment_vouchers", "payment_id", payment_id)
             for payment_id in restored_payment_ids
         }
-        manifest["batch_post_updated_at"] = timestamp
+        manifest["batch_post_updated_at"] = require_batch(conn, batch_id)["updated_at"]
         write_import_job(
             conn,
             "historical-currency-restore",
@@ -2340,18 +2612,36 @@ def delete_request(
     batch_id: int,
     request_id: int,
     reason: str = Query(""),
+    expected_version: Optional[int] = Query(None),
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, str]:
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         old_row = require_accessible_request(conn, batch_id, request_id, user)
+        current_version = checked_expected_version(
+            old_row,
+            expected_version,
+            "payment_request",
+            request_id,
+        )
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理更正")
         if batch["status"] == "archived" and not reason.strip():
             raise HTTPException(status_code=400, detail="归档后删除必须填写原因")
         ensure_can_delete_request_with_payments(conn, request_id, user)
         file_paths = request_owned_file_paths(conn, [request_id])
-        conn.execute("DELETE FROM payment_requests WHERE id = ?", (request_id,))
+        cursor = conn.execute(
+            "DELETE FROM payment_requests WHERE id = ? AND version = ?",
+            (request_id, current_version),
+        )
+        if cursor.rowcount != 1:
+            current = conn.execute("SELECT version FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+            if current:
+                raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
+            raise HTTPException(status_code=404, detail="请款记录不存在")
+        touch_batch(conn, batch_id)
         for file_path in file_paths:
             delete_file_if_unreferenced(conn, file_path)
         write_audit(
@@ -2377,7 +2667,7 @@ def list_request_payments(
     with connect() as conn:
         require_batch(conn, batch_id)
         require_accessible_request(conn, batch_id, request_id, user)
-        refresh_payment_summaries(conn, request_id)
+        refresh_payment_summaries(conn, request_id, bump_version=False)
         request_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         payments = payment_records_public(conn, request_id)
     return {
@@ -2464,9 +2754,16 @@ def create_request_payment(
 ) -> Dict[str, Any]:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_can_manage_payments(batch, user, payload.reason)
         request_row = require_accessible_request(conn, batch_id, request_id, user)
+        checked_expected_version(
+            request_row,
+            payload.expected_request_version,
+            "payment_request",
+            request_id,
+        )
         payment_id = insert_payment_record_internal(
             conn,
             request_id,
@@ -2498,6 +2795,7 @@ def create_request_payment(
             reason=payload.reason,
         )
         request_after = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        touch_batch(conn, batch_id)
         payment = payment_record_public(conn, row)
     return {"payment": payment, "request": row_to_dict(request_after)}
 
@@ -2512,12 +2810,27 @@ def update_request_payment(
 ) -> Dict[str, Any]:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         data = payload.dict(exclude_unset=True)
         reason = data.pop("reason", None)
+        expected_request_version = data.pop("expected_request_version", None)
+        expected_payment_version = data.pop("expected_payment_version", None)
         ensure_can_manage_payments(batch, user, reason)
-        require_accessible_request(conn, batch_id, request_id, user)
+        request_row = require_accessible_request(conn, batch_id, request_id, user)
+        checked_expected_version(
+            request_row,
+            expected_request_version,
+            "payment_request",
+            request_id,
+        )
         old = require_payment_record(conn, request_id, payment_id)
+        current_payment_version = checked_expected_version(
+            old,
+            expected_payment_version,
+            "payment_record",
+            payment_id,
+        )
         if payment_record_is_inherited(row_to_dict(old)):
             raise HTTPException(status_code=400, detail="结转继承的付款明细只读")
         amount = payment_record_amount(data.get("amount", old["amount"]))
@@ -2544,14 +2857,14 @@ def update_request_payment(
         ).fetchone()
         payment_rate = float(request_currency["fx_rate_cny_per_unit"] or 1)
         payment_base_amount = multiply_money(merged["amount"], payment_rate)
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE payment_records
             SET amount = ?, payment_date = ?, payer = ?, payment_account = ?,
                 bank_reference = ?, remark = ?, content_hash = ?,
                 base_amount_cny = ?, fx_rate_cny_per_unit = ?, fx_rate_date = ?, fx_rate_actual_date = ?,
-                updated_by = ?, updated_at = ?
-            WHERE id = ?
+                updated_by = ?, updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ?
             """,
             (
                 merged["amount"],
@@ -2568,8 +2881,12 @@ def update_request_payment(
                 user["id"],
                 now_iso(),
                 payment_id,
+                current_payment_version,
             ),
         )
+        if cursor.rowcount != 1:
+            current = require_payment_record(conn, request_id, payment_id)
+            raise_version_conflict("payment_record", payment_id, int(current["version"] or 1))
         refresh_payment_summaries(conn, request_id)
         row = conn.execute(
             """
@@ -2591,6 +2908,7 @@ def update_request_payment(
             reason=reason,
         )
         request_after = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        touch_batch(conn, batch_id)
         payment = payment_record_public(conn, row)
     return {"payment": payment, "request": row_to_dict(request_after)}
 
@@ -2601,18 +2919,39 @@ def delete_request_payment(
     request_id: int,
     payment_id: int,
     reason: str = Query(""),
+    expected_request_version: Optional[int] = Query(None),
+    expected_payment_version: Optional[int] = Query(None),
     user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_can_manage_payments(batch, user, reason)
-        require_accessible_request(conn, batch_id, request_id, user)
+        request_row = require_accessible_request(conn, batch_id, request_id, user)
+        checked_expected_version(
+            request_row,
+            expected_request_version,
+            "payment_request",
+            request_id,
+        )
         old = require_payment_record(conn, request_id, payment_id)
+        current_payment_version = checked_expected_version(
+            old,
+            expected_payment_version,
+            "payment_record",
+            payment_id,
+        )
         if payment_record_is_inherited(row_to_dict(old)):
             raise HTTPException(status_code=400, detail="结转继承的付款明细只读")
         vouchers = rows_to_dicts(conn.execute("SELECT * FROM payment_vouchers WHERE payment_id = ?", (payment_id,)).fetchall())
-        conn.execute("DELETE FROM payment_records WHERE id = ?", (payment_id,))
+        cursor = conn.execute(
+            "DELETE FROM payment_records WHERE id = ? AND version = ?",
+            (payment_id, current_payment_version),
+        )
+        if cursor.rowcount != 1:
+            current = require_payment_record(conn, request_id, payment_id)
+            raise_version_conflict("payment_record", payment_id, int(current["version"] or 1))
         refresh_payment_summaries(conn, request_id)
         write_audit(
             conn,
@@ -2625,6 +2964,7 @@ def delete_request_payment(
             reason=reason or None,
         )
         request_after = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        touch_batch(conn, batch_id)
         for voucher in vouchers:
             delete_payment_voucher_file_if_unused(conn, voucher)
     return {"status": "ok", "request": row_to_dict(request_after)}
@@ -2647,21 +2987,31 @@ async def upload_payment_voucher(
         payment = require_payment_record(conn, request_id, payment_id)
         if payment_record_is_inherited(row_to_dict(payment)):
             raise HTTPException(status_code=400, detail="结转继承的付款凭证只读")
-        _, relative_path, file_size, mime_type = await save_payment_voucher_upload(file, batch_id, payment_id)
+
+    staged = await save_payment_voucher_upload(file, batch_id, payment_id)
+    with connect() as conn:
+        batch = require_batch(conn, batch_id)
+        ensure_can_manage_payments(batch, user, reason)
+        require_accessible_request(conn, batch_id, request_id, user)
+        payment = require_payment_record(conn, request_id, payment_id)
+        if payment_record_is_inherited(row_to_dict(payment)):
+            raise HTTPException(status_code=400, detail="结转继承的付款凭证只读")
+        file_object = register_file_object(conn, staged)
         cursor = conn.execute(
             """
             INSERT INTO payment_vouchers (
                 payment_id, label, file_path, original_filename, mime_type,
-                file_size, created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                file_size, file_object_id, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payment_id,
                 str(label or "").strip() or None,
-                str(relative_path),
+                staged["storage_path"],
                 file.filename,
-                mime_type,
-                file_size,
+                staged["mime_type"],
+                staged["size_bytes"],
+                file_object["id"],
                 user["id"],
                 now_iso(),
             ),
@@ -2695,10 +3045,10 @@ def get_payment_voucher_file(voucher_id: int, user: Dict[str, Any] = Depends(cur
         ).fetchone()
         if row:
             ensure_sheet_access(conn, user, row["source_sheet"])
+            path, _ = resolve_attachment_path(row, conn)
     if not row:
         raise HTTPException(status_code=404, detail="付款凭证不存在")
-    path = resolve_data_file(row["file_path"])
-    if not path.exists():
+    if path is None:
         raise HTTPException(status_code=404, detail="付款凭证文件不存在")
     return FileResponse(
         path,
@@ -2813,23 +3163,30 @@ async def upload_image_attachment(
         batch = require_batch(conn, batch_id)
         ensure_bulk_editable(batch, user, reason)
         require_accessible_request(conn, batch_id, request_id, user)
-        saved_path, relative_path, file_size = await save_image_upload(file, batch_id)
+
+    staged = await save_image_upload(file, batch_id)
+    with connect() as conn:
+        batch = require_batch(conn, batch_id)
+        ensure_bulk_editable(batch, user, reason)
+        require_accessible_request(conn, batch_id, request_id, user)
+        file_object = register_file_object(conn, staged)
         cursor = conn.execute(
             """
             INSERT INTO attachment_links (
                 request_id, label, url_path, attachment_type, file_path,
-                original_filename, mime_type, file_size, created_by, created_at
+                original_filename, mime_type, file_size, file_object_id, created_by, created_at
             )
-            VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request_id,
                 label,
-                str(relative_path),
-                str(relative_path),
+                staged["storage_path"],
+                staged["storage_path"],
                 file.filename,
-                file.content_type,
-                file_size,
+                staged["mime_type"],
+                staged["size_bytes"],
+                file_object["id"],
                 user["id"],
                 now_iso(),
             ),
@@ -2891,13 +3248,11 @@ def get_attachment_file(attachment_id: int, user: Dict[str, Any] = Depends(curre
         ).fetchone()
         if row:
             ensure_sheet_access(conn, user, row["source_sheet"])
+            path, _ = resolve_attachment_path(row, conn)
     if not row:
         raise HTTPException(status_code=404, detail="附件不存在")
     attachment = row_to_dict(row)
-    if not attachment.get("file_path"):
-        raise HTTPException(status_code=404, detail="附件文件不存在")
-    path = resolve_data_file(attachment["file_path"])
-    if not path.exists():
+    if path is None:
         raise HTTPException(status_code=404, detail="附件文件不存在")
     return FileResponse(
         path,
@@ -3549,7 +3904,7 @@ async def preview_weekly_excel_merge(
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     try:
-        rows, meta = parse_weekly_excel(saved_path)
+        rows, meta = await run_in_threadpool(parse_weekly_excel, saved_path)
         canonicalize_import_sheet_names(rows, meta)
     except Exception as exc:
         saved_path.unlink(missing_ok=True)
@@ -3692,7 +4047,7 @@ def update_payment_from_merge(
     payload["updated_at"] = now_iso()
     columns = list(payload)
     conn.execute(
-        f"UPDATE payment_records SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",
+        f"UPDATE payment_records SET {', '.join(f'{column} = ?' for column in columns)}, version = version + 1 WHERE id = ?",
         [payload[column] for column in columns] + [payment_id],
     )
 
@@ -3718,7 +4073,20 @@ def request_payment_signature(conn, request_id: int) -> str:
     ).hexdigest()
 
 
+def merge_job_batch_id(arguments: Dict[str, Any]) -> int:
+    job_id = int(arguments["job_id"])
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT batch_id FROM import_jobs WHERE id = ? AND kind = 'weekly-excel-merge'",
+            (job_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="合并预览任务不存在")
+    return int(row["batch_id"])
+
+
 @app.post("/api/import-jobs/{job_id}/apply-merge")
+@leased_batch_operation("weekly-excel-merge-apply", merge_job_batch_id)
 def apply_weekly_excel_merge(
     job_id: int,
     payload: WeeklyMergeApplyIn,
@@ -3729,6 +4097,37 @@ def apply_weekly_excel_merge(
         for item in payload.resolutions
     }
     created_file_paths: set[str] = set()
+    # Parse and build the candidate plan before acquiring SQLite's write lock.
+    # The transaction below revalidates every captured version/signature before
+    # applying the already-built plan.
+    with connect() as preview_conn:
+        preview_job = preview_conn.execute(
+            "SELECT * FROM import_jobs WHERE id = ? AND kind = 'weekly-excel-merge'",
+            (job_id,),
+        ).fetchone()
+        if not preview_job:
+            raise HTTPException(status_code=404, detail="合并预览任务不存在")
+        try:
+            preview_meta = json.loads(preview_job["mapping_json"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=409, detail="合并预览任务数据损坏，请重新预览") from exc
+        preview_source_copy = preview_meta.get("source_copy")
+        if not preview_source_copy:
+            raise HTTPException(status_code=409, detail="合并源文件不存在，请重新预览")
+        preview_source_path = resolve_data_file(preview_source_copy)
+        if not preview_source_path.exists():
+            raise HTTPException(status_code=409, detail="合并源文件已变化或丢失，请重新预览")
+        parsed_rows, parsed_meta = parse_weekly_excel(preview_source_path)
+        canonicalize_import_sheet_names(parsed_rows, parsed_meta)
+        prepared_plan = build_weekly_merge_plan(
+            preview_conn,
+            int(preview_job["batch_id"]),
+            parsed_rows,
+            parsed_meta,
+            resolutions,
+            payload.payment_dates,
+        )
+        prepared_file_sha256 = merge_file_sha256(preview_source_path)
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         job = conn.execute(
@@ -3753,7 +4152,7 @@ def apply_weekly_excel_merge(
         if not source_copy:
             raise HTTPException(status_code=409, detail="合并源文件不存在，请重新预览")
         source_path = resolve_data_file(source_copy)
-        if not source_path.exists() or merge_file_sha256(source_path) != job_meta.get("file_sha256"):
+        if not source_path.exists() or prepared_file_sha256 != job_meta.get("file_sha256"):
             raise HTTPException(status_code=409, detail="合并源文件已变化或丢失，请重新预览")
         batch_id = int(job["batch_id"])
         batch = require_batch(conn, batch_id)
@@ -3790,9 +4189,7 @@ def apply_weekly_excel_merge(
                 job_meta.get("payment_voucher_signatures") or {}
             ).get(payment_id):
                 raise HTTPException(status_code=409, detail=f"预览后付款 {payment_id} 的凭证已变化，请重新预览")
-        rows, meta = parse_weekly_excel(source_path)
-        canonicalize_import_sheet_names(rows, meta)
-        plan = build_weekly_merge_plan(conn, batch_id, rows, meta, resolutions, payload.payment_dates)
+        plan = prepared_plan
         if not plan["can_apply"]:
             unresolved = [
                 *[
@@ -3986,7 +4383,7 @@ def apply_weekly_excel_merge(
             timestamp = now_iso()
             next_sheet_order = canonical_sheet_order(plan["sheet_order"]["new"])
             conn.execute(
-                "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+                "UPDATE request_batches SET sheet_order_json = ?, updated_at = ?, version = version + 1 WHERE id = ?",
                 (json.dumps(next_sheet_order, ensure_ascii=False), timestamp, batch_id),
             )
             touched_request_ids = {
@@ -4073,13 +4470,14 @@ def apply_weekly_excel_merge(
 
 
 @app.post("/api/import/weekly-excel")
+@leased_batch_operation("weekly-excel-import", lambda arguments: arguments.get("batch_id"))
 async def import_weekly_excel(
     file: UploadFile = File(...),
     batch_id: Optional[int] = Form(None),
     user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
-    rows, meta = parse_weekly_excel(saved_path)
+    rows, meta = await run_in_threadpool(parse_weekly_excel, saved_path)
     canonicalize_import_sheet_names(rows, meta)
     payment_details = meta.pop("payment_details", [])
     payment_detail_sheet_present = bool(meta.get("payment_detail_sheet_present"))
@@ -4160,6 +4558,7 @@ async def import_weekly_excel(
 
 
 @app.post("/api/import/dingtalk")
+@leased_batch_operation("dingtalk-file-import", lambda arguments: arguments.get("batch_id"))
 async def import_dingtalk(
     file: UploadFile = File(...),
     batch_id: Optional[int] = Form(None),
@@ -4168,7 +4567,7 @@ async def import_dingtalk(
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     if not mapping_json:
-        headers, preview = detect_table_headers(saved_path)
+        headers, preview = await run_in_threadpool(detect_table_headers, saved_path)
         return {
             "status": "needs_mapping",
             "headers": headers,
@@ -4177,7 +4576,7 @@ async def import_dingtalk(
             "preview": preview,
         }
     mapping = json.loads(mapping_json)
-    rows, meta = parse_dingtalk_file(saved_path, mapping)
+    rows, meta = await run_in_threadpool(parse_dingtalk_file, saved_path, mapping)
     canonicalize_import_sheet_names(rows, meta)
     if any(float(row.get("paid_amount") or 0) > 0 for row in rows) and user["role"] not in FINANCE_FIELD_ROLES:
         raise HTTPException(status_code=403, detail="包含付款数据的文件只能由财务、总经理或管理员导入")
@@ -4222,6 +4621,7 @@ async def import_dingtalk(
 
 
 @app.post("/api/batches/{batch_id}/employee-departments/import")
+@leased_batch_operation("employee-department-grouping", lambda arguments: arguments["batch_id"])
 async def import_employee_departments(
     batch_id: int,
     file: UploadFile = File(...),
@@ -4229,7 +4629,11 @@ async def import_employee_departments(
 ) -> Dict[str, Any]:
     content = await file.read()
     try:
-        parsed = parse_employee_department_workbook(content, file.filename or "员工信息.xls")
+        parsed = await run_in_threadpool(
+            parse_employee_department_workbook,
+            content,
+            file.filename or "员工信息.xls",
+        )
     except EmployeeDepartmentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -4284,7 +4688,8 @@ async def import_employee_departments(
             conn.execute(
                 """
                 UPDATE payment_requests
-                SET source_sheet = ?, raw_extra_json = ?, updated_by = ?, updated_at = ?
+                SET source_sheet = ?, raw_extra_json = ?, updated_by = ?, updated_at = ?,
+                    version = version + 1
                 WHERE id = ?
                 """,
                 (new_sheet, raw_extra_json, user["id"], timestamp, current["id"]),
@@ -4317,7 +4722,7 @@ async def import_employee_departments(
             + after_nonempty_order
         )
         conn.execute(
-            "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+            "UPDATE request_batches SET sheet_order_json = ?, updated_at = ?, version = version + 1 WHERE id = ?",
             (json.dumps(final_order, ensure_ascii=False), timestamp, batch_id),
         )
         result = {
@@ -4486,6 +4891,11 @@ def import_external_expense_rows(
         if key not in seen_keys:
             seen_keys.add(key)
             keys.append({"source_type": source_type, "source_id": source_id})
+    with connect() as conn:
+        initial_batch = require_batch(conn, batch_id)
+        if initial_batch["status"] != "draft":
+            raise HTTPException(status_code=400, detail="只能向草稿批次导入中间表数据")
+        initial_batch_version = int(initial_batch["version"] or 1)
     try:
         source_rows = fetch_external_expenses(keys)
     except ExternalExpenseError as exc:
@@ -4499,11 +4909,13 @@ def import_external_expense_rows(
     imported_rows: list[Dict[str, Any]] = []
     skipped_duplicates: list[Dict[str, Any]] = []
 
-    with connect() as conn:
+    with BatchOperationLease(batch_id, "external-expense-import", user.get("id")) as operation, connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只能向草稿批次导入中间表数据")
-        conn.execute("BEGIN IMMEDIATE")
+        checked_expected_version(batch, initial_batch_version, "request_batch", batch_id)
         existing_request_count = conn.execute(
             "SELECT COUNT(*) AS count FROM payment_requests WHERE batch_id = ?",
             (batch_id,),
@@ -4593,33 +5005,193 @@ def import_external_expense_rows(
             if existing_request_count == 0:
                 create_batch_snapshot(conn, batch_id, "baseline", user["id"], replace_existing=True)
 
-    return {
-        "status": "imported",
-        "job_id": job_id,
-        "batch_id": batch_id,
-        "imported_rows": len(imported_ids),
-        "duplicate_rows": len(skipped_duplicates),
-        "invalid_rows": len(invalid_rows) + len(missing_keys),
-        "warnings": sum(1 for row in imported_rows if row["warnings"]),
-        "duplicates": skipped_duplicates,
-        "errors": [
-            {"source_type": row["source_type"], "source_id": row["source_id"], "messages": row["errors"]}
-            for row in invalid_rows
-        ] + [
-            {"source_type": source_type, "source_id": source_id, "messages": ["来源记录不存在"]}
-            for source_type, source_id in missing_keys
-        ],
-    }
+        response_payload = {
+            "status": "imported",
+            "job_id": job_id,
+            "batch_id": batch_id,
+            "imported_rows": len(imported_ids),
+            "duplicate_rows": len(skipped_duplicates),
+            "invalid_rows": len(invalid_rows) + len(missing_keys),
+            "warnings": sum(1 for row in imported_rows if row["warnings"]),
+            "duplicates": skipped_duplicates,
+            "errors": [
+                {"source_type": row["source_type"], "source_id": row["source_id"], "messages": row["errors"]}
+                for row in invalid_rows
+            ] + [
+                {"source_type": source_type, "source_id": source_id, "messages": ["来源记录不存在"]}
+                for source_type, source_id in missing_keys
+            ],
+        }
+        operation.set_result(response_payload)
+
+    return response_payload
 
 
-@app.post("/api/batches/{batch_id}/external-expenses/sync-metadata")
-def sync_external_expense_metadata(
+@contextmanager
+def cleanup_downloaded_dingtalk_files_on_error(downloaded_attachments: list[Dict[str, Any]]):
+    """Keep staged hash objects on failure so concurrent syncs cannot lose a blob.
+
+    The object is content-addressed and may already be shared by another request.
+    Unreferenced staged objects are handled by the explicit storage cleanup command.
+    """
+
+    del downloaded_attachments
+    yield
+
+
+def upsert_dingtalk_attachment_link(
+    conn,
+    *,
+    request_id: int,
+    attachment: Dict[str, Any],
+    file_object_id: int,
+    user_id: int,
+    timestamp: str,
+) -> int:
+    """Create one logical DingTalk attachment or upgrade a legacy identity."""
+
+    process_instance_id = str(attachment["process_instance_id"])
+    source_attachment_id = str(attachment["file_id"])
+    legacy = conn.execute(
+        """
+        SELECT id
+        FROM attachment_links
+        WHERE request_id = ?
+          AND source_system = ?
+          AND file_object_id = ?
+          AND TRIM(COALESCE(source_instance_id, '')) = ''
+          AND COALESCE(original_filename, '') = COALESCE(?, '')
+        ORDER BY id
+        LIMIT 1
+        """,
+        (
+            request_id,
+            DINGTALK_ATTACHMENT_SOURCE,
+            file_object_id,
+            attachment.get("file_name"),
+        ),
+    ).fetchone()
+    if legacy is not None:
+        try:
+            cursor = conn.execute(
+                """
+                UPDATE attachment_links
+                SET source_instance_id = ?, source_attachment_id = ?,
+                    file_path = ?, url_path = ?
+                WHERE id = ?
+                """,
+                (
+                    process_instance_id,
+                    source_attachment_id,
+                    attachment["relative_path"],
+                    attachment["relative_path"],
+                    legacy["id"],
+                ),
+            )
+            return max(0, cursor.rowcount)
+        except sqlite3.IntegrityError:
+            return 0
+
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO attachment_links (
+            request_id, label, url_path, attachment_type, file_path,
+            original_filename, mime_type, file_size, file_object_id,
+            source_system, source_instance_id, source_attachment_id,
+            created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_id,
+            attachment["file_name"],
+            attachment["relative_path"],
+            attachment["attachment_type"],
+            attachment["relative_path"],
+            attachment["file_name"],
+            attachment["mime_type"],
+            attachment["file_size"],
+            file_object_id,
+            DINGTALK_ATTACHMENT_SOURCE,
+            process_instance_id,
+            source_attachment_id,
+            user_id,
+            timestamp,
+        ),
+    )
+    return max(0, cursor.rowcount)
+
+
+def download_dingtalk_attachment_candidates(
+    attachment_candidates: list[Dict[str, Any]],
+    *,
+    max_workers: int = 4,
+    progress_callback=None,
+) -> tuple[list[Dict[str, Any]], int, list[Dict[str, Any]]]:
+    """Download DingTalk files with bounded parallelism and per-file progress."""
+
+    downloaded_attachments: list[Dict[str, Any]] = []
+    attachment_errors: list[Dict[str, Any]] = []
+    total = len(attachment_candidates)
+    if not total:
+        return downloaded_attachments, 0, attachment_errors
+    worker_count = max(1, min(5, int(max_workers or 1), total))
+    completed = 0
+    try:
+        with DingtalkAttachmentClient() as downloader:
+            def download_one(attachment: Dict[str, Any]) -> Dict[str, Any]:
+                content, content_type = downloader.download(
+                    str(attachment["process_instance_id"]),
+                    str(attachment["file_id"]),
+                )
+                saved = save_dingtalk_attachment_file(attachment, content, content_type)
+                return {**attachment, **saved}
+
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="dingtalk-attachment") as executor:
+                futures = {
+                    executor.submit(download_one, attachment): attachment
+                    for attachment in attachment_candidates
+                }
+                for future in as_completed(futures):
+                    attachment = futures[future]
+                    try:
+                        downloaded_attachments.append(future.result())
+                    except Exception as exc:
+                        attachment_errors.append(
+                            {
+                                "approval_no": attachment.get("approval_no"),
+                                "attachment_id": attachment.get("attachment_id"),
+                                "file_name": attachment.get("file_name"),
+                                "message": str(exc),
+                            }
+                        )
+                    completed += 1
+                    if progress_callback is not None:
+                        progress_callback(completed, total)
+    except Exception as exc:
+        attachment_errors.extend(
+            {
+                "approval_no": attachment.get("approval_no"),
+                "attachment_id": attachment.get("attachment_id"),
+                "file_name": attachment.get("file_name"),
+                "message": str(exc),
+            }
+            for attachment in attachment_candidates
+        )
+    return downloaded_attachments, len(attachment_errors), attachment_errors
+
+
+def _sync_external_expense_metadata_blocking(
     batch_id: int,
-    only_if_stale_seconds: int = Query(default=0, ge=0, le=86400),
-    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+    only_if_stale_seconds: int,
+    user: Dict[str, Any],
+    *,
+    operation_id: Optional[str] = None,
+    include_attachments: bool = True,
 ) -> Dict[str, Any]:
+    timings: Dict[str, float] = {}
     with connect() as conn:
         batch = require_batch(conn, batch_id)
+        initial_batch_version = int(batch["version"] or 1)
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉流程")
         if only_if_stale_seconds:
@@ -4649,7 +5221,7 @@ def sync_external_expense_metadata(
                     pass
         initial_rows = conn.execute(
             """
-            SELECT id, dingding_id
+            SELECT id, dingding_id, version
             FROM payment_requests
             WHERE batch_id = ? AND TRIM(COALESCE(dingding_id, '')) <> ''
             ORDER BY id
@@ -4662,12 +5234,48 @@ def sync_external_expense_metadata(
         for row in initial_rows
         if str(row["dingding_id"] or "").strip()
     }
+    initial_version_by_request = {
+        int(row["id"]): int(row["version"] or 1)
+        for row in initial_rows
+        if str(row["dingding_id"] or "").strip()
+    }
     approval_nos = sorted(set(initial_approval_by_request.values()))
     request_counts_by_approval = Counter(initial_approval_by_request.values())
     try:
+        phase_started = perf_counter()
+        if operation_id:
+            update_batch_operation_progress(
+                operation_id,
+                stage="metadata",
+                progress_message="正在查询审批元数据",
+                timings=timings,
+            )
         source_metadata = fetch_external_expense_metadata(approval_nos)
+        timings["metadata_query_ms"] = round((perf_counter() - phase_started) * 1000, 1)
+
+        phase_started = perf_counter()
+        if operation_id:
+            update_batch_operation_progress(
+                operation_id,
+                stage="workflow",
+                progress_message="正在查询流程状态和评论",
+                timings=timings,
+            )
         source_workflows = fetch_dingtalk_workflows(approval_nos)
-        source_attachments = fetch_external_expense_attachments(approval_nos)
+        timings["workflow_query_ms"] = round((perf_counter() - phase_started) * 1000, 1)
+
+        source_attachments = []
+        if include_attachments:
+            phase_started = perf_counter()
+            if operation_id:
+                update_batch_operation_progress(
+                    operation_id,
+                    stage="attachment_inventory",
+                    progress_message="正在查询附件清单",
+                    timings=timings,
+                )
+            source_attachments = fetch_external_expense_attachments(approval_nos)
+            timings["attachment_query_ms"] = round((perf_counter() - phase_started) * 1000, 1)
     except ExternalExpenseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -4694,10 +5302,15 @@ def sync_external_expense_metadata(
 
     with connect() as conn:
         existing_source_attachments = {
-            (int(row["request_id"]), str(row["source_attachment_id"]))
+            (
+                int(row["request_id"]),
+                str(row["source_instance_id"] or ""),
+                str(row["source_attachment_id"]),
+            )
             for row in conn.execute(
                 """
-                SELECT attachment_links.request_id, attachment_links.source_attachment_id
+                SELECT attachment_links.request_id, attachment_links.source_instance_id,
+                       attachment_links.source_attachment_id
                 FROM attachment_links
                 JOIN payment_requests ON payment_requests.id = attachment_links.request_id
                 WHERE payment_requests.batch_id = ?
@@ -4724,6 +5337,15 @@ def sync_external_expense_metadata(
             if str(attachment.get("source_type") or "") == str(metadata.get("source_type") or "")
             and str(attachment.get("source_id") or "") == str(metadata.get("source_id") or "")
         ]
+        # The source table can contain multiple rows for the same DingTalk file.
+        # fileId is the stable identity; the source row id is not.
+        matching_attachments = list(
+            {
+                str(attachment.get("file_id") or "").strip(): attachment
+                for attachment in matching_attachments
+                if str(attachment.get("file_id") or "").strip()
+            }.values()
+        )
         if not matching_attachments:
             continue
         request_ids = request_ids_by_approval.get(approval_no, [])
@@ -4734,11 +5356,11 @@ def sync_external_expense_metadata(
             else ""
         )
         for attachment in matching_attachments:
-            source_attachment_id = str(attachment.get("attachment_id") or "").strip()
+            source_attachment_id = str(attachment.get("file_id") or "").strip()
             pending_request_ids = [
                 request_id
                 for request_id in request_ids
-                if (request_id, source_attachment_id) not in existing_source_attachments
+                if (request_id, process_instance_id, source_attachment_id) not in existing_source_attachments
             ]
             attachment_existing += len(request_ids) - len(pending_request_ids)
             if not pending_request_ids:
@@ -4765,37 +5387,28 @@ def sync_external_expense_metadata(
 
     downloaded_attachments: list[Dict[str, Any]] = []
     if attachment_candidates:
-        try:
-            with DingtalkAttachmentClient() as downloader:
-                for attachment in attachment_candidates:
-                    try:
-                        content, content_type = downloader.download(
-                            str(attachment["process_instance_id"]),
-                            str(attachment["file_id"]),
-                        )
-                        saved = save_dingtalk_attachment_file(attachment, content, content_type)
-                        downloaded_attachments.append({**attachment, **saved})
-                    except ExternalExpenseError as exc:
-                        attachment_failed += 1
-                        attachment_errors.append(
-                            {
-                                "approval_no": attachment.get("approval_no"),
-                                "attachment_id": attachment.get("attachment_id"),
-                                "file_name": attachment.get("file_name"),
-                                "message": str(exc),
-                            }
-                        )
-        except ExternalExpenseError as exc:
-            attachment_failed += len(attachment_candidates)
-            attachment_errors.extend(
-                {
-                    "approval_no": attachment.get("approval_no"),
-                    "attachment_id": attachment.get("attachment_id"),
-                    "file_name": attachment.get("file_name"),
-                    "message": str(exc),
-                }
-                for attachment in attachment_candidates
-            )
+        phase_started = perf_counter()
+        concurrency = max(1, min(5, int(os.getenv("DINGTALK_ATTACHMENT_DOWNLOAD_CONCURRENCY", "4") or 4)))
+
+        def report_attachment_progress(current: int, total: int) -> None:
+            if operation_id:
+                update_batch_operation_progress(
+                    operation_id,
+                    stage="attachment_download",
+                    progress_current=current,
+                    progress_total=total,
+                    progress_message=f"正在同步 {current}/{total} 个附件",
+                    timings=timings,
+                )
+
+        downloaded_attachments, download_failed, download_errors = download_dingtalk_attachment_candidates(
+            attachment_candidates,
+            max_workers=concurrency,
+            progress_callback=report_attachment_progress,
+        )
+        attachment_failed += download_failed
+        attachment_errors.extend(download_errors)
+        timings["attachment_download_ms"] = round((perf_counter() - phase_started) * 1000, 1)
 
     auto_payment_mode = dingtalk_auto_payment_mode()
     timestamp = now_iso()
@@ -4808,8 +5421,27 @@ def sync_external_expense_metadata(
     skipped = 0
     attachment_synced = 0
     candidate_request_ids: set[int] = set()
-    with connect() as conn:
+    commit_started = perf_counter()
+    if operation_id:
+        update_batch_operation_progress(
+            operation_id,
+            stage="status_commit" if not include_attachments else "commit",
+            progress_message="正在更新流程状态和评论" if not include_attachments else "正在保存同步结果",
+            timings=timings,
+        )
+    with (
+        cleanup_downloaded_dingtalk_files_on_error(downloaded_attachments),
+        BatchOperationLease(
+            batch_id,
+            "dingtalk-workflow-sync",
+            user.get("id"),
+            operation_id=operation_id,
+            manage_lifecycle=operation_id is None,
+        ) as operation,
+        connect() as conn,
+    ):
         conn.execute("BEGIN IMMEDIATE")
+        ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉状态")
@@ -4817,6 +5449,23 @@ def sync_external_expense_metadata(
             "SELECT * FROM payment_requests WHERE batch_id = ? ORDER BY id",
             (batch_id,),
         ).fetchall()
+        current_sync_rows = {
+            int(row["id"]): row
+            for row in current_rows
+            if str(row["dingding_id"] or "").strip()
+        }
+        if set(current_sync_rows) != set(initial_version_by_request):
+            raise_version_conflict("request_batch", batch_id, int(batch["version"] or 1))
+        for request_id, row in current_sync_rows.items():
+            current_version = int(row["version"] or 1)
+            current_approval_no = str(row["dingding_id"] or "").strip()
+            if (
+                current_version != initial_version_by_request[request_id]
+                or current_approval_no != initial_approval_by_request[request_id]
+            ):
+                raise_version_conflict("payment_request", request_id, current_version)
+        if int(batch["version"] or 1) != initial_batch_version:
+            raise_version_conflict("request_batch", batch_id, int(batch["version"] or 1))
         for row in current_rows:
             request_id = int(row["id"])
             approval_no = str(row["dingding_id"] or "").strip()
@@ -4825,6 +5474,12 @@ def sync_external_expense_metadata(
             request_data = row_to_dict(row)
             raw_extra = dict(request_data.get("raw_extra") or {})
             existing_source = dict(raw_extra.get("external_source") or {})
+            request_workflows = workflows_by_approval.get(approval_no, [])
+            workflow_process_instance_id = (
+                str(request_workflows[0].get("process_instance_id") or "").strip()
+                if len(request_workflows) == 1
+                else ""
+            )
             if approval_no in matched:
                 external_source = {
                     **existing_source,
@@ -4832,6 +5487,7 @@ def sync_external_expense_metadata(
                     "system": "dingtalk_expense_database",
                     "lookup_status": "matched",
                     "metadata_synced_at": timestamp,
+                    "workflow_process_instance_id": workflow_process_instance_id or None,
                 }
             elif approval_no in conflicts:
                 external_source = {
@@ -4857,7 +5513,7 @@ def sync_external_expense_metadata(
             conn.execute(
                 """
                 UPDATE payment_requests
-                SET raw_extra_json = ?, updated_by = ?, updated_at = ?
+                SET raw_extra_json = ?, updated_by = ?, updated_at = ?, version = version + 1
                 WHERE id = ? AND batch_id = ?
                 """,
                 (json.dumps(raw_extra, ensure_ascii=False, default=str), user["id"], timestamp, request_id, batch_id),
@@ -4868,7 +5524,6 @@ def sync_external_expense_metadata(
                 "UPDATE dingtalk_workflow_events SET active = 0, synced_at = ?, updated_at = ? WHERE request_id = ?",
                 (timestamp, timestamp, request_id),
             )
-            request_workflows = workflows_by_approval.get(approval_no, [])
             if len(request_workflows) == 1:
                 workflow = request_workflows[0]
                 request_amount = round(float(row["amount"] or 0), 2)
@@ -5063,31 +5718,16 @@ def sync_external_expense_metadata(
             updated_requests += 1
 
         for attachment in downloaded_attachments:
+            file_object = register_file_object(conn, attachment)
             for request_id in attachment["request_ids"]:
-                cursor = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO attachment_links (
-                        request_id, label, url_path, attachment_type, file_path,
-                        original_filename, mime_type, file_size, source_system,
-                        source_attachment_id, created_by, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        request_id,
-                        attachment["file_name"],
-                        attachment["relative_path"],
-                        attachment["attachment_type"],
-                        attachment["relative_path"],
-                        attachment["file_name"],
-                        attachment["mime_type"],
-                        attachment["file_size"],
-                        DINGTALK_ATTACHMENT_SOURCE,
-                        str(attachment["attachment_id"]),
-                        user["id"],
-                        timestamp,
-                    ),
+                attachment_synced += upsert_dingtalk_attachment_link(
+                    conn,
+                    request_id=int(request_id),
+                    attachment=attachment,
+                    file_object_id=int(file_object["id"]),
+                    user_id=int(user["id"]),
+                    timestamp=timestamp,
                 )
-                attachment_synced += max(0, cursor.rowcount)
 
         summary = {
             "unique_approval_nos": len(approval_nos),
@@ -5107,7 +5747,10 @@ def sync_external_expense_metadata(
             "attachment_existing": attachment_existing,
             "attachment_failed": attachment_failed,
             "attachment_errors": attachment_errors[:50],
+            "timings": timings,
         }
+        if updated_requests or attachment_synced or auto_payments:
+            touch_batch(conn, batch_id, expected_version=initial_batch_version)
         write_audit(
             conn,
             user["id"],
@@ -5117,7 +5760,350 @@ def sync_external_expense_metadata(
             batch_id=batch_id,
             new_value=summary,
         )
+        operation.set_result({"status": "synced", "batch_id": batch_id, **summary})
+    timings["status_commit_ms" if not include_attachments else "commit_ms"] = round(
+        (perf_counter() - commit_started) * 1000,
+        1,
+    )
+    summary["timings"] = timings
+    if operation_id and not include_attachments:
+        update_batch_operation_progress(
+            operation_id,
+            stage="status_committed",
+            progress_message="流程状态和评论已更新，正在继续补齐附件",
+            timings=timings,
+            partial_result={"status_committed": True, **summary},
+        )
     return {"status": "synced", "batch_id": batch_id, **summary}
+
+
+def _sync_dingtalk_attachments_phase(
+    operation_id: str,
+    batch_id: int,
+    user: Dict[str, Any],
+    timings: Dict[str, Any],
+) -> Dict[str, Any]:
+    phase_started = perf_counter()
+    update_batch_operation_progress(
+        operation_id,
+        stage="attachment_inventory",
+        progress_message="正在查询附件清单",
+        timings=timings,
+    )
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM payment_requests
+            WHERE batch_id = ? AND TRIM(COALESCE(dingding_id, '')) <> ''
+            ORDER BY id
+            """,
+            (batch_id,),
+        ).fetchall()
+        existing_source_attachments = {
+            (
+                int(row["request_id"]),
+                str(row["source_instance_id"] or ""),
+                str(row["source_attachment_id"]),
+            )
+            for row in conn.execute(
+                """
+                SELECT attachment_links.request_id, attachment_links.source_instance_id,
+                       attachment_links.source_attachment_id
+                FROM attachment_links
+                JOIN payment_requests ON payment_requests.id = attachment_links.request_id
+                WHERE payment_requests.batch_id = ?
+                  AND attachment_links.source_system = ?
+                  AND attachment_links.source_attachment_id IS NOT NULL
+                """,
+                (batch_id, DINGTALK_ATTACHMENT_SOURCE),
+            ).fetchall()
+        }
+    request_contexts: Dict[str, list[Dict[str, Any]]] = {}
+    for row in rows:
+        request_data = row_to_dict(row)
+        approval_no = str(row["dingding_id"] or "").strip()
+        external_source = dict((request_data.get("raw_extra") or {}).get("external_source") or {})
+        if external_source.get("lookup_status") != "matched":
+            continue
+        process_instance_id = str(external_source.get("workflow_process_instance_id") or "").strip()
+        request_contexts.setdefault(approval_no, []).append(
+            {
+                "request_id": int(row["id"]),
+                "source_type": str(external_source.get("source_type") or ""),
+                "source_id": str(external_source.get("source_id") or ""),
+                "process_instance_id": process_instance_id,
+            }
+        )
+    approval_nos = sorted(request_contexts)
+    source_attachments = fetch_external_expense_attachments(approval_nos)
+    timings["attachment_query_ms"] = round((perf_counter() - phase_started) * 1000, 1)
+
+    attachment_existing = 0
+    attachment_failed = 0
+    attachment_errors: list[Dict[str, Any]] = []
+    candidates_by_key: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+    counted_existing: set[tuple[int, str, str]] = set()
+    counted_invalid: set[tuple[str, str, str]] = set()
+    for attachment in source_attachments:
+        approval_no = str(attachment.get("approval_no") or "").strip()
+        source_attachment_id = str(attachment.get("file_id") or "").strip()
+        for context in request_contexts.get(approval_no, []):
+            if (
+                str(attachment.get("source_type") or "") != context["source_type"]
+                or str(attachment.get("source_id") or "") != context["source_id"]
+            ):
+                continue
+            request_id = int(context["request_id"])
+            process_instance_id = str(context["process_instance_id"] or "")
+            identity = (request_id, process_instance_id, source_attachment_id)
+            if identity in existing_source_attachments:
+                if identity not in counted_existing:
+                    attachment_existing += 1
+                    counted_existing.add(identity)
+                continue
+            if not source_attachment_id or not attachment.get("file_id") or not process_instance_id:
+                invalid_identity = (approval_no, process_instance_id, source_attachment_id)
+                if invalid_identity not in counted_invalid:
+                    attachment_failed += 1
+                    counted_invalid.add(invalid_identity)
+                    attachment_errors.append(
+                        {
+                            "approval_no": approval_no,
+                            "attachment_id": source_attachment_id or None,
+                            "file_name": attachment.get("file_name"),
+                            "message": "附件缺少流程实例或文件标识",
+                        }
+                    )
+                continue
+            key = (approval_no, process_instance_id, source_attachment_id)
+            candidate = candidates_by_key.setdefault(
+                key,
+                {
+                    **attachment,
+                    "approval_no": approval_no,
+                    "process_instance_id": process_instance_id,
+                    "request_ids": [],
+                },
+            )
+            if request_id not in candidate["request_ids"]:
+                candidate["request_ids"].append(request_id)
+
+    attachment_candidates = list(candidates_by_key.values())
+    download_started = perf_counter()
+    concurrency = max(1, min(5, int(os.getenv("DINGTALK_ATTACHMENT_DOWNLOAD_CONCURRENCY", "4") or 4)))
+
+    def report_progress(current: int, total: int) -> None:
+        update_batch_operation_progress(
+            operation_id,
+            stage="attachment_download",
+            progress_current=current,
+            progress_total=total,
+            progress_message=f"正在同步 {current}/{total} 个附件",
+            timings=timings,
+        )
+
+    downloaded_attachments, download_failed, download_errors = download_dingtalk_attachment_candidates(
+        attachment_candidates,
+        max_workers=concurrency,
+        progress_callback=report_progress,
+    )
+    attachment_failed += download_failed
+    attachment_errors.extend(download_errors)
+    timings["attachment_download_ms"] = round((perf_counter() - download_started) * 1000, 1)
+
+    commit_started = perf_counter()
+    update_batch_operation_progress(
+        operation_id,
+        stage="attachment_commit",
+        progress_current=len(downloaded_attachments),
+        progress_total=len(attachment_candidates),
+        progress_message="正在保存已下载附件",
+        timings=timings,
+    )
+    attachment_synced = 0
+    timestamp = now_iso()
+    with cleanup_downloaded_dingtalk_files_on_error(downloaded_attachments), connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        batch = require_batch(conn, batch_id)
+        if batch["status"] != "draft":
+            raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉附件")
+        current_request_ids = {
+            int(row["id"])
+            for row in conn.execute("SELECT id FROM payment_requests WHERE batch_id = ?", (batch_id,)).fetchall()
+        }
+        for attachment in downloaded_attachments:
+            file_object = register_file_object(conn, attachment)
+            for request_id in attachment["request_ids"]:
+                if int(request_id) not in current_request_ids:
+                    continue
+                attachment_synced += upsert_dingtalk_attachment_link(
+                    conn,
+                    request_id=int(request_id),
+                    attachment=attachment,
+                    file_object_id=int(file_object["id"]),
+                    user_id=int(user["id"]),
+                    timestamp=timestamp,
+                )
+        attachment_summary = {
+            "attachment_downloaded": len(downloaded_attachments),
+            "attachment_synced": attachment_synced,
+            "attachment_existing": attachment_existing,
+            "attachment_failed": attachment_failed,
+            "attachment_errors": attachment_errors[:50],
+        }
+        write_audit(
+            conn,
+            user["id"],
+            "external_expenses.attachment_sync",
+            "batch",
+            batch_id,
+            batch_id=batch_id,
+            new_value=attachment_summary,
+        )
+    timings["attachment_commit_ms"] = round((perf_counter() - commit_started) * 1000, 1)
+    return attachment_summary
+
+
+def run_dingtalk_sync_task(operation_id: str, batch_id: int, user: Dict[str, Any]) -> None:
+    started = perf_counter()
+    try:
+        update_batch_operation_progress(
+            operation_id,
+            stage="metadata",
+            progress_message="正在查询审批元数据",
+        )
+        result = _sync_external_expense_metadata_blocking(
+            batch_id,
+            0,
+            user,
+            operation_id=operation_id,
+            include_attachments=False,
+        )
+        timings = dict(result.get("timings") or {})
+        try:
+            attachment_result = _sync_dingtalk_attachments_phase(
+                operation_id,
+                batch_id,
+                user,
+                timings,
+            )
+        except BaseException as attachment_exc:
+            attachment_result = {
+                "attachment_downloaded": 0,
+                "attachment_synced": 0,
+                "attachment_existing": 0,
+                "attachment_failed": 1,
+                "attachment_errors": [{"message": str(attachment_exc)}],
+            }
+        result.update(attachment_result)
+        timings["total_ms"] = round((perf_counter() - started) * 1000, 1)
+        result["timings"] = timings
+        with connect() as conn:
+            write_audit(
+                conn,
+                user["id"],
+                "external_expenses.sync_timing",
+                "batch",
+                batch_id,
+                batch_id=batch_id,
+                new_value={
+                    "operation_id": operation_id,
+                    "timings": timings,
+                    "updated_requests": result.get("updated_requests", 0),
+                    "workflow_events": result.get("workflow_events", 0),
+                    "attachment_synced": result.get("attachment_synced", 0),
+                    "attachment_failed": result.get("attachment_failed", 0),
+                },
+            )
+        complete_batch_operation(operation_id, result)
+    except BaseException as exc:
+        fail_batch_operation(operation_id, exc)
+
+
+def _discard_dingtalk_sync_future(operation_id: str) -> None:
+    with _DINGTALK_SYNC_FUTURES_LOCK:
+        _DINGTALK_SYNC_FUTURES.pop(operation_id, None)
+
+
+def _submit_dingtalk_sync_task(operation_id: str, batch_id: int, user: Dict[str, Any]) -> None:
+    with _DINGTALK_SYNC_FUTURES_LOCK:
+        if operation_id in _DINGTALK_SYNC_FUTURES:
+            return
+        future = _DINGTALK_SYNC_EXECUTOR.submit(run_dingtalk_sync_task, operation_id, batch_id, dict(user))
+        _DINGTALK_SYNC_FUTURES[operation_id] = future
+        future.add_done_callback(lambda _: _discard_dingtalk_sync_future(operation_id))
+
+
+def _fresh_dingtalk_sync_result(batch_id: int, stale_seconds: int) -> Optional[Dict[str, Any]]:
+    if stale_seconds <= 0:
+        return None
+    with connect() as conn:
+        latest_sync = conn.execute(
+            """
+            SELECT new_value_json, created_at
+            FROM audit_logs
+            WHERE batch_id = ?
+              AND action = 'external_expenses.metadata_sync'
+              AND new_value_json LIKE '%"workflow_events"%'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (batch_id,),
+        ).fetchone()
+    if not latest_sync:
+        return None
+    try:
+        synced_at = datetime.fromisoformat(str(latest_sync["created_at"]))
+        if datetime.now() - synced_at >= timedelta(seconds=stale_seconds):
+            return None
+        return {
+            "status": "fresh",
+            "batch_id": batch_id,
+            **json.loads(latest_sync["new_value_json"] or "{}"),
+        }
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+@app.post("/api/batches/{batch_id}/external-expenses/sync-metadata")
+def sync_external_expense_metadata(
+    batch_id: int,
+    only_if_stale_seconds: int = Query(default=0, ge=0, le=86400),
+    task_mode: bool = Query(default=False),
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Any:
+    with connect() as conn:
+        batch = require_batch(conn, batch_id)
+        if batch["status"] != "draft":
+            raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉流程")
+    if not task_mode:
+        return _sync_external_expense_metadata_blocking(batch_id, only_if_stale_seconds, user)
+    fresh = _fresh_dingtalk_sync_result(batch_id, only_if_stale_seconds)
+    if fresh is not None:
+        return fresh
+    operation, reused = acquire_or_reuse_batch_operation(
+        batch_id,
+        "dingtalk-workflow-sync",
+        user.get("id"),
+        blocks_writes=False,
+    )
+    if not reused:
+        _submit_dingtalk_sync_task(str(operation["id"]), batch_id, user)
+    return JSONResponse(
+        status_code=202,
+        content={"status": "running", "reused": reused, "operation": operation},
+    )
+
+
+@app.get("/api/batch-operations/{operation_id}")
+def get_batch_operation_status(
+    operation_id: str,
+    user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
+) -> Dict[str, Any]:
+    operation = get_batch_operation(operation_id)
+    with connect() as conn:
+        require_batch(conn, int(operation["batch_id"]))
+    return {"operation": operation}
 
 
 @app.get("/api/import-jobs/{job_id}")
@@ -5133,6 +6119,7 @@ def get_import_job(
 
 
 def restore_table_snapshot(conn, table: str, snapshot: Dict[str, Any]) -> None:
+    current = conn.execute(f"SELECT version FROM {table} WHERE id = ?", (snapshot["id"],)).fetchone()
     columns = [
         row["name"]
         for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -5141,6 +6128,10 @@ def restore_table_snapshot(conn, table: str, snapshot: Dict[str, Any]) -> None:
     payload = {column: snapshot.get(column) for column in columns}
     if table == "payment_requests" and "source_sheet" in payload:
         payload["source_sheet"] = canonical_sheet_name(payload["source_sheet"])
+    if "version" in payload:
+        payload["version"] = max(int(payload.get("version") or 1), int(current["version"] or 1)) + 1
+    if "updated_at" in payload:
+        payload["updated_at"] = now_iso()
     conn.execute(
         f"UPDATE {table} SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",
         [payload[column] for column in columns] + [snapshot["id"]],
@@ -5235,7 +6226,7 @@ def rollback_weekly_merge_job(
     timestamp = now_iso()
     restored_sheet_order = canonical_sheet_order(manifest.get("old_sheet_order") or [])
     conn.execute(
-        "UPDATE request_batches SET sheet_order_json = ?, updated_at = ? WHERE id = ?",
+        "UPDATE request_batches SET sheet_order_json = ?, updated_at = ?, version = version + 1 WHERE id = ?",
         (json.dumps(restored_sheet_order, ensure_ascii=False), timestamp, batch_id),
     )
     conn.execute(
@@ -5287,6 +6278,7 @@ def rollback_weekly_merge_job(
 
 
 @app.post("/api/batches/{batch_id}/imports/latest/rollback")
+@leased_batch_operation("import-rollback", lambda arguments: arguments["batch_id"])
 def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES))) -> Dict[str, Any]:
     with connect() as conn:
         batch = require_batch(conn, batch_id)
@@ -5398,7 +6390,10 @@ def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require
         for surviving_request_id in surviving_request_ids:
             refresh_payment_summaries(conn, surviving_request_id)
         conn.execute("UPDATE import_jobs SET status = 'rolled_back', imported_rows = 0 WHERE id = ?", (job["id"],))
-        conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (now_iso(), batch_id))
+        conn.execute(
+            "UPDATE request_batches SET updated_at = ?, version = version + 1 WHERE id = ?",
+            (now_iso(), batch_id),
+        )
         removed_files = 0
         for file_path in owned_file_paths:
             before = resolve_data_file(file_path)
@@ -5506,8 +6501,9 @@ def export_batch(
         for link in links:
             if int(link["request_id"]) not in record_ids:
                 continue
-            if link.get("file_path"):
-                link["absolute_path"] = str(resolve_data_file(link["file_path"]))
+            resolved_path, _ = resolve_attachment_path(link, conn)
+            if resolved_path is not None:
+                link["absolute_path"] = str(resolved_path)
             attachments.setdefault(link["request_id"], []).append(link)
         payments = rows_to_dicts(
             conn.execute(
@@ -5542,8 +6538,9 @@ def export_batch(
             if int(voucher["payment_id"]) not in payment_ids:
                 continue
             voucher["file_url"] = f"/api/payment-vouchers/{voucher['id']}/file"
-            if str(voucher.get("mime_type") or "").startswith("image/") and voucher.get("file_path"):
-                voucher["absolute_path"] = str(resolve_data_file(voucher["file_path"]))
+            resolved_path, _ = resolve_attachment_path(voucher, conn)
+            if str(voucher.get("mime_type") or "").startswith("image/") and resolved_path is not None:
+                voucher["absolute_path"] = str(resolved_path)
             vouchers_by_payment.setdefault(int(voucher["payment_id"]), []).append(voucher)
         for payment in payments:
             payment["vouchers"] = vouchers_by_payment.get(int(payment["id"]), [])
@@ -5724,6 +6721,69 @@ def update_dictionary(dictionary_id: int, payload: DictionaryIn, user: Dict[str,
         row = conn.execute("SELECT * FROM dictionaries WHERE id = ?", (dictionary_id,)).fetchone()
         write_audit(conn, user["id"], "dictionary.update", "dictionary", dictionary_id, old_value=row_to_dict(old), new_value=row_to_dict(row))
     return {"dictionary": row_to_dict(row)}
+
+
+def raise_version_conflict(entity_type: str, entity_id: int, current_version: int) -> None:
+    labels = {
+        "payment_request": "请款",
+        "payment_record": "付款明细",
+        "request_batch": "批次",
+    }
+    label = labels.get(entity_type, "记录")
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "VERSION_CONFLICT",
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "current_version": int(current_version),
+            "message": f"{label}已被其他操作修改，请刷新后重试",
+        },
+    )
+
+
+def checked_expected_version(
+    row: Any,
+    expected_version: Optional[int],
+    entity_type: str,
+    entity_id: int,
+) -> int:
+    current_version = int(row["version"] or 1)
+    # One-release compatibility for older API clients. The web client always sends a version.
+    if expected_version is None:
+        return current_version
+    if int(expected_version) != current_version:
+        raise_version_conflict(entity_type, entity_id, current_version)
+    return current_version
+
+
+def touch_batch(conn, batch_id: int, *, expected_version: Optional[int] = None) -> int:
+    row = require_batch(conn, batch_id)
+    current_version = checked_expected_version(row, expected_version, "request_batch", batch_id)
+    cursor = conn.execute(
+        """
+        UPDATE request_batches
+        SET updated_at = ?, version = version + 1
+        WHERE id = ? AND version = ?
+        """,
+        (now_iso(), batch_id, current_version),
+    )
+    if cursor.rowcount != 1:
+        current = require_batch(conn, batch_id)
+        raise_version_conflict("request_batch", batch_id, int(current["version"] or 1))
+    return current_version + 1
+
+
+def bulk_delete_target(item: Any) -> tuple[int, Optional[int]]:
+    if isinstance(item, dict):
+        request_id = item.get("id")
+        expected_version = item.get("expected_version")
+    else:
+        request_id = item
+        expected_version = None
+    if not request_id:
+        raise HTTPException(status_code=400, detail="批量删除缺少记录 id")
+    return int(request_id), int(expected_version) if expected_version is not None else None
 
 
 def require_batch(conn, batch_id: int):
@@ -5911,7 +6971,7 @@ def copy_attachment_links(conn, source_request_id: int, target_request_id: int, 
     links = conn.execute(
         """
         SELECT label, url_path, attachment_type, file_path, original_filename, mime_type,
-               file_size, source_system, source_attachment_id
+               file_size, file_object_id, source_system, source_instance_id, source_attachment_id
         FROM attachment_links
         WHERE request_id = ?
         ORDER BY id
@@ -5923,10 +6983,10 @@ def copy_attachment_links(conn, source_request_id: int, target_request_id: int, 
             """
             INSERT INTO attachment_links (
                 request_id, label, url_path, attachment_type, file_path,
-                original_filename, mime_type, file_size, source_system,
-                source_attachment_id, created_by, created_at
+                original_filename, mime_type, file_size, file_object_id, source_system,
+                source_instance_id, source_attachment_id, created_by, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 target_request_id,
@@ -5937,7 +6997,9 @@ def copy_attachment_links(conn, source_request_id: int, target_request_id: int, 
                 link["original_filename"],
                 link["mime_type"],
                 link["file_size"],
+                link["file_object_id"],
                 link["source_system"],
+                link["source_instance_id"],
                 link["source_attachment_id"],
                 user_id,
                 now_iso(),
@@ -6047,8 +7109,8 @@ def copy_payment_records(conn, source_request_id: int, target_request_id: int, u
                 """
                 INSERT INTO payment_vouchers (
                     payment_id, label, file_path, original_filename, mime_type,
-                    file_size, created_by, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    file_size, file_object_id, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     target_payment_id,
@@ -6057,6 +7119,7 @@ def copy_payment_records(conn, source_request_id: int, target_request_id: int, u
                     voucher["original_filename"],
                     voucher["mime_type"],
                     voucher["file_size"],
+                    voucher["file_object_id"],
                     user_id,
                     now_iso(),
                 ),
@@ -6146,8 +7209,11 @@ def insert_request(
             validate_total=True,
         )
     else:
-        refresh_payment_summaries(conn, request_id)
-    conn.execute("UPDATE request_batches SET updated_at = ? WHERE id = ?", (timestamp, batch_id))
+        refresh_payment_summaries(conn, request_id, bump_version=False)
+    conn.execute(
+        "UPDATE request_batches SET updated_at = ?, version = version + 1 WHERE id = ?",
+        (timestamp, batch_id),
+    )
     return request_id
 
 
@@ -6190,7 +7256,15 @@ def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int, user_role: str = ROLE_GENERAL_MANAGER) -> bool:
+def update_request_row(
+    conn,
+    request_id: int,
+    data: Dict[str, Any],
+    user_id: int,
+    user_role: str = ROLE_GENERAL_MANAGER,
+    *,
+    expected_version: Optional[int] = None,
+) -> bool:
     allowed = REQUEST_WRITE_FIELDS - {"content_hash"}
     payload = {key: value for key, value in data.items() if key in allowed}
     if "source_sheet" in payload:
@@ -6203,6 +7277,12 @@ def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int
     if not existing_row:
         raise HTTPException(status_code=404, detail="请款记录不存在")
     existing = row_to_dict(existing_row)
+    current_version = checked_expected_version(
+        existing_row,
+        expected_version,
+        "payment_request",
+        request_id,
+    )
     if "currency" in payload:
         requested_currency = normalize_currency(payload.get("currency"), default="CNY")
         existing_currency = normalize_currency(existing.get("currency"), default="CNY")
@@ -6269,13 +7349,22 @@ def update_request_row(conn, request_id: int, data: Dict[str, Any], user_id: int
     changed_payload["updated_by"] = user_id
     changed_payload["updated_at"] = now_iso()
     columns = list(changed_payload.keys())
-    conn.execute(
-        f"UPDATE payment_requests SET {', '.join(f'{col} = ?' for col in columns)} WHERE id = ?",
-        [changed_payload[col] for col in columns] + [request_id],
+    cursor = conn.execute(
+        f"""
+        UPDATE payment_requests
+        SET {', '.join(f'{col} = ?' for col in columns)}, version = version + 1
+        WHERE id = ? AND version = ?
+        """,
+        [changed_payload[col] for col in columns] + [request_id, current_version],
     )
+    if cursor.rowcount != 1:
+        current = conn.execute("SELECT version FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="请款记录不存在")
+        raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
     if "source_sheet" in changed_payload:
         register_batch_sheet(conn, int(existing["batch_id"]), changed_payload["source_sheet"])
-    refresh_payment_summaries(conn, request_id)
+    refresh_payment_summaries(conn, request_id, bump_version=False)
     row = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
     conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(row), request_id))
     return True
@@ -6473,7 +7562,7 @@ async def save_upload(file: UploadFile) -> Path:
     return target
 
 
-async def save_image_upload(file: UploadFile, batch_id: int) -> tuple[Path, Path, int]:
+async def save_image_upload(file: UploadFile, batch_id: int) -> Dict[str, Any]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in IMAGE_EXTENSIONS:
         raise HTTPException(status_code=400, detail="只支持 PNG、JPG、WEBP、GIF、BMP 图片")
@@ -6485,11 +7574,8 @@ async def save_image_upload(file: UploadFile, batch_id: int) -> tuple[Path, Path
         raise HTTPException(status_code=400, detail="图片不能为空")
     if len(content) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=400, detail="图片不能超过 12MB")
-    directory = DATA_DIR / "uploads" / "attachments" / str(batch_id)
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{uuid.uuid4().hex}{suffix}"
-    target.write_bytes(content)
-    return target, target.relative_to(DATA_DIR), len(content)
+    mime_type = content_type if content_type.startswith("image/") else mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+    return write_stream(io.BytesIO(content), mime_type=mime_type)
 
 
 def save_dingtalk_attachment_file(
@@ -6517,24 +7603,9 @@ def save_dingtalk_attachment_file(
     if len(safe_name) > 180:
         suffix = Path(safe_name).suffix[:20]
         safe_name = f"{Path(safe_name).stem[:150]}{suffix}"
-    source_type = "".join(
-        character for character in str(attachment.get("source_type") or "other") if character.isalnum() or character in {"-", "_"}
-    ) or "other"
-    source_attachment_id = "".join(
-        character for character in str(attachment.get("attachment_id") or "") if character.isalnum() or character in {"-", "_"}
-    )
-    if not source_attachment_id:
+    source_file_id = str(attachment.get("file_id") or "").strip()
+    if not source_file_id:
         raise ExternalExpenseError("附件缺少来源标识")
-    directory = DATA_DIR / "uploads" / "dingtalk-attachments" / source_type
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{source_attachment_id}-{safe_name}"
-    temporary = directory / f".{target.name}.{uuid.uuid4().hex}.part"
-    try:
-        temporary.write_bytes(content)
-        temporary.replace(target)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
     suffix = Path(original_name).suffix.lower()
     header_type = str(response_content_type or "").split(";", 1)[0].strip()
     guessed_type = mimetypes.guess_type(original_name)[0]
@@ -6543,15 +7614,16 @@ def save_dingtalk_attachment_file(
         if not header_type or header_type == "application/octet-stream"
         else header_type
     ) or "application/octet-stream"
+    staged = write_stream(io.BytesIO(content), mime_type=mime_type)
     return {
-        "relative_path": str(target.relative_to(DATA_DIR)),
-        "file_size": len(content),
-        "mime_type": mime_type,
+        **staged,
+        "relative_path": staged["storage_path"],
+        "file_size": staged["size_bytes"],
         "attachment_type": "image" if suffix in IMAGE_EXTENSIONS or mime_type.startswith("image/") else "file",
     }
 
 
-async def save_payment_voucher_upload(file: UploadFile, batch_id: int, payment_id: int) -> tuple[Path, Path, int, str]:
+async def save_payment_voucher_upload(file: UploadFile, batch_id: int, payment_id: int) -> Dict[str, Any]:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in PAYMENT_VOUCHER_EXTENSIONS:
         raise HTTPException(status_code=400, detail="付款凭证只支持图片或 PDF")
@@ -6567,12 +7639,8 @@ async def save_payment_voucher_upload(file: UploadFile, batch_id: int, payment_i
         raise HTTPException(status_code=400, detail="付款凭证不能为空")
     if len(content) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=400, detail="付款凭证不能超过 12MB")
-    directory = DATA_DIR / "uploads" / "payment-vouchers" / str(batch_id) / str(payment_id)
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{uuid.uuid4().hex}{suffix}"
-    target.write_bytes(content)
-    mime_type = "application/pdf" if expected_pdf else (content_type if content_type.startswith("image/") else mimetypes.guess_type(target.name)[0] or "application/octet-stream")
-    return target, target.relative_to(DATA_DIR), len(content), mime_type
+    mime_type = "application/pdf" if expected_pdf else (content_type if content_type.startswith("image/") else mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream")
+    return write_stream(io.BytesIO(content), mime_type=mime_type)
 
 
 def resolve_data_file(relative_path: str) -> Path:
@@ -6584,6 +7652,10 @@ def resolve_data_file(relative_path: str) -> Path:
 
 
 def delete_attachment_file_if_unused(conn, attachment: Dict[str, Any]) -> None:
+    if attachment.get("file_object_id"):
+        # 内容对象可能仍被其他请款、付款凭证或快照引用。
+        # 线上清理由专用迁移工具在完整扫描后执行。
+        return
     file_path = attachment.get("file_path")
     if not file_path:
         return
@@ -6591,6 +7663,8 @@ def delete_attachment_file_if_unused(conn, attachment: Dict[str, Any]) -> None:
 
 
 def delete_payment_voucher_file_if_unused(conn, voucher: Dict[str, Any]) -> None:
+    if voucher.get("file_object_id"):
+        return
     file_path = voucher.get("file_path")
     if file_path:
         delete_file_if_unreferenced(conn, file_path)

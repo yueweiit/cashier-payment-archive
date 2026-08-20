@@ -37,7 +37,12 @@ npm run dev
 - 可用环境变量修改：
   - `PAYMENT_APP_DATA_DIR`
   - `PAYMENT_APP_DB`
+  - `PAYMENT_ATTACHMENT_STORAGE_DIR`（附件独立存储根目录；线上使用 `/data/cashier-payment/storage`）
   - `PAYMENT_APP_ADMIN_PASSWORD`
+
+`PAYMENT_APP_DATA_DIR` 继续保存 SQLite 和应用元数据；普通附件、付款凭证及钉钉附件通过
+`PAYMENT_ATTACHMENT_STORAGE_DIR` 写入内容寻址目录。未配置时默认使用
+`data/storage/`，历史 `data/uploads/` 文件仍可兼容读取。
 
 ## 钉钉支出中间表
 

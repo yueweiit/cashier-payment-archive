@@ -33,9 +33,11 @@ import {
 } from "lucide-react";
 import {
   api,
+  isApiError,
   AttachmentLink,
   AuditLog,
   Batch,
+  BatchOperation,
   CurrencyCode,
   CurrencyConversionPreview,
   ForeignAmountCorrectionPreview,
@@ -600,11 +602,26 @@ function TopbarImportActions({
   const [externalImportOpen, setExternalImportOpen] = useState(false);
   const [mergePreview, setMergePreview] = useState<WeeklyMergePreview | null>(null);
   const [importToolsOpen, setImportToolsOpen] = useState(false);
-  const [busyAction, setBusyAction] = useState<"weekly" | "weekly-merge" | "dingtalk" | "employee-departments" | "sync-metadata" | "rollback" | null>(null);
+  const [busyAction, setBusyAction] = useState<"weekly" | "weekly-merge" | "dingtalk" | "employee-departments" | "rollback" | null>(null);
+  const [syncOperation, setSyncOperation] = useState<BatchOperation | null>(null);
   const [weeklyInputKey, setWeeklyInputKey] = useState(0);
   const [dingtalkInputKey, setDingtalkInputKey] = useState(0);
   const [employeeInputKey, setEmployeeInputKey] = useState(0);
   const silentSyncBatchRef = useRef<number | null>(null);
+  const syncStatusRefreshedRef = useRef<string | null>(null);
+  const syncFinishedRef = useRef<string | null>(null);
+  const syncRefreshPendingRef = useRef<string | null>(null);
+  const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
+
+  useEffect(() => {
+    hasUnsavedChangesRef.current = hasUnsavedChanges;
+    if (!hasUnsavedChanges && syncRefreshPendingRef.current) {
+      const operationId = syncRefreshPendingRef.current;
+      syncRefreshPendingRef.current = null;
+      syncStatusRefreshedRef.current = operationId;
+      void reloadBatches().then(onImported);
+    }
+  }, [hasUnsavedChanges]);
 
   async function refreshAfterImport(message: string) {
     await reloadBatches();
@@ -705,13 +722,25 @@ function TopbarImportActions({
   }
 
   async function syncExternalMetadata(silent = false) {
-    if (!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null) return;
-    if (!silent) {
-      setMessage("");
-      setBusyAction("sync-metadata");
+    if (!selectedBatch || selectedBatch.status !== "draft") return;
+    const runningForCurrentBatch = syncOperation?.status === "running" && syncOperation.batch_id === selectedBatch.id;
+    if (runningForCurrentBatch) {
+      if (!silent) setMessage(syncOperation.progress_message || "钉钉流程同步任务正在执行，可继续使用当前页面");
+      return;
     }
+    if (hasUnsavedChanges || busyAction !== null) return;
+    if (!silent) setMessage("");
     try {
-      const result = await api.syncExternalExpenseMetadata(selectedBatch.id, silent ? 300 : 0);
+      const result = await api.syncExternalExpenseMetadata(selectedBatch.id, silent ? 300 : 0, true);
+      if ("operation" in result) {
+        setSyncOperation(result.operation);
+        if (!silent) {
+          setMessage(result.reused
+            ? "已接入当前正在执行的钉钉同步任务，页面可继续操作"
+            : "钉钉流程同步已在后台开始，页面可继续操作");
+        }
+        return;
+      }
       if (result.status === "fresh") return;
       await reloadBatches();
       onImported();
@@ -725,10 +754,95 @@ function TopbarImportActions({
       }
     } catch (err) {
       if (!silent) setMessage((err as Error).message);
-    } finally {
-      if (!silent) setBusyAction(null);
     }
   }
+
+  function syncProgressLabel(operation: BatchOperation) {
+    if (operation.progress_message) return operation.progress_message;
+    return ({
+      starting: "正在准备同步",
+      metadata: "正在查询审批元数据",
+      workflow: "正在查询流程状态和评论",
+      status_commit: "正在更新流程状态和评论",
+      status_committed: "流程状态已更新，正在检查附件",
+      attachment_inventory: "正在查询附件清单",
+      attachment_download: `正在同步 ${operation.progress_current}/${operation.progress_total} 个附件`,
+      attachment_commit: "正在保存附件",
+      completed: "钉钉流程同步完成",
+      failed: "钉钉流程同步失败",
+    } as Record<string, string>)[operation.stage] || "正在同步钉钉流程";
+  }
+
+  function syncTimingSummary(timings?: Record<string, number>) {
+    if (!timings) return "";
+    const parts = [
+      ["元数据", timings.metadata_query_ms],
+      ["流程", timings.workflow_query_ms],
+      ["附件查询", timings.attachment_query_ms],
+      ["附件下载", timings.attachment_download_ms],
+    ].filter((item): item is [string, number] => typeof item[1] === "number");
+    return parts.length ? `；耗时：${parts.map(([label, ms]) => `${label} ${(ms / 1000).toFixed(1)}秒`).join("、")}` : "";
+  }
+
+  useEffect(() => {
+    const operationId = syncOperation?.id;
+    if (!operationId || syncOperation.status !== "running") return;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      try {
+        const { operation } = await api.batchOperation(operationId);
+        if (cancelled) return;
+        setSyncOperation(operation);
+        if (operation.partial_result?.status_committed && syncStatusRefreshedRef.current !== operation.id) {
+          if (hasUnsavedChangesRef.current) {
+            syncRefreshPendingRef.current = operation.id;
+            setMessage("钉钉流程状态已更新；您当前的修改不会被覆盖，保存或放弃后列表会自动刷新");
+          } else {
+            syncStatusRefreshedRef.current = operation.id;
+            await reloadBatches();
+            onImported();
+          }
+        }
+        if (operation.status === "succeeded") {
+          if (syncFinishedRef.current === operation.id) return;
+          syncFinishedRef.current = operation.id;
+          if (syncStatusRefreshedRef.current !== operation.id && !hasUnsavedChangesRef.current) {
+            await reloadBatches();
+            onImported();
+          } else if (syncStatusRefreshedRef.current !== operation.id) {
+            syncRefreshPendingRef.current = operation.id;
+          }
+          const result = operation.result || {};
+          const paymentDetail = result.auto_payment_mode === "preview"
+            ? `发现 ${result.payment_candidates || 0} 条自动付款候选、${result.review_required || 0} 条待核对`
+            : `新增 ${result.auto_payments || 0} 笔自动付款、${result.review_required || 0} 条待核对`;
+          const attachmentDetail = `附件新增 ${result.attachment_synced || 0} 个、已存在 ${result.attachment_existing || 0} 个${result.attachment_failed ? `、失败 ${result.attachment_failed} 个` : ""}`;
+          setMessage(`钉钉流程同步完成：${paymentDetail}；${attachmentDetail}${syncTimingSummary(result.timings || operation.timings)}`);
+          window.setTimeout(() => {
+            setMessage("");
+            setSyncOperation((current) => current?.id === operation.id ? null : current);
+          }, 5000);
+          return;
+        }
+        if (operation.status === "failed" || operation.status === "interrupted") {
+          if (syncFinishedRef.current === operation.id) return;
+          syncFinishedRef.current = operation.id;
+          setMessage(operation.failure_reason || "钉钉流程同步失败，请重试");
+          return;
+        }
+        timer = window.setTimeout(poll, 900);
+      } catch (err) {
+        if (!cancelled) timer = window.setTimeout(poll, 1800);
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [syncOperation?.id]);
 
   useEffect(() => {
     if (
@@ -765,11 +879,11 @@ function TopbarImportActions({
               className="ghost-button compact-import-button"
               type="button"
               onClick={() => void syncExternalMetadata(false)}
-              disabled={!selectedBatch || selectedBatch.status !== "draft" || hasUnsavedChanges || busyAction !== null}
+              disabled={!selectedBatch || selectedBatch.status !== "draft" || (hasUnsavedChanges && !(syncOperation?.status === "running" && syncOperation.batch_id === selectedBatch.id)) || busyAction !== null}
               title={hasUnsavedChanges ? "请先保存或放弃未保存修改" : selectedBatch?.status === "archived" ? "只能同步草稿批次" : "刷新审批状态、流程评论和可信付款证据"}
             >
-              <RefreshCcw size={15} />
-              {busyAction === "sync-metadata" ? "同步中" : "同步钉钉流程"}
+              <RefreshCcw size={15} className={syncOperation?.status === "running" ? "sync-progress-spinner" : undefined} />
+              {syncOperation?.status === "running" && syncOperation.batch_id === selectedBatch?.id ? syncProgressLabel(syncOperation) : "同步钉钉流程"}
             </button>
             <button
               className={importToolsOpen ? "ghost-button active-toggle compact-import-button" : "ghost-button compact-import-button"}
@@ -782,6 +896,19 @@ function TopbarImportActions({
             </button>
           </div>
         </div>
+        {syncOperation?.status === "running" && syncOperation.batch_id === selectedBatch?.id && (
+          <div className="sync-task-progress" role="status" aria-live="polite">
+            <div className="sync-task-progress-copy">
+              <strong>{syncProgressLabel(syncOperation)}</strong>
+              <span>后台任务执行中，您可以继续浏览和编辑；流程状态会先更新，附件随后补齐。</span>
+            </div>
+            {syncOperation.progress_total > 0 && (
+              <div className="sync-task-progress-meter" aria-label={`同步进度 ${syncOperation.progress_current}/${syncOperation.progress_total}`}>
+                <span style={{ width: `${Math.min(100, Math.max(0, syncOperation.progress_current / syncOperation.progress_total * 100))}%` }} />
+              </div>
+            )}
+          </div>
+        )}
         {importToolsOpen && <div className="topbar-import">
           <div className="topbar-import-group">
             <label className="compact-file-button">
@@ -1696,7 +1823,7 @@ function Workspace({
     setSheetOrder(nextOrder);
     setSheetOrderSaving(true);
     try {
-      await api.updateSheetOrder(selectedBatch.id, nextOrder);
+      await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
       await reloadBatches();
       setMessage("Sheet 顺序已保存");
     } catch (error) {
@@ -1753,7 +1880,11 @@ function Workspace({
     const writablePayload = withoutDerivedPaymentFields(payload);
     let savedRequest: PaymentRequest;
     if (payload.id) {
-      const result = await api.updateRequest(selectedBatch.id, payload.id, { ...writablePayload, reason });
+      const result = await api.updateRequest(selectedBatch.id, payload.id, {
+        ...writablePayload,
+        expected_version: Number(payload.version || 1),
+        reason,
+      });
       savedRequest = result.request;
     } else {
       const result = await api.createRequest(selectedBatch.id, writablePayload);
@@ -1767,6 +1898,22 @@ function Workspace({
     await reloadBatches();
     setMessage("已保存");
     return savedRequest;
+  }
+
+  async function reloadEditingRequest(requestId: number) {
+    if (!selectedBatch) return undefined;
+    const result = await api.requests(selectedBatch.id, { dingtalk_lifecycle: "all" });
+    const latest = result.requests.find((item) => item.id === requestId);
+    if (!latest) {
+      setMessage("该请款已不存在，可能已被其他用户删除");
+      return undefined;
+    }
+    setEditing(latest);
+    setEditorDraft(null);
+    setEditorDirty(false);
+    await loadRequests();
+    await reloadBatches();
+    return latest;
   }
 
   function requestCurrencyConversion(request: Partial<PaymentRequest>, target: string) {
@@ -1872,25 +2019,38 @@ function Workspace({
       .map(stripGridRow);
     const updates = gridRows
       .filter((row) => row.id && dirtyRowIds(dirtyCells).has(row.__localId) && !row.__deleted)
-      .map((row) => ({ id: row.id!, ...stripGridRow(row) }));
+      .map((row) => ({ id: row.id!, expected_version: Number(row.version || 1), ...stripGridRow(row) }));
     const deletes = Array.from(deletedLocalIds)
-      .map((localId) => gridRows.find((row) => row.__localId === localId)?.id)
-      .filter((id): id is number => Boolean(id));
-    if (creates.length || updates.length || deletes.length) {
-      await api.bulkSaveRequests(selectedBatch.id, { creates, updates, deletes, reason });
+      .map((localId) => gridRows.find((row) => row.__localId === localId))
+      .filter((row): row is GridRow & { id: number } => Boolean(row?.id))
+      .map((row) => ({ id: row.id, expected_version: Number(row.version || 1) }));
+    try {
+      let batchVersion = selectedBatch.version;
+      if (creates.length || updates.length || deletes.length) {
+        await api.bulkSaveRequests(selectedBatch.id, { creates, updates, deletes, reason });
+        batchVersion = (await api.batch(selectedBatch.id)).batch.version;
+      }
+      const savedSheetOrder = getSheetTabs(gridRows, sheetOrder, deletedSheetNames)
+        .filter((tab) => tab.key !== ALL_SHEET && !deletedSheetNames.has(tab.key))
+        .map((tab) => tab.key);
+      if (canManageSheets) {
+        await api.updateSheetOrder(selectedBatch.id, savedSheetOrder, batchVersion);
+        setSheetOrder(savedSheetOrder);
+      }
+      setReason("");
+      setDeletedSheetNames(new Set());
+      await loadRequests();
+      await reloadBatches();
+      setMessage("表格更改已保存");
+    } catch (error) {
+      if (isApiError(error, "VERSION_CONFLICT")) {
+        await loadRequests();
+        await reloadBatches();
+        setMessage(`${writeErrorMessage(error)}，服务端最新数据已重新加载`);
+        return;
+      }
+      setMessage(writeErrorMessage(error));
     }
-    const savedSheetOrder = getSheetTabs(gridRows, sheetOrder, deletedSheetNames)
-      .filter((tab) => tab.key !== ALL_SHEET && !deletedSheetNames.has(tab.key))
-      .map((tab) => tab.key);
-    if (canManageSheets) {
-      await api.updateSheetOrder(selectedBatch.id, savedSheetOrder);
-      setSheetOrder(savedSheetOrder);
-    }
-    setReason("");
-    setDeletedSheetNames(new Set());
-    await loadRequests();
-    await reloadBatches();
-    setMessage("表格更改已保存");
   }
 
   async function discardUnsavedChanges() {
@@ -1948,7 +2108,7 @@ function Workspace({
         `确定将草稿“${selectedBatch.name}”还原到初始状态吗？\n\n当前已经保存的新增、修改、删除、付款和附件变更都会被撤回；页面上未保存的修改也会被放弃。系统会先保留一份还原前快照。`,
       )
     ) return;
-    await api.restoreBatchBaseline(selectedBatch.id);
+    await api.restoreBatchBaseline(selectedBatch.id, selectedBatch.version);
     setEditingSheet(null);
     setNewSheetName(null);
     setEditing(null);
@@ -1967,14 +2127,15 @@ function Workspace({
       return;
     }
     if (!window.confirm(`确定把草稿“${selectedBatch.name}”当前状态设为新的还原点吗？之后一键还原会回到现在。`)) return;
-    await api.setBatchBaseline(selectedBatch.id);
+    await api.setBatchBaseline(selectedBatch.id, selectedBatch.version);
+    await reloadBatches();
     setMessage("当前草稿状态已设为还原点");
   }
 
   async function deleteCurrentDraft() {
     if (!selectedBatch || !canManageDraftState) return;
     if (!window.confirm(`确定删除草稿批次“${selectedBatch.name}”吗？删除后该批次下的请款、付款明细和附件凭证也会删除。`)) return;
-    await api.deleteBatch(selectedBatch.id);
+    await api.deleteBatch(selectedBatch.id, selectedBatch.version);
     setEditing(null);
     setEditorDraft(null);
     setEditorDirty(false);
@@ -1991,7 +2152,7 @@ function Workspace({
       setMessage("请先保存表格更改，再修改批次状态");
       return;
     }
-    await api.archive(selectedBatch.id);
+    await api.archive(selectedBatch.id, selectedBatch.version);
     await reloadBatches();
     setMessage("批次已归档");
   }
@@ -2002,7 +2163,7 @@ function Workspace({
       setMessage("请先保存表格更改，再修改批次状态");
       return;
     }
-    await api.unarchive(selectedBatch.id);
+    await api.unarchive(selectedBatch.id, selectedBatch.version);
     await reloadBatches();
     setMessage("批次已恢复为草稿");
   }
@@ -2060,7 +2221,7 @@ function Workspace({
     const nextOrder = [...sheetTabs.filter((tab) => tab.key !== ALL_SHEET).map((tab) => tab.key), name];
     setSheetOrderSaving(true);
     try {
-      await api.updateSheetOrder(selectedBatch.id, nextOrder);
+      await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
       setSheetOrder(nextOrder);
       setFilters({
         q: "",
@@ -2130,7 +2291,7 @@ function Workspace({
       const nextOrder = sheetOrder.map((name) => name === oldName ? newName : name);
       setSheetOrderSaving(true);
       try {
-        await api.updateSheetOrder(selectedBatch.id, nextOrder);
+        await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
         setSheetOrder(nextOrder);
         setActiveSheet(newName);
         await reloadBatches();
@@ -2816,6 +2977,7 @@ function Workspace({
           setReason={setReason}
           onCancel={closeRequestEditor}
           onSave={saveRequest}
+          onReloadRequest={reloadEditingRequest}
           onDraftChange={setEditorDraft}
           onDirtyChange={setEditorDirty}
           onAttachmentsChanged={refreshAttachmentCounts}
@@ -2838,6 +3000,13 @@ function Workspace({
           language={gridHeaderLanguage}
           onClose={() => setCurrencyConversion(null)}
           onApplied={currencyConversionApplied}
+          onConflict={async () => {
+            const latest = await reloadEditingRequest(currencyConversion.request.id);
+            if (latest) {
+              setCurrencyConversion((current) => current ? { ...current, request: latest } : current);
+            }
+            return latest;
+          }}
         />
       )}
       {columnSettingsOpen && (
@@ -3104,6 +3273,7 @@ function CurrencyConversionDialog({
   language,
   onClose,
   onApplied,
+  onConflict,
 }: {
   batch: Batch;
   request: PaymentRequest;
@@ -3112,6 +3282,7 @@ function CurrencyConversionDialog({
   language: GridHeaderLanguage;
   onClose: () => void;
   onApplied: (request: PaymentRequest) => Promise<void> | void;
+  onConflict?: () => Promise<PaymentRequest | undefined>;
 }) {
   const [mode, setMode] = useState<"convert" | "correct">("convert");
   const [rateDate, setRateDate] = useState(localIsoDate(new Date()));
@@ -3131,13 +3302,14 @@ function CurrencyConversionDialog({
       rate_date: rateDate,
       mode,
       reason,
+      expected_version: request.version,
       expected_updated_at: request.updated_at,
     })
       .then((result) => active && setPreview(result.preview))
-      .catch((err) => active && setError((err as Error).message))
+      .catch((err) => active && setError(writeErrorMessage(err)))
       .finally(() => active && setLoading(false));
     return () => { active = false; };
-  }, [batch.id, mode, rateDate, reason, request.id, request.updated_at, targetCurrency]);
+  }, [batch.id, mode, rateDate, reason, request.id, request.updated_at, request.version, targetCurrency]);
 
   async function applyConversion() {
     if (!preview || applying) return;
@@ -3149,11 +3321,18 @@ function CurrencyConversionDialog({
         rate_date: rateDate,
         mode,
         reason,
+        expected_version: preview.request_version || request.version,
         expected_updated_at: request.updated_at,
       });
       await onApplied(result.request);
     } catch (err) {
-      setError((err as Error).message);
+      if (isApiError(err, "VERSION_CONFLICT")) {
+        const latest = await onConflict?.();
+        setPreview(null);
+        setError(`${writeErrorMessage(err)}${latest ? "；已刷新最新金额和版本，请重新确认" : ""}`);
+      } else {
+        setError(writeErrorMessage(err));
+      }
     } finally {
       setApplying(false);
     }
@@ -3224,6 +3403,7 @@ function ForeignAmountCorrectionDialog({
   language,
   onClose,
   onApplied,
+  onConflict,
 }: {
   batch: Batch;
   request: PaymentRequest;
@@ -3232,6 +3412,7 @@ function ForeignAmountCorrectionDialog({
   language: GridHeaderLanguage;
   onClose: () => void;
   onApplied: (request: PaymentRequest) => Promise<void> | void;
+  onConflict?: () => Promise<PaymentRequest | undefined>;
 }) {
   const [rateDate, setRateDate] = useState(localIsoDate(new Date()));
   const [preview, setPreview] = useState<ForeignAmountCorrectionPreview | null>(null);
@@ -3250,13 +3431,14 @@ function ForeignAmountCorrectionDialog({
       amount,
       rate_date: rateDate,
       reason,
+      expected_version: request.version,
       expected_updated_at: request.updated_at,
     })
       .then((result) => active && setPreview(result.preview))
-      .catch((err) => active && setError((err as Error).message))
+      .catch((err) => active && setError(writeErrorMessage(err)))
       .finally(() => active && setLoading(false));
     return () => { active = false; };
-  }, [amount, batch.id, rateDate, reason, request.id, request.updated_at]);
+  }, [amount, batch.id, rateDate, reason, request.id, request.updated_at, request.version]);
 
   async function applyCorrection() {
     if (!preview || applying) return;
@@ -3267,11 +3449,18 @@ function ForeignAmountCorrectionDialog({
         amount,
         rate_date: rateDate,
         reason,
+        expected_version: preview.request_version || request.version,
         expected_updated_at: request.updated_at,
       });
       await onApplied(result.request);
     } catch (err) {
-      setError((err as Error).message);
+      if (isApiError(err, "VERSION_CONFLICT")) {
+        const latest = await onConflict?.();
+        setPreview(null);
+        setError(`${writeErrorMessage(err)}${latest ? "；已刷新最新金额和版本，请重新确认" : ""}`);
+      } else {
+        setError(writeErrorMessage(err));
+      }
     } finally {
       setApplying(false);
     }
@@ -3345,7 +3534,11 @@ function HistoricalCurrencyRestoreDialog({ batch, onClose, onApplied }: { batch:
     setBusy(true);
     setError("");
     try {
-      const result = await api.applyHistoricalCurrencyRestore(batch.id, { request_ids: Array.from(selected), reason });
+      const result = await api.applyHistoricalCurrencyRestore(batch.id, {
+        request_ids: Array.from(selected),
+        reason,
+        expected_batch_version: batch.version,
+      });
       await onApplied(result.count);
     } catch (err) {
       setError((err as Error).message);
@@ -3423,7 +3616,15 @@ function RolloverPanel({
     setRolloverError("");
     setCopyingMode(copyMode);
     try {
-      const res = await api.rolloverBatch(Number(sourceBatchId), { name, start_date: startDate, end_date: endDate, copy_mode: copyMode });
+      const sourceBatch = batches.find((batch) => batch.id === Number(sourceBatchId));
+      if (!sourceBatch) throw new Error("来源批次不存在，请刷新后重试");
+      const res = await api.rolloverBatch(Number(sourceBatchId), {
+        name,
+        start_date: startDate,
+        end_date: endDate,
+        copy_mode: copyMode,
+        expected_batch_version: sourceBatch.version,
+      });
       setName("");
       setStartDate("");
       setEndDate("");
@@ -3948,6 +4149,7 @@ function RequestEditor({
   setReason,
   onCancel,
   onSave,
+  onReloadRequest,
   onDraftChange,
   onDirtyChange,
   onAttachmentsChanged,
@@ -3965,6 +4167,7 @@ function RequestEditor({
   setReason: (value: string) => void;
   onCancel: () => void;
   onSave: (request: Partial<PaymentRequest>) => Promise<PaymentRequest | undefined>;
+  onReloadRequest: (requestId: number) => Promise<PaymentRequest | undefined>;
   onDraftChange?: (request: Partial<PaymentRequest> | null) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onAttachmentsChanged?: () => Promise<void> | void;
@@ -3987,6 +4190,7 @@ function RequestEditor({
   const [uploadingImage, setUploadingImage] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [saveConflict, setSaveConflict] = useState(false);
   const [previewImages, setPreviewImages] = useState<{ images: AttachmentLink[]; index: number } | null>(null);
   const [foreignAmountCorrection, setForeignAmountCorrection] = useState<number | null>(null);
   const fields: Array<keyof PaymentRequest> = [
@@ -4023,6 +4227,7 @@ function RequestEditor({
 
   useEffect(() => {
     setForm(request);
+    setSaveConflict(false);
     setAttachments([]);
     setWorkflow(null);
     setWorkflowError("");
@@ -4200,11 +4405,13 @@ function RequestEditor({
     }
     setSaving(true);
     setSaveError("");
+    setSaveConflict(false);
     try {
       const savedRequest = await onSave(form);
       if (savedRequest) setForm(savedRequest);
     } catch (err) {
-      setSaveError((err as Error).message);
+      setSaveConflict(isApiError(err, "VERSION_CONFLICT"));
+      setSaveError(writeErrorMessage(err));
     } finally {
       setSaving(false);
     }
@@ -4213,6 +4420,33 @@ function RequestEditor({
   function discardRequestChanges() {
     setForm(request);
     setSaveError("");
+    setSaveConflict(false);
+  }
+
+  async function copyConflictDraft() {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(withoutDerivedPaymentFields(form), null, 2));
+      setSaveError("当前修改已复制，可刷新最新数据后重新填写");
+    } catch {
+      setSaveError("浏览器未允许复制，请先不要关闭抽屉，手工保留当前修改");
+    }
+  }
+
+  async function refreshAfterConflict() {
+    if (!form.id || saving) return;
+    setSaving(true);
+    try {
+      const latest = await onReloadRequest(form.id);
+      if (latest) {
+        setForm(latest);
+        setSaveConflict(false);
+        setSaveError("");
+      }
+    } catch (err) {
+      setSaveError(writeErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
   }
 
   const editorTabs: Array<{ key: RequestEditorTab; label: string; disabled?: boolean }> = [
@@ -4332,6 +4566,11 @@ function RequestEditor({
               onRequestChanged={async (updatedRequest) => {
                 setForm((current) => ({ ...current, ...updatedRequest }));
                 await onPaymentsChanged?.(updatedRequest);
+              }}
+              onRefreshRequest={async () => {
+                const latest = await onReloadRequest(form.id!);
+                if (latest) setForm(latest);
+                return latest;
               }}
             />
           </div>
@@ -4490,6 +4729,12 @@ function RequestEditor({
           </label>
         )}
         {saveError && <p className="error-text editor-save-error">{saveError}</p>}
+        {saveConflict && (
+          <div className="editor-conflict-actions">
+            <button className="ghost-button" type="button" onClick={copyConflictDraft} disabled={saving}>复制当前修改</button>
+            <button className="ghost-button" type="button" onClick={refreshAfterConflict} disabled={saving}>刷新后重新编辑</button>
+          </div>
+        )}
         <div className="request-editor-actions">
           <div className={isDirty ? "editor-save-state dirty" : "editor-save-state"}>
             <strong>{isDirty ? "有未保存修改" : "已保存"}</strong>
@@ -4514,11 +4759,17 @@ function RequestEditor({
       {foreignAmountCorrection !== null && request.id && (
         <ForeignAmountCorrectionDialog
           batch={batch}
-          request={request as PaymentRequest}
+          request={form as PaymentRequest}
           amount={foreignAmountCorrection}
           reason={reason}
           language={language}
           onClose={() => setForeignAmountCorrection(null)}
+          onConflict={async () => {
+            const result = await api.requests(batch.id, { dingtalk_lifecycle: "all" });
+            const latest = result.requests.find((item) => item.id === request.id);
+            if (latest) setForm(latest);
+            return latest;
+          }}
           onApplied={async (updatedRequest) => {
             setForeignAmountCorrection(null);
             const correctedForm: Partial<PaymentRequest> = {
@@ -4531,6 +4782,7 @@ function RequestEditor({
               fx_rate_cny_per_unit: updatedRequest.fx_rate_cny_per_unit,
               fx_rate_date: updatedRequest.fx_rate_date,
               fx_rate_actual_date: updatedRequest.fx_rate_actual_date,
+              version: updatedRequest.version,
               updated_at: updatedRequest.updated_at,
             };
             setSaving(true);
@@ -4566,12 +4818,14 @@ function PaymentDetailsPanel({
   reason,
   canManage,
   onRequestChanged,
+  onRefreshRequest,
 }: {
   batch: Batch;
   request: PaymentRequest;
   reason: string;
   canManage: boolean;
   onRequestChanged: (request: PaymentRequest) => Promise<void> | void;
+  onRefreshRequest?: () => Promise<PaymentRequest | undefined>;
 }) {
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [summary, setSummary] = useState<PaymentSummary>({
@@ -4600,7 +4854,7 @@ function PaymentDetailsPanel({
     setPaymentForm({ ...emptyPaymentForm, payment_account: request.payment_account || "" });
     setEditingPaymentId(null);
     setPaymentFormOpen(false);
-    loadPayments().catch((err) => setError((err as Error).message));
+    loadPayments().catch((err) => setError(writeErrorMessage(err)));
   }, [batch.id, request.id]);
 
   useEffect(() => {
@@ -4657,15 +4911,28 @@ function PaymentDetailsPanel({
     setBusy(true);
     setError("");
     try {
-      const payload = { ...paymentForm, reason };
+      const payload = {
+        ...paymentForm,
+        reason,
+        expected_request_version: request.version,
+      };
       const result = editingPaymentId
-        ? await api.updatePayment(batch.id, request.id, editingPaymentId, payload)
+        ? await api.updatePayment(batch.id, request.id, editingPaymentId, {
+            ...payload,
+            expected_payment_version: Number(editingPayment?.version || 1),
+          })
         : await api.createPayment(batch.id, request.id, payload);
       resetPaymentForm();
       await loadPayments();
       await onRequestChanged(result.request);
     } catch (err) {
-      setError((err as Error).message);
+      if (isApiError(err, "VERSION_CONFLICT")) {
+        await onRefreshRequest?.();
+        await loadPayments();
+        setError(`${writeErrorMessage(err)}；已刷新最新金额，当前付款表单已保留，请重新确认`);
+      } else {
+        setError(writeErrorMessage(err));
+      }
     } finally {
       setBusy(false);
     }
@@ -4680,12 +4947,25 @@ function PaymentDetailsPanel({
     setBusy(true);
     setError("");
     try {
-      const result = await api.deletePayment(batch.id, request.id, payment.id, reason);
+      const result = await api.deletePayment(
+        batch.id,
+        request.id,
+        payment.id,
+        request.version,
+        payment.version,
+        reason,
+      );
       if (editingPaymentId === payment.id) resetPaymentForm();
       await loadPayments();
       await onRequestChanged(result.request);
     } catch (err) {
-      setError((err as Error).message);
+      if (isApiError(err, "VERSION_CONFLICT")) {
+        await onRefreshRequest?.();
+        await loadPayments();
+        setError(`${writeErrorMessage(err)}；已刷新付款明细，请重新确认`);
+      } else {
+        setError(writeErrorMessage(err));
+      }
     } finally {
       setBusy(false);
     }
@@ -4701,7 +4981,7 @@ function PaymentDetailsPanel({
       }
       await loadPayments();
     } catch (err) {
-      setError((err as Error).message);
+      setError(writeErrorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -4715,7 +4995,7 @@ function PaymentDetailsPanel({
       await api.deletePaymentVoucher(batch.id, request.id, payment.id, voucher.id, reason);
       await loadPayments();
     } catch (err) {
-      setError((err as Error).message);
+      setError(writeErrorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -4944,7 +5224,8 @@ function ArchiveView({
 
   async function archive() {
     if (!selectedBatch) return;
-    await api.archive(selectedBatch.id);
+    await api.archive(selectedBatch.id, selectedBatch.version);
+    await reloadBatches();
     setMessage("批次已归档");
   }
 
@@ -4958,7 +5239,7 @@ function ArchiveView({
   async function deleteDraft(batch: Batch) {
     if (batch.status !== "draft") return;
     if (!window.confirm(`确定删除草稿批次“${batch.name}”吗？删除后该批次下的请款、付款明细和附件凭证也会删除。`)) return;
-    await api.deleteBatch(batch.id);
+    await api.deleteBatch(batch.id, batch.version);
     if (selectedBatch?.id === batch.id) setLogs([]);
     await reloadBatches();
     setMessage("草稿批次已删除");
@@ -5095,6 +5376,7 @@ function ArchiveView({
 function auditActionLabel(action: string) {
   const labels: Record<string, string> = {
     "external_expenses.metadata_sync": "同步钉钉流程",
+    "external_expenses.sync_timing": "钉钉同步耗时",
     "payment.auto_create_from_dingtalk": "钉钉流程自动生成付款",
   };
   return labels[action] || action;
@@ -5727,10 +6009,29 @@ function stripGridRow(row: GridRow): Partial<PaymentRequest> {
 function withoutDerivedPaymentFields(request: Partial<PaymentRequest>): Partial<PaymentRequest> {
   const output: Partial<PaymentRequest> = {};
   Object.entries(request).forEach(([key, value]) => {
-    if (key === "id" || calculatedRequestFields.has(key as keyof PaymentRequest)) return;
+    if (key === "id" || key === "version" || key === "updated_at" || calculatedRequestFields.has(key as keyof PaymentRequest)) return;
     output[key as keyof PaymentRequest] = value as never;
   });
   return output;
+}
+
+function writeErrorMessage(error: unknown): string {
+  if (isApiError(error, "VERSION_CONFLICT")) {
+    const target = error.payload.entity_type === "payment_request"
+      ? `请款 ${error.payload.entity_id || ""}`
+      : error.payload.entity_type === "payment_record"
+        ? `付款记录 ${error.payload.entity_id || ""}`
+        : error.payload.entity_type === "request_batch"
+          ? `批次 ${error.payload.entity_id || ""}`
+          : "数据";
+    return `${target}已被其他操作修改（当前版本 ${error.payload.current_version ?? "未知"}），请刷新后重新确认`;
+  }
+  if (isApiError(error, "BATCH_OPERATION_IN_PROGRESS")) {
+    const operation = String(error.payload.operation_type || "后台任务");
+    return `当前批次正在执行 ${operation}，请等待完成后再操作`;
+  }
+  if (isApiError(error, "DATABASE_BUSY")) return "数据库正忙，请稍后重试";
+  return (error as Error)?.message || "操作失败";
 }
 
 function paymentSourceLabel(sourceType: string) {
