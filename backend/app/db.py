@@ -460,6 +460,211 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     migrate_role_dictionary(conn)
     migrate_external_department_sheets(conn)
     migrate_sheet_registry_and_names(conn)
+    ensure_daily_payable_history_schema(conn)
+
+
+def get_daily_payables_history_start_date(conn: sqlite3.Connection) -> Optional[str]:
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = 'daily_payables_history_start_date'"
+    ).fetchone()
+    return str(row["value"]) if row and row["value"] else None
+
+
+def _logical_request_roots(conn: sqlite3.Connection) -> Dict[int, int]:
+    rows = conn.execute(
+        "SELECT id, copied_from_request_id, logical_request_id FROM payment_requests ORDER BY id"
+    ).fetchall()
+    by_id = {int(row["id"]): row for row in rows}
+    resolved: Dict[int, int] = {}
+
+    def resolve(request_id: int, trail: set[int]) -> int:
+        if request_id in resolved:
+            return resolved[request_id]
+        row = by_id.get(request_id)
+        if row is None:
+            return request_id
+        stored = row["logical_request_id"]
+        if stored is not None and int(stored) in by_id:
+            root = int(stored)
+        else:
+            parent = row["copied_from_request_id"]
+            if parent is None or int(parent) not in by_id or request_id in trail:
+                root = request_id
+            else:
+                root = resolve(int(parent), trail | {request_id})
+        resolved[request_id] = root
+        return root
+
+    for request_id in by_id:
+        resolve(request_id, set())
+    return resolved
+
+
+def _history_inclusion_from_request(row: sqlite3.Row) -> tuple[Optional[str], Optional[str], int]:
+    try:
+        raw_extra = json.loads(row["raw_extra_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        raw_extra = {}
+    external = raw_extra.get("external_source") or {}
+    approval_status = str(
+        external.get("approval_status") or external.get("status") or ""
+    ).strip() or None
+    approval_result = str(
+        external.get("approval_result") or external.get("result") or ""
+    ).strip() or None
+    status_key = str(approval_status or "").upper()
+    result_key = str(approval_result or "").lower()
+    included = int(status_key != "TERMINATED" and result_key not in {"refuse", "rejected"})
+    return approval_status, approval_result, included
+
+
+def _insert_payable_baseline(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    logical_request_id: int,
+    start_date: str,
+    recorded_at: str,
+) -> None:
+    approval_status, approval_result, included = _history_inclusion_from_request(row)
+    amount = float(row["amount"] or 0)
+    paid_amount = float(row["paid_amount"] or 0)
+    pending_amount = float(row["pending_amount"] if row["pending_amount"] is not None else amount - paid_amount)
+    rate = float(row["fx_rate_cny_per_unit"] or (1 if str(row["currency"] or "CNY").upper() == "CNY" else 0))
+    base_amount = float(row["base_amount_cny"] or (amount * rate if rate else 0))
+    base_paid = paid_amount * rate if rate else None
+    base_pending = pending_amount * rate if rate else None
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO payable_history_versions (
+            logical_request_id, source_request_id, effective_at, recorded_at,
+            event_type, event_key, needed_payment_date,
+            amount, paid_amount, pending_amount, currency,
+            base_amount_cny, base_paid_amount_cny, base_pending_amount_cny,
+            fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date,
+            source_sheet, summary, applicant, approval_status, approval_result,
+            included, deleted, created_by
+        ) VALUES (?, ?, ?, ?, 'baseline', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+        """,
+        (
+            logical_request_id,
+            row["id"],
+            recorded_at,
+            recorded_at,
+            f"baseline:{start_date}:{logical_request_id}",
+            row["needed_payment_date"],
+            amount,
+            paid_amount,
+            pending_amount,
+            str(row["currency"] or "CNY").upper(),
+            base_amount,
+            base_paid,
+            base_pending,
+            rate or None,
+            row["fx_rate_date"],
+            row["fx_rate_actual_date"],
+            canonical_sheet_name(row["source_sheet"]),
+            row["summary"],
+            row["applicant"],
+            approval_status,
+            approval_result,
+            included,
+        ),
+    )
+
+
+def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
+    ensure_column(conn, "payment_requests", "logical_request_id", "INTEGER")
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_payment_requests_logical
+        ON payment_requests(logical_request_id, id);
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS payable_history_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            logical_request_id INTEGER NOT NULL,
+            source_request_id INTEGER,
+            effective_at TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_key TEXT NOT NULL UNIQUE,
+            needed_payment_date TEXT,
+            amount REAL NOT NULL DEFAULT 0,
+            paid_amount REAL NOT NULL DEFAULT 0,
+            pending_amount REAL NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'CNY',
+            base_amount_cny REAL,
+            base_paid_amount_cny REAL,
+            base_pending_amount_cny REAL,
+            fx_rate_cny_per_unit REAL,
+            fx_rate_date TEXT,
+            fx_rate_actual_date TEXT,
+            source_sheet TEXT,
+            summary TEXT,
+            applicant TEXT,
+            approval_status TEXT,
+            approval_result TEXT,
+            included INTEGER NOT NULL DEFAULT 1,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            created_by INTEGER REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_payable_history_logical_effective
+        ON payable_history_versions(logical_request_id, effective_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_payable_history_effective_currency
+        ON payable_history_versions(effective_at, currency, logical_request_id);
+
+        CREATE INDEX IF NOT EXISTS idx_payable_history_due_date
+        ON payable_history_versions(needed_payment_date, logical_request_id);
+        """
+    )
+
+    roots = _logical_request_roots(conn)
+    for request_id, logical_request_id in roots.items():
+        conn.execute(
+            "UPDATE payment_requests SET logical_request_id = ? WHERE id = ? AND COALESCE(logical_request_id, 0) != ?",
+            (logical_request_id, request_id, logical_request_id),
+        )
+
+    start_date = get_daily_payables_history_start_date(conn)
+    timestamp = now_iso()
+    if not start_date:
+        start_date = datetime.now().date().isoformat()
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('daily_payables_history_start_date', ?, ?)",
+            (start_date, timestamp),
+        )
+
+    latest_by_logical: Dict[int, sqlite3.Row] = {}
+    rows = conn.execute(
+        """
+        SELECT * FROM payment_requests
+        WHERE logical_request_id IS NOT NULL
+        ORDER BY logical_request_id, updated_at DESC, id DESC
+        """
+    ).fetchall()
+    for row in rows:
+        latest_by_logical.setdefault(int(row["logical_request_id"]), row)
+    for logical_request_id, row in latest_by_logical.items():
+        if conn.execute(
+            "SELECT 1 FROM payable_history_versions WHERE logical_request_id = ? LIMIT 1",
+            (logical_request_id,),
+        ).fetchone():
+            continue
+        _insert_payable_baseline(
+            conn,
+            row,
+            logical_request_id=logical_request_id,
+            start_date=start_date,
+            recorded_at=timestamp,
+        )
 
 
 def ensure_file_storage_tables(conn: sqlite3.Connection) -> None:

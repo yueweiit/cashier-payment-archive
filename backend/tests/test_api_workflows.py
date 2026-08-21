@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 
 from backend.app.db import backup_database, connect, migrate_sheet_registry_and_names, now_iso
+from backend.app import db as db_module
 from backend.app.external_expenses import (
     ExternalExpenseError,
     _parse_workflow_events,
@@ -66,6 +67,62 @@ def test_sqlite_concurrency_pragmas_and_version_columns_are_enabled():
             for table in ("request_batches", "payment_requests", "payment_records"):
                 columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 assert "version" in columns
+
+
+def test_daily_payable_schema_backfills_logical_request_chain_and_one_baseline():
+    with TestClient(app):
+        with connect() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(payment_requests)").fetchall()
+            }
+            assert "logical_request_id" in columns
+            assert conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'payable_history_versions'"
+            ).fetchone()
+            assert conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'app_settings'"
+            ).fetchone()
+
+            timestamp = now_iso()
+            batch_id = conn.execute(
+                """
+                INSERT INTO request_batches (name, status, created_at, updated_at)
+                VALUES ('每日应付链路测试', 'draft', ?, ?)
+                """,
+                (timestamp, timestamp),
+            ).lastrowid
+            root_id = conn.execute(
+                """
+                INSERT INTO payment_requests (
+                    batch_id, amount, paid_amount, pending_amount, currency,
+                    needed_payment_date, source_sheet, created_at, updated_at
+                ) VALUES (?, 20000, 0, 20000, 'CNY', '2026-08-21', '测试公司', ?, ?)
+                """,
+                (batch_id, timestamp, timestamp),
+            ).lastrowid
+            copy_id = conn.execute(
+                """
+                INSERT INTO payment_requests (
+                    batch_id, copied_from_request_id, amount, paid_amount, pending_amount,
+                    currency, needed_payment_date, source_sheet, created_at, updated_at
+                ) VALUES (?, ?, 20000, 0, 20000, 'CNY', '2026-08-21', '测试公司', ?, ?)
+                """,
+                (batch_id, root_id, timestamp, timestamp),
+            ).lastrowid
+
+            db_module.ensure_daily_payable_history_schema(conn)
+
+            rows = conn.execute(
+                "SELECT id, logical_request_id FROM payment_requests WHERE id IN (?, ?) ORDER BY id",
+                (root_id, copy_id),
+            ).fetchall()
+            assert [row["logical_request_id"] for row in rows] == [root_id, root_id]
+            assert conn.execute(
+                "SELECT COUNT(*) FROM payable_history_versions WHERE logical_request_id = ?",
+                (root_id,),
+            ).fetchone()[0] == 1
+            assert db_module.get_daily_payables_history_start_date(conn)
 
 
 def test_sqlite_backup_api_creates_verified_consistent_copy(tmp_path):
