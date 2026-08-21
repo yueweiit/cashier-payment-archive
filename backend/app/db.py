@@ -537,18 +537,21 @@ def _insert_payable_baseline(
     conn.execute(
         """
         INSERT OR IGNORE INTO payable_history_versions (
-            logical_request_id, source_request_id, effective_at, recorded_at,
+            logical_request_id, source_request_id, source_batch_id, dingding_id,
+            effective_at, recorded_at,
             event_type, event_key, needed_payment_date,
             amount, paid_amount, pending_amount, currency,
             base_amount_cny, base_paid_amount_cny, base_pending_amount_cny,
             fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date,
             source_sheet, summary, applicant, approval_status, approval_result,
             included, deleted, created_by
-        ) VALUES (?, ?, ?, ?, 'baseline', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'baseline', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
         """,
         (
             logical_request_id,
             row["id"],
+            row["batch_id"],
+            row["dingding_id"],
             recorded_at,
             recorded_at,
             f"baseline:{start_date}:{logical_request_id}",
@@ -590,6 +593,8 @@ def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             logical_request_id INTEGER NOT NULL,
             source_request_id INTEGER,
+            source_batch_id INTEGER,
+            dingding_id TEXT,
             effective_at TEXT NOT NULL,
             recorded_at TEXT NOT NULL,
             event_type TEXT NOT NULL,
@@ -625,6 +630,8 @@ def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
         ON payable_history_versions(needed_payment_date, logical_request_id);
         """
     )
+    ensure_column(conn, "payable_history_versions", "source_batch_id", "INTEGER")
+    ensure_column(conn, "payable_history_versions", "dingding_id", "TEXT")
 
     roots = _logical_request_roots(conn)
     for request_id, logical_request_id in roots.items():

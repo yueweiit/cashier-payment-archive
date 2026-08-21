@@ -87,6 +87,7 @@ from .fx_rates import (
     normalize_currency,
 )
 from .file_storage import register_file_object, resolve_attachment_path, write_stream
+from .payable_history import payment_effective_at, record_request_state
 from .employee_departments import (
     EmployeeDepartmentError,
     apply_employee_department_mapping,
@@ -1843,6 +1844,14 @@ def bulk_save_requests(
             )
             ensure_can_delete_request_with_payments(conn, request_id, user)
             file_paths = request_owned_file_paths(conn, [request_id])
+            record_request_state(
+                conn,
+                request_id,
+                event_type="request.delete",
+                event_key=f"request:delete:{request_id}:{current_version}",
+                actor_id=user["id"],
+                deleted=True,
+            )
             cursor = conn.execute(
                 "DELETE FROM payment_requests WHERE id = ? AND version = ?",
                 (request_id, current_version),
@@ -2173,6 +2182,13 @@ def apply_foreign_request_amount_correction(
         refresh_payment_summaries(conn, request_id, bump_version=False)
         updated = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
         conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
+        record_request_state(
+            conn,
+            request_id,
+            event_type="request.amount_correct",
+            event_key=f"request:amount-correct:{request_id}:{current_version + 1}",
+            actor_id=user["id"],
+        )
         touch_batch(conn, batch_id)
         write_audit(
             conn,
@@ -2326,6 +2342,13 @@ def apply_request_currency_conversion(
         updated_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         updated = row_to_dict(updated_row)
         conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
+        record_request_state(
+            conn,
+            request_id,
+            event_type="request.currency_correct" if mode == "correct" else "request.currency_convert",
+            event_key=f"request:currency:{mode}:{request_id}:{current_version + 1}",
+            actor_id=user["id"],
+        )
         touch_batch(conn, batch_id)
         write_audit(
             conn,
@@ -2551,6 +2574,13 @@ def apply_historical_currency_restore(
             refresh_payment_summaries(conn, request_id, bump_version=False)
             updated = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
             conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(updated), request_id))
+            record_request_state(
+                conn,
+                request_id,
+                event_type="request.historical_currency_restore",
+                event_key=f"request:historical-currency:{operation_id}:{request_id}",
+                actor_id=user["id"],
+            )
             write_audit(
                 conn, user["id"], "request.historical_currency_restore", "payment_request", request_id, batch_id,
                 old_value={"currency": old.get("currency"), "amount": old.get("amount")},
@@ -2632,6 +2662,14 @@ def delete_request(
             raise HTTPException(status_code=400, detail="归档后删除必须填写原因")
         ensure_can_delete_request_with_payments(conn, request_id, user)
         file_paths = request_owned_file_paths(conn, [request_id])
+        record_request_state(
+            conn,
+            request_id,
+            event_type="request.delete",
+            event_key=f"request:delete:{request_id}:{current_version}",
+            actor_id=user["id"],
+            deleted=True,
+        )
         cursor = conn.execute(
             "DELETE FROM payment_requests WHERE id = ? AND version = ?",
             (request_id, current_version),
@@ -2888,6 +2926,17 @@ def update_request_payment(
             current = require_payment_record(conn, request_id, payment_id)
             raise_version_conflict("payment_record", payment_id, int(current["version"] or 1))
         refresh_payment_summaries(conn, request_id)
+        request_version = conn.execute(
+            "SELECT version FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()["version"]
+        record_request_state(
+            conn,
+            request_id,
+            event_type="payment.update",
+            event_key=f"payment:update:{payment_id}:{current_payment_version + 1}:request:{request_version}",
+            actor_id=user["id"],
+        )
         row = conn.execute(
             """
             SELECT payment_records.*, users.display_name AS creator_name
@@ -2953,6 +3002,17 @@ def delete_request_payment(
             current = require_payment_record(conn, request_id, payment_id)
             raise_version_conflict("payment_record", payment_id, int(current["version"] or 1))
         refresh_payment_summaries(conn, request_id)
+        request_version = conn.execute(
+            "SELECT version FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()["version"]
+        record_request_state(
+            conn,
+            request_id,
+            event_type="payment.delete",
+            event_key=f"payment:delete:{payment_id}:{current_payment_version}:request:{request_version}",
+            actor_id=user["id"],
+        )
         write_audit(
             conn,
             user["id"],
@@ -4391,6 +4451,18 @@ def apply_weekly_excel_merge(
                 *[int(item["id"]) for item in manifest["updated_requests"]],
                 *[int(request_ids_by_row[item["row_id"]]) for item in plan["request_plans"] if item["payment_change"]],
             }
+            for touched_request_id in touched_request_ids:
+                touched_version = conn.execute(
+                    "SELECT version FROM payment_requests WHERE id = ?",
+                    (touched_request_id,),
+                ).fetchone()["version"]
+                record_request_state(
+                    conn,
+                    touched_request_id,
+                    event_type="import.merge.apply",
+                    event_key=f"import:merge:{operation_id}:{touched_request_id}:{touched_version}",
+                    actor_id=user["id"],
+                )
             manifest["request_post_versions"] = {
                 str(request_id): table_row_snapshot(conn, "payment_requests", request_id).get("updated_at")
                 for request_id in touched_request_ids
@@ -5715,6 +5787,17 @@ def _sync_external_expense_metadata_blocking(
                 (timestamp, request_id),
             )
             refresh_payment_summaries(conn, request_id)
+            current_request_version = conn.execute(
+                "SELECT version FROM payment_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()["version"]
+            record_request_state(
+                conn,
+                request_id,
+                event_type="dingtalk.sync",
+                event_key=f"dingtalk:sync:{operation_id}:{request_id}:{current_request_version}",
+                actor_id=user["id"],
+            )
             updated_requests += 1
 
         for attachment in downloaded_attachments:
@@ -6198,6 +6281,15 @@ def rollback_weekly_merge_job(
             placeholders = ", ".join("?" for _ in ids)
             conn.execute(f"DELETE FROM {table} WHERE id IN ({placeholders})", ids)
     if created_request_ids:
+        for created_request_id in created_request_ids:
+            record_request_state(
+                conn,
+                created_request_id,
+                event_type="import.merge.rollback_delete",
+                event_key=f"import:merge-rollback-delete:{job['id']}:{created_request_id}",
+                actor_id=user["id"],
+                deleted=True,
+            )
         placeholders = ", ".join("?" for _ in created_request_ids)
         conn.execute(
             f"DELETE FROM payment_requests WHERE batch_id = ? AND id IN ({placeholders})",
@@ -6221,6 +6313,17 @@ def rollback_weekly_merge_job(
         conn.execute(
             "UPDATE payment_requests SET content_hash = ? WHERE id = ?",
             (content_hash(current), request_id),
+        )
+        current_version = conn.execute(
+            "SELECT version FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()["version"]
+        record_request_state(
+            conn,
+            request_id,
+            event_type="import.merge.rollback",
+            event_key=f"import:merge-rollback:{job['id']}:{request_id}:{current_version}",
+            actor_id=user["id"],
         )
 
     timestamp = now_iso()
@@ -6386,9 +6489,29 @@ def rollback_latest_import(batch_id: int, user: Dict[str, Any] = Depends(require
             conn.execute(f"DELETE FROM payment_records WHERE id IN ({explicit_placeholders})", explicit_ids)
         if request_ids:
             conn.execute(f"DELETE FROM attachment_links WHERE request_id IN ({placeholders})", request_ids)
+            for request_id in request_ids:
+                record_request_state(
+                    conn,
+                    int(request_id),
+                    event_type="import.rollback_delete",
+                    event_key=f"import:rollback-delete:{job['id']}:{request_id}",
+                    actor_id=user["id"],
+                    deleted=True,
+                )
             conn.execute(f"DELETE FROM payment_requests WHERE id IN ({placeholders})", request_ids)
         for surviving_request_id in surviving_request_ids:
             refresh_payment_summaries(conn, surviving_request_id)
+            surviving_version = conn.execute(
+                "SELECT version FROM payment_requests WHERE id = ?",
+                (surviving_request_id,),
+            ).fetchone()["version"]
+            record_request_state(
+                conn,
+                surviving_request_id,
+                event_type="import.rollback_payment",
+                event_key=f"import:rollback-payment:{job['id']}:{surviving_request_id}:{surviving_version}",
+                actor_id=user["id"],
+            )
         conn.execute("UPDATE import_jobs SET status = 'rolled_back', imported_rows = 0 WHERE id = ?", (job["id"],))
         conn.execute(
             "UPDATE request_batches SET updated_at = ?, version = version + 1 WHERE id = ?",
@@ -7078,6 +7201,18 @@ def insert_payment_record_internal(
     if root_payment_id is None:
         conn.execute("UPDATE payment_records SET root_payment_id = ? WHERE id = ?", (payment_id, payment_id))
     refresh_payment_summaries(conn, request_id)
+    request_version = conn.execute(
+        "SELECT version FROM payment_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()["version"]
+    record_request_state(
+        conn,
+        request_id,
+        event_type="payment.create",
+        event_key=f"payment:create:{payment_id}:request:{request_version}",
+        effective_at=payment_effective_at(normalized_date, recorded_at=timestamp),
+        actor_id=user_id,
+    )
     return payment_id
 
 
@@ -7210,6 +7345,14 @@ def insert_request(
         )
     else:
         refresh_payment_summaries(conn, request_id, bump_version=False)
+    record_request_state(
+        conn,
+        request_id,
+        event_type="request.rollover" if payload.get("copied_from_request_id") else "request.create",
+        event_key=f"request:create:{request_id}",
+        effective_at=timestamp,
+        actor_id=user_id,
+    )
     conn.execute(
         "UPDATE request_batches SET updated_at = ?, version = version + 1 WHERE id = ?",
         (timestamp, batch_id),
@@ -7367,6 +7510,13 @@ def update_request_row(
     refresh_payment_summaries(conn, request_id, bump_version=False)
     row = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
     conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(row), request_id))
+    record_request_state(
+        conn,
+        request_id,
+        event_type="request.update",
+        event_key=f"request:update:{request_id}:{current_version + 1}",
+        actor_id=user_id,
+    )
     return True
 
 
