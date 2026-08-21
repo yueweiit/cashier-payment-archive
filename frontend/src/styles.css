@@ -238,7 +238,7 @@ textarea {
   flex: 0 1 auto;
   min-width: 0;
   justify-content: flex-end;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .app-user {
@@ -501,12 +501,86 @@ textarea {
   justify-content: flex-end;
 }
 
-.toast {
+.global-feedback-viewport {
+  position: fixed;
+  top: 72px;
+  right: 20px;
+  z-index: 120;
+  width: max-content;
+  max-width: calc(100vw - 40px);
+  display: grid;
+  justify-items: end;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.global-feedback-toast {
+  width: max-content;
+  max-width: min(520px, calc(100vw - 40px));
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 12px 12px 12px 14px;
   color: #176b4d;
-  background: #e4f5ec;
+  background: #f1fbf6;
   border: 1px solid #b8e3c9;
-  border-radius: 6px;
-  padding: 7px 10px;
+  border-radius: 9px;
+  box-shadow: 0 14px 34px rgba(22, 54, 64, 0.18);
+  pointer-events: auto;
+  animation: global-feedback-enter 160ms ease-out;
+}
+
+.global-feedback-copy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.global-feedback-copy strong {
+  color: #125f45;
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.global-feedback-copy span {
+  color: #477268;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.global-feedback-close {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: #477268;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.global-feedback-close:hover,
+.global-feedback-close:focus-visible {
+  color: #125f45;
+  background: #dff3e9;
+  outline: none;
+}
+
+@keyframes global-feedback-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .workspace-grid {
@@ -3628,7 +3702,21 @@ textarea {
   }
 
   .app-userbar {
-    flex: 1 1 auto;
+    flex: 1 1 220px;
+    overflow-x: auto;
+  }
+
+  .global-feedback-viewport {
+    top: 116px;
+    right: 12px;
+    left: 12px;
+    width: auto;
+    max-width: none;
+  }
+
+  .global-feedback-toast {
+    width: 100%;
+    max-width: none;
   }
 
   .sidebar {

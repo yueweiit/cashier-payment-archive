@@ -370,6 +370,64 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
   );
 }
 
+function GlobalFeedback({
+  message,
+  accountNotice,
+  setMessage,
+  setAccountNotice,
+}: {
+  message: string;
+  accountNotice: string;
+  setMessage: (message: string) => void;
+  setAccountNotice: (message: string) => void;
+}) {
+  const { t } = useLanguage();
+
+  useEffect(() => {
+    if (!message) return;
+    const timer = window.setTimeout(() => setMessage(""), 5000);
+    return () => window.clearTimeout(timer);
+  }, [message, setMessage]);
+
+  useEffect(() => {
+    if (!accountNotice) return;
+    const timer = window.setTimeout(() => setAccountNotice(""), 5000);
+    return () => window.clearTimeout(timer);
+  }, [accountNotice, setAccountNotice]);
+
+  if (!message && !accountNotice) return null;
+
+  const renderToast = (text: string, onDismiss: () => void, key: string) => {
+    const separatorIndex = text.indexOf("：");
+    const title = separatorIndex >= 0 ? text.slice(0, separatorIndex) : text;
+    const detail = separatorIndex >= 0 ? text.slice(separatorIndex + 1).trim() : "";
+    return (
+      <div className="global-feedback-toast" role="status" key={key}>
+        <div className="global-feedback-copy">
+          <strong>{title}</strong>
+          {detail && <span>{detail}</span>}
+        </div>
+        <button
+          className="global-feedback-close"
+          type="button"
+          aria-label={t("关闭提示", "Cerrar aviso")}
+          title={t("关闭", "Cerrar")}
+          onClick={onDismiss}
+        >
+          ×
+        </button>
+      </div>
+    );
+  };
+
+  return (
+    <div className="global-feedback-viewport" aria-live="polite" aria-atomic="true">
+      {message && renderToast(message, () => setMessage(""), "message")}
+      {accountNotice && renderToast(accountNotice, () => setAccountNotice(""), "account")}
+    </div>
+  );
+}
+
 function Shell({
   user,
   message,
@@ -404,12 +462,6 @@ function Shell({
   useEffect(() => {
     loadBatches().catch((err) => setMessage((err as Error).message));
   }, []);
-
-  useEffect(() => {
-    if (!accountNotice) return;
-    const timer = window.setTimeout(() => setAccountNotice(""), 3000);
-    return () => window.clearTimeout(timer);
-  }, [accountNotice]);
 
   async function logout() {
     await api.logout();
@@ -451,14 +503,18 @@ function Shell({
             <span>{user.display_name}</span>
             <small>{roleLabels[user.role]}</small>
           </button>
-          {message && <span className="toast">{message}</span>}
-          {accountNotice && <span className="toast account-notice" role="status">{accountNotice}</span>}
           <button className="icon-text" onClick={logout}>
             <LogOut size={15} />
             退出
           </button>
         </div>
       </header>
+      <GlobalFeedback
+        message={message}
+        accountNotice={accountNotice}
+        setMessage={setMessage}
+        setAccountNotice={setAccountNotice}
+      />
       <main className="main-pane">
         <header className="topbar">
           <h1>{tabTitle(tab, language)}</h1>
@@ -1023,7 +1079,7 @@ function TopbarImportActions({
         const detail = result.auto_payment_mode === "preview"
           ? `发现 ${result.payment_candidates} 条自动付款候选、${result.review_required} 条待核对`
           : `新增 ${result.auto_payments} 笔自动付款、${result.review_required} 条待核对`;
-        const attachmentDetail = `附件新增 ${result.attachment_synced || 0} 个、已存在 ${result.attachment_existing || 0} 个${result.attachment_failed ? `、失败 ${result.attachment_failed} 个` : ""}`;
+        const attachmentDetail = `新增 ${result.attachment_synced || 0} 个附件${result.attachment_failed ? `、${result.attachment_failed} 个失败` : ""}`;
         setMessage(`钉钉流程同步完成：${detail}；${attachmentDetail}`);
         window.setTimeout(() => setMessage(""), 3000);
       }
@@ -1046,17 +1102,6 @@ function TopbarImportActions({
       completed: "钉钉流程同步完成",
       failed: "钉钉流程同步失败",
     } as Record<string, string>)[operation.stage] || "正在同步钉钉流程";
-  }
-
-  function syncTimingSummary(timings?: Record<string, number>) {
-    if (!timings) return "";
-    const parts = [
-      ["元数据", timings.metadata_query_ms],
-      ["流程", timings.workflow_query_ms],
-      ["附件查询", timings.attachment_query_ms],
-      ["附件下载", timings.attachment_download_ms],
-    ].filter((item): item is [string, number] => typeof item[1] === "number");
-    return parts.length ? `；耗时：${parts.map(([label, ms]) => `${label} ${(ms / 1000).toFixed(1)}秒`).join("、")}` : "";
   }
 
   useEffect(() => {
@@ -1093,8 +1138,8 @@ function TopbarImportActions({
           const paymentDetail = result.auto_payment_mode === "preview"
             ? `发现 ${result.payment_candidates || 0} 条自动付款候选、${result.review_required || 0} 条待核对`
             : `新增 ${result.auto_payments || 0} 笔自动付款、${result.review_required || 0} 条待核对`;
-          const attachmentDetail = `附件新增 ${result.attachment_synced || 0} 个、已存在 ${result.attachment_existing || 0} 个${result.attachment_failed ? `、失败 ${result.attachment_failed} 个` : ""}`;
-          setMessage(`钉钉流程同步完成：${paymentDetail}；${attachmentDetail}${syncTimingSummary(result.timings || operation.timings)}`);
+          const attachmentDetail = `新增 ${result.attachment_synced || 0} 个附件${result.attachment_failed ? `、${result.attachment_failed} 个失败` : ""}`;
+          setMessage(`钉钉流程同步完成：${paymentDetail}；${attachmentDetail}`);
           window.setTimeout(() => {
             setMessage("");
             setSyncOperation((current) => current?.id === operation.id ? null : current);

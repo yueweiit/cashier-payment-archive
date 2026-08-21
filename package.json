@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "test:frontend": "node --test frontend/tests/*.test.mjs",
     "build": "tsc --noEmit -p tsconfig.json && vite build",
     "preview": "vite preview --host 0.0.0.0"
   },
