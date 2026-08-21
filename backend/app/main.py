@@ -49,6 +49,7 @@ from .db import (
     rows_to_dicts,
     write_audit,
 )
+from .daily_payables import DailyPayablesError, daily_snapshot, daily_trend
 from .excel_io import (
     CORE_FIELDS,
     EXPORT_FORMAT_VERSION,
@@ -649,6 +650,15 @@ def sheet_access_filter(
     )
 
 
+def daily_payables_allowed_sheets(conn, user: Dict[str, Any]) -> Optional[set[str]]:
+    if not user_has_restricted_sheet_access(user):
+        return None
+    return {
+        canonical_sheet_name(sheet_name)
+        for sheet_name in load_user_sheet_permissions(conn, int(user["id"]))
+    }
+
+
 def ensure_sheet_access(
     conn,
     user: Dict[str, Any],
@@ -1051,6 +1061,74 @@ def change_password(
             new_value={"signed_out_sessions": signed_out_sessions},
         )
     return {"status": "ok", "signed_out_sessions": signed_out_sessions}
+
+
+def daily_payables_http_error(exc: DailyPayablesError) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
+@app.get("/api/daily-payables/summary")
+def get_daily_payables_summary(
+    selected_date: date = Query(alias="date"),
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    try:
+        with connect() as conn:
+            return daily_snapshot(
+                conn,
+                selected_date,
+                allowed_sheets=daily_payables_allowed_sheets(conn, user),
+            )
+    except DailyPayablesError as exc:
+        raise daily_payables_http_error(exc) from exc
+
+
+@app.get("/api/daily-payables/details")
+def get_daily_payables_details(
+    selected_date: date = Query(alias="date"),
+    currency: str = "",
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    normalized_currency = str(currency or "").strip().upper()
+    if normalized_currency and normalized_currency not in SUPPORTED_CURRENCIES:
+        raise HTTPException(status_code=400, detail="仅支持 CNY、USD 和 MXN")
+    try:
+        with connect() as conn:
+            result = daily_snapshot(
+                conn,
+                selected_date,
+                allowed_sheets=daily_payables_allowed_sheets(conn, user),
+                include_details=True,
+            )
+    except DailyPayablesError as exc:
+        raise daily_payables_http_error(exc) from exc
+    if normalized_currency:
+        result["items"] = [
+            item for item in result["items"] if item["currency"] == normalized_currency
+        ]
+    result["currency"] = normalized_currency or None
+    return result
+
+
+@app.get("/api/daily-payables/trend")
+def get_daily_payables_trend(
+    start: date,
+    end: date,
+    user: Dict[str, Any] = Depends(current_user),
+) -> Dict[str, Any]:
+    try:
+        with connect() as conn:
+            return daily_trend(
+                conn,
+                start,
+                end,
+                allowed_sheets=daily_payables_allowed_sheets(conn, user),
+            )
+    except DailyPayablesError as exc:
+        raise daily_payables_http_error(exc) from exc
 
 
 @app.get("/api/batches")
@@ -7145,6 +7223,7 @@ def insert_payment_record_internal(
     copied_from_payment_id: Optional[int] = None,
     root_payment_id: Optional[int] = None,
     validate_total: bool = True,
+    record_history: bool = True,
 ) -> int:
     normalized_amount = payment_record_amount(amount)
     normalized_date = normalize_payment_date(
@@ -7201,18 +7280,19 @@ def insert_payment_record_internal(
     if root_payment_id is None:
         conn.execute("UPDATE payment_records SET root_payment_id = ? WHERE id = ?", (payment_id, payment_id))
     refresh_payment_summaries(conn, request_id)
-    request_version = conn.execute(
-        "SELECT version FROM payment_requests WHERE id = ?",
-        (request_id,),
-    ).fetchone()["version"]
-    record_request_state(
-        conn,
-        request_id,
-        event_type="payment.create",
-        event_key=f"payment:create:{payment_id}:request:{request_version}",
-        effective_at=payment_effective_at(normalized_date, recorded_at=timestamp),
-        actor_id=user_id,
-    )
+    if record_history:
+        request_version = conn.execute(
+            "SELECT version FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()["version"]
+        record_request_state(
+            conn,
+            request_id,
+            event_type="payment.create",
+            event_key=f"payment:create:{payment_id}:request:{request_version}",
+            effective_at=payment_effective_at(normalized_date, recorded_at=timestamp),
+            actor_id=user_id,
+        )
     return payment_id
 
 
@@ -7237,6 +7317,7 @@ def copy_payment_records(conn, source_request_id: int, target_request_id: int, u
             copied_from_payment_id=payment["id"],
             root_payment_id=payment["root_payment_id"] or payment["id"],
             validate_total=False,
+            record_history=False,
         )
         vouchers = conn.execute("SELECT * FROM payment_vouchers WHERE payment_id = ? ORDER BY id", (payment["id"],)).fetchall()
         for voucher in vouchers:
@@ -7261,6 +7342,13 @@ def copy_payment_records(conn, source_request_id: int, target_request_id: int, u
             )
         copied += 1
     refresh_payment_summaries(conn, target_request_id)
+    record_request_state(
+        conn,
+        target_request_id,
+        event_type="request.rollover",
+        event_key=f"request:rollover:final:{target_request_id}",
+        actor_id=user_id,
+    )
     return copied
 
 

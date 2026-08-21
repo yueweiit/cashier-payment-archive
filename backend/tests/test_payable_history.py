@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fastapi.testclient import TestClient
 
-from backend.app.db import connect, now_iso
+from backend.app.db import connect, get_daily_payables_history_start_date, now_iso
 from backend.app.main import app
 from backend.app.payable_history import payment_effective_at, record_request_state
+from backend.app.security import hash_password
 
 
 def login(client: TestClient) -> None:
@@ -19,7 +21,14 @@ def login(client: TestClient) -> None:
     assert response.status_code == 200
 
 
-def create_request(client: TestClient, *, amount: float = 20000) -> dict:
+def create_request(
+    client: TestClient,
+    *,
+    amount: float = 20000,
+    source_sheet: str = "每日应付测试公司",
+    needed_payment_date: str | None = "2026-08-21",
+    currency: str = "CNY",
+) -> dict:
     batch = client.post(
         "/api/batches",
         json={"name": f"每日应付-{uuid.uuid4().hex}", "start_date": "2026-08-21", "end_date": "2026-08-28"},
@@ -27,12 +36,12 @@ def create_request(client: TestClient, *, amount: float = 20000) -> dict:
     return client.post(
         f"/api/batches/{batch['id']}/requests",
         json={
-            "source_sheet": "每日应付测试公司",
+            "source_sheet": source_sheet,
             "summary": "历史状态测试",
             "applicant": "测试申请人",
             "amount": amount,
-            "currency": "CNY",
-            "needed_payment_date": "2026-08-21",
+            "currency": currency,
+            "needed_payment_date": needed_payment_date,
         },
     ).json()["request"]
 
@@ -243,3 +252,200 @@ def test_rollover_inherits_logical_request_id_without_duplicate_identity():
         target_requests = client.get(f"/api/batches/{target_batch['id']}/requests").json()["requests"]
         copied = next(item for item in target_requests if item["copied_from_request_id"] == request["id"])
         assert copied["logical_request_id"] == request["id"]
+
+
+def test_daily_payables_summary_details_trend_and_sheet_permissions():
+    with TestClient(app) as client:
+        login(client)
+        sheet_name = f"每日应付授权-{uuid.uuid4().hex}"
+        hidden_sheet = f"每日应付无权-{uuid.uuid4().hex}"
+        request = create_request(client, source_sheet=sheet_name)
+        hidden_request = create_request(client, amount=99999, source_sheet=hidden_sheet)
+        no_due_request = create_request(
+            client,
+            amount=88888,
+            source_sheet=sheet_name,
+            needed_payment_date=None,
+        )
+        usd_request = create_request(
+            client,
+            amount=100,
+            source_sheet=sheet_name,
+        )
+        reopened_request = create_request(
+            client,
+            amount=300,
+            source_sheet=sheet_name,
+        )
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE payment_requests
+                SET currency = 'USD', base_amount_cny = 680, fx_rate_cny_per_unit = 6.8,
+                    fx_rate_date = '2026-08-21', fx_rate_actual_date = '2026-08-21'
+                WHERE id = ?
+                """,
+                (usd_request["id"],),
+            )
+            record_request_state(
+                conn,
+                usd_request["id"],
+                event_type="test.currency",
+                event_key=f"test:{uuid.uuid4().hex}",
+                actor_id=1,
+            )
+            conn.execute(
+                "UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?",
+                (json.dumps({"external_source": {"approval_status": "TERMINATED"}}), reopened_request["id"]),
+            )
+            record_request_state(
+                conn,
+                reopened_request["id"],
+                event_type="dingtalk.terminated",
+                event_key=f"test:{uuid.uuid4().hex}",
+                effective_at="2026-08-21T20:00:00.000000",
+                actor_id=1,
+            )
+            conn.execute(
+                "UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?",
+                (json.dumps({"external_source": {"approval_status": "RUNNING"}}), reopened_request["id"]),
+            )
+            record_request_state(
+                conn,
+                reopened_request["id"],
+                event_type="dingtalk.reopened",
+                event_key=f"test:{uuid.uuid4().hex}",
+                effective_at="2026-08-22T10:00:00.000000",
+                actor_id=1,
+            )
+
+        payment_response = client.post(
+            f"/api/batches/{request['batch_id']}/requests/{request['id']}/payments",
+            json={
+                "amount": 10000,
+                "payment_date": "2026-08-21",
+                "payer": "测试付款人",
+                "expected_request_version": request["version"],
+            },
+        )
+        assert payment_response.status_code == 200, payment_response.text
+
+        source_batch = next(
+            batch
+            for batch in client.get("/api/batches").json()["batches"]
+            if batch["id"] == request["batch_id"]
+        )
+        rollover = client.post(
+            f"/api/batches/{request['batch_id']}/rollover",
+            json={
+                "name": f"每日应付结转-{uuid.uuid4().hex}",
+                "start_date": "2026-08-22",
+                "end_date": "2026-08-28",
+                "copy_mode": "all",
+                "expected_batch_version": source_batch["version"],
+            },
+        )
+        assert rollover.status_code == 200, rollover.text
+
+        with connect() as conn:
+            conn.execute(
+                "UPDATE payment_requests SET paid_amount = 20000, pending_amount = 0 WHERE id = ?",
+                (request["id"],),
+            )
+            record_request_state(
+                conn,
+                request["id"],
+                event_type="payment.create",
+                event_key=f"test:{uuid.uuid4().hex}",
+                effective_at="2026-08-22T11:00:00.000000",
+                actor_id=1,
+            )
+            conn.execute(
+                "UPDATE payment_requests SET paid_amount = 10000, pending_amount = 10000 WHERE id = ?",
+                (request["id"],),
+            )
+
+        username = f"daily-{uuid.uuid4().hex}"
+        with connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (username, password_hash, role, display_name, active, created_at)
+                VALUES (?, ?, 'business', ?, 1, ?)
+                """,
+                (username, hash_password("daily123"), username, now_iso()),
+            )
+            user_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO user_sheet_permissions (user_id, sheet_name, created_by, created_at)
+                VALUES (?, ?, 1, ?)
+                """,
+                (user_id, sheet_name, now_iso()),
+            )
+            history_start = get_daily_payables_history_start_date(conn)
+
+        client.post("/api/auth/logout")
+        response = client.post(
+            "/api/auth/login",
+            json={"username": username, "password": "daily123"},
+        )
+        assert response.status_code == 200
+
+        summary_response = client.get("/api/daily-payables/summary", params={"date": "2026-08-21"})
+        assert summary_response.status_code == 200, summary_response.text
+        summary = summary_response.json()
+        assert summary["history_start_date"] == history_start
+        assert summary["totals_cny"]["due_today"] == 20680
+        assert summary["totals_cny"]["paid_today"] == 10000
+        assert summary["totals_cny"]["end_pending"] == 10680
+        currencies = {item["currency"]: item for item in summary["currency_totals"]}
+        assert currencies["CNY"]["end_pending"] == 10000
+        assert currencies["USD"]["end_pending"] == 100
+
+        details_response = client.get("/api/daily-payables/details", params={"date": "2026-08-21"})
+        assert details_response.status_code == 200, details_response.text
+        details = details_response.json()["items"]
+        logical_ids = [item["logical_request_id"] for item in details]
+        assert logical_ids.count(request["logical_request_id"]) == 1
+        assert hidden_request["logical_request_id"] not in logical_ids
+        assert no_due_request["logical_request_id"] not in logical_ids
+        assert reopened_request["logical_request_id"] not in logical_ids
+        assert next(item for item in details if item["logical_request_id"] == request["logical_request_id"])[
+            "pending_amount"
+        ] == 10000
+
+        trend_response = client.get(
+            "/api/daily-payables/trend",
+            params={"start": "2026-08-21", "end": "2026-08-22"},
+        )
+        assert trend_response.status_code == 200, trend_response.text
+        trend = trend_response.json()["points"]
+        assert trend[0]["date"] == "2026-08-21"
+        assert trend[0]["totals_cny"]["end_pending"] == 10680
+        assert trend[1]["totals_cny"]["paid_today"] == 10000
+        assert trend[1]["totals_cny"]["overdue_pending"] == 980
+
+        next_day_details = client.get(
+            "/api/daily-payables/details", params={"date": "2026-08-22"}
+        ).json()["items"]
+        assert reopened_request["logical_request_id"] in {
+            item["logical_request_id"] for item in next_day_details
+        }
+
+
+def test_daily_payables_rejects_dates_before_baseline_and_long_trends():
+    with TestClient(app) as client:
+        login(client)
+        with connect() as conn:
+            history_start = get_daily_payables_history_start_date(conn)
+        earlier = (date.fromisoformat(history_start) - timedelta(days=1)).isoformat()
+        response = client.get("/api/daily-payables/summary", params={"date": earlier})
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "HISTORY_NOT_AVAILABLE"
+
+        response = client.get(
+            "/api/daily-payables/trend",
+            params={"start": history_start, "end": (date.fromisoformat(history_start) + timedelta(days=93)).isoformat()},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "TREND_RANGE_TOO_LARGE"
