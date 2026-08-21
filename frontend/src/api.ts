@@ -27,6 +27,61 @@ export type Batch = {
   archived_at?: string;
 };
 
+export type DailyPayableAmounts = {
+  due_today: number;
+  paid_today: number;
+  end_pending: number;
+  overdue_pending: number;
+};
+
+export type DailyPayableCurrencyTotal = DailyPayableAmounts & {
+  currency: string;
+};
+
+export type DailyPayableDetail = {
+  logical_request_id: number;
+  source_request_id?: number;
+  source_batch_id?: number;
+  dingding_id?: string;
+  source_sheet?: string;
+  applicant?: string;
+  summary?: string;
+  needed_payment_date: string;
+  amount: number;
+  paid_amount: number;
+  paid_today: number;
+  pending_amount: number;
+  currency: string;
+  base_amount_cny: number;
+  base_paid_amount_cny: number;
+  base_pending_amount_cny: number;
+  approval_status?: string;
+  approval_result?: string;
+  is_due_today: boolean;
+  is_overdue: boolean;
+};
+
+export type DailyPayableSnapshot = {
+  date: string;
+  history_start_date: string;
+  totals_cny: DailyPayableAmounts;
+  currency_totals: DailyPayableCurrencyTotal[];
+  counts: {
+    due_today: number;
+    end_pending: number;
+    overdue_pending: number;
+  };
+  currency?: string | null;
+  items?: DailyPayableDetail[];
+};
+
+export type DailyPayableTrend = {
+  start: string;
+  end: string;
+  history_start_date: string;
+  points: Array<Omit<DailyPayableSnapshot, "history_start_date" | "items" | "currency">>;
+};
+
 export type PaymentRequest = {
   id: number;
   version: number;
@@ -621,6 +676,17 @@ export const api = {
   me: () => request<{ user: User }>("/api/me"),
   changePassword: (payload: ChangePasswordPayload) =>
     request<{ status: string; signed_out_sessions: number }>("/api/auth/change-password", { method: "POST", body: JSON.stringify(payload) }),
+  dailyPayablesSummary: (selectedDate: string) =>
+    request<DailyPayableSnapshot>(`/api/daily-payables/summary?date=${encodeURIComponent(selectedDate)}`),
+  dailyPayablesDetails: (selectedDate: string, currency = "") => {
+    const query = new URLSearchParams({ date: selectedDate });
+    if (currency) query.set("currency", currency);
+    return request<DailyPayableSnapshot>(`/api/daily-payables/details?${query}`);
+  },
+  dailyPayablesTrend: (start: string, end: string) => {
+    const query = new URLSearchParams({ start, end });
+    return request<DailyPayableTrend>(`/api/daily-payables/trend?${query}`);
+  },
   batches: () => request<{ batches: Batch[] }>("/api/batches"),
   createBatch: (payload: Partial<Batch>) => request<{ batch: Batch }>("/api/batches", { method: "POST", body: JSON.stringify(payload) }),
   deleteBatch: (id: number, expectedBatchVersion: number) =>

@@ -4570,3 +4570,436 @@ textarea {
     grid-column: 2;
   }
 }
+
+.daily-payables-page {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.daily-payables-toolbar,
+.daily-payables-panel,
+.daily-cny-summary,
+.daily-history-note {
+  border: 1px solid #dce5ea;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.daily-payables-toolbar {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px 18px;
+}
+
+.daily-payables-toolbar > div,
+.daily-panel-head > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.daily-payables-toolbar > div > strong {
+  font-size: 18px;
+}
+
+.daily-payables-toolbar span,
+.daily-panel-head span {
+  color: #71838d;
+  font-size: 13px;
+}
+
+.daily-payables-toolbar label {
+  min-width: 210px;
+}
+
+.daily-history-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 12px;
+  color: #60717d;
+  font-size: 13px;
+  background: #f8fbfb;
+}
+
+.daily-payables-error {
+  padding: 12px 14px;
+  border: 1px solid #f3c6c6;
+  border-radius: 8px;
+  color: #b23b3b;
+  background: #fff6f6;
+}
+
+.daily-payables-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.daily-currency-card {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 15px 16px;
+  border: 1px solid #dce5ea;
+  border-top: 4px solid var(--daily-currency-color, #25867c);
+  border-radius: 10px;
+  color: #263842;
+  text-align: left;
+  background: #ffffff;
+  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+
+.daily-currency-card:hover,
+.daily-currency-card.active {
+  border-color: var(--daily-currency-color, #25867c);
+  box-shadow: 0 8px 22px rgba(45, 66, 77, 0.09);
+  transform: translateY(-1px);
+}
+
+.daily-currency-card.currency-cny { --daily-currency-color: #25867c; }
+.daily-currency-card.currency-usd { --daily-currency-color: #4777b8; }
+.daily-currency-card.currency-mxn { --daily-currency-color: #d28b36; }
+
+.daily-currency-card > span,
+.daily-currency-card > small {
+  grid-column: 1 / -1;
+}
+
+.daily-currency-card > span {
+  color: var(--daily-currency-color);
+  font-weight: 800;
+}
+
+.daily-currency-card > div {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.daily-currency-card small {
+  color: #71838d;
+}
+
+.daily-currency-card strong {
+  overflow: hidden;
+  font-size: 17px;
+  text-overflow: ellipsis;
+}
+
+.daily-card-pending strong {
+  color: var(--daily-currency-color);
+}
+
+.daily-cny-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  overflow: hidden;
+}
+
+.daily-cny-summary > div {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 12px 15px;
+  border-right: 1px solid #e4ebee;
+}
+
+.daily-cny-summary > div:last-child {
+  border-right: 0;
+}
+
+.daily-cny-summary span {
+  color: #71838d;
+  font-size: 12px;
+}
+
+.daily-payables-panel {
+  min-width: 0;
+  padding: 16px 18px;
+}
+
+.daily-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.daily-panel-head h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.daily-trend-switch,
+.daily-detail-filter,
+.daily-counts {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.daily-trend-switch button,
+.daily-detail-filter button {
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid #d5e0e4;
+  border-radius: 7px;
+  color: #536872;
+  background: #ffffff;
+}
+
+.daily-trend-switch button.active,
+.daily-detail-filter button.active {
+  border-color: #25867c;
+  color: #176b63;
+  background: #eaf6f4;
+}
+
+.daily-chart-scroll {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.daily-trend-chart {
+  display: block;
+  width: 100%;
+  min-width: 680px;
+  height: 210px;
+}
+
+.daily-chart-grid {
+  stroke: #e4ebee;
+  stroke-width: 1;
+}
+
+.daily-chart-line {
+  fill: none;
+  stroke: #25867c;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.daily-chart-point {
+  cursor: pointer;
+}
+
+.daily-chart-point circle {
+  fill: #ffffff;
+  stroke: #25867c;
+  stroke-width: 3;
+}
+
+.daily-chart-point circle.active {
+  fill: #25867c;
+  stroke: #d9f0ed;
+  stroke-width: 6;
+}
+
+.daily-chart-point text {
+  fill: #71838d;
+  font-size: 12px;
+}
+
+.daily-chart-empty,
+.daily-empty {
+  display: grid;
+  min-height: 140px;
+  place-items: center;
+  color: #7a8c95;
+  border: 1px dashed #d6e0e4;
+  border-radius: 8px;
+  background: #fafcfc;
+}
+
+.daily-counts span {
+  padding: 6px 9px;
+  border-radius: 999px;
+  color: #60717d;
+  font-size: 12px;
+  background: #f0f5f6;
+}
+
+.daily-detail-filter {
+  margin-bottom: 10px;
+}
+
+.daily-detail-table-wrap {
+  max-height: 54vh;
+  overflow: auto;
+  border: 1px solid #dce5ea;
+  border-radius: 8px;
+}
+
+.daily-detail-table {
+  width: 100%;
+  min-width: 1080px;
+  border-collapse: collapse;
+}
+
+.daily-detail-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 11px 12px;
+  color: #38515b;
+  text-align: left;
+  background: #eaf3f2;
+}
+
+.daily-detail-table td {
+  padding: 11px 12px;
+  border-top: 1px solid #e4ebee;
+  vertical-align: middle;
+}
+
+.daily-detail-table .amount {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.daily-summary-cell {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.daily-pending-amount {
+  color: #b56f1e;
+  font-weight: 700;
+}
+
+.daily-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.daily-status.overdue { color: #ae3e38; background: #fdebea; }
+.daily-status.due { color: #946416; background: #fff1c9; }
+.daily-status.paid { color: #177261; background: #dcf5e9; }
+
+.daily-detail-cards {
+  display: none;
+}
+
+@media (max-width: 1180px) {
+  .daily-payables-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .daily-currency-card {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 980px) {
+  .daily-payables-toolbar,
+  .daily-panel-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .daily-payables-toolbar label {
+    min-width: 0;
+  }
+
+  .daily-cny-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .daily-cny-summary > div:nth-child(2) {
+    border-right: 0;
+  }
+
+  .daily-cny-summary > div:nth-child(-n+2) {
+    border-bottom: 1px solid #e4ebee;
+  }
+
+  .daily-detail-table-wrap {
+    display: none;
+  }
+
+  .daily-detail-cards {
+    display: grid;
+    gap: 10px;
+  }
+
+  .daily-detail-card {
+    display: grid;
+    gap: 10px;
+    padding: 13px;
+    border: 1px solid #dce5ea;
+    border-radius: 9px;
+    background: #ffffff;
+  }
+
+  .daily-detail-card header,
+  .daily-detail-meta,
+  .daily-detail-amounts {
+    display: flex;
+    gap: 8px;
+  }
+
+  .daily-detail-card header {
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .daily-detail-card p {
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .daily-detail-meta {
+    flex-direction: column;
+    color: #71838d;
+    font-size: 12px;
+  }
+
+  .daily-detail-amounts > div {
+    min-width: 0;
+    flex: 1;
+    display: grid;
+    gap: 3px;
+  }
+
+  .daily-detail-amounts small {
+    color: #71838d;
+  }
+
+  .daily-detail-amounts strong {
+    font-size: 14px;
+  }
+}
+
+@media (max-width: 560px) {
+  .daily-payables-panel,
+  .daily-payables-toolbar {
+    padding: 13px;
+  }
+
+  .daily-currency-card {
+    grid-template-columns: 1fr;
+  }
+
+  .daily-currency-card > span,
+  .daily-currency-card > small {
+    grid-column: auto;
+  }
+
+  .daily-detail-amounts {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+}

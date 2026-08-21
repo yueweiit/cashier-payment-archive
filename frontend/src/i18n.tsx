@@ -14,6 +14,7 @@ const zhToEs: Record<string, string> = {
   "登录": "Iniciar sesión",
   "请输入账号和密码": "Introduzca el usuario y la contraseña",
   "工作台": "Panel de trabajo",
+  "每日应付": "Pagos diarios pendientes",
   "归档": "Archivo",
   "管理": "Administración",
   "退出": "Cerrar sesión",

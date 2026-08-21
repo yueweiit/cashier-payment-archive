@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   ArrowRight,
   Archive,
+  CalendarDays,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -40,6 +41,10 @@ import {
   BatchOperation,
   CurrencyCode,
   CurrencyConversionPreview,
+  DailyPayableCurrencyTotal,
+  DailyPayableDetail,
+  DailyPayableSnapshot,
+  DailyPayableTrend,
   ForeignAmountCorrectionPreview,
   HistoricalCurrencyRestorePreview,
   DingtalkWorkflow,
@@ -67,7 +72,7 @@ import {
 } from "./api";
 import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
 
-type Tab = "workspace" | "archive" | "admin";
+type Tab = "workspace" | "daily-payables" | "archive" | "admin";
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
 type PendingEditorNavigation =
   | { kind: "close" }
@@ -423,6 +428,10 @@ function Shell({
             <FileSpreadsheet size={16} />
             工作台
           </button>
+          <button className={tab === "daily-payables" ? "active" : ""} onPointerDown={() => setTab("daily-payables")} onClick={() => setTab("daily-payables")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("daily-payables"))}>
+            <CalendarDays size={16} />
+            每日应付
+          </button>
           <button className={tab === "archive" ? "active" : ""} onPointerDown={() => setTab("archive")} onClick={() => setTab("archive")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("archive"))}>
             <Archive size={16} />
             归档
@@ -466,6 +475,7 @@ function Shell({
             setMessage={setMessage}
           />
         )}
+        {tab === "daily-payables" && <DailyPayablesView setMessage={setMessage} />}
         {tab === "archive" && (
           <ArchiveView
             user={user}
@@ -576,8 +586,273 @@ function ChangePasswordDialog({ onClose, onSuccess }: { onClose: () => void; onS
 
 function tabTitle(tab: Tab, language: GridHeaderLanguage = "zh") {
   return language === "es"
-    ? { workspace: "Panel de la semana actual", archive: "Archivo histórico", admin: "Gestión de usuarios" }[tab]
-    : { workspace: "当前周工作台", archive: "历史归档", admin: "用户管理" }[tab];
+    ? { workspace: "Panel de la semana actual", "daily-payables": "Pagos diarios pendientes", archive: "Archivo histórico", admin: "Gestión de usuarios" }[tab]
+    : { workspace: "当前周工作台", "daily-payables": "每日应付", archive: "历史归档", admin: "用户管理" }[tab];
+}
+
+type DailyTrendCurrency = "CNY_EQ" | CurrencyCode;
+
+function shiftIsoDate(value: string, days: number) {
+  const dateValue = new Date(`${value}T12:00:00`);
+  dateValue.setDate(dateValue.getDate() + days);
+  return localIsoDate(dateValue);
+}
+
+function dailyCurrencyTotal(snapshot: DailyPayableSnapshot | undefined, currency: CurrencyCode): DailyPayableCurrencyTotal {
+  return snapshot?.currency_totals.find((item) => item.currency === currency) || {
+    currency,
+    due_today: 0,
+    paid_today: 0,
+    end_pending: 0,
+    overdue_pending: 0,
+  };
+}
+
+function DailyPayablesView({ setMessage }: { setMessage: (message: string) => void }) {
+  const { language, t } = useLanguage();
+  const [selectedDate, setSelectedDate] = useState(localIsoDate(new Date()));
+  const [snapshot, setSnapshot] = useState<DailyPayableSnapshot | null>(null);
+  const [details, setDetails] = useState<DailyPayableDetail[]>([]);
+  const [trend, setTrend] = useState<DailyPayableTrend | null>(null);
+  const [trendCurrency, setTrendCurrency] = useState<DailyTrendCurrency>("CNY_EQ");
+  const [detailCurrency, setDetailCurrency] = useState<"" | CurrencyCode>("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    api.dailyPayablesDetails(selectedDate, detailCurrency)
+      .then(async (response) => {
+        const start = shiftIsoDate(selectedDate, -13) < response.history_start_date
+          ? response.history_start_date
+          : shiftIsoDate(selectedDate, -13);
+        const trendResponse = await api.dailyPayablesTrend(start, selectedDate);
+        if (cancelled) return;
+        setSnapshot(response);
+        setDetails(response.items || []);
+        setTrend(trendResponse);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        const message = (err as Error).message;
+        setSnapshot(null);
+        setDetails([]);
+        setTrend(null);
+        setError(message);
+        setMessage(message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [detailCurrency, selectedDate, setMessage]);
+
+  const trendValues = useMemo(() => (trend?.points || []).map((point) => {
+    if (trendCurrency === "CNY_EQ") return Number(point.totals_cny.end_pending || 0);
+    return Number(dailyCurrencyTotal(point as DailyPayableSnapshot, trendCurrency).end_pending || 0);
+  }), [trend, trendCurrency]);
+
+  const historyStart = snapshot?.history_start_date || trend?.history_start_date || selectedDate;
+  const currencyCards: CurrencyCode[] = ["CNY", "USD", "MXN"];
+  const dateLocale = language === "es" ? "es-MX" : "zh-CN";
+
+  return (
+    <section className="daily-payables-page">
+      <div className="daily-payables-toolbar">
+        <div>
+          <strong>{t("查看日期", "Fecha de consulta")}</strong>
+          <span>{t("按当天结束时的状态计算，不受以后付款影响", "Calculado al cierre del día, sin alterarse por pagos posteriores")}</span>
+        </div>
+        <label>
+          <span>{t("选择日期", "Seleccionar fecha")}</span>
+          <input type="date" min={historyStart} value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)} />
+        </label>
+      </div>
+
+      <div className="daily-history-note">
+        <History size={16} />
+        {t("历史数据自", "Datos históricos registrados desde")} <strong>{historyStart}</strong> {t("开始记录", "en adelante")}
+      </div>
+
+      {error && <div className="daily-payables-error" role="alert">{error}</div>}
+
+      <div className="daily-payables-overview">
+        {currencyCards.map((currency) => {
+          const total = dailyCurrencyTotal(snapshot || undefined, currency);
+          const active = detailCurrency === currency;
+          return (
+            <button
+              className={`daily-currency-card currency-${currency.toLowerCase()}${active ? " active" : ""}`}
+              key={currency}
+              type="button"
+              onClick={() => setDetailCurrency(active ? "" : currency)}
+            >
+              <span>{currencyLabel(currency)}</span>
+              <div><small>{t("当天新增到期", "Nuevo vencimiento hoy")}</small><strong>{formatMoney(total.due_today, currency)}</strong></div>
+              <div><small>{t("当日支付", "Pagado hoy")}</small><strong>{formatMoney(total.paid_today, currency)}</strong></div>
+              <div className="daily-card-pending"><small>{t("日终待付", "Pendiente al cierre")}</small><strong>{formatMoney(total.end_pending, currency)}</strong></div>
+              <small>{t("其中逾期", "Vencido")} {formatMoney(total.overdue_pending, currency)}</small>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="daily-cny-summary">
+        <div><span>{t("当天新增到期（折合人民币）", "Nuevo vencimiento hoy (equivalente CNY)")}</span><strong>{formatMoney(snapshot?.totals_cny.due_today || 0)}</strong></div>
+        <div><span>{t("当日支付（折合人民币）", "Pagado hoy (equivalente CNY)")}</span><strong>{formatMoney(snapshot?.totals_cny.paid_today || 0)}</strong></div>
+        <div><span>{t("日终待付（折合人民币）", "Pendiente al cierre (equivalente CNY)")}</span><strong>{formatMoney(snapshot?.totals_cny.end_pending || 0)}</strong></div>
+        <div><span>{t("逾期待付（折合人民币）", "Vencido pendiente (equivalente CNY)")}</span><strong>{formatMoney(snapshot?.totals_cny.overdue_pending || 0)}</strong></div>
+      </div>
+
+      <div className="daily-payables-panel">
+        <div className="daily-panel-head">
+          <div>
+            <h2>{t("近 14 日待付变化", "Evolución pendiente de los últimos 14 días")}</h2>
+            <span>{t("点击趋势节点可查看当天明细", "Seleccione un punto para consultar el detalle del día")}</span>
+          </div>
+          <div className="daily-trend-switch" role="group" aria-label={t("趋势币种", "Moneda del gráfico")}>
+            {(["CNY_EQ", "CNY", "USD", "MXN"] as DailyTrendCurrency[]).map((currency) => (
+              <button className={trendCurrency === currency ? "active" : ""} key={currency} type="button" onClick={() => setTrendCurrency(currency)}>
+                {currency === "CNY_EQ" ? t("折合人民币", "Equivalente CNY") : currency}
+              </button>
+            ))}
+          </div>
+        </div>
+        <DailyPayablesTrendChart
+          points={trend?.points || []}
+          values={trendValues}
+          currency={trendCurrency}
+          selectedDate={selectedDate}
+          onSelectDate={setSelectedDate}
+        />
+      </div>
+
+      <div className="daily-payables-panel daily-details-panel">
+        <div className="daily-panel-head">
+          <div>
+            <h2>{t("当天应付明细", "Detalle de pagos del día")}</h2>
+            <span>{new Date(`${selectedDate}T12:00:00`).toLocaleDateString(dateLocale)} · {t("截至日终", "al cierre del día")}</span>
+          </div>
+          <div className="daily-counts">
+            <span>{t("当日到期", "Vence hoy")} <strong>{snapshot?.counts.due_today || 0}</strong></span>
+            <span>{t("日终未付", "Pendiente al cierre")} <strong>{snapshot?.counts.end_pending || 0}</strong></span>
+            <span>{t("其中逾期", "Vencido")} <strong>{snapshot?.counts.overdue_pending || 0}</strong></span>
+          </div>
+        </div>
+        <div className="daily-detail-filter">
+          <button className={detailCurrency === "" ? "active" : ""} type="button" onClick={() => setDetailCurrency("")}>{t("全部币种", "Todas las monedas")}</button>
+          {currencyCards.map((currency) => <button className={detailCurrency === currency ? "active" : ""} type="button" key={currency} onClick={() => setDetailCurrency(currency)}>{currency}</button>)}
+        </div>
+        {loading ? (
+          <div className="daily-empty">{t("加载中", "Cargando")}</div>
+        ) : details.length ? (
+          <>
+            <div className="daily-detail-table-wrap">
+              <table className="daily-detail-table">
+                <thead><tr>
+                  <th>{t("状态", "Estado")}</th>
+                  <th>{t("应付款公司", "Empresa a pagar")}</th>
+                  <th>{t("申请人", "Solicitante")}</th>
+                  <th>{t("摘要", "Resumen / Concepto")}</th>
+                  <th>{t("需求付款日期", "Fecha requerida")}</th>
+                  <th>{t("应付金额", "Monto a pagar")}</th>
+                  <th>{t("当日支付", "Pagado hoy")}</th>
+                  <th>{t("日终待付", "Pendiente al cierre")}</th>
+                </tr></thead>
+                <tbody>{details.map((item) => <DailyPayableDetailRow item={item} key={item.logical_request_id} />)}</tbody>
+              </table>
+            </div>
+            <div className="daily-detail-cards">{details.map((item) => <DailyPayableDetailCard item={item} key={item.logical_request_id} />)}</div>
+          </>
+        ) : (
+          <div className="daily-empty">{t("当天没有应付或逾期待付记录", "No hay pagos con vencimiento ni pendientes vencidos para este día")}</div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function DailyPayablesTrendChart({
+  points,
+  values,
+  currency,
+  selectedDate,
+  onSelectDate,
+}: {
+  points: DailyPayableTrend["points"];
+  values: number[];
+  currency: DailyTrendCurrency;
+  selectedDate: string;
+  onSelectDate: (value: string) => void;
+}) {
+  const { t } = useLanguage();
+  if (!points.length) return <div className="daily-chart-empty">{t("暂无趋势数据", "No hay datos de tendencia")}</div>;
+  const width = 900;
+  const height = 210;
+  const paddingX = 46;
+  const paddingTop = 18;
+  const paddingBottom = 40;
+  const maxValue = Math.max(...values, 1);
+  const x = (index: number) => points.length === 1 ? width / 2 : paddingX + index * ((width - paddingX * 2) / (points.length - 1));
+  const y = (value: number) => paddingTop + (1 - value / maxValue) * (height - paddingTop - paddingBottom);
+  const polyline = values.map((value, index) => `${x(index)},${y(value)}`).join(" ");
+  const displayCurrency = currency === "CNY_EQ" ? "CNY" : currency;
+  return (
+    <div className="daily-chart-scroll">
+      <svg className="daily-trend-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t("日终待付趋势", "Tendencia pendiente al cierre")}>
+        {[0, 0.5, 1].map((ratio) => {
+          const lineY = y(maxValue * ratio);
+          return <line x1={paddingX} x2={width - paddingX} y1={lineY} y2={lineY} className="daily-chart-grid" key={ratio} />;
+        })}
+        <polyline points={polyline} className="daily-chart-line" />
+        {points.map((point, index) => {
+          const active = point.date === selectedDate;
+          const showLabel = points.length <= 7 || index === 0 || index === points.length - 1 || index % 2 === 0;
+          return <g className="daily-chart-point" key={point.date} onClick={() => onSelectDate(point.date)}>
+            <circle cx={x(index)} cy={y(values[index])} r={active ? 7 : 5} className={active ? "active" : ""} />
+            <title>{point.date} · {formatMoney(values[index], displayCurrency)}</title>
+            {showLabel && <text x={x(index)} y={height - 14} textAnchor="middle">{point.date.slice(5)}</text>}
+          </g>;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function DailyPayableStatus({ item }: { item: DailyPayableDetail }) {
+  const { t } = useLanguage();
+  if (item.is_overdue) return <span className="daily-status overdue">{t("逾期待付", "Vencido")}</span>;
+  if (item.pending_amount > 0) return <span className="daily-status due">{t("当日待付", "Pendiente hoy")}</span>;
+  return <span className="daily-status paid">{t("当日已结清", "Liquidado hoy")}</span>;
+}
+
+function DailyPayableDetailRow({ item }: { item: DailyPayableDetail }) {
+  return <tr>
+    <td><DailyPayableStatus item={item} /></td>
+    <td>{item.source_sheet || "—"}</td>
+    <td>{item.applicant || "—"}</td>
+    <td className="daily-summary-cell" title={item.summary || ""}>{item.summary || "—"}</td>
+    <td>{item.needed_payment_date}</td>
+    <td className="amount">{formatMoney(item.amount, item.currency)}</td>
+    <td className="amount">{formatMoney(item.paid_today, item.currency)}</td>
+    <td className="amount daily-pending-amount">{formatMoney(item.pending_amount, item.currency)}</td>
+  </tr>;
+}
+
+function DailyPayableDetailCard({ item }: { item: DailyPayableDetail }) {
+  const { t } = useLanguage();
+  return <article className="daily-detail-card">
+    <header><DailyPayableStatus item={item} /><strong>{item.source_sheet || "—"}</strong></header>
+    <p>{item.summary || "—"}</p>
+    <div className="daily-detail-meta"><span>{t("申请人", "Solicitante")}：{item.applicant || "—"}</span><span>{t("需求付款日期", "Fecha requerida")}：{item.needed_payment_date}</span></div>
+    <div className="daily-detail-amounts">
+      <div><small>{t("应付", "A pagar")}</small><strong>{formatMoney(item.amount, item.currency)}</strong></div>
+      <div><small>{t("当日支付", "Pagado hoy")}</small><strong>{formatMoney(item.paid_today, item.currency)}</strong></div>
+      <div><small>{t("日终待付", "Pendiente al cierre")}</small><strong>{formatMoney(item.pending_amount, item.currency)}</strong></div>
+    </div>
+  </article>;
 }
 
 function TopbarImportActions({
