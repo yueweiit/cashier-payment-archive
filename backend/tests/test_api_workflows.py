@@ -1031,6 +1031,207 @@ def test_employee_workbook_regroups_requests_by_level_two_department_and_keeps_u
         assert rejected.status_code == 400
 
 
+def test_manual_sheet_move_wins_over_unchanged_employee_mapping_data():
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "员工数据"
+    worksheet.append(["员工UserID", "姓名", "1级部门", "2级部门"])
+    worksheet.append(["MOVE-U1", "移动测试人员", "一级", "自动归组部门"])
+    workbook_buffer = io.BytesIO()
+    workbook.save(workbook_buffer)
+
+    with TestClient(app) as admin_client:
+        login(admin_client)
+        batch = admin_client.post(
+            "/api/batches",
+            json={"name": "手动移动优先", "start_date": "2026-08-15", "end_date": "2026-08-21"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+        imported = admin_client.post(
+            f"/api/batches/{batch_id}/employee-departments/import",
+            files={
+                "file": (
+                    "员工信息.xlsx",
+                    workbook_buffer.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+        assert imported.status_code == 200, imported.text
+
+        created = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={
+                "applicant": "移动测试人员",
+                "source_sheet": "导入临时 Sheet",
+                "summary": "移动前",
+                "amount": 100,
+            },
+        ).json()["request"]
+        assert created["source_sheet"] == "自动归组部门"
+
+        moved = admin_client.patch(
+            f"/api/batches/{batch_id}/requests/bulk",
+            json={
+                "creates": [],
+                "updates": [
+                    {
+                        "id": created["id"],
+                        "expected_version": created["version"],
+                        "source_sheet": "人工调整 Sheet",
+                        # Simulate the legacy frontend sending the whole row.
+                        "applicant": "移动测试人员",
+                        "summary": "移动前",
+                    }
+                ],
+                "deletes": [],
+            },
+        )
+        assert moved.status_code == 200, moved.text
+        refreshed = admin_client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        request = next(item for item in refreshed if item["id"] == created["id"])
+        assert request["source_sheet"] == "人工调整 Sheet"
+
+
+def test_unchanged_applicant_does_not_remap_sheet_during_unrelated_edit():
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "员工数据"
+    worksheet.append(["员工UserID", "姓名", "1级部门", "2级部门"])
+    worksheet.append(["EDIT-U1", "普通编辑测试人员", "一级", "自动归组部门"])
+    workbook_buffer = io.BytesIO()
+    workbook.save(workbook_buffer)
+
+    with TestClient(app) as admin_client:
+        login(admin_client)
+        batch = admin_client.post(
+            "/api/batches",
+            json={"name": "普通编辑不归组", "start_date": "2026-08-15", "end_date": "2026-08-21"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+        assert admin_client.post(
+            f"/api/batches/{batch_id}/employee-departments/import",
+            files={"file": ("员工信息.xlsx", workbook_buffer.getvalue())},
+        ).status_code == 200
+        created = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"applicant": "普通编辑测试人员", "summary": "修改前", "amount": 100},
+        ).json()["request"]
+
+        with connect() as conn:
+            conn.execute(
+                "UPDATE payment_requests SET source_sheet = '人工保留 Sheet', version = version + 1 WHERE id = ?",
+                (created["id"],),
+            )
+            current_version = conn.execute(
+                "SELECT version FROM payment_requests WHERE id = ?",
+                (created["id"],),
+            ).fetchone()["version"]
+
+        updated = admin_client.patch(
+            f"/api/batches/{batch_id}/requests/{created['id']}",
+            json={
+                "expected_version": current_version,
+                "applicant": "普通编辑测试人员",
+                "summary": "修改后",
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["request"]["source_sheet"] == "人工保留 Sheet"
+        assert updated.json()["request"]["summary"] == "修改后"
+
+
+def test_changed_applicant_still_remaps_when_full_editor_payload_keeps_old_sheet():
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "员工数据"
+    worksheet.append(["员工UserID", "姓名", "1级部门", "2级部门"])
+    worksheet.append(["EDITOR-U1", "抽屉原申请人", "一级", "原申请人部门"])
+    worksheet.append(["EDITOR-U2", "抽屉新申请人", "一级", "新申请人部门"])
+    workbook_buffer = io.BytesIO()
+    workbook.save(workbook_buffer)
+
+    with TestClient(app) as admin_client:
+        login(admin_client)
+        batch = admin_client.post(
+            "/api/batches",
+            json={"name": "抽屉申请人换组", "start_date": "2026-08-15", "end_date": "2026-08-21"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+        assert admin_client.post(
+            f"/api/batches/{batch_id}/employee-departments/import",
+            files={"file": ("员工信息.xlsx", workbook_buffer.getvalue())},
+        ).status_code == 200
+        created = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={"applicant": "抽屉原申请人", "summary": "修改申请人前", "amount": 100},
+        ).json()["request"]
+        assert created["source_sheet"] == "原申请人部门"
+
+        updated = admin_client.patch(
+            f"/api/batches/{batch_id}/requests/{created['id']}",
+            json={
+                "expected_version": created["version"],
+                "applicant": "抽屉新申请人",
+                # The drawer sends the full request, including the unchanged
+                # old Sheet. Its mere presence must not suppress re-mapping.
+                "source_sheet": "原申请人部门",
+                "summary": "修改申请人后",
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["request"]["source_sheet"] == "新申请人部门"
+
+
+def test_sparse_grid_update_can_clear_optional_fields_without_overwriting_others():
+    with TestClient(app) as admin_client:
+        login(admin_client)
+        batch = admin_client.post(
+            "/api/batches",
+            json={"name": "稀疏更新清空字段", "start_date": "2026-08-15", "end_date": "2026-08-21"},
+        ).json()["batch"]
+        batch_id = batch["id"]
+        created = admin_client.post(
+            f"/api/batches/{batch_id}/requests",
+            json={
+                "source_sheet": "清空测试 Sheet",
+                "summary": "保留摘要",
+                "payee_name": "待清空收款人",
+                "needed_payment_date": "2026-08-21",
+                "remark": "待清空备注",
+                "amount": 100,
+            },
+        ).json()["request"]
+
+        cleared = admin_client.patch(
+            f"/api/batches/{batch_id}/requests/bulk",
+            json={
+                "creates": [],
+                "updates": [
+                    {
+                        "id": created["id"],
+                        "expected_version": created["version"],
+                        "payee_name": "",
+                        "needed_payment_date": None,
+                        "remark": "",
+                    }
+                ],
+                "deletes": [],
+            },
+        )
+        assert cleared.status_code == 200, cleared.text
+        request = next(
+            item
+            for item in admin_client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+            if item["id"] == created["id"]
+        )
+        assert request["payee_name"] == ""
+        assert request["needed_payment_date"] is None
+        assert request["remark"] in (None, "")
+        assert request["summary"] == "保留摘要"
+        assert request["source_sheet"] == "清空测试 Sheet"
+
+
 def test_employee_workbook_splits_supply_chain_center_by_level_three_department():
     workbook = Workbook()
     worksheet = workbook.active

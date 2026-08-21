@@ -71,6 +71,7 @@ import {
   WeeklyMergeRow,
 } from "./api";
 import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
+import { buildDirtyGridPayload, sameSheetOrder } from "./gridSave";
 
 type Tab = "workspace" | "daily-payables" | "archive" | "admin";
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
@@ -2339,7 +2340,15 @@ function Workspace({
       .map(stripGridRow);
     const updates = gridRows
       .filter((row) => row.id && dirtyRowIds(dirtyCells).has(row.__localId) && !row.__deleted)
-      .map((row) => ({ id: row.id!, expected_version: Number(row.version || 1), ...stripGridRow(row) }));
+      .map((row) => ({
+        id: row.id!,
+        expected_version: Number(row.version || 1),
+        ...buildDirtyGridPayload(
+          row as unknown as Record<string, unknown>,
+          dirtyCells,
+          calculatedRequestFields as unknown as ReadonlySet<string>,
+        ),
+      }));
     const deletes = Array.from(deletedLocalIds)
       .map((localId) => gridRows.find((row) => row.__localId === localId))
       .filter((row): row is GridRow & { id: number } => Boolean(row?.id))
@@ -2353,10 +2362,11 @@ function Workspace({
       const savedSheetOrder = getSheetTabs(gridRows, sheetOrder, deletedSheetNames)
         .filter((tab) => tab.key !== ALL_SHEET && !deletedSheetNames.has(tab.key))
         .map((tab) => tab.key);
-      if (canManageSheets) {
+      const sheetOrderChanged = !sameSheetOrder(savedSheetOrder, selectedBatch.sheet_order || []);
+      if (canManageSheets && sheetOrderChanged) {
         await api.updateSheetOrder(selectedBatch.id, savedSheetOrder, batchVersion);
-        setSheetOrder(savedSheetOrder);
       }
+      setSheetOrder(savedSheetOrder);
       setReason("");
       setDeletedSheetNames(new Set());
       await loadRequests();

@@ -412,7 +412,10 @@ def normalize_request_business_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     append_remark_texts(row, finance_note)
     append_general_manager_opinions(row, manager_note)
     status_note = stringify(payment_status_raw)
-    if status_note and status_note not in LEGACY_PAYMENT_STATUS_OPTIONS:
+    # Current system payment states are already represented by the calculated
+    # payment fields.  Do not re-inject them into a remark that the user has
+    # intentionally cleared; only preserve genuinely non-standard legacy text.
+    if status_note and status_note not in (LEGACY_PAYMENT_STATUS_OPTIONS | FINANCE_REVIEW_OPTIONS):
         append_remark_texts(row, f"原付款情况：{status_note}")
 
     has_payment_date = bool(strict_date_string(row.get("actual_payment_date")))

@@ -94,6 +94,7 @@ from .employee_departments import (
     apply_employee_department_mapping,
     parse_employee_department_workbook,
     replace_employee_department_mappings,
+    request_applicant_identity,
     resolve_employee_department,
 )
 from .security import new_session_token, verify_password, hash_password
@@ -7522,10 +7523,31 @@ def update_request_row(
         payload.pop("currency", None)
     for field in ("base_amount_cny", "fx_rate_cny_per_unit", "fx_rate_date", "fx_rate_actual_date"):
         payload.pop(field, None)
-    if user_role != ROLE_BUSINESS and (data.get("applicant") or "raw_extra" in data or "raw_extra_json" in data):
-        mapping_input = {**existing, **data}
-        if "raw_extra" not in data and "raw_extra_json" not in data:
-            mapping_input["raw_extra"] = existing.get("raw_extra") or {}
+    # Full-form saves include source_sheet even when the user did not touch it.
+    # Treat it as an explicit manual move only when the normalized value really
+    # differs from the persisted Sheet; otherwise an applicant change may still
+    # apply the employee-to-department mapping below.
+    source_sheet_was_explicitly_changed = (
+        "source_sheet" in payload
+        and not request_values_equal(
+            payload.get("source_sheet"),
+            canonical_sheet_name(existing.get("source_sheet")),
+        )
+    )
+    mapping_input = {**existing, **data}
+    if "raw_extra" in data:
+        mapping_input["raw_extra"] = data["raw_extra"]
+    elif "raw_extra_json" in data:
+        # Do not let the parsed raw_extra from the existing row mask a newly
+        # submitted raw_extra_json value when comparing applicant identities.
+        mapping_input.pop("raw_extra", None)
+    else:
+        mapping_input["raw_extra"] = existing.get("raw_extra") or {}
+    applicant_identity_changed = (
+        request_applicant_identity(mapping_input)
+        != request_applicant_identity(existing)
+    )
+    if user_role != ROLE_BUSINESS and not source_sheet_was_explicitly_changed and applicant_identity_changed:
         mapped, mapping, _ = apply_employee_department_mapping(conn, mapping_input)
         if mapping:
             payload["source_sheet"] = canonical_sheet_name(mapped.get("source_sheet"))
