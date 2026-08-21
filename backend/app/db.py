@@ -484,7 +484,7 @@ def _logical_request_roots(conn: sqlite3.Connection) -> Dict[int, int]:
         if row is None:
             return request_id
         stored = row["logical_request_id"]
-        if stored is not None and int(stored) in by_id:
+        if stored is not None:
             root = int(stored)
         else:
             parent = row["copied_from_request_id"]
