@@ -17,13 +17,19 @@ from backend.app.mexico_tracking import (
     cache_mexico_workflow_snapshots,
     backfill_request_regions,
     build_bilingual_reminder,
+    collect_mexico_attachment_candidates,
     complete_mexico_sync_run,
     fail_mexico_sync_run,
     get_mexico_sync_run,
     get_mexico_tracking_settings,
+    list_mexico_attachment_download_candidates,
+    mark_mexico_attachment_failed,
+    mark_mexico_attachment_ready,
+    mark_mexico_attachments_downloading,
     node_age_days,
     persist_request_region,
     resolve_region,
+    upsert_mexico_attachment_candidates,
     update_mexico_tracking_settings,
     warning_level,
 )
@@ -1148,3 +1154,155 @@ def test_mexico_discovery_cache_preserves_admin_region_override(isolated_db) -> 
             "resolved",
             1,
         )
+
+
+def _insert_mexico_tracking_row(conn, approval_no: str = "202608241200000000888") -> None:
+    timestamp = "2026-08-24T12:00:00.000000+08:00"
+    conn.execute(
+        """
+        INSERT INTO mexico_approval_tracking (
+            approval_no, source_type, process_instance_id, resolved_region,
+            region_resolution_source, region_review_status, workflow_status,
+            created_at, updated_at
+        ) VALUES (?, 'purchase', 'process-888', 'mexico',
+                  'execution_region', 'resolved', 'RUNNING', ?, ?)
+        """,
+        (approval_no, timestamp, timestamp),
+    )
+    conn.commit()
+
+
+def test_mexico_attachment_candidates_deduplicate_workflow_and_source_rows() -> None:
+    workflows = [
+        {
+            "approval_no": "202608241200000000888",
+            "process_instance_id": "process-888",
+            "events": [
+                {
+                    "event_key": "event-1",
+                    "images": [
+                        {"fileId": "file-1", "fileName": "pago.png", "fileSize": 12}
+                    ],
+                    "attachments": [
+                        {"fileId": "file-1", "fileName": "pago.png", "fileType": "png"}
+                    ],
+                }
+            ],
+        }
+    ]
+    source_rows = [
+        {
+            "approval_no": "202608241200000000888",
+            "attachment_id": "source-row-1",
+            "file_id": "file-1",
+            "file_name": "pago.png",
+            "file_type": "image/png",
+            "file_size": 12,
+        }
+    ]
+
+    candidates = collect_mexico_attachment_candidates(workflows, source_rows)
+
+    assert len(candidates) == 1
+    assert candidates[0]["approval_no"] == "202608241200000000888"
+    assert candidates[0]["process_instance_id"] == "process-888"
+    assert candidates[0]["source_file_id"] == "file-1"
+    assert candidates[0]["event_key"] == "event-1"
+    assert candidates[0]["file_name"] == "pago.png"
+
+
+def test_mexico_attachment_inventory_is_idempotent_and_failed_rows_retry(isolated_db) -> None:
+    approval_no = "202608241200000000888"
+    candidate = {
+        "approval_no": approval_no,
+        "process_instance_id": "process-888",
+        "source_file_id": "file-1",
+        "file_id": "file-1",
+        "event_key": "event-1",
+        "file_name": "pago.pdf",
+        "mime_type": "application/pdf",
+        "size_bytes": 123,
+    }
+    with isolated_db.connect() as conn:
+        _insert_mexico_tracking_row(conn, approval_no)
+
+        first = upsert_mexico_attachment_candidates(conn, [candidate])
+        second = upsert_mexico_attachment_candidates(conn, [candidate])
+        assert first == {"inserted": 1, "updated": 0, "existing": 0}
+        assert second == {"inserted": 0, "updated": 0, "existing": 1}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM mexico_approval_attachments"
+        ).fetchone()[0] == 1
+
+        pending = list_mexico_attachment_download_candidates(conn, [approval_no])
+        assert len(pending) == 1
+        attachment_id = pending[0]["attachment_id"]
+        mark_mexico_attachments_downloading(conn, [attachment_id])
+        mark_mexico_attachment_failed(conn, attachment_id, "network timeout")
+
+        failed = list_mexico_attachment_download_candidates(conn, [approval_no])
+        assert len(failed) == 1
+        assert failed[0]["attempts"] == 1
+        assert failed[0]["status"] == "failed"
+
+        mark_mexico_attachments_downloading(conn, [attachment_id])
+        timestamp = isolated_db.now_iso()
+        file_object_id = int(
+            conn.execute(
+                """
+                INSERT INTO file_objects (
+                    sha256, size_bytes, mime_type, storage_backend, storage_path,
+                    status, created_at, verified_at
+                ) VALUES (?, 1, 'application/pdf', 'local', ?, 'ready', ?, ?)
+                """,
+                ("f" * 64, "attachments/sha256/ff/" + "f" * 64, timestamp, timestamp),
+            ).lastrowid
+        )
+        mark_mexico_attachment_ready(
+            conn, attachment_id, file_object_id=file_object_id
+        )
+        upsert_mexico_attachment_candidates(conn, [candidate])
+        stored = conn.execute(
+            "SELECT status, attempts, file_object_id FROM mexico_approval_attachments WHERE id = ?",
+            (attachment_id,),
+        ).fetchone()
+        assert tuple(stored) == ("ready", 2, file_object_id)
+        assert list_mexico_attachment_download_candidates(conn, [approval_no]) == []
+
+
+def test_stale_mexico_attachment_download_is_retried_after_interruption(isolated_db) -> None:
+    approval_no = "202608241200000000889"
+    candidate = {
+        "approval_no": approval_no,
+        "source_file_id": "file-stale",
+        "file_name": "stale.pdf",
+    }
+    with isolated_db.connect() as conn:
+        _insert_mexico_tracking_row(conn, approval_no)
+        upsert_mexico_attachment_candidates(conn, [candidate])
+        attachment_id = conn.execute(
+            "SELECT id FROM mexico_approval_attachments WHERE approval_no = ?",
+            (approval_no,),
+        ).fetchone()[0]
+        mark_mexico_attachments_downloading(
+            conn,
+            [attachment_id],
+            timestamp="2026-08-24T10:00:00.000000+08:00",
+        )
+
+        retryable = list_mexico_attachment_download_candidates(
+            conn,
+            [approval_no],
+            now="2026-08-24T11:00:00.000000+08:00",
+            stale_after_seconds=1800,
+        )
+
+        assert len(retryable) == 1
+        assert retryable[0]["attachment_id"] == attachment_id
+        assert retryable[0]["status"] == "downloading"
+
+        mark_mexico_attachments_downloading(conn, [attachment_id])
+        assert conn.execute(
+            "SELECT attempts FROM mexico_approval_attachments WHERE id = ?",
+            (attachment_id,),
+        ).fetchone()[0] == 2

@@ -182,8 +182,9 @@ def delete_physical_file_if_unreferenced(
         SELECT
             (SELECT COUNT(*) FROM attachment_links WHERE file_object_id = ?)
           + (SELECT COUNT(*) FROM payment_vouchers WHERE file_object_id = ?)
+          + (SELECT COUNT(*) FROM mexico_approval_attachments WHERE file_object_id = ?)
         """,
-        (file_object_id, file_object_id),
+        (file_object_id, file_object_id, file_object_id),
     ).fetchone()[0]
     if int(reference_count or 0) > 0:
         return False

@@ -161,3 +161,62 @@ def test_resolve_file_object_rejects_path_outside_storage_root(isolated_db):
                 "status": "ready",
             }
         )
+
+
+def test_mexico_attachment_reference_prevents_physical_file_deletion(isolated_db):
+    from backend.app import file_storage
+
+    file_storage = importlib.reload(file_storage)
+    with isolated_db.connect() as conn:
+        timestamp = isolated_db.now_iso()
+        conn.execute(
+            """
+            INSERT INTO mexico_approval_tracking (
+                approval_no, source_type, resolved_region,
+                region_resolution_source, region_review_status,
+                created_at, updated_at
+            ) VALUES ('mx-attachment-reference', 'purchase', 'mexico',
+                      'execution_region', 'resolved', ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        stored = file_storage.store_stream(
+            conn, io.BytesIO(b"mexico-attachment"), mime_type="application/pdf"
+        )
+        conn.execute(
+            """
+            INSERT INTO mexico_approval_attachments (
+                approval_no, source_file_id, file_name, file_object_id,
+                status, created_at, updated_at
+            ) VALUES ('mx-attachment-reference', 'file-1', 'proof.pdf', ?,
+                      'ready', ?, ?)
+            """,
+            (stored["id"], timestamp, timestamp),
+        )
+        conn.commit()
+
+        assert file_storage.delete_physical_file_if_unreferenced(conn, stored["id"]) is False
+        conn.execute("DELETE FROM mexico_approval_attachments WHERE source_file_id = 'file-1'")
+        assert file_storage.delete_physical_file_if_unreferenced(conn, stored["id"]) is True
+
+
+def test_failed_stream_write_removes_temporary_part_file(isolated_db):
+    from backend.app import file_storage
+
+    file_storage = importlib.reload(file_storage)
+
+    class BrokenStream:
+        def __init__(self):
+            self.calls = 0
+
+        def read(self, _size):
+            self.calls += 1
+            if self.calls == 1:
+                return b"partial"
+            raise OSError("connection reset")
+
+    with pytest.raises(OSError, match="connection reset"):
+        file_storage.write_stream(BrokenStream())
+
+    temporary_dir = isolated_db.ATTACHMENT_STORAGE_DIR / "tmp"
+    assert list(temporary_dir.glob("*.part")) == []

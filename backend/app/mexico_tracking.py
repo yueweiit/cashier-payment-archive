@@ -6,7 +6,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 
@@ -1135,6 +1135,314 @@ def cache_mexico_workflow_snapshots(
             conn.rollback()
         raise
     return summary
+
+
+def _attachment_items(value: Any) -> list[Dict[str, Any]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _attachment_value(item: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _attachment_size(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_mexico_attachment_candidates(
+    workflows: list[Dict[str, Any]],
+    source_attachments: list[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Merge workflow and source-table attachments by DingTalk file identity."""
+
+    process_instances = {
+        str(workflow.get("approval_no") or "").strip(): str(
+            workflow.get("process_instance_id") or ""
+        ).strip()
+        for workflow in workflows
+        if str(workflow.get("approval_no") or "").strip()
+    }
+    merged: Dict[tuple[str, str], Dict[str, Any]] = {}
+
+    def add(item: Dict[str, Any], *, approval_no: str, event_key: Optional[str] = None) -> None:
+        normalized_approval = str(approval_no or "").strip()
+        source_file_id = str(
+            _attachment_value(
+                item,
+                "source_file_id",
+                "file_id",
+                "fileId",
+                "spaceId",
+                "attachment_id",
+                "id",
+            )
+            or ""
+        ).strip()
+        if not normalized_approval or not source_file_id:
+            return
+        key = (normalized_approval, source_file_id)
+        candidate = merged.setdefault(
+            key,
+            {
+                "approval_no": normalized_approval,
+                "process_instance_id": process_instances.get(normalized_approval, ""),
+                "source_file_id": source_file_id,
+                "file_id": source_file_id,
+                "event_key": event_key,
+                "file_name": None,
+                "mime_type": None,
+                "size_bytes": None,
+                "source_url": None,
+            },
+        )
+        values = {
+            "event_key": event_key or item.get("event_key"),
+            "process_instance_id": item.get("process_instance_id")
+            or process_instances.get(normalized_approval),
+            "file_name": _attachment_value(
+                item, "file_name", "fileName", "name", "title"
+            ),
+            "mime_type": _attachment_value(
+                item, "mime_type", "contentType", "file_type", "fileType", "type"
+            ),
+            "size_bytes": _attachment_size(
+                _attachment_value(item, "size_bytes", "file_size", "fileSize", "size")
+            ),
+            "source_url": _attachment_value(item, "source_url", "downloadUrl", "url"),
+        }
+        for field, value in values.items():
+            if value not in (None, "") and candidate.get(field) in (None, ""):
+                candidate[field] = value
+
+    for item in source_attachments:
+        add(item, approval_no=str(item.get("approval_no") or ""))
+    for workflow in workflows:
+        approval_no = str(workflow.get("approval_no") or "").strip()
+        for event in workflow.get("events") or []:
+            if not isinstance(event, dict):
+                continue
+            event_key = str(event.get("event_key") or "").strip() or None
+            for field in ("images", "attachments"):
+                for item in _attachment_items(event.get(field)):
+                    add(item, approval_no=approval_no, event_key=event_key)
+
+    return [merged[key] for key in sorted(merged)]
+
+
+def upsert_mexico_attachment_candidates(
+    conn: sqlite3.Connection,
+    candidates: list[Dict[str, Any]],
+    *,
+    synced_at: Optional[str] = None,
+    manage_transaction: bool = True,
+) -> Dict[str, int]:
+    """Register candidates without resetting ready or retryable attachment state."""
+
+    timestamp = synced_at or _now_iso()
+    summary = {"inserted": 0, "updated": 0, "existing": 0}
+    try:
+        if manage_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        for candidate in candidates:
+            approval_no = str(candidate.get("approval_no") or "").strip()
+            source_file_id = str(
+                candidate.get("source_file_id") or candidate.get("file_id") or ""
+            ).strip()
+            if not approval_no or not source_file_id:
+                continue
+            existing = conn.execute(
+                """
+                SELECT * FROM mexico_approval_attachments
+                WHERE approval_no = ? AND source_file_id = ?
+                """,
+                (approval_no, source_file_id),
+            ).fetchone()
+            values = {
+                "event_key": candidate.get("event_key"),
+                "file_name": candidate.get("file_name"),
+                "mime_type": candidate.get("mime_type"),
+                "size_bytes": _attachment_size(candidate.get("size_bytes")),
+                "source_url": candidate.get("source_url"),
+            }
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO mexico_approval_attachments (
+                        approval_no, event_key, source_file_id, file_name,
+                        mime_type, size_bytes, source_url, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        approval_no,
+                        values["event_key"],
+                        source_file_id,
+                        values["file_name"],
+                        values["mime_type"],
+                        values["size_bytes"],
+                        values["source_url"],
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                summary["inserted"] += 1
+                continue
+            # A later inventory source can know less than an earlier one. Keep
+            # the richer metadata instead of clearing it during an idempotent
+            # rescan of the same DingTalk file.
+            values = {
+                field: existing[field] if value in (None, "") else value
+                for field, value in values.items()
+            }
+            changed = any(existing[field] != value for field, value in values.items())
+            if changed:
+                conn.execute(
+                    """
+                    UPDATE mexico_approval_attachments
+                    SET event_key = ?, file_name = ?, mime_type = ?, size_bytes = ?,
+                        source_url = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (*values.values(), timestamp, existing["id"]),
+                )
+                summary["updated"] += 1
+            else:
+                summary["existing"] += 1
+        if manage_transaction:
+            conn.commit()
+    except Exception:
+        if manage_transaction:
+            conn.rollback()
+        raise
+    return summary
+
+
+def list_mexico_attachment_download_candidates(
+    conn: sqlite3.Connection,
+    approval_nos: Iterable[str],
+    *,
+    now: Optional[str] = None,
+    stale_after_seconds: int = 1800,
+) -> list[Dict[str, Any]]:
+    normalized = sorted(
+        {str(value or "").strip() for value in approval_nos if str(value or "").strip()}
+    )
+    if not normalized:
+        return []
+    current = datetime.fromisoformat(now) if now else datetime.now(tz=SHANGHAI_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SHANGHAI_TZ)
+    stale_before = (current - timedelta(seconds=max(1, stale_after_seconds))).isoformat(
+        timespec="microseconds"
+    )
+    placeholders = ",".join("?" for _ in normalized)
+    rows = conn.execute(
+        f"""
+        SELECT a.id AS attachment_id, a.approval_no, a.event_key,
+               a.source_file_id, a.source_file_id AS file_id,
+               a.file_name, a.mime_type, a.size_bytes, a.source_url,
+               a.status, a.attempts, t.process_instance_id
+        FROM mexico_approval_attachments AS a
+        JOIN mexico_approval_tracking AS t ON t.approval_no = a.approval_no
+        WHERE a.approval_no IN ({placeholders})
+          AND (
+              a.status IN ('pending', 'failed')
+              OR (a.status = 'downloading' AND a.updated_at <= ?)
+          )
+          AND TRIM(COALESCE(t.process_instance_id, '')) <> ''
+        ORDER BY a.approval_no, a.id
+        """,
+        (*normalized, stale_before),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_mexico_attachments_downloading(
+    conn: sqlite3.Connection,
+    attachment_ids: list[int],
+    *,
+    timestamp: Optional[str] = None,
+    manage_transaction: bool = True,
+) -> None:
+    if not attachment_ids:
+        return
+    changed_at = timestamp or _now_iso()
+    try:
+        if manage_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        conn.executemany(
+            """
+            UPDATE mexico_approval_attachments
+            SET status = 'downloading', attempts = attempts + 1,
+                last_error = NULL, updated_at = ?
+            WHERE id = ? AND status IN ('pending', 'failed', 'downloading')
+            """,
+            [(changed_at, int(attachment_id)) for attachment_id in attachment_ids],
+        )
+        if manage_transaction:
+            conn.commit()
+    except Exception:
+        if manage_transaction:
+            conn.rollback()
+        raise
+
+
+def mark_mexico_attachment_failed(
+    conn: sqlite3.Connection,
+    attachment_id: int,
+    error_message: str,
+    *,
+    timestamp: Optional[str] = None,
+    manage_transaction: bool = True,
+) -> None:
+    changed_at = timestamp or _now_iso()
+    conn.execute(
+        """
+        UPDATE mexico_approval_attachments
+        SET status = 'failed', last_error = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (str(error_message)[:2000], changed_at, int(attachment_id)),
+    )
+    if manage_transaction:
+        conn.commit()
+
+
+def mark_mexico_attachment_ready(
+    conn: sqlite3.Connection,
+    attachment_id: int,
+    *,
+    file_object_id: int,
+    timestamp: Optional[str] = None,
+    manage_transaction: bool = True,
+) -> None:
+    changed_at = timestamp or _now_iso()
+    conn.execute(
+        """
+        UPDATE mexico_approval_attachments
+        SET status = 'ready', file_object_id = ?, last_error = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (int(file_object_id), changed_at, int(attachment_id)),
+    )
+    if manage_transaction:
+        conn.commit()
 
 
 def _as_shanghai(value: datetime) -> datetime:
