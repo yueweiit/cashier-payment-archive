@@ -1489,3 +1489,453 @@ def build_bilingual_reminder(
             f"Enlace del flujo: {workflow_url}"
         ),
     }
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return _as_shanghai(parsed)
+
+
+def _mexico_tracking_view_clause(view: str) -> tuple[str, list[Any]]:
+    normalized = str(view or "pending").strip().lower()
+    if normalized == "pending":
+        return (
+            "resolved_region = 'mexico' AND region_review_status = 'resolved' "
+            "AND UPPER(COALESCE(workflow_status, '')) = 'RUNNING' "
+            "AND LOWER(COALESCE(workflow_result, '')) NOT IN ('refuse', 'rejected')",
+            [],
+        )
+    if normalized == "history":
+        return (
+            "resolved_region = 'mexico' AND region_review_status = 'resolved' "
+            "AND (UPPER(COALESCE(workflow_status, '')) <> 'RUNNING' "
+            "OR LOWER(COALESCE(workflow_result, '')) IN ('refuse', 'rejected'))",
+            [],
+        )
+    if normalized == "review":
+        return (
+            "(resolved_region = 'review' OR region_review_status = 'pending')",
+            [],
+        )
+    raise ValueError("view must be pending, history or review")
+
+
+def _mexico_tracking_where(
+    *,
+    view: str,
+    allowed_sheets: Optional[set[str]] = None,
+    keyword: Optional[str] = None,
+    company: Optional[str] = None,
+    source_type: Optional[str] = None,
+    applicant: Optional[str] = None,
+    approver: Optional[str] = None,
+    node: Optional[str] = None,
+    request_date_from: Optional[str] = None,
+    request_date_to: Optional[str] = None,
+) -> tuple[str, list[Any]]:
+    view_clause, params = _mexico_tracking_view_clause(view)
+    clauses = [view_clause]
+    if allowed_sheets is not None:
+        sheets = sorted(str(item).strip() for item in allowed_sheets if str(item).strip())
+        if not sheets:
+            clauses.append("0 = 1")
+        else:
+            placeholders = ", ".join("?" for _ in sheets)
+            clauses.append(
+                f"COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') IN ({placeholders})"
+            )
+            params.extend(sheets)
+    if keyword and str(keyword).strip():
+        token = f"%{str(keyword).strip()}%"
+        clauses.append(
+            "(" + " OR ".join(
+                f"COALESCE({column}, '') LIKE ?"
+                for column in (
+                    "approval_no",
+                    "applicant_name",
+                    "summary",
+                    "company_name",
+                    "source_sheet",
+                    "current_approver_name",
+                    "current_node_name",
+                )
+            ) + ")"
+        )
+        params.extend([token] * 7)
+    for value, column in (
+        (company, "company_name"),
+        (source_type, "source_type"),
+        (applicant, "applicant_name"),
+        (approver, "current_approver_name"),
+        (node, "current_node_name"),
+    ):
+        if value and str(value).strip():
+            clauses.append(f"COALESCE({column}, '') = ?")
+            params.append(str(value).strip())
+    if request_date_from and str(request_date_from).strip():
+        clauses.append("request_date >= ?")
+        params.append(str(request_date_from).strip())
+    if request_date_to and str(request_date_to).strip():
+        clauses.append("request_date <= ?")
+        params.append(str(request_date_to).strip())
+    return " AND ".join(f"({clause})" for clause in clauses), params
+
+
+def _mexico_tracking_public(
+    row: sqlite3.Row | Dict[str, Any],
+    *,
+    settings: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    payload = dict(row)
+    entered_at = _parse_datetime(payload.get("current_node_entered_at"))
+    age_days = node_age_days(entered_at, now=now) if entered_at is not None else 0
+    payload["age_days"] = age_days
+    payload["warning_level"] = warning_level(
+        age_days,
+        yellow_days=int(settings["yellow_days"]),
+        red_days=int(settings["red_days"]),
+    )
+    if (
+        str(payload.get("resolved_region") or "") == "mexico"
+        and str(payload.get("workflow_status") or "").upper() == "RUNNING"
+    ):
+        payload["reminder"] = build_bilingual_reminder(
+            approval_no=str(payload.get("approval_no") or ""),
+            applicant=str(payload.get("applicant_name") or "-"),
+            current_node=str(payload.get("current_node_name") or "-"),
+            current_approver=str(payload.get("current_approver_name") or "-"),
+            age_days=age_days,
+            workflow_url=str(payload.get("workflow_url") or ""),
+        )
+    else:
+        payload["reminder"] = None
+    payload.pop("raw_summary_json", None)
+    return payload
+
+
+def list_mexico_tracking(
+    conn: sqlite3.Connection,
+    *,
+    view: str = "pending",
+    page: int = 1,
+    page_size: int = 50,
+    allowed_sheets: Optional[set[str]] = None,
+    keyword: Optional[str] = None,
+    company: Optional[str] = None,
+    source_type: Optional[str] = None,
+    applicant: Optional[str] = None,
+    approver: Optional[str] = None,
+    node: Optional[str] = None,
+    warning: Optional[str] = None,
+    request_date_from: Optional[str] = None,
+    request_date_to: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Return a lightweight, permission-filtered Mexico tracking page."""
+
+    current_page = max(1, int(page))
+    limit = min(100, max(1, int(page_size)))
+    where, params = _mexico_tracking_where(
+        view=view,
+        allowed_sheets=allowed_sheets,
+        keyword=keyword,
+        company=company,
+        source_type=source_type,
+        applicant=applicant,
+        approver=approver,
+        node=node,
+        request_date_from=request_date_from,
+        request_date_to=request_date_to,
+    )
+    settings = get_mexico_tracking_settings(conn)
+    rows = conn.execute(
+        f"""
+        SELECT id, approval_no, source_type, resolved_region,
+               region_resolution_source, region_review_status,
+               region_conflict_reason, request_date, applicant_name,
+               applicant_department, company_name, source_sheet, summary,
+               amount, currency, workflow_status, workflow_result,
+               current_node_name, current_approver_name,
+               current_node_entered_at, workflow_url, last_state_synced_at,
+               last_attachment_synced_at, last_synced_at, version, updated_at
+        FROM mexico_approval_tracking
+        WHERE {where}
+        ORDER BY
+            CASE WHEN current_node_entered_at IS NULL OR TRIM(current_node_entered_at) = '' THEN 1 ELSE 0 END,
+            current_node_entered_at ASC,
+            COALESCE(request_date, '') DESC,
+            id DESC
+        """,
+        params,
+    ).fetchall()
+    items = [
+        _mexico_tracking_public(row, settings=settings, now=now)
+        for row in rows
+    ]
+    requested_warning = str(warning or "").strip().lower()
+    if requested_warning:
+        if requested_warning not in {"normal", "yellow", "red"}:
+            raise ValueError("warning must be normal, yellow or red")
+        items = [item for item in items if item["warning_level"] == requested_warning]
+    total = len(items)
+    start = (current_page - 1) * limit
+    return {
+        "items": items[start : start + limit],
+        "total": total,
+        "page": current_page,
+        "page_size": limit,
+        "pages": max(1, (total + limit - 1) // limit),
+    }
+
+
+def summarize_mexico_tracking(
+    conn: sqlite3.Connection,
+    *,
+    allowed_sheets: Optional[set[str]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, int]:
+    pending = list_mexico_tracking(
+        conn,
+        view="pending",
+        page=1,
+        page_size=100,
+        allowed_sheets=allowed_sheets,
+        now=now,
+    )
+    # Summary must not be truncated by the public page-size ceiling.
+    pending_items = pending["items"]
+    if pending["total"] > len(pending_items):
+        where, params = _mexico_tracking_where(
+            view="pending", allowed_sheets=allowed_sheets
+        )
+        settings = get_mexico_tracking_settings(conn)
+        rows = conn.execute(
+            f"SELECT * FROM mexico_approval_tracking WHERE {where}", params
+        ).fetchall()
+        pending_items = [
+            _mexico_tracking_public(row, settings=settings, now=now) for row in rows
+        ]
+    history_where, history_params = _mexico_tracking_where(
+        view="history", allowed_sheets=allowed_sheets
+    )
+    review_where, review_params = _mexico_tracking_where(
+        view="review", allowed_sheets=allowed_sheets
+    )
+    counts = {"normal": 0, "yellow": 0, "red": 0}
+    for item in pending_items:
+        counts[item["warning_level"]] += 1
+    counts.update(
+        {
+            "pending": len(pending_items),
+            "history": int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM mexico_approval_tracking WHERE {history_where}",
+                    history_params,
+                ).fetchone()[0]
+            ),
+            "review": int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM mexico_approval_tracking WHERE {review_where}",
+                    review_params,
+                ).fetchone()[0]
+            ),
+        }
+    )
+    return counts
+
+
+def mexico_tracking_filter_options(
+    conn: sqlite3.Connection,
+    *,
+    allowed_sheets: Optional[set[str]] = None,
+) -> Dict[str, list[str]]:
+    where, params = _mexico_tracking_where(
+        view="pending", allowed_sheets=allowed_sheets
+    )
+    rows = conn.execute(
+        f"""
+        SELECT company_name, source_sheet, source_type, applicant_name,
+               current_approver_name, current_node_name
+        FROM mexico_approval_tracking
+        WHERE {where}
+        """,
+        params,
+    ).fetchall()
+
+    def distinct(key: str) -> list[str]:
+        return sorted(
+            {
+                str(row[key]).strip()
+                for row in rows
+                if row[key] is not None and str(row[key]).strip()
+            }
+        )
+
+    return {
+        "companies": distinct("company_name"),
+        "sheets": distinct("source_sheet"),
+        "source_types": distinct("source_type"),
+        "applicants": distinct("applicant_name"),
+        "approvers": distinct("current_approver_name"),
+        "nodes": distinct("current_node_name"),
+    }
+
+
+def get_mexico_tracking_detail(
+    conn: sqlite3.Connection,
+    tracking_id: int,
+    *,
+    allowed_sheets: Optional[set[str]] = None,
+    allow_review: bool = True,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM mexico_approval_tracking WHERE id = ?", (int(tracking_id),)
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"Mexico tracking item {tracking_id} does not exist")
+    if (
+        not allow_review
+        and (
+            str(row["resolved_region"] or "") == "review"
+            or str(row["region_review_status"] or "") == "pending"
+        )
+    ):
+        raise PermissionError("review item is restricted")
+    if allowed_sheets is not None and str(row["source_sheet"] or "").strip() not in allowed_sheets:
+        raise PermissionError("sheet access denied")
+    settings = get_mexico_tracking_settings(conn)
+    payload = _mexico_tracking_public(row, settings=settings, now=now)
+    events = conn.execute(
+        """
+        SELECT * FROM mexico_approval_events
+        WHERE approval_no = ?
+        ORDER BY CASE WHEN event_time IS NULL OR TRIM(event_time) = '' THEN 1 ELSE 0 END,
+                 event_time, sequence_index, id
+        """,
+        (row["approval_no"],),
+    ).fetchall()
+    payload["events"] = []
+    for event in events:
+        item = dict(event)
+        for key in ("images_json", "attachments_json"):
+            try:
+                item[key.removesuffix("_json")] = json.loads(item.get(key) or "[]")
+            except (TypeError, json.JSONDecodeError):
+                item[key.removesuffix("_json")] = []
+            item.pop(key, None)
+        payload["events"].append(item)
+    attachment_rows = conn.execute(
+        """
+        SELECT id, event_key, source_file_id, file_name, mime_type, size_bytes,
+               status, attempts, last_error, file_object_id, created_at, updated_at
+        FROM mexico_approval_attachments
+        WHERE approval_no = ? ORDER BY id
+        """,
+        (row["approval_no"],),
+    ).fetchall()
+    payload["attachments"] = []
+    for attachment in attachment_rows:
+        item = dict(attachment)
+        item["content_url"] = (
+            f"/api/mexico-tracking/{tracking_id}/attachments/{item['id']}/content"
+            if item["status"] == "ready" and item["file_object_id"]
+            else None
+        )
+        payload["attachments"].append(item)
+    payload["linked_requests"] = [
+        dict(linked)
+        for linked in conn.execute(
+            """
+            SELECT payment_requests.id, payment_requests.batch_id,
+                   request_batches.name AS batch_name, payment_requests.dingding_id,
+                   payment_requests.source_sheet, payment_requests.summary,
+                   payment_requests.payment_status, payment_requests.amount,
+                   payment_requests.paid_amount, payment_requests.pending_amount,
+                   payment_requests.currency, mexico_approval_request_links.is_primary
+            FROM mexico_approval_request_links
+            JOIN payment_requests
+              ON payment_requests.id = mexico_approval_request_links.request_id
+            JOIN request_batches ON request_batches.id = payment_requests.batch_id
+            WHERE mexico_approval_request_links.approval_no = ?
+            ORDER BY mexico_approval_request_links.is_primary DESC, payment_requests.id
+            """,
+            (row["approval_no"],),
+        ).fetchall()
+    ]
+    return payload
+
+
+def resolve_mexico_tracking_region(
+    conn: sqlite3.Connection,
+    tracking_id: int,
+    *,
+    region: str,
+    expected_version: int,
+    actor_id: Optional[int],
+) -> Dict[str, Any]:
+    target = str(region or "").strip().lower()
+    if target not in {"china", "mexico"}:
+        raise ValueError("region must be china or mexico")
+    timestamp = _now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current = conn.execute(
+            "SELECT * FROM mexico_approval_tracking WHERE id = ?", (int(tracking_id),)
+        ).fetchone()
+        if current is None:
+            raise KeyError(f"Mexico tracking item {tracking_id} does not exist")
+        if int(current["version"] or 1) != int(expected_version):
+            raise ValueError(
+                f"VERSION_CONFLICT: current={int(current['version'] or 1)} expected={int(expected_version)}"
+            )
+        changed = conn.execute(
+            """
+            UPDATE mexico_approval_tracking
+            SET resolved_region = ?, region_resolution_source = 'admin_override',
+                region_review_status = 'resolved', region_reviewed_by = ?,
+                region_reviewed_at = ?, version = version + 1, updated_at = ?
+            WHERE id = ? AND version = ?
+            """,
+            (target, actor_id, timestamp, timestamp, int(tracking_id), int(expected_version)),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("VERSION_CONFLICT")
+        from .db import write_audit
+
+        write_audit(
+            conn,
+            actor_id,
+            "mexico.region_resolve",
+            "mexico_approval_tracking",
+            entity_id=int(tracking_id),
+            old_value={
+                "resolved_region": current["resolved_region"],
+                "region_review_status": current["region_review_status"],
+                "version": current["version"],
+            },
+            new_value={
+                "resolved_region": target,
+                "region_review_status": "resolved",
+                "version": int(expected_version) + 1,
+            },
+        )
+        updated = conn.execute(
+            "SELECT * FROM mexico_approval_tracking WHERE id = ?", (int(tracking_id),)
+        ).fetchone()
+        conn.commit()
+        return _mexico_tracking_public(
+            updated, settings=get_mexico_tracking_settings(conn)
+        )
+    except Exception:
+        conn.rollback()
+        raise

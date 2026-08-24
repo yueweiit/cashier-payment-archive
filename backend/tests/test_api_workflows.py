@@ -4675,3 +4675,94 @@ def test_historical_currency_restore_uses_explicit_peso_total_in_summary():
         assert candidate["source_amount"] == 76800
         assert candidate["base_amount_cny"] == 29952
         assert candidate["currency_source"] == "summary_text"
+
+
+def test_mexico_tracking_api_enforces_review_and_sheet_permissions():
+    with TestClient(app) as admin_client, TestClient(app) as business_client:
+        login(admin_client)
+        created_user = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": "mexico-tracking-sheet-user",
+                "password": "Yuewei123",
+                "display_name": "墨西哥跟进用户",
+                "role": "business",
+                "active": True,
+                "sheet_permissions": ["YW MOLDES MX模具"],
+            },
+        )
+        assert created_user.status_code == 200, created_user.text
+        timestamp = now_iso()
+        with connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO mexico_approval_tracking (
+                    approval_no, source_type, resolved_region,
+                    region_resolution_source, region_review_status,
+                    source_sheet, company_name, applicant_name, summary,
+                    workflow_status, current_node_name, current_approver_name,
+                    current_node_entered_at, created_at, updated_at
+                ) VALUES (?, 'purchase', 'mexico', 'execution_region', 'resolved',
+                          ?, ?, '甲', '待审批', 'RUNNING', '会计', '乙', ?, ?, ?)
+                """,
+                (
+                    "MX-API-AUTHORIZED",
+                    "YW MOLDES MX模具",
+                    "YW MOLDES MX模具",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO mexico_approval_tracking (
+                    approval_no, source_type, resolved_region,
+                    region_resolution_source, region_review_status,
+                    source_sheet, company_name, applicant_name, summary,
+                    workflow_status, current_node_name, current_approver_name,
+                    current_node_entered_at, created_at, updated_at
+                ) VALUES (?, 'operation', 'mexico', 'execution_region', 'resolved',
+                          ?, ?, '丙', '无权记录', 'RUNNING', '审批', '丁', ?, ?, ?)
+                """,
+                (
+                    "MX-API-DENIED",
+                    "UV IMPRESION MX彩印",
+                    "UV IMPRESION MX彩印",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO mexico_approval_tracking (
+                    approval_no, source_type, resolved_region,
+                    region_resolution_source, region_review_status,
+                    source_sheet, summary, workflow_status, created_at, updated_at
+                ) VALUES (?, 'operation', 'review', 'conflict', 'pending',
+                          ?, '地区冲突', 'RUNNING', ?, ?)
+                """,
+                ("MX-API-REVIEW", "YW MOLDES MX模具", timestamp, timestamp),
+            )
+
+        login(business_client, "mexico-tracking-sheet-user", "Yuewei123")
+        listed = business_client.get("/api/mexico-tracking?view=pending")
+        assert listed.status_code == 200, listed.text
+        assert [item["approval_no"] for item in listed.json()["items"]] == [
+            "MX-API-AUTHORIZED"
+        ]
+        assert business_client.get("/api/mexico-tracking?view=review").status_code == 403
+
+        review = admin_client.get("/api/mexico-tracking?view=review")
+        assert review.status_code == 200, review.text
+        assert any(item["approval_no"] == "MX-API-REVIEW" for item in review.json()["items"])
+        assert business_client.put(
+            "/api/mexico-tracking/settings",
+            json={
+                "yellow_days": 2,
+                "red_days": 5,
+                "cache_stale_seconds": 300,
+                "china_region_isolation_enabled": False,
+            },
+        ).status_code == 403

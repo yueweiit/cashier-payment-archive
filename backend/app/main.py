@@ -97,12 +97,19 @@ from .mexico_tracking import (
     collect_mexico_attachment_candidates,
     complete_mexico_sync_run,
     fail_mexico_sync_run,
+    get_mexico_tracking_detail,
+    get_mexico_tracking_settings,
     get_mexico_sync_run,
+    list_mexico_tracking,
     list_mexico_attachment_download_candidates,
     mark_mexico_attachment_failed,
     mark_mexico_attachment_ready,
     mark_mexico_attachments_downloading,
+    mexico_tracking_filter_options,
     persist_request_region,
+    resolve_mexico_tracking_region,
+    summarize_mexico_tracking,
+    update_mexico_tracking_settings,
     upsert_mexico_attachment_candidates,
     update_mexico_sync_run,
 )
@@ -256,6 +263,18 @@ class ForeignAmountCorrectionIn(BaseModel):
 class RequestGridPreferenceIn(BaseModel):
     order: list[str] = Field(default_factory=list)
     hidden: list[str] = Field(default_factory=list)
+
+
+class MexicoTrackingSettingsIn(BaseModel):
+    yellow_days: int = Field(ge=0, le=365)
+    red_days: int = Field(ge=1, le=365)
+    cache_stale_seconds: int = Field(ge=0, le=86400)
+    china_region_isolation_enabled: bool = False
+
+
+class MexicoRegionResolutionIn(BaseModel):
+    region: str
+    expected_version: int = Field(ge=1)
 
 
 class HistoricalCurrencyRestoreIn(BaseModel):
@@ -673,6 +692,18 @@ def sheet_access_filter(
 
 
 def daily_payables_allowed_sheets(conn, user: Dict[str, Any]) -> Optional[set[str]]:
+    if not user_has_restricted_sheet_access(user):
+        return None
+    return {
+        canonical_sheet_name(sheet_name)
+        for sheet_name in load_user_sheet_permissions(conn, int(user["id"]))
+    }
+
+
+def mexico_tracking_allowed_sheets(
+    conn,
+    user: Dict[str, Any],
+) -> Optional[set[str]]:
     if not user_has_restricted_sheet_access(user):
         return None
     return {
@@ -6667,6 +6698,203 @@ def get_mexico_tracking_sync_status(
         except KeyError:
             raise HTTPException(status_code=404, detail="墨西哥同步任务不存在")
     return {"run": run}
+
+
+@app.get("/api/mexico-tracking/summary")
+def get_mexico_tracking_summary(
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        allowed_sheets = mexico_tracking_allowed_sheets(conn, user)
+        return {"summary": summarize_mexico_tracking(conn, allowed_sheets=allowed_sheets)}
+
+
+@app.get("/api/mexico-tracking/filter-options")
+def get_mexico_tracking_filter_options(
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        allowed_sheets = mexico_tracking_allowed_sheets(conn, user)
+        return {
+            "options": mexico_tracking_filter_options(
+                conn,
+                allowed_sheets=allowed_sheets,
+            )
+        }
+
+
+@app.get("/api/mexico-tracking/settings")
+def get_mexico_settings(
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        return {"settings": get_mexico_tracking_settings(conn)}
+
+
+@app.put("/api/mexico-tracking/settings")
+def save_mexico_settings(
+    payload: MexicoTrackingSettingsIn,
+    user: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        old_settings = get_mexico_tracking_settings(conn)
+        try:
+            settings = update_mexico_tracking_settings(
+                conn,
+                yellow_days=payload.yellow_days,
+                red_days=payload.red_days,
+                cache_stale_seconds=payload.cache_stale_seconds,
+                china_region_isolation_enabled=payload.china_region_isolation_enabled,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        write_audit(
+            conn,
+            user.get("id"),
+            "mexico.settings_update",
+            "app_settings",
+            old_value=old_settings,
+            new_value=settings,
+        )
+    return {"settings": settings}
+
+
+@app.get("/api/mexico-tracking")
+def get_mexico_tracking_list(
+    view: str = Query(default="pending", pattern="^(pending|history|review)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+    keyword: Optional[str] = Query(default=None),
+    company: Optional[str] = Query(default=None),
+    source_type: Optional[str] = Query(default=None),
+    applicant: Optional[str] = Query(default=None),
+    approver: Optional[str] = Query(default=None),
+    node: Optional[str] = Query(default=None),
+    warning: Optional[str] = Query(default=None),
+    request_date_from: Optional[str] = Query(default=None),
+    request_date_to: Optional[str] = Query(default=None),
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    if view == "review" and user["role"] != ROLE_ADMIN:
+        raise HTTPException(status_code=403, detail="仅管理员可查看地区待核对记录")
+    with connect() as conn:
+        allowed_sheets = mexico_tracking_allowed_sheets(conn, user)
+        try:
+            return list_mexico_tracking(
+                conn,
+                view=view,
+                page=page,
+                page_size=page_size,
+                allowed_sheets=allowed_sheets,
+                keyword=keyword,
+                company=company,
+                source_type=source_type,
+                applicant=applicant,
+                approver=approver,
+                node=node,
+                warning=warning,
+                request_date_from=request_date_from,
+                request_date_to=request_date_to,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/mexico-tracking/{tracking_id}/resolve-region")
+def resolve_mexico_region(
+    tracking_id: int,
+    payload: MexicoRegionResolutionIn,
+    user: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        try:
+            item = resolve_mexico_tracking_region(
+                conn,
+                tracking_id,
+                region=payload.region,
+                expected_version=payload.expected_version,
+                actor_id=user.get("id"),
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="墨西哥审批记录不存在")
+        except ValueError as exc:
+            message = str(exc)
+            if "VERSION_CONFLICT" in message:
+                current = conn.execute(
+                    "SELECT version FROM mexico_approval_tracking WHERE id = ?",
+                    (tracking_id,),
+                ).fetchone()
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "VERSION_CONFLICT",
+                        "entity_type": "mexico_approval_tracking",
+                        "entity_id": tracking_id,
+                        "current_version": int(current["version"]) if current else None,
+                        "message": "记录已被其他操作更新，请刷新后重试",
+                    },
+                )
+            raise HTTPException(status_code=400, detail=message)
+    return {"item": item}
+
+
+@app.get("/api/mexico-tracking/{tracking_id}")
+def get_mexico_tracking_item(
+    tracking_id: int,
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        try:
+            item = get_mexico_tracking_detail(
+                conn,
+                tracking_id,
+                allowed_sheets=mexico_tracking_allowed_sheets(conn, user),
+                allow_review=user["role"] == ROLE_ADMIN,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="墨西哥审批记录不存在")
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="无权查看该审批记录")
+    return {"item": item}
+
+
+@app.get("/api/mexico-tracking/{tracking_id}/attachments/{attachment_id}/content")
+def get_mexico_tracking_attachment(
+    tracking_id: int,
+    attachment_id: int,
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> FileResponse:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT a.*, t.source_sheet, t.resolved_region, t.region_review_status
+            FROM mexico_approval_attachments AS a
+            JOIN mexico_approval_tracking AS t ON t.approval_no = a.approval_no
+            WHERE a.id = ? AND t.id = ?
+            """,
+            (attachment_id, tracking_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="附件不存在")
+        if (
+            str(row["resolved_region"] or "") == "review"
+            or str(row["region_review_status"] or "") == "pending"
+        ) and user["role"] != ROLE_ADMIN:
+            raise HTTPException(status_code=403, detail="无权查看待核对记录附件")
+        ensure_sheet_access(conn, user, row["source_sheet"])
+        if row["status"] != "ready" or not row["file_object_id"]:
+            raise HTTPException(status_code=404, detail="附件尚未同步完成")
+        path, _ = resolve_attachment_path(row, conn)
+        file_name = str(row["file_name"] or path.name)
+        mime_type = str(row["mime_type"] or "application/octet-stream")
+    return FileResponse(
+        path,
+        media_type=mime_type,
+        filename=file_name,
+        content_disposition_type=(
+            "inline" if mime_type.startswith("image/") or mime_type == "application/pdf" else "attachment"
+        ),
+    )
 
 
 @app.get("/api/import-jobs/{job_id}")

@@ -21,7 +21,12 @@ from backend.app.mexico_tracking import (
     complete_mexico_sync_run,
     fail_mexico_sync_run,
     get_mexico_sync_run,
+    get_mexico_tracking_detail,
     get_mexico_tracking_settings,
+    list_mexico_tracking,
+    mexico_tracking_filter_options,
+    resolve_mexico_tracking_region,
+    summarize_mexico_tracking,
     list_mexico_attachment_download_candidates,
     mark_mexico_attachment_failed,
     mark_mexico_attachment_ready,
@@ -1170,6 +1175,238 @@ def _insert_mexico_tracking_row(conn, approval_no: str = "202608241200000000888"
         (approval_no, timestamp, timestamp),
     )
     conn.commit()
+
+
+def _insert_tracking_case(
+    conn,
+    *,
+    approval_no: str,
+    sheet: str,
+    status: str = "RUNNING",
+    result: str = "",
+    region: str = "mexico",
+    review_status: str = "resolved",
+    node_entered_at: str = "2026-08-20T09:00:00.000000+08:00",
+    applicant: str = "Nelly Mendez",
+    approver: str = "Eduardo Gomez",
+) -> int:
+    timestamp = "2026-08-24T12:00:00.000000+08:00"
+    cursor = conn.execute(
+        """
+        INSERT INTO mexico_approval_tracking (
+            approval_no, source_type, process_instance_id, resolved_region,
+            region_resolution_source, region_review_status, request_date,
+            applicant_name, applicant_department, company_name, source_sheet,
+            summary, amount, currency, workflow_status, workflow_result,
+            current_node_name, current_approver_name, current_node_entered_at,
+            workflow_url, created_at, updated_at
+        ) VALUES (?, 'purchase', ?, ?, 'execution_region', ?, '2026-08-20',
+                  ?, ?, ?, ?, 'Compra de materiales', 1200, 'MXN', ?, ?,
+                  'Director approval', ?, ?, 'https://oa.example/approval', ?, ?)
+        """,
+        (
+            approval_no,
+            f"process-{approval_no}",
+            region,
+            review_status,
+            applicant,
+            sheet,
+            sheet,
+            sheet,
+            status,
+            result,
+            approver,
+            node_entered_at,
+            timestamp,
+            timestamp,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def test_mexico_tracking_list_separates_pending_history_and_review(isolated_db) -> None:
+    now = datetime.fromisoformat("2026-08-24T12:00:00+08:00")
+    with isolated_db.connect() as conn:
+        pending_id = _insert_tracking_case(
+            conn,
+            approval_no="MX-PENDING",
+            sheet="YUEWEI MX核心制造",
+        )
+        _insert_tracking_case(
+            conn,
+            approval_no="MX-DONE",
+            sheet="YUEWEI MX核心制造",
+            status="COMPLETED",
+            result="agree",
+        )
+        _insert_tracking_case(
+            conn,
+            approval_no="MX-REVIEW",
+            sheet="未登记公司",
+            region="review",
+            review_status="pending",
+        )
+
+        pending = list_mexico_tracking(conn, view="pending", now=now)
+        history = list_mexico_tracking(conn, view="history", now=now)
+        review = list_mexico_tracking(conn, view="review", now=now)
+
+        assert [item["id"] for item in pending["items"]] == [pending_id]
+        assert [item["approval_no"] for item in history["items"]] == ["MX-DONE"]
+        assert [item["approval_no"] for item in review["items"]] == ["MX-REVIEW"]
+        assert pending["items"][0]["age_days"] == 4
+        assert pending["items"][0]["warning_level"] == "yellow"
+        assert "MX-PENDING" in pending["items"][0]["reminder"]["zh"]
+
+
+def test_mexico_tracking_list_respects_business_sheet_permissions(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        _insert_tracking_case(
+            conn,
+            approval_no="MX-MOLDES",
+            sheet="YW MOLDES MX模具",
+        )
+        _insert_tracking_case(
+            conn,
+            approval_no="MX-LEMOS",
+            sheet="LEMOS MX 销售",
+        )
+
+        result = list_mexico_tracking(
+            conn,
+            view="pending",
+            allowed_sheets={"YW MOLDES MX模具"},
+        )
+        options = mexico_tracking_filter_options(
+            conn,
+            allowed_sheets={"YW MOLDES MX模具"},
+        )
+
+        assert [item["approval_no"] for item in result["items"]] == ["MX-MOLDES"]
+        assert options["companies"] == ["YW MOLDES MX模具"]
+
+
+def test_mexico_tracking_summary_and_warning_filter_use_configured_thresholds(
+    isolated_db,
+) -> None:
+    now = datetime.fromisoformat("2026-08-24T12:00:00+08:00")
+    with isolated_db.connect() as conn:
+        update_mexico_tracking_settings(conn, yellow_days=1, red_days=3)
+        _insert_tracking_case(
+            conn,
+            approval_no="MX-YELLOW",
+            sheet="YUEWEI MX核心制造",
+            node_entered_at="2026-08-22T09:00:00+08:00",
+        )
+        _insert_tracking_case(
+            conn,
+            approval_no="MX-RED",
+            sheet="YUEWEI MX核心制造",
+            node_entered_at="2026-08-19T09:00:00+08:00",
+        )
+
+        summary = summarize_mexico_tracking(conn, now=now)
+        red = list_mexico_tracking(conn, view="pending", warning="red", now=now)
+
+        assert summary["pending"] == 2
+        assert summary["yellow"] == 1
+        assert summary["red"] == 1
+        assert [item["approval_no"] for item in red["items"]] == ["MX-RED"]
+
+
+def test_mexico_tracking_detail_returns_timeline_attachments_and_links(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        tracking_id = _insert_tracking_case(
+            conn,
+            approval_no="MX-DETAIL",
+            sheet="YUEWEI MX核心制造",
+        )
+        timestamp = "2026-08-24T12:00:00.000000+08:00"
+        conn.execute(
+            """
+            INSERT INTO mexico_approval_events (
+                approval_no, event_key, sequence_index, event_type, node_name,
+                result, operator_name, event_time, comment, images_json,
+                attachments_json, is_current, created_at, updated_at
+            ) VALUES ('MX-DETAIL', 'event-1', 1, 'TASK', 'Finance', 'AGREE',
+                      'Keira', '2026-08-23T10:00:00+08:00', 'Reviewed', '[]',
+                      '[]', 0, ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        conn.execute(
+            """
+            INSERT INTO mexico_approval_attachments (
+                approval_no, source_file_id, file_name, mime_type, status,
+                created_at, updated_at
+            ) VALUES ('MX-DETAIL', 'file-1', 'invoice.pdf', 'application/pdf',
+                      'ready', ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        batch_id = int(
+            conn.execute(
+                "INSERT INTO request_batches (name, status, created_at, updated_at) VALUES ('B', 'draft', ?, ?)",
+                (timestamp, timestamp),
+            ).lastrowid
+        )
+        request_id = int(
+            conn.execute(
+                """
+                INSERT INTO payment_requests (
+                    batch_id, dingding_id, source_sheet, summary, amount,
+                    paid_amount, pending_amount, currency, payment_status,
+                    created_at, updated_at
+                ) VALUES (?, 'MX-DETAIL', 'YUEWEI MX核心制造', 'Compra', 1200,
+                          0, 1200, 'MXN', '未付款', ?, ?)
+                """,
+                (batch_id, timestamp, timestamp),
+            ).lastrowid
+        )
+        conn.execute(
+            "INSERT INTO mexico_approval_request_links (approval_no, request_id, is_primary, created_at) VALUES ('MX-DETAIL', ?, 1, ?)",
+            (request_id, timestamp),
+        )
+        conn.commit()
+
+        detail = get_mexico_tracking_detail(conn, tracking_id)
+
+        assert detail["approval_no"] == "MX-DETAIL"
+        assert detail["events"][0]["comment"] == "Reviewed"
+        assert detail["attachments"][0]["file_name"] == "invoice.pdf"
+        assert detail["linked_requests"][0]["id"] == request_id
+
+
+def test_admin_region_resolution_is_versioned_and_auditable(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        tracking_id = _insert_tracking_case(
+            conn,
+            approval_no="MX-REVIEW-RESOLVE",
+            sheet="未登记公司",
+            region="review",
+            review_status="pending",
+        )
+
+        resolved = resolve_mexico_tracking_region(
+            conn,
+            tracking_id,
+            region="mexico",
+            expected_version=1,
+            actor_id=1,
+        )
+
+        assert resolved["resolved_region"] == "mexico"
+        assert resolved["region_resolution_source"] == "admin_override"
+        assert resolved["version"] == 2
+        with pytest.raises(ValueError, match="VERSION_CONFLICT"):
+            resolve_mexico_tracking_region(
+                conn,
+                tracking_id,
+                region="china",
+                expected_version=1,
+                actor_id=1,
+            )
 
 
 def test_mexico_attachment_candidates_deduplicate_workflow_and_source_rows() -> None:
