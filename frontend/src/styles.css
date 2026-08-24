@@ -214,6 +214,13 @@ textarea {
 .app-nav {
   flex: 1 1 auto;
   min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.app-nav::-webkit-scrollbar {
+  display: none;
 }
 
 .app-nav button {
@@ -235,8 +242,8 @@ textarea {
 }
 
 .app-userbar {
-  flex: 0 1 auto;
-  min-width: 0;
+  flex: 0 0 auto;
+  min-width: max-content;
   justify-content: flex-end;
   flex-wrap: nowrap;
 }

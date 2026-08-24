@@ -473,7 +473,7 @@ function Shell({
 
   return (
     <div className="app-shell">
-      <header className="app-header">
+      <header className="app-header" data-language={language}>
         <div className="app-brand">
           <FileSpreadsheet />
           <strong>{t("出纳请款明细", "Detalle de solicitudes de pago de tesorería")}</strong>
