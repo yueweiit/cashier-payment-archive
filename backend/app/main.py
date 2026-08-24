@@ -108,6 +108,7 @@ from .mexico_tracking import (
     mexico_tracking_filter_options,
     persist_request_region,
     resolve_mexico_tracking_region,
+    sheet_region,
     summarize_mexico_tracking,
     update_mexico_tracking_settings,
     upsert_mexico_attachment_candidates,
@@ -700,6 +701,22 @@ def daily_payables_allowed_sheets(conn, user: Dict[str, Any]) -> Optional[set[st
     }
 
 
+def china_region_isolation_enabled(conn) -> bool:
+    return bool(
+        get_mexico_tracking_settings(conn).get("china_region_isolation_enabled")
+    )
+
+
+def china_workbench_scope(conn, column_prefix: str = "") -> str:
+    if not china_region_isolation_enabled(conn):
+        return "1 = 1"
+    prefix = f"{column_prefix}." if column_prefix else ""
+    return (
+        f"LOWER(TRIM(COALESCE({prefix}resolved_region, ''))) = 'china' "
+        f"AND LOWER(TRIM(COALESCE({prefix}region_review_status, ''))) = 'resolved'"
+    )
+
+
 def mexico_tracking_allowed_sheets(
     conn,
     user: Dict[str, Any],
@@ -811,6 +828,28 @@ def batch_public_for_user(
     data["sheet_order"] = batch_sheet_order(data)
     access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
     active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
+    region_sql = china_workbench_scope(conn, "p")
+    if china_region_isolation_enabled(conn):
+        visible_sheet_rows = conn.execute(
+            f"""
+            SELECT DISTINCT COALESCE(NULLIF(TRIM(p.source_sheet), ''), '未分 Sheet') AS sheet_name
+            FROM payment_requests p
+            WHERE p.batch_id = ? AND {access_sql} AND {active_sql} AND {region_sql}
+            ORDER BY p.id
+            """,
+            [data["id"], *access_params],
+        ).fetchall()
+        visible_row_sheets = [canonical_sheet_name(item["sheet_name"]) for item in visible_sheet_rows]
+        visible_row_sheet_set = set(visible_row_sheets)
+        filtered_order = [
+            sheet_name
+            for sheet_name in data["sheet_order"]
+            if sheet_region(sheet_name) == "china" or sheet_name in visible_row_sheet_set
+        ]
+        filtered_order.extend(
+            sheet_name for sheet_name in visible_row_sheets if sheet_name not in filtered_order
+        )
+        data["sheet_order"] = filtered_order
     currency_rows = conn.execute(
         f"""
         SELECT UPPER(COALESCE(NULLIF(TRIM(p.currency), ''), 'CNY')) AS currency,
@@ -822,7 +861,7 @@ def batch_public_for_user(
                COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS paid_amount_cny,
                COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS pending_amount_cny
         FROM payment_requests p
-        WHERE p.batch_id = ? AND {access_sql} AND {active_sql}
+        WHERE p.batch_id = ? AND {access_sql} AND {active_sql} AND {region_sql}
         GROUP BY UPPER(COALESCE(NULLIF(TRIM(p.currency), ''), 'CNY'))
         ORDER BY currency
         """,
@@ -1134,6 +1173,7 @@ def get_daily_payables_summary(
                 conn,
                 selected_date,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
+                china_only=china_region_isolation_enabled(conn),
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1155,6 +1195,7 @@ def get_daily_payables_details(
                 selected_date,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
                 include_details=True,
+                china_only=china_region_isolation_enabled(conn),
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1179,6 +1220,7 @@ def get_daily_payables_trend(
                 start,
                 end,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
+                china_only=china_region_isolation_enabled(conn),
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1189,6 +1231,7 @@ def list_batches(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]
     with connect() as conn:
         access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
         active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
+        region_sql = china_workbench_scope(conn, "p")
         rows = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
@@ -1196,7 +1239,7 @@ def list_batches(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]
                    COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_paid_amount,
                    COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
             FROM request_batches b
-            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql} AND {active_sql}
+            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql} AND {active_sql} AND {region_sql}
             GROUP BY b.id
             ORDER BY COALESCE(b.end_date, b.created_at) DESC, b.id DESC
             """,
@@ -1362,6 +1405,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
     with connect() as conn:
         access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
         active_join_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
+        region_join_sql = china_workbench_scope(conn, "p")
         row = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
@@ -1369,7 +1413,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
                    COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_paid_amount,
                    COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
             FROM request_batches b
-            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql} AND {active_join_sql}
+            LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql} AND {active_join_sql} AND {region_join_sql}
             WHERE b.id = ?
             GROUP BY b.id
             """,
@@ -1379,6 +1423,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
             raise HTTPException(status_code=404, detail="批次不存在")
         stats_access_sql, stats_access_params = sheet_access_filter(conn, user, "source_sheet")
         active_stats_sql = f"NOT {dingtalk_inactive_sql('raw_extra_json')}"
+        region_stats_sql = china_workbench_scope(conn)
         stats = conn.execute(
             f"""
             SELECT payment_account, invoice_status, project, COUNT(*) AS count,
@@ -1386,7 +1431,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
                    COALESCE(SUM(COALESCE(paid_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS paid_amount,
                    COALESCE(SUM(COALESCE(pending_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS pending_amount
             FROM payment_requests
-            WHERE batch_id = ? AND {stats_access_sql} AND {active_stats_sql}
+            WHERE batch_id = ? AND {stats_access_sql} AND {active_stats_sql} AND {region_stats_sql}
             GROUP BY payment_account, invoice_status, project
             """,
             [batch_id, *stats_access_params],
@@ -1837,6 +1882,7 @@ def list_requests(
         access_sql, access_params = sheet_access_filter(conn, user)
         conditions.append(access_sql)
         params.extend(access_params)
+        conditions.append(china_workbench_scope(conn))
         rows = conn.execute(
             f"""
             SELECT payment_requests.*,
@@ -7309,6 +7355,7 @@ def export_batch(
         access_sql, access_params = sheet_access_filter(conn, user)
         conditions.append(access_sql)
         params.extend(access_params)
+        conditions.append(china_workbench_scope(conn))
         records = rows_to_dicts(
             conn.execute(
                 f"""

@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from backend.app.db import connect, get_daily_payables_history_start_date, now_iso
 from backend.app.main import app
+from backend.app.daily_payables import daily_snapshot
 from backend.app.payable_history import payment_effective_at, record_request_state
 from backend.app.security import hash_password
 
@@ -461,3 +462,52 @@ def test_daily_payables_rejects_dates_before_baseline_and_long_trends():
         )
         assert response.status_code == 422
         assert response.json()["detail"]["code"] == "TREND_RANGE_TOO_LARGE"
+
+
+def test_daily_payables_can_exclude_mexico_and_region_review_history():
+    with TestClient(app) as client:
+        login(client)
+        china = create_request(
+            client,
+            amount=100,
+            source_sheet="凌翔产品&开发",
+            needed_payment_date="2026-08-24",
+        )
+        mexico = create_request(
+            client,
+            amount=200,
+            source_sheet="YW MOLDES MX模具",
+            needed_payment_date="2026-08-24",
+        )
+        review = create_request(
+            client,
+            amount=300,
+            source_sheet=f"地区待核对-{uuid.uuid4().hex}",
+            needed_payment_date="2026-08-24",
+        )
+
+        with connect() as conn:
+            all_regions = daily_snapshot(
+                conn,
+                date(2026, 8, 24),
+                include_details=True,
+                china_only=False,
+            )
+            china_only = daily_snapshot(
+                conn,
+                date(2026, 8, 24),
+                include_details=True,
+                china_only=True,
+            )
+
+        assert all_regions["totals_cny"]["due_today"] == 600
+        assert china_only["totals_cny"]["due_today"] == 100
+        assert [item["logical_request_id"] for item in china_only["items"]] == [
+            china["logical_request_id"]
+        ]
+        assert mexico["logical_request_id"] not in {
+            item["logical_request_id"] for item in china_only["items"]
+        }
+        assert review["logical_request_id"] not in {
+            item["logical_request_id"] for item in china_only["items"]
+        }

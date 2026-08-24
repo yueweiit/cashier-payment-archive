@@ -76,8 +76,18 @@ def _base_number(row: Dict[str, Any], base_key: str, raw_key: str) -> float:
     return raw * rate if rate > 0 else 0.0
 
 
-def _visible(row: Dict[str, Any], allowed_sheets: Optional[set[str]]) -> bool:
+def _visible(
+    row: Dict[str, Any],
+    allowed_sheets: Optional[set[str]],
+    *,
+    china_only: bool = False,
+) -> bool:
     if not int(row.get("included") or 0) or int(row.get("deleted") or 0):
+        return False
+    if china_only and (
+        str(row.get("resolved_region") or "").strip().lower() != "china"
+        or str(row.get("region_review_status") or "").strip().lower() != "resolved"
+    ):
         return False
     if allowed_sheets is None:
         return True
@@ -133,6 +143,7 @@ def _snapshot_payload(
     allowed_sheets: Optional[set[str]],
     *,
     include_details: bool,
+    china_only: bool = False,
 ) -> Dict[str, Any]:
     selected_iso = selected.isoformat()
     currency_totals: Dict[str, Dict[str, float]] = defaultdict(_empty_totals)
@@ -143,7 +154,7 @@ def _snapshot_payload(
     overdue_count = 0
 
     for logical_id, state in states.items():
-        if not _visible(state, allowed_sheets):
+        if not _visible(state, allowed_sheets, china_only=china_only):
             continue
         due_date = str(state.get("needed_payment_date") or "").strip()[:10]
         if not due_date or due_date > selected_iso:
@@ -236,6 +247,7 @@ def daily_snapshot(
     *,
     allowed_sheets: Optional[set[str]] = None,
     include_details: bool = False,
+    china_only: bool = False,
 ) -> Dict[str, Any]:
     history_start = _validate_date(conn, selected)
     events = _load_events(conn, selected)
@@ -246,6 +258,7 @@ def daily_snapshot(
         deltas,
         allowed_sheets,
         include_details=include_details,
+        china_only=china_only,
     )
     result["history_start_date"] = history_start.isoformat()
     return result
@@ -257,6 +270,7 @@ def daily_trend(
     end: date,
     *,
     allowed_sheets: Optional[set[str]] = None,
+    china_only: bool = False,
 ) -> Dict[str, Any]:
     history_start = _validate_date(conn, start)
     if end < start:
@@ -300,6 +314,7 @@ def daily_trend(
             deltas,
             allowed_sheets,
             include_details=False,
+            china_only=china_only,
         )
         points.append(point)
         selected += timedelta(days=1)

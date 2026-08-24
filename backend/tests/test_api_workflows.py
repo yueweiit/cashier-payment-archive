@@ -6,6 +6,7 @@ import sqlite3
 import shutil
 import sys
 import tempfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from decimal import Decimal
@@ -4766,3 +4767,84 @@ def test_mexico_tracking_api_enforces_review_and_sheet_permissions():
                 "china_region_isolation_enabled": False,
             },
         ).status_code == 403
+
+
+def test_china_region_isolation_filters_workbench_totals_sheets_and_export():
+    with TestClient(app) as client:
+        login(client)
+        settings_payload = {
+            "yellow_days": 2,
+            "red_days": 5,
+            "cache_stale_seconds": 300,
+            "china_region_isolation_enabled": False,
+        }
+        assert client.put("/api/mexico-tracking/settings", json=settings_payload).status_code == 200
+        try:
+            batch = client.post(
+                "/api/batches",
+                json={
+                    "name": f"中国口径隔离-{uuid.uuid4().hex}",
+                    "start_date": "2026-08-24",
+                    "end_date": "2026-08-31",
+                },
+            ).json()["batch"]
+            rows = [
+                ("凌翔产品&开发", "CN-ISOLATION", 100),
+                ("YW MOLDES MX模具", "MX-ISOLATION", 200),
+                (f"地区待核对-{uuid.uuid4().hex}", "REVIEW-ISOLATION", 300),
+            ]
+            for sheet_name, approval_no, amount in rows:
+                created = client.post(
+                    f"/api/batches/{batch['id']}/requests",
+                    json={
+                        "source_sheet": sheet_name,
+                        "dingding_id": approval_no,
+                        "summary": approval_no,
+                        "amount": amount,
+                        "currency": "CNY",
+                    },
+                )
+                assert created.status_code == 200, created.text
+
+            before = client.get(f"/api/batches/{batch['id']}/requests").json()
+            assert before["totals"]["count"] == 3
+            assert before["totals"]["amount"] == 600
+
+            settings_payload["china_region_isolation_enabled"] = True
+            assert client.put("/api/mexico-tracking/settings", json=settings_payload).status_code == 200
+
+            listed = client.get(f"/api/batches/{batch['id']}/requests")
+            assert listed.status_code == 200, listed.text
+            assert [row["dingding_id"] for row in listed.json()["requests"]] == ["CN-ISOLATION"]
+            assert listed.json()["totals"]["count"] == 1
+            assert listed.json()["totals"]["amount"] == 100
+
+            detail = client.get(f"/api/batches/{batch['id']}")
+            assert detail.status_code == 200, detail.text
+            assert detail.json()["batch"]["request_count"] == 1
+            assert detail.json()["batch"]["total_amount"] == 100
+            assert "凌翔产品&开发" in detail.json()["batch"]["sheet_order"]
+            assert "YW MOLDES MX模具" not in detail.json()["batch"]["sheet_order"]
+            assert not any(name.startswith("地区待核对-") for name in detail.json()["batch"]["sheet_order"])
+
+            batches = client.get("/api/batches").json()["batches"]
+            public_batch = next(item for item in batches if item["id"] == batch["id"])
+            assert public_batch["request_count"] == 1
+            assert public_batch["total_amount"] == 100
+
+            exported = client.get(f"/api/batches/{batch['id']}/export.xlsx")
+            assert exported.status_code == 200, exported.text
+            workbook = load_workbook(io.BytesIO(exported.content), data_only=True)
+            workbook_text = "\n".join(
+                str(cell.value)
+                for sheet in workbook.worksheets
+                for row in sheet.iter_rows()
+                for cell in row
+                if cell.value is not None
+            )
+            assert "CN-ISOLATION" in workbook_text
+            assert "MX-ISOLATION" not in workbook_text
+            assert "REVIEW-ISOLATION" not in workbook_text
+        finally:
+            settings_payload["china_region_isolation_enabled"] = False
+            client.put("/api/mexico-tracking/settings", json=settings_payload)
