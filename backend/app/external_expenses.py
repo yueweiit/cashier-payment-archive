@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import re
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from psycopg.rows import dict_row
 
 from .db import ROOT_DIR
 from .fx_rates import FxRateError, fetch_rates, multiply_money, normalize_currency
+from .mexico_tracking import resolve_region
 
 
 ALLOWED_SOURCE_TYPES = ("operation", "purchase", "monthly")
@@ -99,6 +101,14 @@ class SourceDatabaseConfig:
     user_dbname: str
     user: str
     password: str
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    candidates: list[Dict[str, Any]]
+    next_cursors: Dict[str, Dict[str, str]]
+    source_conflicts: list[str]
+    query_timings: Dict[str, float]
 
 
 class DingtalkAttachmentClient:
@@ -315,6 +325,286 @@ def source_connection(dbname: Optional[str] = None) -> Iterator[psycopg.Connecti
         raise
     except Exception as exc:
         raise ExternalExpenseError("无法读取支出中间表，请检查数据库配置或网络连接") from exc
+
+
+class PostgresDiscoveryGateway:
+    """Read approval changes without binding Mexico tracking to local requests."""
+
+    def fetch_source_changes(
+        self,
+        source_type: str,
+        cursor: Optional[Dict[str, str]],
+        running_approval_nos: Iterable[str],
+    ) -> list[Dict[str, Any]]:
+        if source_type not in ALLOWED_SOURCE_TYPES:
+            raise ExternalExpenseError("不支持的支出来源")
+        running = list(running_approval_nos)
+        if source_type == "monthly":
+            return self._fetch_monthly_changes(cursor, running)
+        conditions = ["source_type = %s"]
+        params: list[Any] = [source_type]
+        if cursor:
+            updated_at = str(cursor.get("updated_at") or "").strip()
+            source_id = str(cursor.get("source_id") or "").strip()
+            if updated_at:
+                conditions.append(
+                    "("
+                    "COALESCE(source_updated_at, source_created_at) > %s::timestamptz "
+                    "OR (COALESCE(source_updated_at, source_created_at) = %s::timestamptz "
+                    "AND source_id > %s) "
+                    "OR BTRIM(COALESCE(approval_no, '')) = ANY(%s)"
+                    ")"
+                )
+                params.extend([updated_at, updated_at, source_id, running])
+        query = f"""
+            {SOURCE_ROWS_CTE}
+            SELECT *
+            FROM source_rows
+            WHERE {' AND '.join(conditions)}
+            ORDER BY COALESCE(source_updated_at, source_created_at), source_id
+        """
+        with source_connection() as conn:
+            return conn.execute(query, params).fetchall()
+
+    def _fetch_monthly_changes(
+        self,
+        cursor: Optional[Dict[str, str]],
+        running_approval_nos: list[str],
+    ) -> list[Dict[str, Any]]:
+        conditions = ["deleted_at IS NULL", "process_code = %s"]
+        params: list[Any] = [MONTHLY_PAYMENT_PROCESS_CODE]
+        if cursor:
+            updated_at = str(cursor.get("updated_at") or "").strip()
+            source_id = str(cursor.get("source_id") or "").strip()
+            if updated_at:
+                conditions.append(
+                    "("
+                    "COALESCE(updated_at, create_time) > %s::timestamptz "
+                    "OR (COALESCE(updated_at, create_time) = %s::timestamptz "
+                    "AND id::text > %s) "
+                    "OR BTRIM(COALESCE(raw_payload->>'businessId', '')) = ANY(%s)"
+                    ")"
+                )
+                params.extend([updated_at, updated_at, source_id, running_approval_nos])
+        config = source_database_config()
+        with source_connection(config.user_dbname) as conn:
+            return conn.execute(
+                f"""
+                SELECT id::text AS source_id,
+                       process_instance_id,
+                       process_code,
+                       create_time,
+                       updated_at,
+                       status,
+                       result,
+                       title,
+                       raw_payload
+                FROM public.ding_approval_instance
+                WHERE {' AND '.join(conditions)}
+                ORDER BY COALESCE(updated_at, create_time), id
+                """,
+                params,
+            ).fetchall()
+
+    def fetch_user_names(self, user_ids: Iterable[Any]) -> Dict[str, str]:
+        return fetch_dingtalk_user_names(user_ids)
+
+
+def _discovery_cursor_value(source_type: str, row: Dict[str, Any]) -> tuple[str, str]:
+    updated = row.get("updated_at") if source_type == "monthly" else row.get("source_updated_at")
+    if updated is None:
+        updated = row.get("create_time") if source_type == "monthly" else row.get("source_created_at")
+    return _datetime_text(updated) or "", str(row.get("source_id") or "").strip()
+
+
+def _candidate_process_instance(source_type: str, row: Dict[str, Any]) -> Optional[str]:
+    if source_type == "monthly":
+        return _text(row.get("process_instance_id"))
+    raw_data = _json_object(row.get("raw_data"))
+    return _first_text(
+        raw_data.get("processInstanceId"),
+        raw_data.get("process_instance_id"),
+        raw_data.get("processInstanceID"),
+    )
+
+
+def _candidate_process_code(source_type: str, row: Dict[str, Any]) -> Optional[str]:
+    if source_type == "monthly":
+        return _text(row.get("process_code")) or MONTHLY_PAYMENT_PROCESS_CODE
+    raw_data = _json_object(row.get("raw_data"))
+    return _first_text(raw_data.get("processCode"), raw_data.get("process_code"))
+
+
+def _map_discovery_candidate(
+    source_type: str,
+    row: Dict[str, Any],
+    user_names: Dict[str, str],
+) -> Dict[str, Any]:
+    mapped = (
+        map_monthly_payment(row, user_names)
+        if source_type == "monthly"
+        else map_external_expense(row, user_names)
+    )
+    external_source = (
+        mapped.get("request_data", {}).get("raw_extra", {}).get("external_source", {})
+    )
+    raw_execution_region = _text(external_source.get("execution_region"))
+    company_name = _text(mapped.get("applicant_department")) or "未归属公司"
+    decision = resolve_region(
+        execution_region=raw_execution_region,
+        source_sheet=company_name,
+    )
+    status = _text(mapped.get("approval_status")) or ""
+    result = _text(mapped.get("approval_result"))
+    return {
+        "approval_no": str(mapped.get("approval_no") or "").strip(),
+        "source_type": source_type,
+        "source_record_id": str(row.get("source_id") or "").strip(),
+        "source_id": str(row.get("source_id") or "").strip(),
+        "process_code": _candidate_process_code(source_type, row),
+        "process_instance_id": _candidate_process_instance(source_type, row),
+        "raw_execution_region": raw_execution_region,
+        "resolved_region": decision.region,
+        "region_resolution_source": decision.source,
+        "region_conflict_reason": decision.conflict_reason,
+        "request_date": mapped.get("application_date"),
+        "applicant_id": mapped.get("applicant_id") or None,
+        "applicant_name": mapped.get("applicant") or "未识别人员",
+        "applicant_department": mapped.get("applicant_department") or None,
+        "company_name": company_name,
+        "source_sheet": company_name,
+        "summary": mapped.get("summary") or "",
+        "amount": mapped.get("amount"),
+        "currency": mapped.get("currency"),
+        "workflow_status": status.upper(),
+        "workflow_result": result.lower() if result else None,
+        "source_updated_at": _discovery_cursor_value(source_type, row)[0] or None,
+        "source_conflict": False,
+        "warnings": list(mapped.get("warnings") or []),
+        "errors": list(mapped.get("errors") or []),
+        "raw_summary": external_source,
+    }
+
+
+def _conflict_candidate(approval_no: str, candidates: list[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "approval_no": approval_no,
+        "source_type": "conflict",
+        "source_record_id": None,
+        "source_id": None,
+        "process_code": None,
+        "process_instance_id": None,
+        "raw_execution_region": None,
+        "resolved_region": "review",
+        "region_resolution_source": "source_conflict",
+        "region_conflict_reason": "同一钉钉单号存在多个来源记录",
+        "request_date": None,
+        "applicant_id": None,
+        "applicant_name": "待核对",
+        "applicant_department": None,
+        "company_name": "未归属公司",
+        "source_sheet": "未归属公司",
+        "summary": "同一钉钉单号存在多个来源记录",
+        "amount": None,
+        "currency": None,
+        "workflow_status": None,
+        "workflow_result": None,
+        "source_updated_at": max(
+            (str(candidate.get("source_updated_at") or "") for candidate in candidates),
+            default="",
+        ) or None,
+        "source_conflict": True,
+        "warnings": [],
+        "errors": ["同一钉钉单号存在多个来源记录"],
+        "raw_summary": {},
+        "raw_candidates": candidates,
+    }
+
+
+def discover_expense_workflows(
+    cursors: Dict[str, Dict[str, str]],
+    running_approval_nos: Iterable[str],
+    *,
+    gateway: Optional[Any] = None,
+) -> DiscoveryResult:
+    """Discover all three DingTalk sources independently of imported requests.
+
+    The first call intentionally has no historical date cutoff.  Later calls
+    read changes after each source cursor while also re-reading every cached
+    RUNNING approval, so a terminal transition cannot be missed.
+    """
+
+    reader = gateway or PostgresDiscoveryGateway()
+    running = tuple(
+        sorted({str(value).strip() for value in running_approval_nos if str(value).strip()})
+    )
+    next_cursors = {
+        source_type: dict(cursor)
+        for source_type, cursor in cursors.items()
+        if source_type in ALLOWED_SOURCE_TYPES and cursor
+    }
+    query_timings: Dict[str, float] = {}
+    rows_by_identity: Dict[tuple[str, str], Dict[str, Any]] = {}
+    source_rows: list[tuple[str, Dict[str, Any]]] = []
+    for source_type in ALLOWED_SOURCE_TYPES:
+        started = time.perf_counter()
+        rows = reader.fetch_source_changes(source_type, cursors.get(source_type), running)
+        query_timings[source_type] = round(time.perf_counter() - started, 6)
+        for raw_row in rows:
+            row = dict(raw_row)
+            source_id = str(row.get("source_id") or "").strip()
+            if not source_id:
+                continue
+            identity = (source_type, source_id)
+            prior = rows_by_identity.get(identity)
+            if prior is None or _discovery_cursor_value(source_type, row) >= _discovery_cursor_value(source_type, prior):
+                rows_by_identity[identity] = row
+        cursor_values = [
+            _discovery_cursor_value(source_type, dict(row))
+            for row in rows
+            if str(row.get("source_id") or "").strip()
+        ]
+        if cursor_values:
+            updated_at, source_id = max(cursor_values)
+            next_cursors[source_type] = {
+                "updated_at": updated_at,
+                "source_id": source_id,
+            }
+
+    source_rows.extend(
+        (source_type, row)
+        for (source_type, _), row in rows_by_identity.items()
+    )
+    applicant_ids: list[Any] = []
+    for source_type, row in source_rows:
+        if source_type == "monthly":
+            applicant_ids.append(_json_object(row.get("raw_payload")).get("originatorUserId"))
+        else:
+            applicant_ids.append(row.get("creator_name"))
+    user_names = reader.fetch_user_names(applicant_ids)
+
+    grouped: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
+    for source_type, row in source_rows:
+        candidate = _map_discovery_candidate(source_type, row, user_names)
+        approval_no = str(candidate.get("approval_no") or "").strip()
+        if approval_no:
+            grouped[approval_no].append(candidate)
+
+    candidates: list[Dict[str, Any]] = []
+    conflicts: list[str] = []
+    for approval_no in sorted(grouped):
+        matches = grouped[approval_no]
+        if len(matches) > 1:
+            conflicts.append(approval_no)
+            candidates.append(_conflict_candidate(approval_no, matches))
+        else:
+            candidates.append(matches[0])
+    return DiscoveryResult(
+        candidates=candidates,
+        next_cursors=next_cursors,
+        source_conflicts=conflicts,
+        query_timings=query_timings,
+    )
 
 
 def _monthly_payment_query(

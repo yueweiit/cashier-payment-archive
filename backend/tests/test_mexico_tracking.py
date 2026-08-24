@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from backend.app.external_expenses import discover_expense_workflows
 from backend.app.mexico_tracking import (
     backfill_request_regions,
     build_bilingual_reminder,
@@ -520,3 +521,210 @@ def test_request_write_helpers_persist_region_and_history(isolated_db) -> None:
             (request_id,),
         ).fetchone()
         assert tuple(history) == ("mexico", "resolved")
+
+
+class FakeDiscoveryGateway:
+    def __init__(self, rows_by_source):
+        self.rows_by_source = rows_by_source
+        self.calls = []
+
+    def fetch_source_changes(self, source_type, cursor, running_approval_nos):
+        self.calls.append((source_type, cursor, tuple(running_approval_nos)))
+        return list(self.rows_by_source.get(source_type, []))
+
+    def fetch_user_names(self, user_ids):
+        return {
+            "mx-user": "María López",
+            "cn-user": "张三",
+        }
+
+
+def _standard_discovery_row(
+    *,
+    source_type: str,
+    source_id: str,
+    approval_no: str,
+    execution_region: str,
+    source_updated_at: str,
+    amount: float = 100,
+    applicant_id: str = "mx-user",
+    applicant_department: str = "YUEWEI MX核心制造",
+):
+    return {
+        "source_type": source_type,
+        "source_id": source_id,
+        "effective_date": "2026-08-24",
+        "approval_no": approval_no,
+        "creator_name": applicant_id,
+        "applicant_department": applicant_department,
+        "approval_title": "María López enviado por",
+        "approval_status": "RUNNING",
+        "approval_result": "",
+        "execution_region": execution_region,
+        "beneficiary": "Proveedor MX",
+        "expense_type": "Gastos",
+        "summary": "Compra local",
+        "project": "Proyecto MX",
+        "needed_payment_date": "2026-08-28",
+        "source_currency": "MXN",
+        "source_amount": amount,
+        "base_currency_amount": amount * 0.4,
+        "order_name": None,
+        "product_name": None,
+        "source_created_at": "2026-08-24T09:00:00+08:00",
+        "source_updated_at": source_updated_at,
+        "raw_data": {
+            "processInstanceId": f"process-{source_type}-{source_id}",
+        },
+    }
+
+
+def _monthly_discovery_row(*, source_id: str, approval_no: str, updated_at: str):
+    return {
+        "source_id": source_id,
+        "process_instance_id": f"monthly-process-{source_id}",
+        "process_code": "PROC-EE85EDD4-5CF2-4C08-B948-1690A6ACC51C",
+        "create_time": "2026-08-24T08:00:00+08:00",
+        "updated_at": updated_at,
+        "status": "RUNNING",
+        "result": "",
+        "title": "María López提交的月结付款",
+        "raw_payload": {
+            "businessId": approval_no,
+            "originatorUserId": "mx-user",
+            "originatorDeptName": "LEMOS MX供应链开发及管理",
+            "formComponentValues": [
+                {"name": "执行地区", "value": "墨西哥 Mexico"},
+                {"name": "币种", "value": "MXN"},
+                {"name": "合计总额", "value": "500"},
+                {"name": "申请事由", "value": "Pago mensual"},
+                {"name": "收款账户信息", "value": "Proveedor MX"},
+            ],
+        },
+    }
+
+
+def test_discovery_first_sync_finds_all_three_sources_without_history_cutoff(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.external_expenses.fetch_rates",
+        lambda requested_date, currencies: {
+            "MXN": {"cny_per_unit": 0.4, "actual_date": requested_date.isoformat()}
+        },
+    )
+    gateway = FakeDiscoveryGateway(
+        {
+            "operation": [
+                _standard_discovery_row(
+                    source_type="operation",
+                    source_id="11",
+                    approval_no=" 202608240001 ",
+                    execution_region="Mexico",
+                    source_updated_at="2026-08-24T10:00:00+08:00",
+                )
+            ],
+            "purchase": [
+                _standard_discovery_row(
+                    source_type="purchase",
+                    source_id="22",
+                    approval_no="202608240002",
+                    execution_region="中国 China",
+                    source_updated_at="2026-08-24T10:01:00+08:00",
+                    applicant_id="cn-user",
+                    applicant_department="凌翔产品&开发",
+                )
+            ],
+            "monthly": [
+                _monthly_discovery_row(
+                    source_id="33",
+                    approval_no="202608240003",
+                    updated_at="2026-08-24T10:02:00+08:00",
+                )
+            ],
+        }
+    )
+
+    result = discover_expense_workflows({}, [], gateway=gateway)
+
+    assert {candidate["source_type"] for candidate in result.candidates} == {
+        "operation",
+        "purchase",
+        "monthly",
+    }
+    assert {candidate["approval_no"] for candidate in result.candidates} == {
+        "202608240001",
+        "202608240002",
+        "202608240003",
+    }
+    assert all(call[1] is None for call in gateway.calls)
+    monthly = next(row for row in result.candidates if row["source_type"] == "monthly")
+    assert monthly["process_instance_id"] == "monthly-process-33"
+    assert monthly["applicant_name"] == "María López"
+    assert monthly["company_name"] == "LEMOS MX供应链开发及管理"
+    assert monthly["raw_execution_region"] == "墨西哥 Mexico"
+    assert monthly["amount"] == 500
+    assert monthly["currency"] == "MXN"
+    assert result.next_cursors["monthly"] == {
+        "updated_at": "2026-08-24T10:02:00+08:00",
+        "source_id": "33",
+    }
+
+
+def test_discovery_incremental_passes_each_cursor_and_rechecks_running() -> None:
+    gateway = FakeDiscoveryGateway({})
+    cursors = {
+        "operation": {"updated_at": "2026-08-20T10:00:00+08:00", "source_id": "10"},
+        "purchase": {"updated_at": "2026-08-21T10:00:00+08:00", "source_id": "20"},
+        "monthly": {"updated_at": "2026-08-22T10:00:00+08:00", "source_id": "30"},
+    }
+
+    result = discover_expense_workflows(
+        cursors,
+        [" 202608010001 ", "202608010002", "202608010001"],
+        gateway=gateway,
+    )
+
+    assert result.next_cursors == cursors
+    assert gateway.calls == [
+        ("operation", cursors["operation"], ("202608010001", "202608010002")),
+        ("purchase", cursors["purchase"], ("202608010001", "202608010002")),
+        ("monthly", cursors["monthly"], ("202608010001", "202608010002")),
+    ]
+
+
+def test_discovery_deduplicates_same_source_row_and_surfaces_cross_source_conflict() -> None:
+    operation = _standard_discovery_row(
+        source_type="operation",
+        source_id="11",
+        approval_no="202608240099",
+        execution_region="Mexico",
+        source_updated_at="2026-08-24T10:00:00+08:00",
+        amount=100,
+    )
+    purchase = _standard_discovery_row(
+        source_type="purchase",
+        source_id="22",
+        approval_no="202608240099",
+        execution_region="China",
+        source_updated_at="2026-08-24T10:01:00+08:00",
+        amount=900,
+        applicant_id="cn-user",
+        applicant_department="凌翔产品&开发",
+    )
+    gateway = FakeDiscoveryGateway(
+        {
+            "operation": [operation, dict(operation)],
+            "purchase": [purchase],
+            "monthly": [],
+        }
+    )
+
+    result = discover_expense_workflows({}, [], gateway=gateway)
+
+    assert result.source_conflicts == ["202608240099"]
+    assert len(result.candidates) == 1
+    conflict = result.candidates[0]
+    assert conflict["approval_no"] == "202608240099"
+    assert conflict["source_type"] == "conflict"
+    assert conflict["source_conflict"] is True
+    assert conflict["resolved_region"] == "review"
+    assert len(conflict["raw_candidates"]) == 2
