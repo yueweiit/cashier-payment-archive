@@ -5,7 +5,6 @@ import os
 import sqlite3
 import shutil
 import sys
-import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
@@ -19,10 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-TEST_DIR = Path(tempfile.mkdtemp(prefix="cashier-payment-tests-"))
-os.environ["PAYMENT_APP_DATA_DIR"] = str(TEST_DIR / "data")
-os.environ["PAYMENT_APP_DB"] = str(TEST_DIR / "app.db")
-os.environ["PAYMENT_ATTACHMENT_STORAGE_DIR"] = str(TEST_DIR / "attachment-storage")
+TEST_DIR = Path(os.environ["PAYMENT_APP_DB"]).parent
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
