@@ -1,16 +1,42 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from backend.app.mexico_tracking import (
     build_bilingual_reminder,
+    get_mexico_tracking_settings,
     node_age_days,
     resolve_region,
+    update_mexico_tracking_settings,
     warning_level,
 )
+
+
+@pytest.fixture()
+def isolated_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import backend.app.db as db_module
+
+    original_paths = (
+        db_module.DATA_DIR,
+        db_module.DB_PATH,
+        db_module.ATTACHMENT_STORAGE_DIR,
+    )
+    monkeypatch.setattr(db_module, "DATA_DIR", tmp_path / "app-data")
+    monkeypatch.setattr(db_module, "DB_PATH", tmp_path / "app-data" / "app.db")
+    monkeypatch.setattr(db_module, "ATTACHMENT_STORAGE_DIR", tmp_path / "attachment-data")
+    db_module.init_db()
+    try:
+        yield db_module
+    finally:
+        (
+            db_module.DATA_DIR,
+            db_module.DB_PATH,
+            db_module.ATTACHMENT_STORAGE_DIR,
+        ) = original_paths
 
 
 @pytest.mark.parametrize(
@@ -146,3 +172,133 @@ def test_bilingual_reminder_contains_operational_context() -> None:
         assert value in reminder["es"]
     assert "请协助" in reminder["zh"]
     assert "favor" in reminder["es"].lower()
+
+
+def _columns(conn, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _indexes(conn, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA index_list({table})").fetchall()}
+
+
+def test_mexico_tracking_schema_and_migration_are_idempotent(isolated_db) -> None:
+    isolated_db.init_db()
+
+    with isolated_db.connect() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {
+            "mexico_approval_tracking",
+            "mexico_approval_events",
+            "mexico_approval_request_links",
+            "mexico_approval_attachments",
+            "mexico_sync_runs",
+        } <= tables
+
+        assert {
+            "approval_no",
+            "resolved_region",
+            "region_resolution_source",
+            "region_review_status",
+            "workflow_status",
+            "current_node_name",
+            "current_approver_id",
+            "current_node_entered_at",
+            "last_synced_at",
+            "version",
+        } <= _columns(conn, "mexico_approval_tracking")
+        assert {
+            "resolved_region",
+            "region_resolution_source",
+            "region_review_status",
+            "region_reviewed_by",
+            "region_reviewed_at",
+        } <= _columns(conn, "payment_requests")
+        assert {"resolved_region", "region_review_status"} <= _columns(
+            conn, "payable_history_versions"
+        )
+
+
+def test_mexico_tracking_schema_has_required_unique_constraints_and_indexes(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        tracking_indexes = _indexes(conn, "mexico_approval_tracking")
+        assert {
+            "idx_mexico_tracking_region_status",
+            "idx_mexico_tracking_sheet",
+            "idx_mexico_tracking_applicant",
+            "idx_mexico_tracking_approver",
+            "idx_mexico_tracking_node",
+            "idx_mexico_tracking_request_date",
+            "idx_mexico_tracking_last_synced",
+        } <= tracking_indexes
+        assert "idx_mexico_events_approval_time" in _indexes(conn, "mexico_approval_events")
+
+        unique_tracking = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(mexico_approval_tracking)")
+            if row["unique"]
+        }
+        unique_events = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(mexico_approval_events)")
+            if row["unique"]
+        }
+        unique_links = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(mexico_approval_request_links)")
+            if row["unique"]
+        }
+        unique_attachments = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(mexico_approval_attachments)")
+            if row["unique"]
+        }
+        assert unique_tracking
+        assert unique_events
+        assert unique_links
+        assert unique_attachments
+
+        attachment_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mexico_approval_attachments'"
+        ).fetchone()["sql"]
+        for status in ("pending", "downloading", "ready", "failed"):
+            assert status in attachment_sql
+
+
+def test_mexico_tracking_settings_have_safe_defaults_and_validation(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        assert get_mexico_tracking_settings(conn) == {
+            "yellow_days": 2,
+            "red_days": 5,
+            "cache_stale_seconds": 300,
+            "china_region_isolation_enabled": False,
+        }
+
+        updated = update_mexico_tracking_settings(
+            conn,
+            yellow_days=4,
+            red_days=9,
+            cache_stale_seconds=600,
+            china_region_isolation_enabled=True,
+        )
+        assert updated == {
+            "yellow_days": 4,
+            "red_days": 9,
+            "cache_stale_seconds": 600,
+            "china_region_isolation_enabled": True,
+        }
+        conn.commit()
+
+        with pytest.raises(ValueError):
+            update_mexico_tracking_settings(conn, yellow_days=10, red_days=5)
+        with pytest.raises(ValueError):
+            update_mexico_tracking_settings(conn, yellow_days=-1, red_days=5)
+        with pytest.raises(ValueError):
+            update_mexico_tracking_settings(conn, yellow_days=2, red_days=366)
+        with pytest.raises(ValueError):
+            update_mexico_tracking_settings(conn, cache_stale_seconds=-1)
+        with pytest.raises(ValueError):
+            update_mexico_tracking_settings(conn, china_region_isolation_enabled="yes")

@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+MEXICO_TRACKING_SETTING_DEFAULTS = {
+    "mexico_warning_yellow_days": "2",
+    "mexico_warning_red_days": "5",
+    "mexico_tracking_cache_stale_seconds": "300",
+    "china_region_isolation_enabled": "false",
+}
 
 CHINA_SHEETS = frozenset(
     {
@@ -31,6 +39,267 @@ MEXICO_SHEETS = frozenset(
         "FC 财务中心 Centro Financiero (FC)",
     }
 )
+
+
+def _now_iso() -> str:
+    return datetime.now(tz=SHANGHAI_TZ).isoformat(timespec="microseconds")
+
+
+def _ensure_column(
+    conn: sqlite3.Connection, table: str, column: str, definition: str
+) -> None:
+    existing = {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def ensure_mexico_tracking_schema(conn: sqlite3.Connection) -> None:
+    """Create the Mexico approval cache without changing current China views."""
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS mexico_approval_tracking (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_no TEXT NOT NULL UNIQUE,
+            source_type TEXT NOT NULL,
+            source_record_id TEXT,
+            process_code TEXT,
+            process_instance_id TEXT,
+            raw_execution_region TEXT,
+            resolved_region TEXT NOT NULL DEFAULT 'review'
+                CHECK (resolved_region IN ('china', 'mexico', 'review')),
+            region_resolution_source TEXT NOT NULL DEFAULT 'unknown',
+            region_review_status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (region_review_status IN ('pending', 'resolved')),
+            region_reviewed_by INTEGER REFERENCES users(id),
+            region_reviewed_at TEXT,
+            region_conflict_reason TEXT,
+            request_date TEXT,
+            applicant_id TEXT,
+            applicant_name TEXT,
+            applicant_department TEXT,
+            company_name TEXT,
+            source_sheet TEXT,
+            summary TEXT,
+            amount REAL,
+            currency TEXT,
+            workflow_status TEXT,
+            workflow_result TEXT,
+            current_node_name TEXT,
+            current_approver_id TEXT,
+            current_approver_name TEXT,
+            current_node_entered_at TEXT,
+            workflow_url TEXT,
+            linked_request_id INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL,
+            source_updated_at TEXT,
+            last_state_synced_at TEXT,
+            last_attachment_synced_at TEXT,
+            last_synced_at TEXT,
+            raw_summary_json TEXT,
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mexico_tracking_region_status
+        ON mexico_approval_tracking(resolved_region, region_review_status, workflow_status);
+        CREATE INDEX IF NOT EXISTS idx_mexico_tracking_sheet
+        ON mexico_approval_tracking(source_sheet);
+        CREATE INDEX IF NOT EXISTS idx_mexico_tracking_applicant
+        ON mexico_approval_tracking(applicant_id, applicant_name);
+        CREATE INDEX IF NOT EXISTS idx_mexico_tracking_approver
+        ON mexico_approval_tracking(current_approver_id, current_approver_name);
+        CREATE INDEX IF NOT EXISTS idx_mexico_tracking_node
+        ON mexico_approval_tracking(current_node_name, current_node_entered_at);
+        CREATE INDEX IF NOT EXISTS idx_mexico_tracking_request_date
+        ON mexico_approval_tracking(request_date DESC);
+        CREATE INDEX IF NOT EXISTS idx_mexico_tracking_last_synced
+        ON mexico_approval_tracking(last_synced_at);
+
+        CREATE TABLE IF NOT EXISTS mexico_approval_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_no TEXT NOT NULL REFERENCES mexico_approval_tracking(approval_no)
+                ON DELETE CASCADE,
+            event_key TEXT NOT NULL,
+            process_instance_id TEXT,
+            sequence_index INTEGER NOT NULL DEFAULT 0,
+            activity_id TEXT,
+            event_type TEXT,
+            node_name TEXT,
+            result TEXT,
+            operator_id TEXT,
+            operator_name TEXT,
+            event_time TEXT,
+            comment TEXT,
+            images_json TEXT,
+            attachments_json TEXT,
+            is_current INTEGER NOT NULL DEFAULT 0,
+            synced_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(approval_no, event_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mexico_events_approval_time
+        ON mexico_approval_events(approval_no, event_time, sequence_index, id);
+
+        CREATE TABLE IF NOT EXISTS mexico_approval_request_links (
+            approval_no TEXT NOT NULL REFERENCES mexico_approval_tracking(approval_no)
+                ON DELETE CASCADE,
+            request_id INTEGER NOT NULL REFERENCES payment_requests(id) ON DELETE CASCADE,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(approval_no, request_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mexico_links_request
+        ON mexico_approval_request_links(request_id);
+
+        CREATE TABLE IF NOT EXISTS mexico_approval_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_no TEXT NOT NULL REFERENCES mexico_approval_tracking(approval_no)
+                ON DELETE CASCADE,
+            event_key TEXT,
+            source_file_id TEXT NOT NULL,
+            file_name TEXT,
+            mime_type TEXT,
+            size_bytes INTEGER,
+            source_url TEXT,
+            file_object_id INTEGER REFERENCES file_objects(id) ON DELETE SET NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'downloading', 'ready', 'failed')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(approval_no, source_file_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mexico_attachments_status
+        ON mexico_approval_attachments(status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS mexico_sync_runs (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            trigger_type TEXT,
+            triggered_by INTEGER REFERENCES users(id),
+            status TEXT NOT NULL DEFAULT 'queued'
+                CHECK (status IN ('queued', 'running', 'completed', 'failed', 'interrupted')),
+            phase TEXT,
+            processed_count INTEGER NOT NULL DEFAULT 0,
+            total_count INTEGER NOT NULL DEFAULT 0,
+            attachment_processed_count INTEGER NOT NULL DEFAULT 0,
+            attachment_total_count INTEGER NOT NULL DEFAULT 0,
+            source_cursors_json TEXT,
+            stage_timings_json TEXT,
+            result_json TEXT,
+            error_message TEXT,
+            lease_owner TEXT,
+            lease_until TEXT,
+            started_at TEXT,
+            heartbeat_at TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mexico_sync_one_running
+        ON mexico_sync_runs(kind) WHERE status = 'running';
+        CREATE INDEX IF NOT EXISTS idx_mexico_sync_created
+        ON mexico_sync_runs(created_at DESC);
+        """
+    )
+
+    for column, definition in (
+        ("resolved_region", "TEXT NOT NULL DEFAULT 'review'"),
+        ("region_resolution_source", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("region_review_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("region_reviewed_by", "INTEGER REFERENCES users(id)"),
+        ("region_reviewed_at", "TEXT"),
+    ):
+        _ensure_column(conn, "payment_requests", column, definition)
+
+    _ensure_column(conn, "payable_history_versions", "resolved_region", "TEXT")
+    _ensure_column(conn, "payable_history_versions", "region_review_status", "TEXT")
+
+    timestamp = _now_iso()
+    for key, value in MEXICO_TRACKING_SETTING_DEFAULTS.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, timestamp),
+        )
+
+
+def _setting_value(conn: sqlite3.Connection, key: str, default: str) -> str:
+    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return str(row["value"]) if row is not None else default
+
+
+def get_mexico_tracking_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
+    defaults = MEXICO_TRACKING_SETTING_DEFAULTS
+    return {
+        "yellow_days": int(
+            _setting_value(conn, "mexico_warning_yellow_days", defaults["mexico_warning_yellow_days"])
+        ),
+        "red_days": int(
+            _setting_value(conn, "mexico_warning_red_days", defaults["mexico_warning_red_days"])
+        ),
+        "cache_stale_seconds": int(
+            _setting_value(
+                conn,
+                "mexico_tracking_cache_stale_seconds",
+                defaults["mexico_tracking_cache_stale_seconds"],
+            )
+        ),
+        "china_region_isolation_enabled": _setting_value(
+            conn,
+            "china_region_isolation_enabled",
+            defaults["china_region_isolation_enabled"],
+        ).lower()
+        == "true",
+    }
+
+
+def update_mexico_tracking_settings(
+    conn: sqlite3.Connection,
+    *,
+    yellow_days: Optional[int] = None,
+    red_days: Optional[int] = None,
+    cache_stale_seconds: Optional[int] = None,
+    china_region_isolation_enabled: Optional[bool] = None,
+) -> Dict[str, Any]:
+    current = get_mexico_tracking_settings(conn)
+    yellow = current["yellow_days"] if yellow_days is None else yellow_days
+    red = current["red_days"] if red_days is None else red_days
+    stale = current["cache_stale_seconds"] if cache_stale_seconds is None else cache_stale_seconds
+    isolation = (
+        current["china_region_isolation_enabled"]
+        if china_region_isolation_enabled is None
+        else china_region_isolation_enabled
+    )
+    if isinstance(yellow, bool) or isinstance(red, bool) or not isinstance(yellow, int) or not isinstance(red, int):
+        raise ValueError("warning days must be integers")
+    if not 0 <= yellow < red <= 365:
+        raise ValueError("warning days must satisfy 0 <= yellow < red <= 365")
+    if isinstance(stale, bool) or not isinstance(stale, int) or stale < 0:
+        raise ValueError("cache_stale_seconds must be a non-negative integer")
+    if not isinstance(isolation, bool):
+        raise ValueError("china_region_isolation_enabled must be boolean")
+
+    values = {
+        "mexico_warning_yellow_days": str(yellow),
+        "mexico_warning_red_days": str(red),
+        "mexico_tracking_cache_stale_seconds": str(stale),
+        "china_region_isolation_enabled": "true" if isolation else "false",
+    }
+    timestamp = _now_iso()
+    for key, value in values.items():
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, value, timestamp),
+        )
+    return get_mexico_tracking_settings(conn)
 
 
 @dataclass(frozen=True)

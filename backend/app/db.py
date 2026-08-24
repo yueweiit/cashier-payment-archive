@@ -461,6 +461,9 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     migrate_external_department_sheets(conn)
     migrate_sheet_registry_and_names(conn)
     ensure_daily_payable_history_schema(conn)
+    from .mexico_tracking import ensure_mexico_tracking_schema
+
+    ensure_mexico_tracking_schema(conn)
 
 
 def get_daily_payables_history_start_date(conn: sqlite3.Connection) -> Optional[str]:
