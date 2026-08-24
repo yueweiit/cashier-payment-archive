@@ -257,6 +257,17 @@ def test_rollover_inherits_logical_request_id_without_duplicate_identity():
 def test_daily_payables_summary_details_trend_and_sheet_permissions():
     with TestClient(app) as client:
         login(client)
+        with connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES ('daily_payables_history_start_date', '2026-08-21', ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (now_iso(),),
+            )
         sheet_name = f"每日应付授权-{uuid.uuid4().hex}"
         hidden_sheet = f"每日应付无权-{uuid.uuid4().hex}"
         request = create_request(client, source_sheet=sheet_name)
@@ -292,6 +303,7 @@ def test_daily_payables_summary_details_trend_and_sheet_permissions():
                 usd_request["id"],
                 event_type="test.currency",
                 event_key=f"test:{uuid.uuid4().hex}",
+                effective_at="2026-08-21T09:00:00.000000",
                 actor_id=1,
             )
             conn.execute(
