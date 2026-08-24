@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -405,6 +406,110 @@ def resolve_region(
         sheet_region=None,
         conflict_reason="缺少可确认的执行地区和 Sheet 映射",
     )
+
+
+def _request_external_source(row: sqlite3.Row) -> Dict[str, Any]:
+    try:
+        raw_extra = json.loads(row["raw_extra_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw_extra, dict):
+        return {}
+    external = raw_extra.get("external_source")
+    return external if isinstance(external, dict) else {}
+
+
+def persist_request_region(
+    conn: sqlite3.Connection,
+    request_id: int,
+    actor_id: Optional[int],
+    preserve_admin_override: bool = True,
+) -> RegionDecision:
+    """Recalculate and persist one request's derived region classification.
+
+    The operation intentionally does not increment the request version: callers
+    invoke it inside the same transaction as the business write that already
+    owns versioning.  A prior explicit administrator decision remains stable
+    unless a future review endpoint deliberately opts out of preservation.
+    """
+
+    del actor_id  # Reserved for the explicit review endpoint and its audit log.
+    row = conn.execute(
+        "SELECT * FROM payment_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"payment request {request_id} does not exist")
+
+    external = _request_external_source(row)
+    existing_source = str(row["region_resolution_source"] or "").strip()
+    existing_region = str(row["resolved_region"] or "").strip().lower()
+    existing_review = str(row["region_review_status"] or "").strip().lower()
+    admin_region = None
+    if (
+        preserve_admin_override
+        and existing_source == "admin_override"
+        and existing_review == "resolved"
+        and existing_region in {"china", "mexico"}
+    ):
+        admin_region = existing_region
+
+    decision = resolve_region(
+        execution_region=external.get("execution_region"),
+        source_sheet=row["source_sheet"],
+        currency=row["currency"],
+        admin_region=admin_region,
+    )
+    review_status = "pending" if decision.region == "review" else "resolved"
+    if decision.source == "admin_override":
+        conn.execute(
+            """
+            UPDATE payment_requests
+            SET resolved_region = ?, region_resolution_source = ?, region_review_status = ?
+            WHERE id = ?
+            """,
+            (decision.region, decision.source, review_status, request_id),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE payment_requests
+            SET resolved_region = ?, region_resolution_source = ?, region_review_status = ?,
+                region_reviewed_by = NULL, region_reviewed_at = NULL
+            WHERE id = ?
+            """,
+            (decision.region, decision.source, review_status, request_id),
+        )
+    return decision
+
+
+def backfill_request_regions(conn: sqlite3.Connection) -> Dict[str, int]:
+    """Classify every existing request and report the migration outcome."""
+
+    counts = {
+        "china": 0,
+        "mexico": 0,
+        "review": 0,
+        "preserved_override": 0,
+    }
+    rows = conn.execute(
+        """
+        SELECT id, resolved_region, region_resolution_source, region_review_status
+        FROM payment_requests
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        was_override = (
+            str(row["region_resolution_source"] or "") == "admin_override"
+            and str(row["region_review_status"] or "") == "resolved"
+            and str(row["resolved_region"] or "") in {"china", "mexico"}
+        )
+        decision = persist_request_region(conn, int(row["id"]), actor_id=None)
+        counts[decision.region] += 1
+        if was_override and decision.source == "admin_override":
+            counts["preserved_override"] += 1
+    return counts
 
 
 def _as_shanghai(value: datetime) -> datetime:

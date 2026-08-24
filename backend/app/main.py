@@ -88,6 +88,7 @@ from .fx_rates import (
     normalize_currency,
 )
 from .file_storage import register_file_object, resolve_attachment_path, write_stream
+from .mexico_tracking import persist_request_region
 from .payable_history import payment_effective_at, record_request_state
 from .employee_departments import (
     EmployeeDepartmentError,
@@ -4845,12 +4846,23 @@ async def import_employee_departments(
                 """,
                 (new_sheet, raw_extra_json, user["id"], timestamp, current["id"]),
             )
+            persist_request_region(conn, int(current["id"]), actor_id=int(user["id"]))
             refreshed = row_to_dict(
                 conn.execute("SELECT * FROM payment_requests WHERE id = ?", (current["id"],)).fetchone()
             )
             conn.execute(
                 "UPDATE payment_requests SET content_hash = ? WHERE id = ?",
                 (content_hash(refreshed), current["id"]),
+            )
+            record_request_state(
+                conn,
+                int(current["id"]),
+                event_type="request.employee_department_regroup",
+                event_key=(
+                    f"request:employee_department_regroup:{current['id']}:"
+                    f"{int(current.get('version') or 1) + 1}"
+                ),
+                actor_id=int(user["id"]),
             )
             changed_request_ids.append(int(current["id"]))
 
@@ -5669,6 +5681,7 @@ def _sync_external_expense_metadata_blocking(
                 """,
                 (json.dumps(raw_extra, ensure_ascii=False, default=str), user["id"], timestamp, request_id, batch_id),
             )
+            persist_request_region(conn, request_id, actor_id=int(user["id"]))
             refresh_payment_summaries(conn, request_id)
 
             conn.execute(
@@ -6298,6 +6311,8 @@ def restore_table_snapshot(conn, table: str, snapshot: Dict[str, Any]) -> None:
         f"UPDATE {table} SET {', '.join(f'{column} = ?' for column in columns)} WHERE id = ?",
         [payload[column] for column in columns] + [snapshot["id"]],
     )
+    if table == "payment_requests":
+        persist_request_region(conn, int(snapshot["id"]), actor_id=None)
 
 
 def rollback_weekly_merge_job(
@@ -7434,6 +7449,7 @@ def insert_request(
         )
     else:
         refresh_payment_summaries(conn, request_id, bump_version=False)
+    persist_request_region(conn, request_id, actor_id=user_id)
     record_request_state(
         conn,
         request_id,
@@ -7618,6 +7634,7 @@ def update_request_row(
     if "source_sheet" in changed_payload:
         register_batch_sheet(conn, int(existing["batch_id"]), changed_payload["source_sheet"])
     refresh_payment_summaries(conn, request_id, bump_version=False)
+    persist_request_region(conn, request_id, actor_id=user_id)
     row = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())
     conn.execute("UPDATE payment_requests SET content_hash = ? WHERE id = ?", (content_hash(row), request_id))
     record_request_state(

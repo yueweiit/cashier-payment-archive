@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -7,13 +8,16 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from backend.app.mexico_tracking import (
+    backfill_request_regions,
     build_bilingual_reminder,
     get_mexico_tracking_settings,
     node_age_days,
+    persist_request_region,
     resolve_region,
     update_mexico_tracking_settings,
     warning_level,
 )
+from backend.app.payable_history import record_request_state
 
 
 @pytest.fixture()
@@ -302,3 +306,217 @@ def test_mexico_tracking_settings_have_safe_defaults_and_validation(isolated_db)
             update_mexico_tracking_settings(conn, cache_stale_seconds=-1)
         with pytest.raises(ValueError):
             update_mexico_tracking_settings(conn, china_region_isolation_enabled="yes")
+
+
+def _insert_region_request(
+    conn,
+    *,
+    source_sheet: str,
+    execution_region: str | None = None,
+    resolved_region: str = "review",
+    resolution_source: str = "unknown",
+    review_status: str = "pending",
+) -> int:
+    timestamp = "2026-08-24T10:00:00.000000+08:00"
+    user_id = int(conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()["id"])
+    batch = conn.execute(
+        """
+        INSERT INTO request_batches (name, status, created_by, created_at, updated_at)
+        VALUES ('地区测试批次', 'draft', ?, ?, ?)
+        """,
+        (user_id, timestamp, timestamp),
+    )
+    raw_extra = {
+        "external_source": {
+            "execution_region": execution_region,
+            "approval_status": "RUNNING",
+        }
+    }
+    request = conn.execute(
+        """
+        INSERT INTO payment_requests (
+            batch_id, dingding_id, amount, paid_amount, pending_amount, currency,
+            source_sheet, raw_extra_json, resolved_region, region_resolution_source,
+            region_review_status, created_by, updated_by, created_at, updated_at
+        ) VALUES (?, ?, 100, 0, 100, 'CNY', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(batch.lastrowid),
+            f"region-{batch.lastrowid}",
+            source_sheet,
+            json.dumps(raw_extra, ensure_ascii=False),
+            resolved_region,
+            resolution_source,
+            review_status,
+            user_id,
+            user_id,
+            timestamp,
+            timestamp,
+        ),
+    )
+    return int(request.lastrowid)
+
+
+def test_region_persist_prefers_external_execution_region_and_falls_back_to_sheet(
+    isolated_db,
+) -> None:
+    with isolated_db.connect() as conn:
+        explicit_id = _insert_region_request(
+            conn,
+            source_sheet="未登记的新公司",
+            execution_region="墨西哥 Mexico",
+        )
+        fallback_id = _insert_region_request(
+            conn,
+            source_sheet="星铭FC财务中心",
+        )
+
+        explicit = persist_request_region(conn, explicit_id, actor_id=None)
+        fallback = persist_request_region(conn, fallback_id, actor_id=None)
+
+        assert (explicit.region, explicit.source) == ("mexico", "execution_region")
+        assert (fallback.region, fallback.source) == ("china", "sheet_mapping")
+        stored = conn.execute(
+            "SELECT resolved_region, region_resolution_source, region_review_status "
+            "FROM payment_requests WHERE id = ?",
+            (explicit_id,),
+        ).fetchone()
+        assert tuple(stored) == ("mexico", "execution_region", "resolved")
+
+
+def test_region_persist_marks_conflict_for_review(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        request_id = _insert_region_request(
+            conn,
+            source_sheet="YW MOLDES MX模具",
+            execution_region="中国 China",
+        )
+
+        decision = persist_request_region(conn, request_id, actor_id=None)
+
+        assert decision.region == "review"
+        stored = conn.execute(
+            "SELECT resolved_region, region_resolution_source, region_review_status "
+            "FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        assert tuple(stored) == ("review", "conflict", "pending")
+
+
+def test_region_persist_preserves_admin_override(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        request_id = _insert_region_request(
+            conn,
+            source_sheet="YW MOLDES MX模具",
+            execution_region="Mexico",
+            resolved_region="china",
+            resolution_source="admin_override",
+            review_status="resolved",
+        )
+
+        decision = persist_request_region(conn, request_id, actor_id=1)
+
+        assert (decision.region, decision.source) == ("china", "admin_override")
+        stored = conn.execute(
+            "SELECT resolved_region, region_resolution_source, region_review_status "
+            "FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        assert tuple(stored) == ("china", "admin_override", "resolved")
+
+
+def test_region_backfill_counts_and_history_snapshot(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        china_id = _insert_region_request(conn, source_sheet="拉丁购")
+        mexico_id = _insert_region_request(conn, source_sheet="YUEWEI MX核心制造")
+        review_id = _insert_region_request(conn, source_sheet="未登记 Sheet")
+
+        counts = backfill_request_regions(conn)
+
+        assert counts == {
+            "china": 1,
+            "mexico": 1,
+            "review": 1,
+            "preserved_override": 0,
+        }
+        assert record_request_state(
+            conn,
+            mexico_id,
+            event_type="request.update",
+            event_key="region-history-test",
+        )
+        history = conn.execute(
+            "SELECT resolved_region, region_review_status FROM payable_history_versions "
+            "WHERE event_key = 'region-history-test'"
+        ).fetchone()
+        assert tuple(history) == ("mexico", "resolved")
+        assert china_id != review_id
+
+
+def test_request_write_helpers_persist_region_and_history(isolated_db) -> None:
+    from backend.app.main import insert_request, update_request_row
+
+    with isolated_db.connect() as conn:
+        user_id = int(
+            conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()["id"]
+        )
+        timestamp = "2026-08-24T10:00:00.000000+08:00"
+        batch_id = int(
+            conn.execute(
+                """
+                INSERT INTO request_batches
+                    (name, status, created_by, created_at, updated_at)
+                VALUES ('写入路径地区测试', 'draft', ?, ?, ?)
+                """,
+                (user_id, timestamp, timestamp),
+            ).lastrowid
+        )
+
+        request_id = insert_request(
+            conn,
+            batch_id,
+            {
+                "dingding_id": "region-write-path-1",
+                "source_sheet": "星铭FC财务中心",
+                "amount": 100,
+                "currency": "CNY",
+            },
+            user_id,
+        )
+        created = conn.execute(
+            "SELECT * FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        assert (
+            created["resolved_region"],
+            created["region_resolution_source"],
+            created["region_review_status"],
+        ) == ("china", "sheet_mapping", "resolved")
+
+        assert update_request_row(
+            conn,
+            request_id,
+            {"source_sheet": "YW MOLDES MX模具"},
+            user_id,
+            expected_version=int(created["version"]),
+        )
+        updated = conn.execute(
+            "SELECT * FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        assert (
+            updated["resolved_region"],
+            updated["region_resolution_source"],
+            updated["region_review_status"],
+        ) == ("mexico", "sheet_mapping", "resolved")
+        history = conn.execute(
+            """
+            SELECT resolved_region, region_review_status
+            FROM payable_history_versions
+            WHERE source_request_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (request_id,),
+        ).fetchone()
+        assert tuple(history) == ("mexico", "resolved")

@@ -149,8 +149,8 @@ def record_request_state(
             base_amount_cny, base_paid_amount_cny, base_pending_amount_cny,
             fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date,
             source_sheet, summary, applicant, approval_status, approval_result,
-            included, deleted, created_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            resolved_region, region_review_status, included, deleted, created_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             logical_request_id,
@@ -177,6 +177,8 @@ def record_request_state(
             row["applicant"],
             state["approval_status"],
             state["approval_result"],
+            row["resolved_region"],
+            row["region_review_status"],
             0 if deleted else state["included"],
             int(deleted),
             actor_id,

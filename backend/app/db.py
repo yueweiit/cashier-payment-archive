@@ -461,9 +461,19 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     migrate_external_department_sheets(conn)
     migrate_sheet_registry_and_names(conn)
     ensure_daily_payable_history_schema(conn)
-    from .mexico_tracking import ensure_mexico_tracking_schema
+    from .mexico_tracking import backfill_request_regions, ensure_mexico_tracking_schema
 
     ensure_mexico_tracking_schema(conn)
+    migration_key = "mexico_request_region_backfill_v1"
+    if not conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE key = ?",
+        (migration_key,),
+    ).fetchone():
+        backfill_request_regions(conn)
+        conn.execute(
+            "INSERT INTO schema_migrations (key, applied_at) VALUES (?, ?)",
+            (migration_key, now_iso()),
+        )
 
 
 def get_daily_payables_history_start_date(conn: sqlite3.Connection) -> Optional[str]:
@@ -529,6 +539,7 @@ def _insert_payable_baseline(
     start_date: str,
     recorded_at: str,
 ) -> None:
+    row_columns = set(row.keys())
     approval_status, approval_result, included = _history_inclusion_from_request(row)
     amount = float(row["amount"] or 0)
     paid_amount = float(row["paid_amount"] or 0)
@@ -547,8 +558,8 @@ def _insert_payable_baseline(
             base_amount_cny, base_paid_amount_cny, base_pending_amount_cny,
             fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date,
             source_sheet, summary, applicant, approval_status, approval_result,
-            included, deleted, created_by
-        ) VALUES (?, ?, ?, ?, ?, ?, 'baseline', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+            resolved_region, region_review_status, included, deleted, created_by
+        ) VALUES (?, ?, ?, ?, ?, ?, 'baseline', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
         """,
         (
             logical_request_id,
@@ -574,6 +585,8 @@ def _insert_payable_baseline(
             row["applicant"],
             approval_status,
             approval_result,
+            row["resolved_region"] if "resolved_region" in row_columns else "review",
+            row["region_review_status"] if "region_review_status" in row_columns else "pending",
             included,
         ),
     )
