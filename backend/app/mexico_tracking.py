@@ -512,6 +512,261 @@ def backfill_request_regions(conn: sqlite3.Connection) -> Dict[str, int]:
     return counts
 
 
+def _stable_json(value: Any) -> str:
+    return json.dumps(value if value is not None else [], ensure_ascii=False, sort_keys=True)
+
+
+def cache_mexico_workflow_snapshots(
+    conn: sqlite3.Connection,
+    workflows: list[Dict[str, Any]],
+    *,
+    synced_at: Optional[str] = None,
+) -> Dict[str, int]:
+    """Persist externally fetched workflow state in one short SQLite transaction.
+
+    PostgreSQL reads must finish before calling this function. Events remain in
+    the local history even when DingTalk later omits them; only their current
+    marker is refreshed. Replaying an identical snapshot does not increment the
+    tracking version or duplicate links/events.
+    """
+
+    timestamp = synced_at or _now_iso()
+    summary = {
+        "workflows_changed": 0,
+        "events_added": 0,
+        "events_updated": 0,
+        "links_added": 0,
+        "links_removed": 0,
+    }
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for workflow in workflows:
+            approval_no = str(workflow.get("approval_no") or "").strip()
+            if not approval_no:
+                continue
+            tracking = conn.execute(
+                "SELECT * FROM mexico_approval_tracking WHERE approval_no = ?",
+                (approval_no,),
+            ).fetchone()
+            if tracking is None:
+                continue
+
+            request_ids = [
+                int(row["id"])
+                for row in conn.execute(
+                    """
+                    SELECT id
+                    FROM payment_requests
+                    WHERE TRIM(COALESCE(dingding_id, '')) = ?
+                    ORDER BY id
+                    """,
+                    (approval_no,),
+                ).fetchall()
+            ]
+            desired_links = set(request_ids)
+            existing_links = {
+                int(row["request_id"])
+                for row in conn.execute(
+                    "SELECT request_id FROM mexico_approval_request_links WHERE approval_no = ?",
+                    (approval_no,),
+                ).fetchall()
+            }
+            removed_links = existing_links - desired_links
+            added_links = desired_links - existing_links
+            if removed_links:
+                conn.executemany(
+                    "DELETE FROM mexico_approval_request_links WHERE approval_no = ? AND request_id = ?",
+                    [(approval_no, request_id) for request_id in sorted(removed_links)],
+                )
+            if added_links:
+                conn.executemany(
+                    """
+                    INSERT INTO mexico_approval_request_links (
+                        approval_no, request_id, is_primary, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            approval_no,
+                            request_id,
+                            int(bool(request_ids) and request_id == request_ids[0]),
+                            timestamp,
+                        )
+                        for request_id in sorted(added_links)
+                    ],
+                )
+            if request_ids:
+                conn.execute(
+                    """
+                    UPDATE mexico_approval_request_links
+                    SET is_primary = CASE WHEN request_id = ? THEN 1 ELSE 0 END
+                    WHERE approval_no = ?
+                    """,
+                    (request_ids[0], approval_no),
+                )
+            summary["links_added"] += len(added_links)
+            summary["links_removed"] += len(removed_links)
+
+            workflow_values = {
+                "process_instance_id": workflow.get("process_instance_id"),
+                "workflow_status": str(workflow.get("status") or "").upper(),
+                "workflow_result": str(workflow.get("result") or "").lower(),
+                "current_node_name": workflow.get("current_node_name"),
+                "current_approver_id": workflow.get("current_approver_id"),
+                "current_approver_name": workflow.get("current_approver_name"),
+                "current_node_entered_at": workflow.get("current_node_entered_at"),
+                "workflow_url": workflow.get("workflow_url"),
+                "linked_request_id": request_ids[0] if request_ids else None,
+                "source_updated_at": workflow.get("updated_at"),
+            }
+            workflow_changed = any(
+                tracking[key] != value for key, value in workflow_values.items()
+            ) or bool(added_links or removed_links)
+            if workflow_changed:
+                conn.execute(
+                    """
+                    UPDATE mexico_approval_tracking
+                    SET process_instance_id = ?, workflow_status = ?, workflow_result = ?,
+                        current_node_name = ?, current_approver_id = ?, current_approver_name = ?,
+                        current_node_entered_at = ?, workflow_url = ?, linked_request_id = ?,
+                        source_updated_at = ?, last_state_synced_at = ?, last_synced_at = ?,
+                        version = version + 1, updated_at = ?
+                    WHERE approval_no = ?
+                    """,
+                    (
+                        workflow_values["process_instance_id"],
+                        workflow_values["workflow_status"],
+                        workflow_values["workflow_result"],
+                        workflow_values["current_node_name"],
+                        workflow_values["current_approver_id"],
+                        workflow_values["current_approver_name"],
+                        workflow_values["current_node_entered_at"],
+                        workflow_values["workflow_url"],
+                        workflow_values["linked_request_id"],
+                        workflow_values["source_updated_at"],
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                        approval_no,
+                    ),
+                )
+                summary["workflows_changed"] += 1
+            else:
+                conn.execute(
+                    """
+                    UPDATE mexico_approval_tracking
+                    SET last_state_synced_at = ?, last_synced_at = ?
+                    WHERE approval_no = ?
+                    """,
+                    (timestamp, timestamp, approval_no),
+                )
+
+            events = [
+                event
+                for event in workflow.get("events") or []
+                if str(event.get("event_key") or "").strip()
+            ]
+            current_keys = {
+                str(event["event_key"])
+                for event in events
+                if bool(event.get("current"))
+            }
+            if current_keys:
+                placeholders = ",".join("?" for _ in current_keys)
+                stale_current = conn.execute(
+                    f"""
+                    SELECT event_key FROM mexico_approval_events
+                    WHERE approval_no = ? AND is_current = 1
+                      AND event_key NOT IN ({placeholders})
+                    """,
+                    (approval_no, *sorted(current_keys)),
+                ).fetchall()
+            else:
+                stale_current = conn.execute(
+                    """
+                    SELECT event_key FROM mexico_approval_events
+                    WHERE approval_no = ? AND is_current = 1
+                    """,
+                    (approval_no,),
+                ).fetchall()
+            if stale_current:
+                conn.execute(
+                    "UPDATE mexico_approval_events SET is_current = 0, updated_at = ? "
+                    "WHERE approval_no = ? AND is_current = 1",
+                    (timestamp, approval_no),
+                )
+                summary["events_updated"] += len(stale_current)
+
+            for event in events:
+                event_key = str(event["event_key"])
+                values = {
+                    "process_instance_id": event.get("process_instance_id"),
+                    "sequence_index": int(event.get("sequence_index") or 0),
+                    "activity_id": event.get("activity_id"),
+                    "event_type": event.get("event_type"),
+                    "node_name": event.get("stage_name") or event.get("node_name"),
+                    "result": event.get("result"),
+                    "operator_id": event.get("operator_id"),
+                    "operator_name": event.get("operator_name"),
+                    "event_time": event.get("event_time"),
+                    "comment": event.get("comment"),
+                    "images_json": _stable_json(event.get("images")),
+                    "attachments_json": _stable_json(event.get("attachments")),
+                    "is_current": int(bool(event.get("current"))),
+                }
+                existing = conn.execute(
+                    """
+                    SELECT * FROM mexico_approval_events
+                    WHERE approval_no = ? AND event_key = ?
+                    """,
+                    (approval_no, event_key),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO mexico_approval_events (
+                            approval_no, event_key, process_instance_id, sequence_index,
+                            activity_id, event_type, node_name, result, operator_id,
+                            operator_name, event_time, comment, images_json,
+                            attachments_json, is_current, synced_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            approval_no,
+                            event_key,
+                            *values.values(),
+                            timestamp,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    summary["events_added"] += 1
+                elif any(existing[key] != value for key, value in values.items()):
+                    conn.execute(
+                        """
+                        UPDATE mexico_approval_events
+                        SET process_instance_id = ?, sequence_index = ?, activity_id = ?,
+                            event_type = ?, node_name = ?, result = ?, operator_id = ?,
+                            operator_name = ?, event_time = ?, comment = ?, images_json = ?,
+                            attachments_json = ?, is_current = ?, synced_at = ?, updated_at = ?
+                        WHERE approval_no = ? AND event_key = ?
+                        """,
+                        (
+                            *values.values(),
+                            timestamp,
+                            timestamp,
+                            approval_no,
+                            event_key,
+                        ),
+                    )
+                    summary["events_updated"] += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return summary
+
+
 def _as_shanghai(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=SHANGHAI_TZ)

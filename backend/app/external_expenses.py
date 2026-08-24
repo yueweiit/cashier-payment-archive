@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1277,6 +1278,13 @@ def fetch_external_expense_attachments(approval_nos: Iterable[str]) -> list[Dict
 
 
 def _workflow_event_time(value: Any) -> Optional[str]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(
+            SHANGHAI_TZ
+        ).replace(microsecond=0).isoformat()
     text = _text(value)
     if not text:
         return None
@@ -1302,14 +1310,26 @@ def _json_list(value: Any) -> list[Any]:
     return []
 
 
-def _workflow_event_key(process_instance_id: str, operation: Dict[str, Any]) -> str:
+def _normalized_workflow_comment(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", _text(value) or "")
+    return " ".join(normalized.split())
+
+
+def _workflow_event_key(
+    process_instance_id: str,
+    operation: Dict[str, Any],
+    *,
+    node_name: Optional[str] = None,
+    event_time: Optional[str] = None,
+) -> str:
     stable_parts = [
         process_instance_id,
+        _text(operation.get("activityId")) or "",
+        (_text(operation.get("type")) or "").upper(),
         _text(operation.get("userId")) or "",
-        _text(operation.get("date")) or "",
-        _text(operation.get("type")) or "",
-        _text(operation.get("showName")) or "",
-        _text(operation.get("remark")) or "",
+        event_time or _workflow_event_time(operation.get("date")) or "",
+        node_name or _text(operation.get("showName")) or "",
+        _normalized_workflow_comment(operation.get("remark")),
     ]
     return hashlib.sha256("|".join(stable_parts).encode("utf-8")).hexdigest()
 
@@ -1402,7 +1422,12 @@ def _parse_workflow_events(
             )
         )
         events.append({
-            "event_key": _workflow_event_key(process_instance_id, operation),
+            "event_key": _workflow_event_key(
+                process_instance_id,
+                operation,
+                node_name=stage_name,
+                event_time=event_time,
+            ),
             "process_instance_id": process_instance_id,
             "activity_id": activity_id or None,
             "event_type": event_type,
@@ -1426,6 +1451,136 @@ def _parse_workflow_events(
             int(event.get("sequence_index") or 0),
         ),
     )
+
+
+def _task_assignee_ids(task: Dict[str, Any]) -> list[str]:
+    values: list[Any] = []
+    for key in (
+        "userId",
+        "assigneeUserId",
+        "assigneeId",
+        "processorId",
+        "executorUserId",
+    ):
+        if task.get(key) is not None:
+            values.append(task.get(key))
+    for key in ("userIds", "assigneeUserIds", "processorIds", "executorUserIds"):
+        raw = task.get(key)
+        if isinstance(raw, list):
+            values.extend(raw)
+        elif isinstance(raw, str):
+            decoded = _json_list(raw)
+            values.extend(decoded if decoded else raw.split(","))
+    return list(dict.fromkeys(filter(None, (_text(value) for value in values))))
+
+
+def _current_workflow_task(
+    tasks: list[Dict[str, Any]],
+    events: list[Dict[str, Any]],
+    user_names: Dict[str, str],
+) -> Dict[str, Optional[str]]:
+    active: list[tuple[str, int, Dict[str, Any]]] = []
+    for index, task in enumerate(tasks):
+        status = (_text(task.get("status")) or "").upper()
+        if status not in {"RUNNING", "PROCESSING", "PENDING"}:
+            continue
+        entered_at = _workflow_event_time(
+            task.get("startTime")
+            or task.get("createTime")
+            or task.get("createdAt")
+            or task.get("updatedAt")
+        )
+        active.append((entered_at or "", index, task))
+    if not active:
+        return {
+            "current_node_name": None,
+            "current_approver_id": None,
+            "current_approver_name": None,
+            "current_node_entered_at": None,
+        }
+
+    entered_at, _, task = max(active, key=lambda item: (item[0], item[1]))
+    activity_id = _text(task.get("activityId")) or ""
+    node_name = (
+        _text(task.get("activityName"))
+        or _text(task.get("showName"))
+        or _text(task.get("name"))
+        or next(
+            (
+                _text(event.get("stage_name"))
+                for event in reversed(events)
+                if activity_id and _text(event.get("activity_id")) == activity_id
+            ),
+            None,
+        )
+    )
+    assignee_ids = _task_assignee_ids(task)
+    approver_id = assignee_ids[0] if assignee_ids else None
+    return {
+        "current_node_name": node_name,
+        "current_approver_id": approver_id,
+        "current_approver_name": (
+            user_names.get(approver_id) or "未识别人员"
+            if approver_id
+            else None
+        ),
+        "current_node_entered_at": entered_at or None,
+    }
+
+
+def parse_dingtalk_workflow_instance(
+    instance: Dict[str, Any],
+    user_names: Dict[str, str],
+) -> Dict[str, Any]:
+    process_instance_id = _text(instance.get("process_instance_id")) or ""
+    operations = [
+        dict(operation)
+        for operation in _json_list(instance.get("operation_records"))
+        if isinstance(operation, dict)
+    ]
+    tasks = [
+        dict(task)
+        for task in _json_list(instance.get("tasks"))
+        if isinstance(task, dict)
+    ]
+    current_activity_ids = {
+        _text(task.get("activityId")) or ""
+        for task in tasks
+        if (_text(task.get("status")) or "").upper()
+        in {"RUNNING", "PROCESSING", "PENDING"}
+        and _text(task.get("activityId"))
+    }
+    events = _parse_workflow_events(
+        process_instance_id,
+        operations,
+        current_activity_ids,
+        user_names,
+    )
+    current_task = _current_workflow_task(tasks, events, user_names)
+    return {
+        "approval_no": _text(instance.get("approval_no")) or "",
+        "process_instance_id": process_instance_id,
+        "status": (_text(instance.get("status")) or "").upper(),
+        "result": (_text(instance.get("result")) or "").lower(),
+        "title": _text(instance.get("title")),
+        "updated_at": _workflow_event_time(instance.get("updated_at")),
+        "events": events,
+        **current_task,
+    }
+
+
+def _workflow_user_ids(instances: Iterable[Dict[str, Any]]) -> list[str]:
+    user_ids: set[str] = set()
+    for instance in instances:
+        for operation in _json_list(instance.get("operation_records")):
+            if isinstance(operation, dict):
+                user_id = _text(operation.get("userId")) or ""
+                if user_id:
+                    user_ids.add(user_id)
+        for task in _json_list(instance.get("tasks")):
+            if isinstance(task, dict):
+                user_ids.update(_task_assignee_ids(task))
+    return sorted(user_ids)
 
 
 def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]]:
@@ -1458,12 +1613,7 @@ def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]
                     [chunk],
                 ).fetchall()
             )
-        user_ids = sorted({
-            str(operation.get("userId") or "").strip()
-            for instance in instances
-            for operation in _json_list(instance.get("operation_records"))
-            if isinstance(operation, dict) and str(operation.get("userId") or "").strip()
-        })
+        user_ids = _workflow_user_ids(instances)
         user_names: Dict[str, str] = {}
         for start in range(0, len(user_ids), 500):
             chunk = user_ids[start : start + 500]
@@ -1491,35 +1641,13 @@ def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]
             })
 
     workflows: list[Dict[str, Any]] = []
+    seen_approval_nos: set[str] = set()
     for instance in instances:
-        process_instance_id = _text(instance.get("process_instance_id")) or ""
-        operations = [
-            dict(operation)
-            for operation in _json_list(instance.get("operation_records"))
-            if isinstance(operation, dict)
-        ]
-        current_activity_ids = {
-            _text(task.get("activityId")) or ""
-            for task in _json_list(instance.get("tasks"))
-            if isinstance(task, dict)
-            and (_text(task.get("status")) or "").upper() in {"RUNNING", "PROCESSING"}
-            and _text(task.get("activityId"))
-        }
-        events = _parse_workflow_events(
-            process_instance_id,
-            operations,
-            current_activity_ids,
-            user_names,
-        )
-        workflows.append({
-            "approval_no": _text(instance.get("approval_no")) or "",
-            "process_instance_id": process_instance_id,
-            "status": (_text(instance.get("status")) or "").upper(),
-            "result": (_text(instance.get("result")) or "").lower(),
-            "title": _text(instance.get("title")),
-            "updated_at": _workflow_event_time(instance.get("updated_at")),
-            "events": events,
-        })
+        approval_no = _text(instance.get("approval_no")) or ""
+        if not approval_no or approval_no in seen_approval_nos:
+            continue
+        seen_approval_nos.add(approval_no)
+        workflows.append(parse_dingtalk_workflow_instance(instance, user_names))
     return workflows
 
 

@@ -7,8 +7,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from backend.app.external_expenses import discover_expense_workflows
+from backend.app.external_expenses import (
+    discover_expense_workflows,
+    parse_dingtalk_workflow_instance,
+)
 from backend.app.mexico_tracking import (
+    cache_mexico_workflow_snapshots,
     backfill_request_regions,
     build_bilingual_reminder,
     get_mexico_tracking_settings,
@@ -728,3 +732,249 @@ def test_discovery_deduplicates_same_source_row_and_surfaces_cross_source_confli
     assert conflict["source_conflict"] is True
     assert conflict["resolved_region"] == "review"
     assert len(conflict["raw_candidates"]) == 2
+
+
+def _workflow_operation(
+    *,
+    activity_id: str,
+    event_type: str,
+    user_id: str,
+    event_time: str,
+    show_name: str,
+    remark: str = "",
+    result: str = "",
+):
+    return {
+        "activityId": activity_id,
+        "type": event_type,
+        "userId": user_id,
+        "date": event_time,
+        "showName": show_name,
+        "remark": remark,
+        "result": result,
+    }
+
+
+def test_workflow_snapshot_keeps_stable_distinct_event_keys_when_comments_reorder() -> None:
+    operations = [
+        _workflow_operation(
+            activity_id="finance",
+            event_type="ADD_REMARK",
+            user_id="finance-user",
+            event_time="2026-08-24T01:00:00Z",
+            show_name="财务",
+            remark="请核对收款账户",
+        ),
+        _workflow_operation(
+            activity_id="finance",
+            event_type="ADD_REMARK",
+            user_id="finance-user",
+            event_time="2026-08-24T01:01:00Z",
+            show_name="财务",
+            remark="账户已核对",
+        ),
+    ]
+    instance = {
+        "approval_no": "202608240099",
+        "process_instance_id": "process-99",
+        "status": "RUNNING",
+        "result": "",
+        "title": "María López提交的采购支出",
+        "operation_records": operations,
+        "tasks": [],
+        "updated_at": "2026-08-24T01:02:00Z",
+    }
+
+    first = parse_dingtalk_workflow_instance(
+        instance,
+        {"finance-user": "吴嘉洪"},
+    )
+    second = parse_dingtalk_workflow_instance(
+        {**instance, "operation_records": list(reversed(operations))},
+        {"finance-user": "吴嘉洪"},
+    )
+
+    first_keys = {event["comment"]: event["event_key"] for event in first["events"]}
+    second_keys = {event["comment"]: event["event_key"] for event in second["events"]}
+    assert first_keys == second_keys
+    assert len(set(first_keys.values())) == 2
+
+
+def test_workflow_snapshot_uses_latest_active_task_for_current_node_and_approver() -> None:
+    instance = {
+        "approval_no": "202608240100",
+        "process_instance_id": "process-100",
+        "status": "RUNNING",
+        "result": "",
+        "title": "María López提交的采购支出",
+        "operation_records": [],
+        "tasks": [
+            {
+                "activityId": "old-node",
+                "activityName": "主管审批",
+                "userId": "old-user",
+                "status": "COMPLETED",
+                "createTime": "2026-08-22T08:00:00Z",
+            },
+            {
+                "activityId": "finance-node",
+                "activityName": "财务审批",
+                "userId": "finance-user",
+                "status": "RUNNING",
+                "createTime": "2026-08-24T01:00:00Z",
+            },
+        ],
+        "updated_at": "2026-08-24T01:02:00Z",
+    }
+
+    snapshot = parse_dingtalk_workflow_instance(
+        instance,
+        {"finance-user": "吴嘉洪"},
+    )
+
+    assert snapshot["current_node_name"] == "财务审批"
+    assert snapshot["current_approver_id"] == "finance-user"
+    assert snapshot["current_approver_name"] == "吴嘉洪"
+    assert snapshot["current_node_entered_at"] == "2026-08-24T09:00:00+08:00"
+
+
+def test_workflow_snapshot_keeps_unknown_current_approver_id() -> None:
+    snapshot = parse_dingtalk_workflow_instance(
+        {
+            "approval_no": "202608240101",
+            "process_instance_id": "process-101",
+            "status": "RUNNING",
+            "result": "",
+            "title": "测试流程",
+            "operation_records": [],
+            "tasks": [
+                {
+                    "activityId": "ceo-node",
+                    "showName": "CEO 审批",
+                    "assigneeUserId": "unknown-user-id",
+                    "status": "PROCESSING",
+                    "startTime": "2026-08-24T02:00:00Z",
+                }
+            ],
+        },
+        {},
+    )
+
+    assert snapshot["current_approver_id"] == "unknown-user-id"
+    assert snapshot["current_approver_name"] == "未识别人员"
+
+
+def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
+    isolated_db,
+) -> None:
+    approval_no = "202608240102"
+    workflow = parse_dingtalk_workflow_instance(
+        {
+            "approval_no": approval_no,
+            "process_instance_id": "process-102",
+            "status": "COMPLETED",
+            "result": "agree",
+            "title": "María López提交的采购支出",
+            "operation_records": [
+                _workflow_operation(
+                    activity_id="ceo-node",
+                    event_type="EXECUTE_TASK_NORMAL",
+                    user_id="ceo-user",
+                    event_time="2026-08-24T03:00:00Z",
+                    show_name="CEO 审批",
+                    result="AGREE",
+                    remark="同意",
+                )
+            ],
+            "tasks": [],
+            "updated_at": "2026-08-24T03:01:00Z",
+        },
+        {"ceo-user": "Eduardo Gómez"},
+    )
+    timestamp = "2026-08-24T12:00:00.000000+08:00"
+
+    with isolated_db.connect() as conn:
+        first_request = _insert_region_request(
+            conn,
+            source_sheet="YUEWEI MX核心制造",
+            execution_region="Mexico",
+        )
+        second_request = _insert_region_request(
+            conn,
+            source_sheet="YUEWEI MX核心制造",
+            execution_region="Mexico",
+        )
+        conn.execute(
+            "UPDATE payment_requests SET dingding_id = ? WHERE id IN (?, ?)",
+            (approval_no, first_request, second_request),
+        )
+        conn.execute(
+            """
+            INSERT INTO mexico_approval_tracking (
+                approval_no, source_type, resolved_region, region_resolution_source,
+                region_review_status, workflow_status, created_at, updated_at
+            ) VALUES (?, 'purchase', 'mexico', 'execution_region', 'resolved',
+                      'RUNNING', ?, ?)
+            """,
+            (approval_no, timestamp, timestamp),
+        )
+        conn.commit()
+
+        first_result = cache_mexico_workflow_snapshots(
+            conn,
+            [workflow],
+            synced_at=timestamp,
+        )
+        stored_after_first = conn.execute(
+            "SELECT workflow_status, workflow_result, version FROM mexico_approval_tracking "
+            "WHERE approval_no = ?",
+            (approval_no,),
+        ).fetchone()
+        second_result = cache_mexico_workflow_snapshots(
+            conn,
+            [workflow],
+            synced_at="2026-08-24T12:05:00.000000+08:00",
+        )
+        stored_after_second = conn.execute(
+            "SELECT workflow_status, workflow_result, version FROM mexico_approval_tracking "
+            "WHERE approval_no = ?",
+            (approval_no,),
+        ).fetchone()
+
+        assert first_result == {
+            "workflows_changed": 1,
+            "events_added": 1,
+            "events_updated": 0,
+            "links_added": 2,
+            "links_removed": 0,
+        }
+        assert second_result == {
+            "workflows_changed": 0,
+            "events_added": 0,
+            "events_updated": 0,
+            "links_added": 0,
+            "links_removed": 0,
+        }
+        assert tuple(stored_after_first) == ("COMPLETED", "agree", 2)
+        assert tuple(stored_after_second) == ("COMPLETED", "agree", 2)
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM mexico_approval_events WHERE approval_no = ?",
+            (approval_no,),
+        ).fetchone()["count"] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM mexico_approval_request_links WHERE approval_no = ?",
+            (approval_no,),
+        ).fetchone()["count"] == 2
+
+        resumed = {**workflow, "status": "RUNNING", "result": ""}
+        cache_mexico_workflow_snapshots(
+            conn,
+            [resumed],
+            synced_at="2026-08-24T12:10:00.000000+08:00",
+        )
+        restored = conn.execute(
+            "SELECT workflow_status, workflow_result, version FROM mexico_approval_tracking "
+            "WHERE approval_no = ?",
+            (approval_no,),
+        ).fetchone()
+        assert tuple(restored) == ("RUNNING", "", 3)
