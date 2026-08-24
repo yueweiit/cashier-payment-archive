@@ -4977,6 +4977,544 @@ textarea {
 .daily-status.due { color: #946416; background: #fff1c9; }
 .daily-status.paid { color: #177261; background: #dcf5e9; }
 
+/* Mexico approval tracking */
+.mexico-tracking-page {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.mexico-tracking-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 22px 24px;
+  border: 1px solid #d8e3e7;
+  border-radius: 12px;
+  background:
+    radial-gradient(circle at 92% 5%, rgba(31, 132, 117, 0.15), transparent 24%),
+    linear-gradient(135deg, #ffffff 0%, #f7fbfa 100%);
+}
+
+.mexico-tracking-hero h2,
+.mexico-tracking-hero p {
+  margin: 0;
+}
+
+.mexico-tracking-hero h2 {
+  margin-top: 5px;
+  color: #20323a;
+  font-size: 24px;
+}
+
+.mexico-tracking-hero p {
+  margin-top: 7px;
+  color: #6c7e87;
+  line-height: 1.5;
+}
+
+.mexico-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #187969;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.mexico-hero-actions,
+.mexico-sync-status-head,
+.mexico-list-heading,
+.mexico-list-heading > div,
+.mexico-pagination {
+  display: flex;
+  align-items: center;
+}
+
+.mexico-hero-actions {
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.mexico-hero-actions .primary,
+.mexico-filter-main .primary,
+.mexico-settings-dialog .primary,
+.mexico-region-review .primary {
+  border-color: #1e8272;
+  color: #fff;
+  background: #1e8272;
+}
+
+.mexico-hero-actions .primary:hover,
+.mexico-filter-main .primary:hover,
+.mexico-settings-dialog .primary:hover,
+.mexico-region-review .primary:hover {
+  background: #176f62;
+}
+
+.mexico-sync-status {
+  display: grid;
+  gap: 8px;
+  padding: 12px 16px;
+  border: 1px solid #cce3dd;
+  border-radius: 9px;
+  color: #236a5e;
+  background: #eff9f6;
+}
+
+.mexico-sync-status.failed {
+  border-color: #f1c6c3;
+  color: #a0443e;
+  background: #fff4f3;
+}
+
+.mexico-sync-status-head {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mexico-sync-status-head span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 700;
+}
+
+.mexico-sync-progress {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dcebe7;
+}
+
+.mexico-sync-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #299783;
+  transition: width 0.25s ease;
+}
+
+.spin {
+  animation: mexico-spin 0.8s linear infinite;
+}
+
+@keyframes mexico-spin {
+  to { transform: rotate(360deg); }
+}
+
+.mexico-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mexico-kpi-grid > button {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 74px;
+  padding: 14px 16px;
+  border: 1px solid #dbe4e8;
+  border-radius: 10px;
+  color: #50646e;
+  text-align: left;
+  background: #fff;
+}
+
+.mexico-kpi-grid > button svg {
+  width: 19px;
+  color: #72858e;
+}
+
+.mexico-kpi-grid > button span {
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.mexico-kpi-grid > button strong {
+  color: #273a43;
+  font-size: 23px;
+}
+
+.mexico-kpi-grid > button:hover,
+.mexico-kpi-grid > button.active {
+  border-color: #67ad9f;
+  box-shadow: 0 0 0 2px rgba(35, 134, 117, 0.09);
+  background: #f4fbf9;
+}
+
+.mexico-kpi-grid > button.warning-yellow svg,
+.mexico-kpi-grid > button.warning-yellow strong { color: #a87513; }
+.mexico-kpi-grid > button.warning-yellow.active { border-color: #e2bd63; background: #fff9e9; }
+.mexico-kpi-grid > button.warning-red svg,
+.mexico-kpi-grid > button.warning-red strong { color: #b84a43; }
+.mexico-kpi-grid > button.warning-red.active { border-color: #df8a84; background: #fff4f3; }
+.mexico-kpi-grid > button.warning-neutral svg,
+.mexico-kpi-grid > button.warning-neutral strong { color: #6e668b; }
+
+.mexico-filter-panel,
+.mexico-table-wrap {
+  border: 1px solid #dbe5e9;
+  border-radius: 11px;
+  background: #fff;
+}
+
+.mexico-filter-panel {
+  padding: 13px;
+}
+
+.mexico-filter-main {
+  display: grid;
+  grid-template-columns: minmax(280px, 1.6fr) minmax(180px, 0.75fr) minmax(180px, 0.75fr) auto auto;
+  gap: 9px;
+}
+
+.mexico-filter-main > *,
+.mexico-filter-extra > * {
+  min-width: 0;
+}
+
+.mexico-search-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 11px;
+  border: 1px solid #cfdbe1;
+  border-radius: 7px;
+  background: #fff;
+}
+
+.mexico-search-field:focus-within {
+  border-color: #3e9788;
+  box-shadow: 0 0 0 2px rgba(41, 143, 125, 0.1);
+}
+
+.mexico-search-field input {
+  width: 100%;
+  border: 0;
+  box-shadow: none;
+}
+
+.mexico-filter-main button b {
+  min-width: 20px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  color: #fff;
+  font-size: 11px;
+  background: #278b79;
+}
+
+.mexico-filter-extra {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(145px, 1fr)) minmax(180px, 1fr) minmax(180px, 1fr) auto;
+  gap: 9px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #e7edef;
+}
+
+.mexico-filter-extra label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 9px;
+  border: 1px solid #d2dde2;
+  border-radius: 7px;
+  color: #70818a;
+  font-size: 12px;
+}
+
+.mexico-filter-extra label input {
+  flex: 1;
+  border: 0;
+  box-shadow: none;
+}
+
+.mexico-list-heading {
+  justify-content: space-between;
+  min-height: 30px;
+  color: #71838c;
+}
+
+.mexico-list-heading > div { gap: 9px; }
+.mexico-list-heading strong { color: #283b44; font-size: 17px; }
+.mexico-list-heading span { font-size: 13px; }
+
+.mexico-table-wrap {
+  position: relative;
+  min-height: 150px;
+  overflow: hidden;
+}
+
+.mexico-tracking-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.mexico-tracking-table th {
+  padding: 12px 10px;
+  color: #39515b;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  background: #edf5f4;
+}
+
+.mexico-tracking-table th:nth-child(1) { width: 92px; }
+.mexico-tracking-table th:nth-child(2) { width: 190px; }
+.mexico-tracking-table th:nth-child(3) { width: 180px; }
+.mexico-tracking-table th:nth-child(4) { width: 150px; }
+.mexico-tracking-table th:nth-child(6) { width: 150px; }
+.mexico-tracking-table th:nth-child(7) { width: 150px; }
+.mexico-tracking-table th:nth-child(8) { width: 105px; }
+.mexico-tracking-table th:nth-child(9) { width: 90px; }
+
+.mexico-tracking-table td {
+  padding: 12px 10px;
+  border-top: 1px solid #e3eaed;
+  color: #33464f;
+  vertical-align: middle;
+}
+
+.mexico-tracking-table tr:hover { background: #f8fbfb; }
+.mexico-tracking-table tr.warning-red { background: #fffafa; }
+.mexico-tracking-table td small,
+.mexico-tracking-table td strong,
+.mexico-tracking-table td > span {
+  display: block;
+}
+
+.mexico-tracking-table td small {
+  margin-top: 4px;
+  overflow: hidden;
+  color: #82929a;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mexico-summary-cell > span {
+  display: -webkit-box !important;
+  overflow: hidden;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.mexico-warning-chip {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  width: max-content;
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #467069;
+  font-size: 11px;
+  font-weight: 700;
+  background: #e7f3f0;
+}
+
+.mexico-warning-chip.yellow { color: #906211; background: #fff0c3; }
+.mexico-warning-chip.red { color: #a8413b; background: #fde5e3; }
+
+.mexico-row-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.mexico-row-actions button {
+  padding: 6px 8px;
+}
+
+.mexico-loading,
+.mexico-empty,
+.mexico-detail-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 150px;
+  color: #71838c;
+}
+
+.mexico-empty {
+  flex-direction: column;
+  padding: 30px;
+  text-align: center;
+}
+
+.mexico-empty svg { width: 30px; color: #4d9b8e; }
+.mexico-empty strong { color: #40545d; }
+.mexico-error { padding: 11px 14px; border: 1px solid #efc6c3; border-radius: 8px; color: #a6433e; background: #fff5f4; }
+.mexico-error button { margin-left: 10px; }
+
+.mexico-card-list { display: none; }
+
+.mexico-pagination {
+  justify-content: center;
+  gap: 12px;
+}
+
+.mexico-pagination button {
+  width: 38px;
+  height: 36px;
+  padding: 6px;
+}
+
+.mexico-detail-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(23, 39, 47, 0.34);
+  backdrop-filter: blur(1px);
+}
+
+.mexico-detail-drawer {
+  display: flex;
+  flex-direction: column;
+  width: min(820px, 84vw);
+  height: 100%;
+  box-shadow: -16px 0 44px rgba(20, 39, 47, 0.18);
+  background: #f5f8f9;
+}
+
+.mexico-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 22px;
+  border-bottom: 1px solid #dce5e8;
+  background: #fff;
+}
+
+.mexico-detail-header small { color: #278675; font-weight: 700; }
+.mexico-detail-header h2 { margin: 5px 0 0; font-size: 21px; line-height: 1.4; }
+.mexico-detail-header > button { flex: 0 0 auto; width: 40px; padding: 7px; }
+
+.mexico-detail-content {
+  display: grid;
+  gap: 13px;
+  padding: 16px 20px 32px;
+  overflow-y: auto;
+}
+
+.mexico-detail-content > section {
+  padding: 17px;
+  border: 1px solid #dce5e8;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.mexico-detail-content h3 { margin: 0 0 13px; color: #334851; font-size: 16px; }
+.mexico-detail-content h3 span { margin-left: 5px; color: #788a92; font-size: 12px; }
+
+.mexico-detail-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mexico-detail-overview > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 11px;
+  border-radius: 7px;
+  background: #f4f8f8;
+}
+
+.mexico-detail-overview span,
+.mexico-detail-meta dt { color: #7b8b93; font-size: 12px; }
+.mexico-detail-overview strong { overflow-wrap: anywhere; }
+
+.mexico-reminder-box,
+.mexico-region-review {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+
+.mexico-reminder-box { justify-content: space-between; border-color: #cbe4dc !important; background: #f2fbf8 !important; }
+.mexico-reminder-box > div { display: grid; gap: 3px; }
+.mexico-reminder-box span { color: #75878f; font-size: 12px; }
+.mexico-reminder-box button { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+
+.mexico-region-review { border-color: #efd78e !important; background: #fffbec !important; }
+.mexico-region-review > svg { color: #af7917; }
+.mexico-region-review > div:nth-of-type(1) { min-width: 0; flex: 1; }
+.mexico-region-review p { margin: 5px 0 0; color: #74684c; }
+.mexico-region-review > div:last-child { display: flex; gap: 7px; flex: 0 0 auto; }
+
+.mexico-detail-meta dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 13px;
+  margin: 0;
+}
+
+.mexico-detail-meta dl > div { display: grid; gap: 4px; min-width: 0; }
+.mexico-detail-meta dd { margin: 0; overflow-wrap: anywhere; }
+.mexico-workflow-link { display: inline-flex; align-items: center; gap: 5px; margin-top: 14px; color: #167868; }
+
+.mexico-timeline {
+  position: relative;
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0 0 0 20px;
+  list-style: none;
+}
+
+.mexico-timeline::before { content: ""; position: absolute; top: 6px; bottom: 7px; left: 5px; width: 2px; background: #dce6e8; }
+.mexico-timeline > li { position: relative; }
+.mexico-timeline > li > i { position: absolute; top: 17px; left: -20px; width: 12px; height: 12px; border: 3px solid #fff; border-radius: 50%; box-shadow: 0 0 0 2px #a7b9bf; background: #a7b9bf; }
+.mexico-timeline > li.current > i { box-shadow: 0 0 0 3px #c9e7df; background: #208b77; }
+
+.mexico-timeline-card { padding: 13px 14px; border: 1px solid #dce5e8; border-radius: 8px; background: #fbfcfc; }
+.mexico-timeline li.current .mexico-timeline-card { border-color: #92c8bb; background: #f5fcfa; }
+.mexico-timeline-card header { display: flex; justify-content: space-between; gap: 10px; }
+.mexico-timeline-card header > div { display: flex; align-items: center; gap: 7px; }
+.mexico-timeline-card header span { padding: 2px 6px; border-radius: 999px; color: #14705f; font-size: 10px; background: #dff3ed; }
+.mexico-timeline-card time { color: #84949b; font-size: 11px; }
+.mexico-event-operator { display: flex; align-items: center; gap: 5px; margin: 7px 0; color: #667982; font-size: 12px; }
+.mexico-timeline-card blockquote { margin: 9px 0 0; padding: 9px 11px; border-left: 3px solid #70ad9f; border-radius: 4px; color: #3c5059; background: #f0f5f5; }
+.mexico-timeline-card > small { display: flex; align-items: center; gap: 5px; margin-top: 8px; color: #73868e; }
+
+.mexico-attachment-list { display: grid; gap: 7px; }
+.mexico-attachment-list > a,
+.mexico-attachment-list > div { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 10px 12px; border: 1px solid #dfe7ea; border-radius: 7px; color: #354a53; }
+.mexico-attachment-list > a:hover { border-color: #84bcaf; background: #f7fbfa; }
+.mexico-attachment-list > .disabled { color: #88979d; background: #f5f6f7; }
+.mexico-attachment-list span { display: grid; gap: 2px; min-width: 0; }
+.mexico-attachment-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mexico-attachment-list small { color: #829199; }
+
+.mexico-linked-section { display: grid; gap: 7px; }
+.mexico-linked-section h3 { margin-bottom: 5px; }
+.mexico-linked-section > div { display: grid; grid-template-columns: 1fr 2fr auto; gap: 9px; padding: 10px; border-radius: 7px; background: #f5f8f8; }
+.mexico-linked-section > div span,
+.mexico-linked-section > div small { color: #71838c; }
+.mexico-inline-empty { padding: 17px; border: 1px dashed #d9e3e6; border-radius: 7px; color: #7d8d94; text-align: center; }
+
+.mexico-settings-dialog { width: min(560px, calc(100vw - 32px)); }
+.mexico-settings-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.mexico-settings-dialog h2,
+.mexico-settings-dialog p { margin: 0; }
+.mexico-settings-dialog p { margin-top: 5px; color: #73858d; }
+.mexico-settings-dialog header button { width: 38px; padding: 6px; }
+.mexico-settings-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 18px 0; }
+.mexico-settings-form label { display: grid; gap: 6px; color: #5d7079; font-size: 12px; }
+.mexico-settings-dialog footer { display: flex; justify-content: flex-end; gap: 8px; }
+
 .daily-detail-cards {
   display: none;
 }
@@ -5090,4 +5628,79 @@ textarea {
     display: grid;
     grid-template-columns: 1fr;
   }
+}
+
+@media (max-width: 1280px) {
+  .mexico-kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .mexico-filter-main { grid-template-columns: minmax(250px, 1.5fr) minmax(170px, 1fr) minmax(170px, 1fr) auto auto; }
+  .mexico-filter-extra { grid-template-columns: repeat(3, minmax(160px, 1fr)); }
+  .mexico-table-wrap { overflow-x: auto; }
+  .mexico-tracking-table { min-width: 1260px; }
+}
+
+@media (max-width: 980px) {
+  .mexico-tracking-page { gap: 12px; }
+  .mexico-tracking-hero { align-items: flex-start; padding: 17px; }
+  .mexico-tracking-hero h2 { font-size: 21px; }
+  .mexico-hero-actions { flex-direction: column-reverse; align-items: stretch; }
+  .mexico-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mexico-kpi-grid > button { min-height: 66px; padding: 11px 12px; }
+  .mexico-filter-main { grid-template-columns: 1fr 1fr; }
+  .mexico-search-field { grid-column: 1 / -1; min-height: 44px; }
+  .mexico-filter-main > button:last-child { grid-column: 2; }
+  .mexico-filter-extra { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mexico-list-heading { padding: 0 2px; }
+  .mexico-tracking-table { display: none; }
+  .mexico-card-list { display: grid; gap: 9px; padding: 10px; }
+  .mexico-tracking-card { display: grid; gap: 9px; padding: 13px; border: 1px solid #dce5e8; border-radius: 9px; background: #fff; }
+  .mexico-tracking-card.warning-yellow { border-left: 4px solid #dfb54f; }
+  .mexico-tracking-card.warning-red { border-left: 4px solid #d9665f; }
+  .mexico-tracking-card header,
+  .mexico-tracking-card footer,
+  .mexico-tracking-card footer > div { display: flex; align-items: center; }
+  .mexico-tracking-card header,
+  .mexico-tracking-card footer { justify-content: space-between; gap: 8px; }
+  .mexico-tracking-card h3,
+  .mexico-tracking-card p { margin: 0; }
+  .mexico-tracking-card h3 { color: #2b4049; font-size: 16px; line-height: 1.45; }
+  .mexico-tracking-card p { color: #61757e; }
+  .mexico-tracking-card dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin: 0; }
+  .mexico-tracking-card dl > div { display: grid; gap: 2px; min-width: 0; }
+  .mexico-tracking-card dt { color: #829198; font-size: 11px; }
+  .mexico-tracking-card dd { margin: 0; overflow-wrap: anywhere; font-weight: 600; }
+  .mexico-tracking-card footer { padding-top: 8px; border-top: 1px solid #e5ebee; color: #819198; font-size: 11px; }
+  .mexico-tracking-card footer > div { gap: 6px; }
+  .mexico-tracking-card footer button { display: inline-flex; align-items: center; gap: 4px; padding: 6px 8px; }
+  .mexico-detail-drawer { width: 100%; max-width: none; }
+  .mexico-detail-content { padding: 12px 12px 28px; }
+  .mexico-detail-overview,
+  .mexico-detail-meta dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 620px) {
+  .mexico-tracking-hero { flex-direction: column; }
+  .mexico-hero-actions { width: 100%; }
+  .mexico-hero-actions button { justify-content: center; min-height: 44px; }
+  .mexico-kpi-grid { gap: 7px; }
+  .mexico-kpi-grid > button { grid-template-columns: auto 1fr; }
+  .mexico-kpi-grid > button strong { grid-column: 2; font-size: 19px; }
+  .mexico-filter-main,
+  .mexico-filter-extra { grid-template-columns: 1fr; }
+  .mexico-filter-main > button:last-child,
+  .mexico-search-field { grid-column: auto; }
+  .mexico-filter-main > *,
+  .mexico-filter-extra > * { min-height: 44px; }
+  .mexico-list-heading { align-items: flex-start; flex-direction: column; gap: 3px; }
+  .mexico-tracking-card dl,
+  .mexico-detail-overview,
+  .mexico-detail-meta dl { grid-template-columns: 1fr; }
+  .mexico-detail-header { padding: 15px; }
+  .mexico-detail-header h2 { font-size: 18px; }
+  .mexico-reminder-box,
+  .mexico-region-review { align-items: stretch; flex-direction: column; }
+  .mexico-reminder-box button { justify-content: center; }
+  .mexico-region-review > div:last-child { display: grid; grid-template-columns: 1fr 1fr; }
+  .mexico-timeline-card header { align-items: flex-start; flex-direction: column; }
+  .mexico-linked-section > div { grid-template-columns: 1fr; }
+  .mexico-settings-form { grid-template-columns: 1fr; }
 }

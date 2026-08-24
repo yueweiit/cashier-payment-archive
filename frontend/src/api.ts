@@ -9,6 +9,156 @@ export type User = {
   sheet_permissions: string[];
 };
 
+export type MexicoTrackingView = "pending" | "history" | "review";
+export type MexicoWarningLevel = "normal" | "yellow" | "red";
+
+export type MexicoTrackingReminder = {
+  zh: string;
+  es: string;
+};
+
+export type MexicoTrackingItem = {
+  id: number;
+  approval_no: string;
+  source_type: string;
+  resolved_region: "china" | "mexico" | "review";
+  region_resolution_source?: string | null;
+  region_review_status: "resolved" | "pending";
+  region_conflict_reason?: string | null;
+  request_date?: string | null;
+  applicant_name?: string | null;
+  applicant_department?: string | null;
+  company_name?: string | null;
+  source_sheet?: string | null;
+  summary?: string | null;
+  amount?: number | null;
+  currency?: string | null;
+  workflow_status?: string | null;
+  workflow_result?: string | null;
+  current_node_name?: string | null;
+  current_approver_name?: string | null;
+  current_node_entered_at?: string | null;
+  workflow_url?: string | null;
+  last_state_synced_at?: string | null;
+  last_attachment_synced_at?: string | null;
+  last_synced_at?: string | null;
+  version: number;
+  updated_at?: string | null;
+  age_days: number;
+  warning_level: MexicoWarningLevel;
+  reminder?: MexicoTrackingReminder | null;
+};
+
+export type MexicoTrackingEvent = {
+  id: number;
+  event_key: string;
+  event_time?: string | null;
+  sequence_index?: number | null;
+  node_name?: string | null;
+  event_type?: string | null;
+  result?: string | null;
+  operator_name?: string | null;
+  remark?: string | null;
+  is_current?: number | boolean | null;
+  images?: Array<Record<string, unknown>>;
+  attachments?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+};
+
+export type MexicoTrackingAttachment = {
+  id: number;
+  event_key?: string | null;
+  source_file_id?: string | null;
+  file_name: string;
+  mime_type?: string | null;
+  size_bytes?: number | null;
+  status: string;
+  attempts: number;
+  last_error?: string | null;
+  content_url?: string | null;
+};
+
+export type MexicoTrackingLinkedRequest = {
+  id: number;
+  batch_id: number;
+  batch_name: string;
+  dingding_id?: string | null;
+  source_sheet?: string | null;
+  summary?: string | null;
+  payment_status?: string | null;
+  amount?: number | null;
+  paid_amount?: number | null;
+  pending_amount?: number | null;
+  currency?: string | null;
+  is_primary?: number | boolean;
+};
+
+export type MexicoTrackingDetail = MexicoTrackingItem & {
+  events: MexicoTrackingEvent[];
+  attachments: MexicoTrackingAttachment[];
+  linked_requests: MexicoTrackingLinkedRequest[];
+};
+
+export type MexicoTrackingSummary = {
+  pending: number;
+  history: number;
+  review: number;
+  normal: number;
+  yellow: number;
+  red: number;
+};
+
+export type MexicoTrackingFilterOptions = {
+  companies: string[];
+  sheets: string[];
+  source_types: string[];
+  applicants: string[];
+  approvers: string[];
+  nodes: string[];
+};
+
+export type MexicoTrackingSettings = {
+  yellow_days: number;
+  red_days: number;
+  cache_stale_seconds: number;
+  china_region_isolation_enabled: boolean;
+};
+
+export type MexicoSyncRun = {
+  id: string;
+  kind: string;
+  trigger_type: "manual" | "automatic";
+  status: "queued" | "running" | "completed" | "failed" | "interrupted";
+  phase: string;
+  processed_count: number;
+  total_count: number;
+  attachment_processed_count: number;
+  attachment_total_count: number;
+  error_message?: string | null;
+  stage_timings?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  fresh?: boolean;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type MexicoTrackingListParams = {
+  view?: MexicoTrackingView;
+  page?: number;
+  page_size?: number;
+  keyword?: string;
+  company?: string;
+  source_type?: string;
+  applicant?: string;
+  approver?: string;
+  node?: string;
+  warning?: MexicoWarningLevel | "";
+  request_date_from?: string;
+  request_date_to?: string;
+};
+
 export type Batch = {
   id: number;
   version: number;
@@ -856,6 +1006,40 @@ export const api = {
     request<{ operation: BatchOperation }>(`/api/batch-operations/${operationId}`),
   dingtalkWorkflow: (batchId: number, requestId: number) =>
     request<DingtalkWorkflow>(`/api/batches/${batchId}/requests/${requestId}/dingtalk-workflow`),
+  mexicoTrackingList: (params: MexicoTrackingListParams = {}) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
+    });
+    return request<{ items: MexicoTrackingItem[]; total: number; page: number; page_size: number; pages: number }>(
+      `/api/mexico-tracking?${query}`,
+    );
+  },
+  mexicoTrackingDetail: (trackingId: number) =>
+    request<{ item: MexicoTrackingDetail }>(`/api/mexico-tracking/${trackingId}`),
+  mexicoTrackingSummary: () =>
+    request<{ summary: MexicoTrackingSummary }>("/api/mexico-tracking/summary"),
+  mexicoTrackingFilterOptions: () =>
+    request<{ options: MexicoTrackingFilterOptions }>("/api/mexico-tracking/filter-options"),
+  startMexicoTrackingSync: (onlyIfStaleSeconds = 300, triggerType: "manual" | "automatic" = "manual") =>
+    request<{ status: string; reused: boolean; run: MexicoSyncRun }>(
+      `/api/mexico-tracking/sync?only_if_stale_seconds=${onlyIfStaleSeconds}&trigger_type=${triggerType}`,
+      { method: "POST" },
+    ),
+  mexicoTrackingSyncRun: (runId: string) =>
+    request<{ run: MexicoSyncRun }>(`/api/mexico-tracking/sync-runs/${encodeURIComponent(runId)}`),
+  mexicoTrackingSettings: () =>
+    request<{ settings: MexicoTrackingSettings }>("/api/mexico-tracking/settings"),
+  updateMexicoTrackingSettings: (payload: MexicoTrackingSettings) =>
+    request<{ settings: MexicoTrackingSettings }>("/api/mexico-tracking/settings", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  resolveMexicoTrackingRegion: (trackingId: number, region: "china" | "mexico", expectedVersion: number) =>
+    request<{ item: MexicoTrackingItem }>(`/api/mexico-tracking/${trackingId}/resolve-region`, {
+      method: "POST",
+      body: JSON.stringify({ region, expected_version: expectedVersion }),
+    }),
   rollbackLatestImport: (batchId: number) =>
     request<{
       status: string;

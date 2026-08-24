@@ -17,6 +17,7 @@ import {
   LayoutList,
   Languages,
   LogOut,
+  MapPinned,
   MoreHorizontal,
   MessageSquareText,
   Paperclip,
@@ -72,8 +73,9 @@ import {
 } from "./api";
 import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
 import { buildDirtyGridPayload, sameSheetOrder } from "./gridSave";
+import { MexicoTrackingPage } from "./MexicoTrackingPage";
 
-type Tab = "workspace" | "daily-payables" | "archive" | "admin";
+type Tab = "workspace" | "daily-payables" | "mexico-tracking" | "archive" | "admin";
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
 type PendingEditorNavigation =
   | { kind: "close" }
@@ -485,6 +487,10 @@ function Shell({
             <CalendarDays size={16} />
             每日应付
           </button>
+          <button data-page="mexico-tracking" className={tab === "mexico-tracking" ? "active" : ""} onPointerDown={() => setTab("mexico-tracking")} onClick={() => setTab("mexico-tracking")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("mexico-tracking"))}>
+            <MapPinned size={16} />
+            墨西哥审批
+          </button>
           <button className={tab === "archive" ? "active" : ""} onPointerDown={() => setTab("archive")} onClick={() => setTab("archive")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("archive"))}>
             <Archive size={16} />
             归档
@@ -517,9 +523,11 @@ function Shell({
         setAccountNotice={setAccountNotice}
       />
       <main className="main-pane">
-        <header className="topbar">
-          <h1>{tabTitle(tab, language)}</h1>
-        </header>
+        {tab !== "mexico-tracking" && (
+          <header className="topbar">
+            <h1>{tabTitle(tab, language)}</h1>
+          </header>
+        )}
         {tab === "workspace" && (
           <Workspace
             user={user}
@@ -533,6 +541,7 @@ function Shell({
           />
         )}
         {tab === "daily-payables" && <DailyPayablesView setMessage={setMessage} />}
+        {tab === "mexico-tracking" && <MexicoTrackingPage user={user} setMessage={setMessage} />}
         {tab === "archive" && (
           <ArchiveView
             user={user}
@@ -643,8 +652,8 @@ function ChangePasswordDialog({ onClose, onSuccess }: { onClose: () => void; onS
 
 function tabTitle(tab: Tab, language: GridHeaderLanguage = "zh") {
   return language === "es"
-    ? { workspace: "Panel de la semana actual", "daily-payables": "Pagos diarios pendientes", archive: "Archivo histórico", admin: "Gestión de usuarios" }[tab]
-    : { workspace: "当前周工作台", "daily-payables": "每日应付", archive: "历史归档", admin: "用户管理" }[tab];
+    ? { workspace: "Panel de la semana actual", "daily-payables": "Pagos diarios pendientes", "mexico-tracking": "Seguimiento de aprobaciones de México", archive: "Archivo histórico", admin: "Gestión de usuarios" }[tab]
+    : { workspace: "当前周工作台", "daily-payables": "每日应付", "mexico-tracking": "墨西哥审批跟进", archive: "历史归档", admin: "用户管理" }[tab];
 }
 
 type DailyTrendCurrency = "CNY_EQ" | CurrencyCode;
