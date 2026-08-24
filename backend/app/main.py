@@ -67,11 +67,13 @@ from .external_expenses import (
     ALLOWED_SOURCE_TYPES,
     DingtalkAttachmentClient,
     ExternalExpenseError,
+    PostgresDiscoveryGateway,
     classify_dingtalk_payment_event,
     currency_amount_from_summary_text,
     currency_from_execution_region,
     currency_from_summary_text,
     dingtalk_auto_payment_mode,
+    discover_expense_workflows,
     fetch_dingtalk_workflows,
     fetch_external_expense_attachments,
     fetch_external_expense_metadata,
@@ -88,7 +90,16 @@ from .fx_rates import (
     normalize_currency,
 )
 from .file_storage import register_file_object, resolve_attachment_path, write_stream
-from .mexico_tracking import persist_request_region
+from .mexico_tracking import (
+    acquire_or_reuse_mexico_sync_run,
+    cache_mexico_discovery_candidates,
+    cache_mexico_workflow_snapshots,
+    complete_mexico_sync_run,
+    fail_mexico_sync_run,
+    get_mexico_sync_run,
+    persist_request_region,
+    update_mexico_sync_run,
+)
 from .payable_history import payment_effective_at, record_request_state
 from .employee_departments import (
     EmployeeDepartmentError,
@@ -113,6 +124,9 @@ app = FastAPI(title="出纳请款明细系统")
 _DINGTALK_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dingtalk-sync")
 _DINGTALK_SYNC_FUTURES: Dict[str, Any] = {}
 _DINGTALK_SYNC_FUTURES_LOCK = Lock()
+_MEXICO_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mexico-sync")
+_MEXICO_SYNC_FUTURES: Dict[str, Any] = {}
+_MEXICO_SYNC_FUTURES_LOCK = Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -6209,6 +6223,179 @@ def _submit_dingtalk_sync_task(operation_id: str, batch_id: int, user: Dict[str,
         future.add_done_callback(lambda _: _discard_dingtalk_sync_future(operation_id))
 
 
+def _latest_mexico_source_cursors() -> Dict[str, Any]:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT source_cursors_json
+            FROM mexico_sync_runs
+            WHERE kind = 'mexico-tracking' AND status = 'completed'
+            ORDER BY completed_at DESC LIMIT 1
+            """
+        ).fetchone()
+    if row is None or not row["source_cursors_json"]:
+        return {}
+    try:
+        value = json.loads(row["source_cursors_json"])
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _run_mexico_tracking_sync(run_id: str, user: Dict[str, Any]) -> None:
+    """Refresh the global Mexico cache without holding a lock during I/O."""
+
+    timings: Dict[str, Any] = {}
+    started = perf_counter()
+    try:
+        source_cursors = _latest_mexico_source_cursors()
+        with connect() as conn:
+            running_approval_nos = [
+                row["approval_no"]
+                for row in conn.execute(
+                    """
+                    SELECT approval_no FROM mexico_approval_tracking
+                    WHERE workflow_status = 'RUNNING'
+                    ORDER BY approval_no
+                    """
+                ).fetchall()
+            ]
+            existing_mexico_nos = {
+                row["approval_no"]
+                for row in conn.execute(
+                    """
+                    SELECT approval_no FROM mexico_approval_tracking
+                    WHERE resolved_region IN ('mexico', 'review')
+                    ORDER BY approval_no
+                    """
+                ).fetchall()
+            }
+            update_mexico_sync_run(conn, run_id, phase="querying_sources")
+
+        source_started = perf_counter()
+        discovery = discover_expense_workflows(
+            source_cursors,
+            running_approval_nos,
+            gateway=PostgresDiscoveryGateway(),
+        )
+        timings["source_seconds"] = round(perf_counter() - source_started, 3)
+        timings["source_queries"] = discovery.query_timings
+
+        with connect() as conn:
+            update_mexico_sync_run(
+                conn,
+                run_id,
+                phase="resolving_regions",
+                processed_count=len(discovery.candidates),
+                total_count=len(discovery.candidates),
+                stage_timings=timings,
+            )
+
+        workflow_approval_nos = set(existing_mexico_nos)
+        workflow_approval_nos.update(
+            str(candidate.get("approval_no") or "").strip()
+            for candidate in discovery.candidates
+            if str(candidate.get("resolved_region") or "") in {"mexico", "review"}
+        )
+        workflow_approval_nos.discard("")
+        with connect() as conn:
+            update_mexico_sync_run(
+                conn,
+                run_id,
+                phase="querying_workflows",
+                total_count=len(workflow_approval_nos),
+                stage_timings=timings,
+            )
+
+        workflow_started = perf_counter()
+        workflows = fetch_dingtalk_workflows(workflow_approval_nos)
+        timings["workflow_seconds"] = round(perf_counter() - workflow_started, 3)
+
+        with connect() as conn:
+            update_mexico_sync_run(
+                conn,
+                run_id,
+                phase="committing_state",
+                processed_count=len(workflows),
+                total_count=len(workflow_approval_nos),
+                stage_timings=timings,
+            )
+
+        commit_started = perf_counter()
+        with connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                discovery_summary = cache_mexico_discovery_candidates(
+                    conn,
+                    discovery.candidates,
+                    manage_transaction=False,
+                )
+                workflow_summary = cache_mexico_workflow_snapshots(
+                    conn,
+                    workflows,
+                    manage_transaction=False,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        timings["commit_seconds"] = round(perf_counter() - commit_started, 3)
+
+        # Attachment discovery/download is a separate, lower-priority phase.
+        # Task 7 fills this phase without delaying source and workflow status.
+        with connect() as conn:
+            update_mexico_sync_run(
+                conn,
+                run_id,
+                phase="syncing_attachments",
+                processed_count=len(workflows),
+                total_count=len(workflow_approval_nos),
+                stage_timings=timings,
+            )
+
+        timings.setdefault("attachment_query_seconds", 0.0)
+        timings.setdefault("attachment_download_seconds", 0.0)
+        timings["total_seconds"] = round(perf_counter() - started, 3)
+        result = {
+            "discovered": len(discovery.candidates),
+            "source_conflicts": len(discovery.source_conflicts),
+            "workflows_queried": len(workflows),
+            "discovery": discovery_summary,
+            "workflow": workflow_summary,
+            "attachments": {"ready": 0, "failed": 0, "existing": 0},
+        }
+        with connect() as conn:
+            complete_mexico_sync_run(
+                conn,
+                run_id,
+                source_cursors=discovery.next_cursors,
+                result=result,
+                stage_timings=timings,
+            )
+    except BaseException as exc:
+        try:
+            with connect() as conn:
+                fail_mexico_sync_run(conn, run_id, str(exc))
+        except Exception:
+            pass
+
+
+def _discard_mexico_sync_future(run_id: str) -> None:
+    with _MEXICO_SYNC_FUTURES_LOCK:
+        _MEXICO_SYNC_FUTURES.pop(run_id, None)
+
+
+def _submit_mexico_sync_task(run_id: str, user: Dict[str, Any]) -> None:
+    with _MEXICO_SYNC_FUTURES_LOCK:
+        if run_id in _MEXICO_SYNC_FUTURES:
+            return
+        future = _MEXICO_SYNC_EXECUTOR.submit(
+            _run_mexico_tracking_sync, run_id, dict(user)
+        )
+        _MEXICO_SYNC_FUTURES[run_id] = future
+        future.add_done_callback(lambda _: _discard_mexico_sync_future(run_id))
+
+
 def _fresh_dingtalk_sync_result(batch_id: int, stale_seconds: int) -> Optional[Dict[str, Any]]:
     if stale_seconds <= 0:
         return None
@@ -6279,6 +6466,42 @@ def get_batch_operation_status(
     with connect() as conn:
         require_batch(conn, int(operation["batch_id"]))
     return {"operation": operation}
+
+
+@app.post("/api/mexico-tracking/sync")
+def start_mexico_tracking_sync(
+    only_if_stale_seconds: int = Query(default=300, ge=0, le=86400),
+    trigger_type: str = Query(default="manual", pattern="^(manual|automatic)$"),
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Any:
+    with connect() as conn:
+        run, reused = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=user.get("id"),
+            trigger_type=trigger_type,
+            only_if_stale_seconds=only_if_stale_seconds,
+        )
+    if run["status"] in {"queued", "running"}:
+        # Reusing the same id is intentional: a manual click observes the
+        # already-running automatic refresh instead of starting duplicate work.
+        _submit_mexico_sync_task(str(run["id"]), user)
+    return JSONResponse(
+        status_code=202,
+        content={"status": run["status"], "reused": reused, "run": run},
+    )
+
+
+@app.get("/api/mexico-tracking/sync-runs/{run_id}")
+def get_mexico_tracking_sync_status(
+    run_id: str,
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    with connect() as conn:
+        try:
+            run = get_mexico_sync_run(conn, run_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="墨西哥同步任务不存在")
+    return {"run": run}
 
 
 @app.get("/api/import-jobs/{job_id}")

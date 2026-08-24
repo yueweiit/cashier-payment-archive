@@ -3,8 +3,9 @@ from __future__ import annotations
 import sqlite3
 import json
 import unicodedata
+import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
@@ -44,6 +45,222 @@ MEXICO_SHEETS = frozenset(
 
 def _now_iso() -> str:
     return datetime.now(tz=SHANGHAI_TZ).isoformat(timespec="microseconds")
+
+
+def _json_object(value: Optional[str]) -> Dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _sync_run_payload(row: sqlite3.Row, *, fresh: bool = False) -> Dict[str, Any]:
+    payload = dict(row)
+    payload["source_cursors"] = _json_object(row["source_cursors_json"])
+    payload["stage_timings"] = _json_object(row["stage_timings_json"])
+    payload["result"] = _json_object(row["result_json"])
+    payload["fresh"] = fresh
+    return payload
+
+
+def _lease_until(seconds: int) -> str:
+    return (
+        datetime.now(tz=SHANGHAI_TZ) + timedelta(seconds=seconds)
+    ).isoformat(timespec="microseconds")
+
+
+def acquire_or_reuse_mexico_sync_run(
+    conn: sqlite3.Connection,
+    *,
+    actor_id: Optional[int],
+    trigger_type: str,
+    only_if_stale_seconds: int = 0,
+    lease_seconds: int = 1800,
+) -> tuple[Dict[str, Any], bool]:
+    """Acquire the single global Mexico sync lease or reuse current work.
+
+    Acquisition is serialized with ``BEGIN IMMEDIATE`` but the transaction is
+    committed before any PostgreSQL or attachment I/O starts.  This keeps the
+    page writable while the external systems are being queried.
+    """
+
+    timestamp = _now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """
+            UPDATE mexico_sync_runs
+            SET status = 'interrupted', phase = 'interrupted', completed_at = ?,
+                error_message = COALESCE(error_message, '任务租约过期，已由后续同步接管'),
+                updated_at = ?
+            WHERE kind = 'mexico-tracking'
+              AND status IN ('queued', 'running')
+              AND lease_until IS NOT NULL AND lease_until <= ?
+            """,
+            (timestamp, timestamp, timestamp),
+        )
+        active = conn.execute(
+            """
+            SELECT * FROM mexico_sync_runs
+            WHERE kind = 'mexico-tracking' AND status IN ('queued', 'running')
+            ORDER BY created_at DESC LIMIT 1
+            """
+        ).fetchone()
+        if active is not None:
+            conn.commit()
+            return _sync_run_payload(active), True
+
+        if only_if_stale_seconds > 0:
+            latest = conn.execute(
+                """
+                SELECT * FROM mexico_sync_runs
+                WHERE kind = 'mexico-tracking' AND status = 'completed'
+                ORDER BY completed_at DESC LIMIT 1
+                """
+            ).fetchone()
+            if latest is not None and latest["completed_at"]:
+                completed_at = datetime.fromisoformat(str(latest["completed_at"]))
+                if datetime.now(tz=SHANGHAI_TZ) - completed_at < timedelta(
+                    seconds=only_if_stale_seconds
+                ):
+                    conn.commit()
+                    return _sync_run_payload(latest, fresh=True), True
+
+        run_id = uuid.uuid4().hex
+        conn.execute(
+            """
+            INSERT INTO mexico_sync_runs (
+                id, kind, trigger_type, triggered_by, status, phase,
+                lease_owner, lease_until, created_at, updated_at
+            ) VALUES (?, 'mexico-tracking', ?, ?, 'queued', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                str(trigger_type or "manual"),
+                actor_id,
+                run_id,
+                _lease_until(lease_seconds),
+                timestamp,
+                timestamp,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM mexico_sync_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        conn.commit()
+        return _sync_run_payload(row), False
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_mexico_sync_run(conn: sqlite3.Connection, run_id: str) -> Dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM mexico_sync_runs WHERE id = ?", (str(run_id),)
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"Mexico sync run {run_id} does not exist")
+    return _sync_run_payload(row)
+
+
+def update_mexico_sync_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    phase: str,
+    processed_count: int = 0,
+    total_count: int = 0,
+    attachment_processed_count: int = 0,
+    attachment_total_count: int = 0,
+    stage_timings: Optional[Dict[str, Any]] = None,
+    lease_seconds: int = 1800,
+) -> Dict[str, Any]:
+    timestamp = _now_iso()
+    cursor = conn.execute(
+        """
+        UPDATE mexico_sync_runs
+        SET status = 'running', phase = ?, processed_count = ?, total_count = ?,
+            attachment_processed_count = ?, attachment_total_count = ?,
+            stage_timings_json = COALESCE(?, stage_timings_json),
+            started_at = COALESCE(started_at, ?), heartbeat_at = ?,
+            lease_until = ?, updated_at = ?
+        WHERE id = ? AND status IN ('queued', 'running')
+        """,
+        (
+            str(phase),
+            max(0, int(processed_count)),
+            max(0, int(total_count)),
+            max(0, int(attachment_processed_count)),
+            max(0, int(attachment_total_count)),
+            json.dumps(stage_timings, ensure_ascii=False, default=str)
+            if stage_timings is not None
+            else None,
+            timestamp,
+            timestamp,
+            _lease_until(lease_seconds),
+            timestamp,
+            str(run_id),
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("墨西哥同步任务已结束或租约已失效")
+    conn.commit()
+    return get_mexico_sync_run(conn, run_id)
+
+
+def complete_mexico_sync_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    source_cursors: Dict[str, Any],
+    result: Dict[str, Any],
+    stage_timings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    timestamp = _now_iso()
+    cursor = conn.execute(
+        """
+        UPDATE mexico_sync_runs
+        SET status = 'completed', phase = 'complete', source_cursors_json = ?,
+            result_json = ?, stage_timings_json = COALESCE(?, stage_timings_json),
+            completed_at = ?, heartbeat_at = ?, lease_until = NULL, updated_at = ?
+        WHERE id = ? AND status IN ('queued', 'running')
+        """,
+        (
+            json.dumps(source_cursors, ensure_ascii=False, default=str),
+            json.dumps(result, ensure_ascii=False, default=str),
+            json.dumps(stage_timings, ensure_ascii=False, default=str)
+            if stage_timings is not None
+            else None,
+            timestamp,
+            timestamp,
+            timestamp,
+            str(run_id),
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("墨西哥同步任务无法完成")
+    conn.commit()
+    return get_mexico_sync_run(conn, run_id)
+
+
+def fail_mexico_sync_run(
+    conn: sqlite3.Connection, run_id: str, error_message: str
+) -> Dict[str, Any]:
+    timestamp = _now_iso()
+    conn.execute(
+        """
+        UPDATE mexico_sync_runs
+        SET status = 'failed', phase = 'failed', error_message = ?,
+            completed_at = ?, heartbeat_at = ?, lease_until = NULL, updated_at = ?
+        WHERE id = ? AND status IN ('queued', 'running')
+        """,
+        (str(error_message)[:2000], timestamp, timestamp, timestamp, str(run_id)),
+    )
+    conn.commit()
+    return get_mexico_sync_run(conn, run_id)
 
 
 def _ensure_column(
@@ -516,11 +733,161 @@ def _stable_json(value: Any) -> str:
     return json.dumps(value if value is not None else [], ensure_ascii=False, sort_keys=True)
 
 
+def cache_mexico_discovery_candidates(
+    conn: sqlite3.Connection,
+    candidates: list[Dict[str, Any]],
+    *,
+    synced_at: Optional[str] = None,
+    manage_transaction: bool = True,
+) -> Dict[str, int]:
+    """Upsert source discoveries without overwriting an administrator decision.
+
+    Discovery happens against PostgreSQL before this function is called.  The
+    caller can combine this write with workflow caching by passing
+    ``manage_transaction=False`` inside one short ``BEGIN IMMEDIATE`` block.
+    """
+
+    timestamp = synced_at or _now_iso()
+    summary = {"inserted": 0, "updated": 0, "unchanged": 0}
+    if manage_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        for candidate in candidates:
+            approval_no = str(candidate.get("approval_no") or "").strip()
+            if not approval_no:
+                continue
+            existing = conn.execute(
+                "SELECT * FROM mexico_approval_tracking WHERE approval_no = ?",
+                (approval_no,),
+            ).fetchone()
+            preserve_override = bool(
+                existing is not None
+                and str(existing["region_resolution_source"] or "") == "admin_override"
+                and str(existing["region_review_status"] or "") == "resolved"
+                and str(existing["resolved_region"] or "") in {"china", "mexico"}
+            )
+            resolved_region = (
+                str(existing["resolved_region"])
+                if preserve_override
+                else str(candidate.get("resolved_region") or "review")
+            )
+            resolution_source = (
+                "admin_override"
+                if preserve_override
+                else str(candidate.get("region_resolution_source") or "unknown")
+            )
+            review_status = (
+                "resolved"
+                if preserve_override
+                else ("pending" if resolved_region == "review" else "resolved")
+            )
+            raw_summary = {
+                "source_conflict": bool(candidate.get("source_conflict")),
+                "warnings": list(candidate.get("warnings") or []),
+                "errors": list(candidate.get("errors") or []),
+                "raw_summary": candidate.get("raw_summary") or {},
+                "raw_candidates": candidate.get("raw_candidates") or [],
+            }
+            values = {
+                "source_type": str(candidate.get("source_type") or "unknown"),
+                "source_record_id": candidate.get("source_record_id")
+                or candidate.get("source_id"),
+                "process_code": candidate.get("process_code"),
+                "process_instance_id": candidate.get("process_instance_id"),
+                "raw_execution_region": candidate.get("raw_execution_region"),
+                "resolved_region": resolved_region,
+                "region_resolution_source": resolution_source,
+                "region_review_status": review_status,
+                "region_conflict_reason": candidate.get("region_conflict_reason"),
+                "request_date": candidate.get("request_date"),
+                "applicant_id": candidate.get("applicant_id"),
+                "applicant_name": candidate.get("applicant_name"),
+                "applicant_department": candidate.get("applicant_department"),
+                "company_name": candidate.get("company_name"),
+                "source_sheet": candidate.get("source_sheet"),
+                "summary": candidate.get("summary"),
+                "amount": candidate.get("amount"),
+                "currency": candidate.get("currency"),
+                "workflow_status": str(candidate.get("workflow_status") or "").upper(),
+                "workflow_result": str(candidate.get("workflow_result") or "").lower(),
+                "source_updated_at": candidate.get("source_updated_at"),
+                "raw_summary_json": json.dumps(
+                    raw_summary, ensure_ascii=False, sort_keys=True, default=str
+                ),
+            }
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO mexico_approval_tracking (
+                        approval_no, source_type, source_record_id, process_code,
+                        process_instance_id, raw_execution_region, resolved_region,
+                        region_resolution_source, region_review_status,
+                        region_conflict_reason, request_date, applicant_id,
+                        applicant_name, applicant_department, company_name,
+                        source_sheet, summary, amount, currency, workflow_status,
+                        workflow_result, source_updated_at, last_synced_at,
+                        raw_summary_json, created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        approval_no,
+                        *[
+                            values[key]
+                            for key in values
+                            if key != "raw_summary_json"
+                        ],
+                        timestamp,
+                        values["raw_summary_json"],
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                summary["inserted"] += 1
+                continue
+
+            changed = any(existing[key] != value for key, value in values.items())
+            if not changed:
+                conn.execute(
+                    "UPDATE mexico_approval_tracking SET last_synced_at = ? WHERE approval_no = ?",
+                    (timestamp, approval_no),
+                )
+                summary["unchanged"] += 1
+                continue
+            conn.execute(
+                """
+                UPDATE mexico_approval_tracking
+                SET source_type = ?, source_record_id = ?, process_code = ?,
+                    process_instance_id = ?, raw_execution_region = ?,
+                    resolved_region = ?, region_resolution_source = ?,
+                    region_review_status = ?, region_conflict_reason = ?,
+                    request_date = ?, applicant_id = ?, applicant_name = ?,
+                    applicant_department = ?, company_name = ?, source_sheet = ?,
+                    summary = ?, amount = ?, currency = ?, workflow_status = ?,
+                    workflow_result = ?, source_updated_at = ?, raw_summary_json = ?,
+                    last_synced_at = ?, version = version + 1, updated_at = ?
+                WHERE approval_no = ?
+                """,
+                (*values.values(), timestamp, timestamp, approval_no),
+            )
+            summary["updated"] += 1
+        if manage_transaction:
+            conn.commit()
+    except Exception:
+        if manage_transaction:
+            conn.rollback()
+        raise
+    return summary
+
+
 def cache_mexico_workflow_snapshots(
     conn: sqlite3.Connection,
     workflows: list[Dict[str, Any]],
     *,
     synced_at: Optional[str] = None,
+    manage_transaction: bool = True,
 ) -> Dict[str, int]:
     """Persist externally fetched workflow state in one short SQLite transaction.
 
@@ -539,7 +906,8 @@ def cache_mexico_workflow_snapshots(
         "links_removed": 0,
     }
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        if manage_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         for workflow in workflows:
             approval_no = str(workflow.get("approval_no") or "").strip()
             if not approval_no:
@@ -760,9 +1128,11 @@ def cache_mexico_workflow_snapshots(
                         ),
                     )
                     summary["events_updated"] += 1
-        conn.commit()
+        if manage_transaction:
+            conn.commit()
     except Exception:
-        conn.rollback()
+        if manage_transaction:
+            conn.rollback()
         raise
     return summary
 

@@ -12,9 +12,14 @@ from backend.app.external_expenses import (
     parse_dingtalk_workflow_instance,
 )
 from backend.app.mexico_tracking import (
+    acquire_or_reuse_mexico_sync_run,
+    cache_mexico_discovery_candidates,
     cache_mexico_workflow_snapshots,
     backfill_request_regions,
     build_bilingual_reminder,
+    complete_mexico_sync_run,
+    fail_mexico_sync_run,
+    get_mexico_sync_run,
     get_mexico_tracking_settings,
     node_age_days,
     persist_request_region,
@@ -978,3 +983,168 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
             (approval_no,),
         ).fetchone()
         assert tuple(restored) == ("RUNNING", "", 3)
+
+
+def test_mexico_sync_run_reuses_active_task_and_recent_completion(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        first, reused = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="automatic",
+            only_if_stale_seconds=0,
+        )
+        second, second_reused = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="manual",
+            only_if_stale_seconds=0,
+        )
+
+        assert reused is False
+        assert second_reused is True
+        assert second["id"] == first["id"]
+
+        completed = complete_mexico_sync_run(
+            conn,
+            first["id"],
+            source_cursors={
+                "purchase": {
+                    "updated_at": "2026-08-24T12:00:00+08:00",
+                    "source_id": "9",
+                }
+            },
+            result={"tracked": 12},
+        )
+        fresh, fresh_reused = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="automatic",
+            only_if_stale_seconds=300,
+        )
+
+        assert completed["status"] == "completed"
+        assert fresh_reused is True
+        assert fresh["id"] == first["id"]
+        assert fresh["fresh"] is True
+
+
+def test_mexico_sync_run_takes_over_expired_lease(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        expired, _ = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="automatic",
+            only_if_stale_seconds=0,
+            lease_seconds=-1,
+        )
+        replacement, reused = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="manual",
+            only_if_stale_seconds=0,
+        )
+
+        assert reused is False
+        assert replacement["id"] != expired["id"]
+        assert get_mexico_sync_run(conn, expired["id"])["status"] == "interrupted"
+
+
+def test_failed_mexico_sync_does_not_advance_successful_cursor(isolated_db) -> None:
+    old_cursor = {
+        "operation": {
+            "updated_at": "2026-08-20T10:00:00+08:00",
+            "source_id": "10",
+        }
+    }
+    with isolated_db.connect() as conn:
+        successful, _ = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="manual",
+            only_if_stale_seconds=0,
+        )
+        complete_mexico_sync_run(
+            conn,
+            successful["id"],
+            source_cursors=old_cursor,
+            result={"tracked": 3},
+        )
+        failed, _ = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="manual",
+            only_if_stale_seconds=0,
+        )
+        fail_mexico_sync_run(conn, failed["id"], "external database unavailable")
+
+        assert get_mexico_sync_run(conn, failed["id"])["source_cursors"] == {}
+        latest_success = conn.execute(
+            "SELECT id FROM mexico_sync_runs WHERE kind = 'mexico-tracking' "
+            "AND status = 'completed' ORDER BY completed_at DESC LIMIT 1"
+        ).fetchone()
+        assert get_mexico_sync_run(conn, latest_success["id"])["source_cursors"] == old_cursor
+
+
+def test_mexico_discovery_cache_preserves_admin_region_override(isolated_db) -> None:
+    candidate = {
+        "approval_no": "202608241200000000001",
+        "source_type": "purchase",
+        "source_record_id": "88",
+        "process_code": "PROC-PURCHASE",
+        "process_instance_id": "instance-88",
+        "raw_execution_region": "Mexico",
+        "resolved_region": "mexico",
+        "region_resolution_source": "execution_region",
+        "region_conflict_reason": None,
+        "request_date": "2026-08-24",
+        "applicant_id": "user-1",
+        "applicant_name": "Nelly Mendez",
+        "applicant_department": "YUEWEI MX",
+        "company_name": "YUEWEI MX核心制造",
+        "source_sheet": "YUEWEI MX核心制造",
+        "summary": "Compra de materiales",
+        "amount": 1200.5,
+        "currency": "MXN",
+        "workflow_status": "RUNNING",
+        "workflow_result": "",
+        "source_updated_at": "2026-08-24T11:00:00+08:00",
+        "source_conflict": False,
+        "warnings": [],
+        "errors": [],
+        "raw_summary": {"execution_region": "Mexico"},
+    }
+    with isolated_db.connect() as conn:
+        first = cache_mexico_discovery_candidates(conn, [candidate])
+        assert first == {"inserted": 1, "updated": 0, "unchanged": 0}
+
+        conn.execute(
+            """
+            UPDATE mexico_approval_tracking
+            SET resolved_region = 'china', region_resolution_source = 'admin_override',
+                region_review_status = 'resolved', region_reviewed_by = 1,
+                region_reviewed_at = '2026-08-24T12:05:00+08:00'
+            WHERE approval_no = ?
+            """,
+            (candidate["approval_no"],),
+        )
+        conn.commit()
+
+        changed = {**candidate, "summary": "Compra de materiales actualizada"}
+        second = cache_mexico_discovery_candidates(conn, [changed])
+        stored = conn.execute(
+            """
+            SELECT summary, resolved_region, region_resolution_source,
+                   region_review_status, region_reviewed_by
+            FROM mexico_approval_tracking WHERE approval_no = ?
+            """,
+            (candidate["approval_no"],),
+        ).fetchone()
+
+        assert second == {"inserted": 0, "updated": 1, "unchanged": 0}
+        assert tuple(stored) == (
+            "Compra de materiales actualizada",
+            "china",
+            "admin_override",
+            "resolved",
+            1,
+        )
