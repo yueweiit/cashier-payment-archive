@@ -87,6 +87,81 @@ def test_sqlite_concurrency_pragmas_and_version_columns_are_enabled():
                 assert "version" in columns
 
 
+def test_mexico_user_access_schema_and_admin_validation():
+    username = f"mexico-access-{uuid.uuid4().hex}"
+    with TestClient(app) as admin_client:
+        login(admin_client)
+        with connect() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+        assert {"mexico_access_scope", "mexico_identity_name"} <= columns
+
+        missing_identity = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": f"{username}-missing",
+                "password": "Yuewei123",
+                "display_name": "缺少绑定",
+                "role": "business",
+                "mexico_access_scope": "participant",
+            },
+        )
+        assert missing_identity.status_code == 400
+
+        invalid_scope = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": f"{username}-invalid",
+                "password": "Yuewei123",
+                "display_name": "非法权限",
+                "role": "business",
+                "mexico_access_scope": "everyone",
+                "mexico_identity_name": "Nobody",
+            },
+        )
+        assert invalid_scope.status_code == 400
+
+        created = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": username,
+                "password": "Yuewei123",
+                "display_name": "墨西哥审批参与者",
+                "role": "business",
+                "mexico_access_scope": "participant",
+                "mexico_identity_name": "CHONG.MARTINEZ.DAUL",
+            },
+        )
+        assert created.status_code == 200, created.text
+        created_user = created.json()["user"]
+        assert created_user["mexico_access_scope"] == "participant"
+        assert created_user["mexico_identity_name"] == "CHONG.MARTINEZ.DAUL"
+
+        with TestClient(app) as participant_client:
+            login(participant_client, username, "Yuewei123")
+            me = participant_client.get("/api/me")
+            assert me.status_code == 200
+            assert me.json()["user"]["mexico_access_scope"] == "participant"
+            assert me.json()["user"]["mexico_identity_name"] == "CHONG.MARTINEZ.DAUL"
+
+        cleared_identity = admin_client.patch(
+            f"/api/admin/users/{created_user['id']}",
+            json={"mexico_identity_name": ""},
+        )
+        assert cleared_identity.status_code == 400
+
+        disabled = admin_client.patch(
+            f"/api/admin/users/{created_user['id']}",
+            json={"mexico_access_scope": "none", "mexico_identity_name": ""},
+        )
+        assert disabled.status_code == 200
+        assert disabled.json()["user"]["mexico_access_scope"] == "none"
+        assert disabled.json()["user"]["mexico_identity_name"] is None
+        assert admin_client.delete(f"/api/admin/users/{created_user['id']}").status_code == 200
+
+
 def test_daily_payable_schema_backfills_logical_request_chain_and_one_baseline():
     with TestClient(app):
         with connect() as conn:

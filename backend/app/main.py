@@ -348,6 +348,8 @@ class UserIn(BaseModel):
     display_name: str
     active: bool = True
     sheet_permissions: list[str] = Field(default_factory=list)
+    mexico_access_scope: str = "none"
+    mexico_identity_name: Optional[str] = None
 
 
 class UserPatch(BaseModel):
@@ -356,6 +358,8 @@ class UserPatch(BaseModel):
     display_name: Optional[str] = None
     active: Optional[bool] = None
     sheet_permissions: Optional[list[str]] = None
+    mexico_access_scope: Optional[str] = None
+    mexico_identity_name: Optional[str] = None
 
 
 class DictionaryIn(BaseModel):
@@ -405,6 +409,7 @@ PRIVILEGED_ROLES = (ROLE_GENERAL_MANAGER, ROLE_ADMIN)
 ALL_ROLES = (ROLE_BUSINESS, ROLE_FINANCE, ROLE_GENERAL_MANAGER, ROLE_ADMIN)
 FINANCE_FIELD_ROLES = (ROLE_FINANCE, *PRIVILEGED_ROLES)
 GENERAL_MANAGER_ROLES = PRIVILEGED_ROLES
+MEXICO_ACCESS_SCOPES = {"all", "participant", "none"}
 REQUEST_GRID_PREFERENCE_KEY = "request_grid_v1"
 REQUEST_GRID_COLUMN_KEYS = [
     "dingding_id",
@@ -587,6 +592,8 @@ def user_public(
         "role": row["role"],
         "display_name": row["display_name"],
         "active": bool(row["active"]),
+        "mexico_access_scope": str(row.get("mexico_access_scope") or "none"),
+        "mexico_identity_name": str(row.get("mexico_identity_name") or "").strip() or None,
     }
     if sheet_permissions is not None:
         public["sheet_permissions"] = list(sheet_permissions)
@@ -965,6 +972,16 @@ def enforce_request_field_permissions(
 def validate_user_role(role: str) -> None:
     if role not in ALL_ROLES:
         raise HTTPException(status_code=400, detail="角色无效")
+
+
+def validate_mexico_user_access(scope: Any, identity: Any) -> tuple[str, Optional[str]]:
+    normalized_scope = str(scope or "none").strip().lower()
+    normalized_identity = str(identity or "").strip() or None
+    if normalized_scope not in MEXICO_ACCESS_SCOPES:
+        raise HTTPException(status_code=400, detail="墨西哥权限范围无效")
+    if normalized_scope == "participant" and not normalized_identity:
+        raise HTTPException(status_code=400, detail="仅本人参与权限必须绑定钉钉姓名")
+    return normalized_scope, normalized_identity
 
 
 def active_privileged_user_count(conn) -> int:
@@ -7529,16 +7546,32 @@ def list_users(user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROL
 @app.post("/api/admin/users")
 def create_user(payload: UserIn, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
     validate_user_role(payload.role)
+    mexico_access_scope, mexico_identity_name = validate_mexico_user_access(
+        payload.mexico_access_scope,
+        payload.mexico_identity_name,
+    )
     if not payload.username.strip() or not payload.password or not payload.display_name.strip():
         raise HTTPException(status_code=400, detail="账号、姓名和初始密码不能为空")
     with connect() as conn:
         try:
             cursor = conn.execute(
                 """
-                INSERT INTO users (username, password_hash, role, display_name, active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO users (
+                    username, password_hash, role, display_name, active,
+                    mexico_access_scope, mexico_identity_name, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (payload.username.strip(), hash_password(payload.password), payload.role, payload.display_name.strip(), int(payload.active), now_iso()),
+                (
+                    payload.username.strip(),
+                    hash_password(payload.password),
+                    payload.role,
+                    payload.display_name.strip(),
+                    int(payload.active),
+                    mexico_access_scope,
+                    mexico_identity_name,
+                    now_iso(),
+                ),
             )
         except Exception as exc:
             if "UNIQUE" in str(exc).upper():
@@ -7568,14 +7601,28 @@ def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends
         updates["active"] = int(updates["active"])
     if not updates and sheet_permissions is None:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
-    allowed = {"password_hash", "role", "display_name", "active"}
-    columns = [key for key in updates if key in allowed]
-    if not columns and sheet_permissions is None:
-        raise HTTPException(status_code=400, detail="没有需要更新的字段")
+    allowed = {
+        "password_hash",
+        "role",
+        "display_name",
+        "active",
+        "mexico_access_scope",
+        "mexico_identity_name",
+    }
     with connect() as conn:
         old = conn.execute("SELECT * FROM users WHERE id = ? AND deleted_at IS NULL", (user_id,)).fetchone()
         if not old:
             raise HTTPException(status_code=404, detail="用户不存在")
+        if "mexico_access_scope" in updates or "mexico_identity_name" in updates:
+            normalized_scope, normalized_identity = validate_mexico_user_access(
+                updates.get("mexico_access_scope", old["mexico_access_scope"]),
+                updates.get("mexico_identity_name", old["mexico_identity_name"]),
+            )
+            updates["mexico_access_scope"] = normalized_scope
+            updates["mexico_identity_name"] = normalized_identity
+        columns = [key for key in updates if key in allowed]
+        if not columns and sheet_permissions is None:
+            raise HTTPException(status_code=400, detail="没有需要更新的字段")
         old_public = user_public_with_permissions(conn, old)
         ensure_can_change_user(conn, old, user, updates)
         if "display_name" in updates:

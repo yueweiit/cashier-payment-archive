@@ -97,6 +97,8 @@ def init_db() -> None:
                 role TEXT NOT NULL CHECK(role IN ('business','finance','general_manager','admin')),
                 display_name TEXT NOT NULL,
                 active INTEGER NOT NULL DEFAULT 1,
+                mexico_access_scope TEXT NOT NULL DEFAULT 'none',
+                mexico_identity_name TEXT,
                 created_at TEXT NOT NULL,
                 deleted_at TEXT,
                 deleted_by INTEGER REFERENCES users(id)
@@ -404,6 +406,8 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     migrate_user_roles(conn)
     ensure_column(conn, "users", "deleted_at", "TEXT")
     ensure_column(conn, "users", "deleted_by", "INTEGER REFERENCES users(id)")
+    ensure_column(conn, "users", "mexico_access_scope", "TEXT NOT NULL DEFAULT 'none'")
+    ensure_column(conn, "users", "mexico_identity_name", "TEXT")
     ensure_column(conn, "employee_department_mappings", "third_level_department", "TEXT")
     conn.execute(
         """
