@@ -91,7 +91,11 @@ test("Mexico tracking switches between the approval list and approver statistics
   assert.match(pageSource, /api\.mexicoTrackingApproverStats\(\)/);
   assert.match(pageSource, /function applyApproverStat/);
   assert.match(pageSource, /setMode\("list"\)/);
-  assert.match(pageSource, /approver:\s*approverName/);
+  assert.match(pageSource, /\.\.\.appliedFilters,\s*approver:\s*approverName/);
+  assert.doesNotMatch(
+    pageSource,
+    /function applyApproverStat[\s\S]*?nextFilters:\s*Filters\s*=\s*\{\s*\.\.\.emptyFilters,\s*approver:/,
+  );
 });
 
 test("Mexico tracking navigation and actions include Spanish translations", () => {

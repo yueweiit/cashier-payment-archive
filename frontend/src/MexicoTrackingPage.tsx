@@ -363,7 +363,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
   }
 
   function applyApproverStat(approverName: string) {
-    const nextFilters: Filters = { ...emptyFilters, approver: approverName };
+    const nextFilters: Filters = { ...appliedFilters, approver: approverName };
     setFilters(nextFilters);
     setAppliedFilters(nextFilters);
     setMode("list");

@@ -4875,6 +4875,7 @@ def test_mexico_tracking_api_enforces_mexico_access_scope_and_participation():
         summary = participant_client.get("/api/mexico-tracking/summary")
         assert summary.status_code == 200, summary.text
         assert summary.json()["summary"]["pending"] == 3
+        assert summary.json()["summary"]["review"] == 0
         options = participant_client.get("/api/mexico-tracking/filter-options")
         assert options.status_code == 200, options.text
         assert "Hidden Company" not in options.json()["options"]["companies"]
@@ -4890,6 +4891,9 @@ def test_mexico_tracking_api_enforces_mexico_access_scope_and_participation():
         all_items = all_client.get("/api/mexico-tracking?view=pending")
         assert all_items.status_code == 200, all_items.text
         assert all_items.json()["total"] == 4
+        all_summary = all_client.get("/api/mexico-tracking/summary")
+        assert all_summary.status_code == 200, all_summary.text
+        assert all_summary.json()["summary"]["review"] == 0
 
         login(none_client, "mexico-none", "Yuewei123")
         for method, path in (
@@ -4906,6 +4910,9 @@ def test_mexico_tracking_api_enforces_mexico_access_scope_and_participation():
         review = admin_client.get("/api/mexico-tracking?view=review")
         assert review.status_code == 200, review.text
         assert any(item["approval_no"] == "MX-API-REVIEW" for item in review.json()["items"])
+        admin_summary = admin_client.get("/api/mexico-tracking/summary")
+        assert admin_summary.status_code == 200, admin_summary.text
+        assert admin_summary.json()["summary"]["review"] >= 1
         assert participant_client.put(
             "/api/mexico-tracking/settings",
             json={

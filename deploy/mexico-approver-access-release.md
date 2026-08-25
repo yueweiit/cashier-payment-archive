@@ -4,21 +4,57 @@
 
 ## 1. 发布前检查与一致性备份
 
-选择低峰期，先记录当前版本，再停止服务。将示例时间目录替换为本次实际发布时间，不要覆盖已有备份。
+选择低峰期，先从正在运行的 systemd 进程捕获其真实数据库环境，再记录当前版本并停止服务。这样即使生产机通过 `PAYMENT_APP_DATA_DIR` 或 `PAYMENT_APP_DB` 改过默认目录，后续备份、开通账号和回滚仍会操作同一个数据库。将示例时间目录替换为本次实际发布时间，不要覆盖已有备份。
 
 ```bash
 cd /www/wwwroot/cashier-payment-archive
 sudo systemctl status cashier-payment --no-pager
+SERVICE_PID="$(sudo systemctl show cashier-payment --property=MainPID --value)"
+RELEASE_ENV_FILE=/run/cashier-payment-release.env
+sudo env SERVICE_PID="$SERVICE_PID" RELEASE_ENV_FILE="$RELEASE_ENV_FILE" \
+  .venv/bin/python - <<'PY'
+import os
+import shlex
+from pathlib import Path
+
+service_pid = int(os.environ["SERVICE_PID"])
+if service_pid <= 0:
+    raise SystemExit("cashier-payment 服务没有正在运行的 MainPID")
+entries = Path(f"/proc/{service_pid}/environ").read_bytes().split(b"\0")
+service_env = {}
+for entry in entries:
+    if b"=" not in entry:
+        continue
+    key, value = entry.split(b"=", 1)
+    service_env[key.decode()] = value.decode()
+working_dir = Path(f"/proc/{service_pid}/cwd").resolve()
+data_dir = Path(service_env.get("PAYMENT_APP_DATA_DIR", working_dir / "data")).resolve()
+db_path = Path(service_env.get("PAYMENT_APP_DB", data_dir / "app.db")).resolve()
+if not db_path.is_file():
+    raise SystemExit(f"解析的生产数据库不存在: {db_path}")
+release_env = Path(os.environ["RELEASE_ENV_FILE"])
+release_env.write_text(
+    f"PAYMENT_APP_DATA_DIR={shlex.quote(str(data_dir))}\n"
+    f"PAYMENT_APP_DB={shlex.quote(str(db_path))}\n",
+    encoding="utf-8",
+)
+release_env.chmod(0o600)
+print(f"PAYMENT_APP_DB={db_path}")
+PY
+. "$RELEASE_ENV_FILE"
+sudo -u www env PAYMENT_APP_DATA_DIR="$PAYMENT_APP_DATA_DIR" PAYMENT_APP_DB="$PAYMENT_APP_DB" \
+  .venv/bin/python -c 'from backend.app.db import DB_PATH; print(f"已确认生产数据库: {DB_PATH.resolve()}"); assert DB_PATH.resolve().is_file()'
 git rev-parse HEAD
 sudo install -d -o www -g www -m 0750 /data/cashier-payment/backups/20260825-120000
 git rev-parse HEAD | sudo tee /data/cashier-payment/backups/20260825-120000/previous-commit.txt
 sudo systemctl stop cashier-payment
 ```
 
-使用应用内的 SQLite Backup API 生成包含已提交 WAL 页的一致性副本，并执行完整性校验：
+屏幕打印的 `PAYMENT_APP_DB` 必须与当前生产配置一致；路径不存在或不符合预期时立即停止，不要继续。使用刚捕获的同一环境调用 SQLite Backup API，生成包含已提交 WAL 页的一致性副本并执行完整性校验：
 
 ```bash
-sudo -u www env PAYMENT_RELEASE_BACKUP_PATH=/data/cashier-payment/backups/20260825-120000/app.db \
+sudo -u www env PAYMENT_APP_DATA_DIR="$PAYMENT_APP_DATA_DIR" PAYMENT_APP_DB="$PAYMENT_APP_DB" \
+  PAYMENT_RELEASE_BACKUP_PATH=/data/cashier-payment/backups/20260825-120000/app.db \
   .venv/bin/python -c 'import json, os; from backend.app.db import backup_database; print(json.dumps(backup_database(os.environ["PAYMENT_RELEASE_BACKUP_PATH"]), ensure_ascii=False))'
 ```
 
@@ -48,7 +84,8 @@ sudo systemctl stop cashier-payment
 脚本要求 Tiffany/周汉琴和施鸣坤各自只能匹配到一个现有账号；匹配不唯一或缺失时会在任何写入前退出。脚本不会覆盖任何现有账号的角色和密码。
 
 ```bash
-sudo -u www .venv/bin/python -m backend.app.provision_mexico_users --actor-username admin
+sudo -u www env PAYMENT_APP_DATA_DIR="$PAYMENT_APP_DATA_DIR" PAYMENT_APP_DB="$PAYMENT_APP_DB" \
+  .venv/bin/python -m backend.app.provision_mexico_users --actor-username admin
 ```
 
 首次预期输出：
@@ -96,10 +133,14 @@ sudo journalctl -u cashier-payment -n 200 --no-pager
 ```bash
 cd /www/wwwroot/cashier-payment-archive
 sudo systemctl stop cashier-payment
+. /run/cashier-payment-release.env
 git checkout "$(cat /data/cashier-payment/backups/20260825-120000/previous-commit.txt)"
-cp data/app.db /data/cashier-payment/backups/20260825-120000/failed-release-app.db
-cp /data/cashier-payment/backups/20260825-120000/app.db data/app.db
-rm -f data/app.db-wal data/app.db-shm
+sudo cp "$PAYMENT_APP_DB" /data/cashier-payment/backups/20260825-120000/failed-release-app.db
+sudo cp /data/cashier-payment/backups/20260825-120000/app.db "$PAYMENT_APP_DB"
+sudo chown www:www "$PAYMENT_APP_DB"
+sudo rm -f "${PAYMENT_APP_DB}-wal" "${PAYMENT_APP_DB}-shm"
+sudo -u www env PAYMENT_APP_DATA_DIR="$PAYMENT_APP_DATA_DIR" PAYMENT_APP_DB="$PAYMENT_APP_DB" \
+  .venv/bin/python -c 'from backend.app.db import DB_PATH; print(f"已恢复生产数据库: {DB_PATH.resolve()}"); assert DB_PATH.resolve().is_file()'
 .venv/bin/pip install -r requirements.txt
 npm ci
 npm run build

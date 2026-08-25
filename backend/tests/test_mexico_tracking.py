@@ -1614,6 +1614,45 @@ def test_mexico_approver_stats_deduplicate_tasks_and_respect_participant_scope(
         ]
 
 
+def test_mexico_legacy_approver_and_node_fallbacks_match_stat_filters(
+    isolated_db,
+) -> None:
+    with isolated_db.connect() as conn:
+        _insert_tracking_case(
+            conn,
+            approval_no="MX-STATS-FALLBACK",
+            sheet="Fallback company",
+            approver="Fallback Ana",
+        )
+
+        stats = summarize_mexico_approvers(conn)
+        by_approver = list_mexico_tracking(
+            conn,
+            view="pending",
+            approver="Fallback Ana",
+        )
+        by_node = list_mexico_tracking(
+            conn,
+            view="pending",
+            node="Director approval",
+        )
+
+        assert stats == [
+            {
+                "approver_name": "Fallback Ana",
+                "pending": 1,
+                "overdue": 1,
+                "severe": 0,
+            }
+        ]
+        assert [item["approval_no"] for item in by_approver["items"]] == [
+            "MX-STATS-FALLBACK"
+        ]
+        assert [item["approval_no"] for item in by_node["items"]] == [
+            "MX-STATS-FALLBACK"
+        ]
+
+
 def test_mexico_tracking_detail_returns_timeline_attachments_and_links(isolated_db) -> None:
     with isolated_db.connect() as conn:
         tracking_id = _insert_tracking_case(

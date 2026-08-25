@@ -6800,6 +6800,7 @@ def get_mexico_tracking_summary(
             "summary": summarize_mexico_tracking(
                 conn,
                 participant_name=participant_name,
+                include_review=user["role"] == ROLE_ADMIN,
             )
         }
 

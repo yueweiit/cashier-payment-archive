@@ -1977,18 +1977,24 @@ def _mexico_tracking_where(
             params.append(str(value).strip())
     if approver and str(approver).strip():
         clauses.append(
-            "EXISTS (SELECT 1 FROM mexico_approval_current_tasks current_task "
+            "(EXISTS (SELECT 1 FROM mexico_approval_current_tasks current_task "
             "WHERE current_task.approval_no = mexico_approval_tracking.approval_no "
-            "AND COALESCE(current_task.approver_name, '') = ?)"
+            "AND TRIM(COALESCE(current_task.approver_name, '')) = ?) "
+            "OR (NOT EXISTS (SELECT 1 FROM mexico_approval_current_tasks any_task "
+            "WHERE any_task.approval_no = mexico_approval_tracking.approval_no) "
+            "AND TRIM(COALESCE(mexico_approval_tracking.current_approver_name, '')) = ?))"
         )
-        params.append(str(approver).strip())
+        params.extend([str(approver).strip()] * 2)
     if node and str(node).strip():
         clauses.append(
-            "EXISTS (SELECT 1 FROM mexico_approval_current_tasks current_task "
+            "(EXISTS (SELECT 1 FROM mexico_approval_current_tasks current_task "
             "WHERE current_task.approval_no = mexico_approval_tracking.approval_no "
-            "AND COALESCE(current_task.node_name, '') = ?)"
+            "AND TRIM(COALESCE(current_task.node_name, '')) = ?) "
+            "OR (NOT EXISTS (SELECT 1 FROM mexico_approval_current_tasks any_task "
+            "WHERE any_task.approval_no = mexico_approval_tracking.approval_no) "
+            "AND TRIM(COALESCE(mexico_approval_tracking.current_node_name, '')) = ?))"
         )
-        params.append(str(node).strip())
+        params.extend([str(node).strip()] * 2)
     if request_date_from and str(request_date_from).strip():
         clauses.append("request_date >= ?")
         params.append(str(request_date_from).strip())
@@ -2177,6 +2183,7 @@ def summarize_mexico_tracking(
     *,
     allowed_sheets: Optional[set[str]] = None,
     participant_name: Optional[str] = None,
+    include_review: bool = True,
     now: Optional[datetime] = None,
 ) -> Dict[str, int]:
     pending = list_mexico_tracking(
@@ -2225,11 +2232,15 @@ def summarize_mexico_tracking(
                     history_params,
                 ).fetchone()[0]
             ),
-            "review": int(
-                conn.execute(
-                    f"SELECT COUNT(*) FROM mexico_approval_tracking WHERE {review_where}",
-                    review_params,
-                ).fetchone()[0]
+            "review": (
+                int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM mexico_approval_tracking WHERE {review_where}",
+                        review_params,
+                    ).fetchone()[0]
+                )
+                if include_review
+                else 0
             ),
         }
     )
