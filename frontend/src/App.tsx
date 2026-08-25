@@ -664,6 +664,7 @@ function dailyCurrencyTotal(snapshot: DailyPayableSnapshot | undefined, currency
 function DailyPayablesView({ setMessage }: { setMessage: (message: string) => void }) {
   const { language, t } = useLanguage();
   const [selectedDate, setSelectedDate] = useState(localIsoDate(new Date()));
+  const [trendEndDate, setTrendEndDate] = useState(localIsoDate(new Date()));
   const [snapshot, setSnapshot] = useState<DailyPayableSnapshot | null>(null);
   const [details, setDetails] = useState<DailyPayableDetail[]>([]);
   const [trend, setTrend] = useState<DailyPayableTrend | null>(null);
@@ -672,16 +673,21 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  function selectQueryDate(value: string) {
+    setSelectedDate(value);
+    setTrendEndDate(value);
+  }
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError("");
     api.dailyPayablesDetails(selectedDate, detailCurrency)
       .then(async (response) => {
-        const start = shiftIsoDate(selectedDate, -13) < response.history_start_date
+        const start = shiftIsoDate(trendEndDate, -13) < response.history_start_date
           ? response.history_start_date
-          : shiftIsoDate(selectedDate, -13);
-        const trendResponse = await api.dailyPayablesTrend(start, selectedDate);
+          : shiftIsoDate(trendEndDate, -13);
+        const trendResponse = await api.dailyPayablesTrend(start, trendEndDate);
         if (cancelled) return;
         setSnapshot(response);
         setDetails(response.items || []);
@@ -700,7 +706,7 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [detailCurrency, selectedDate, setMessage]);
+  }, [detailCurrency, selectedDate, setMessage, trendEndDate]);
 
   const trendValues = useMemo(() => (trend?.points || []).map((point) => {
     if (trendCurrency === "CNY_EQ") return Number(point.totals_cny.end_pending || 0);
@@ -720,7 +726,7 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
         </div>
         <label>
           <span>{t("选择日期", "Seleccionar fecha")}</span>
-          <input type="date" min={historyStart} value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)} />
+          <input type="date" min={historyStart} value={selectedDate} onChange={(event) => selectQueryDate(event.target.value)} />
         </label>
       </div>
 
