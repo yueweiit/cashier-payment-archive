@@ -32,6 +32,7 @@ from backend.app.external_expenses import (
     _preview_conditions,
     approval_result_is_disallowed,
     execution_region_is_allowed,
+    general_manager_approval_from_workflow_events,
     applicant_name_from_title,
     classify_dingtalk_payment_event,
     map_monthly_payment,
@@ -3763,6 +3764,52 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         unchanged = client.get(f"/api/batches/{failure_batch['id']}/requests").json()["requests"][0]
         assert unchanged["id"] == created["id"]
         assert unchanged["raw_extra"] == {"kept": True}
+
+
+@pytest.mark.parametrize(
+    "stage_name",
+    ["悦为智能 CEO 审批", "总经理审批", "Gerente General", "Dirección General"],
+)
+def test_general_manager_approval_uses_latest_explicit_manager_node(stage_name):
+    result = general_manager_approval_from_workflow_events([
+        {
+            "event_type": "EXECUTE_TASK_NORMAL",
+            "stage_name": stage_name,
+            "result": "AGREE",
+            "event_time": "2026-08-24T16:20:00+08:00",
+            "sequence_index": 3,
+        }
+    ])
+    assert result == ("同意付款", "2026-08-24")
+
+
+def test_general_manager_approval_uses_latest_decision_and_ignores_department_manager():
+    assert general_manager_approval_from_workflow_events([
+        {
+            "event_type": "EXECUTE_TASK_NORMAL",
+            "stage_name": "采购经理审批",
+            "result": "AGREE",
+            "event_time": "2026-08-24T09:00:00+08:00",
+            "sequence_index": 1,
+        }
+    ]) is None
+
+    assert general_manager_approval_from_workflow_events([
+        {
+            "event_type": "EXECUTE_TASK_NORMAL",
+            "stage_name": "CEO 审批",
+            "result": "AGREE",
+            "event_time": "2026-08-23T09:00:00+08:00",
+            "sequence_index": 1,
+        },
+        {
+            "event_type": "EXECUTE_TASK_NORMAL",
+            "stage_name": "CEO 审批",
+            "result": "REFUSE",
+            "event_time": "2026-08-24T09:00:00+08:00",
+            "sequence_index": 2,
+        },
+    ]) is None
 
 
 def test_dingtalk_payment_comment_classifier_is_strict():

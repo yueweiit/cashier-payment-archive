@@ -66,6 +66,10 @@ SOURCE_TABLES = {
 }
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 FINANCE_STAGE_RE = re.compile(r"(财务|出纳|会计|付款|financ|cajer|tesorer|contab)", re.IGNORECASE)
+GENERAL_MANAGER_STAGE_RE = re.compile(
+    r"(?:\bCEO\b|总经理|gerente\s+general|direcci[oó]n\s+general)",
+    re.IGNORECASE,
+)
 PAID_PHRASE_RE = re.compile(r"(已支付|已经支付|已付款|已经付款|付款完成|支付完成|打款完成|款已付|款项已付)")
 YUEWEI_PAYMENT_CONFIRM_RE = re.compile(
     r"(?:^|[\s,，。；;：:])悦为支付(?:$|[\s,，。；;！!])",
@@ -1296,6 +1300,30 @@ def _workflow_event_time(value: Any) -> Optional[str]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(SHANGHAI_TZ).replace(microsecond=0).isoformat()
+
+
+def general_manager_approval_from_workflow_events(
+    events: Iterable[Dict[str, Any]],
+) -> Optional[tuple[str, str]]:
+    candidates = [
+        event
+        for event in events
+        if str(event.get("event_type") or "").upper() == "EXECUTE_TASK_NORMAL"
+        and GENERAL_MANAGER_STAGE_RE.search(str(event.get("stage_name") or ""))
+    ]
+    if not candidates:
+        return None
+    latest = max(
+        candidates,
+        key=lambda event: (
+            str(event.get("event_time") or ""),
+            int(event.get("sequence_index") or 0),
+        ),
+    )
+    event_time = str(latest.get("event_time") or "").strip()
+    if str(latest.get("result") or "").upper() != "AGREE" or not event_time:
+        return None
+    return "同意付款", event_time[:10]
 
 
 def _json_list(value: Any) -> list[Any]:
