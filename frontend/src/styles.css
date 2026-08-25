@@ -5145,6 +5145,124 @@ textarea {
   to { transform: rotate(360deg); }
 }
 
+.mexico-view-tabs {
+  display: inline-flex;
+  justify-self: start;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid #d7e3e6;
+  border-radius: 10px;
+  background: #e8eff1;
+}
+
+.mexico-view-tabs button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 7px;
+  color: #61737c;
+  background: transparent;
+}
+
+.mexico-view-tabs button.active {
+  color: #176f63;
+  background: #fff;
+  box-shadow: 0 2px 8px rgba(28, 65, 73, 0.1);
+}
+
+.mexico-approver-stats {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+  border: 1px solid #dbe5e9;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.mexico-approver-stats > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.mexico-approver-stats h3,
+.mexico-approver-stats p { margin: 0; }
+.mexico-approver-stats h3 { color: #283b44; font-size: 19px; }
+.mexico-approver-stats p { max-width: 760px; margin-top: 6px; color: #71838c; line-height: 1.55; }
+.mexico-approver-stats > header > span { flex: 0 0 auto; padding: 5px 9px; border-radius: 999px; color: #276e64; background: #e9f5f2; font-size: 12px; }
+
+.mexico-approver-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.mexico-approver-stat-card {
+  min-width: 0;
+  min-height: 126px;
+  display: grid;
+  gap: 15px;
+  padding: 16px;
+  border: 1px solid #dce6e9;
+  border-left: 4px solid #7ab4aa;
+  border-radius: 10px;
+  color: #304750;
+  text-align: left;
+  background: #fbfdfd;
+  transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.mexico-approver-stat-card:hover {
+  transform: translateY(-1px);
+  border-color: #73ada2;
+  box-shadow: 0 8px 20px rgba(36, 83, 88, 0.1);
+}
+
+.mexico-approver-stat-card.overdue { border-left-color: #d6a431; }
+.mexico-approver-stat-card.severe { border-left-color: #cf5c55; }
+.mexico-approver-stat-card.all { align-content: center; border-left-color: #397fba; background: #f5f9fc; }
+.mexico-approver-stat-card.all > strong { color: #2f638f; font-size: 29px; }
+.mexico-approver-stat-card.all > small { color: #71838c; }
+
+.mexico-stat-person {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow-wrap: anywhere;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.mexico-stat-person svg { flex: 0 0 auto; color: #39877a; }
+
+.mexico-stat-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.mexico-stat-metrics > span { min-width: 0; display: grid; gap: 3px; }
+.mexico-stat-metrics small { color: #7d8e96; font-size: 11px; }
+.mexico-stat-metrics strong { color: #304750; font-size: 21px; }
+.mexico-stat-metrics .overdue strong { color: #a87513; }
+.mexico-stat-metrics .severe strong { color: #b84a43; }
+
+.mexico-stats-loading,
+.mexico-stats-empty {
+  min-height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: #71838c;
+}
+
+.mexico-stats-empty { grid-column: 1 / -1; }
+
 .mexico-kpi-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -5294,7 +5412,7 @@ textarea {
 
 .mexico-tracking-table {
   width: 100%;
-  min-width: 1720px;
+  min-width: 1400px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -5308,15 +5426,12 @@ textarea {
   background: #edf5f4;
 }
 
-.mexico-tracking-table th:nth-child(1) { width: 90px; }
-.mexico-tracking-table th:nth-child(2) { width: 210px; }
-.mexico-tracking-table th:nth-child(3) { width: 240px; }
-.mexico-tracking-table th:nth-child(4) { width: 180px; }
-.mexico-tracking-table th:nth-child(5) { width: 320px; }
-.mexico-tracking-table th:nth-child(6) { width: 200px; }
-.mexico-tracking-table th:nth-child(7) { width: 240px; }
-.mexico-tracking-table th:nth-child(8) { width: 110px; }
-.mexico-tracking-table th:nth-child(9) { width: 130px; }
+.mexico-tracking-table th:nth-child(1) { width: 110px; }
+.mexico-tracking-table th:nth-child(2) { width: 220px; }
+.mexico-tracking-table th:nth-child(3) { width: 260px; }
+.mexico-tracking-table th:nth-child(4) { width: 330px; }
+.mexico-tracking-table th:nth-child(5) { width: 300px; }
+.mexico-tracking-table th:nth-child(6) { width: 180px; }
 
 .mexico-tracking-table td {
   padding: 12px 10px;
@@ -5326,12 +5441,25 @@ textarea {
 }
 
 .mexico-tracking-table td:nth-child(2),
-.mexico-tracking-table td:nth-child(8),
+.mexico-duration-actions,
 .mexico-row-actions { white-space: nowrap; }
 
-.mexico-tracking-table td:nth-child(3),
-.mexico-tracking-table td:nth-child(4),
-.mexico-tracking-table td:nth-child(5) { overflow-wrap: anywhere; }
+.mexico-request-cell,
+.mexico-summary-cell,
+.mexico-current-task-cell { overflow-wrap: anywhere; }
+
+.mexico-request-cell > strong { line-height: 1.4; }
+.mexico-request-cell > * + *,
+.mexico-current-task-cell > * + * { margin-top: 7px; }
+
+.mexico-company-clamp,
+.mexico-summary-clamp {
+  display: -webkit-box !important;
+  overflow: hidden;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
 
 .mexico-approver-list,
 .mexico-node-list {
@@ -5352,7 +5480,9 @@ textarea {
 }
 
 .mexico-tracking-table tr:hover { background: #f8fbfb; }
-.mexico-tracking-table tr.warning-red { background: #fffafa; }
+.mexico-row > td:first-child { border-left: 4px solid transparent; }
+.mexico-row.warning-yellow > td:first-child { border-left-color: #dfb54f; }
+.mexico-row.warning-red > td:first-child { border-left-color: #d9665f; }
 .mexico-tracking-table td small,
 .mexico-tracking-table td strong,
 .mexico-tracking-table td > span {
@@ -5366,14 +5496,6 @@ textarea {
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.mexico-summary-cell > span {
-  display: -webkit-box !important;
-  overflow: hidden;
-  line-height: 1.45;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
 }
 
 .mexico-warning-chip {
@@ -5396,6 +5518,9 @@ textarea {
   display: flex;
   gap: 5px;
 }
+
+.mexico-duration-actions > div:first-child { display: grid; gap: 2px; }
+.mexico-duration-actions > div + div { margin-top: 8px; }
 
 .mexico-row-actions button {
   padding: 6px 8px;

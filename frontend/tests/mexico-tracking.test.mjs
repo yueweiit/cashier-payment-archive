@@ -22,6 +22,7 @@ test("Mexico tracking API exposes list, detail, sync, settings and resolution op
     "mexicoTrackingList",
     "mexicoTrackingDetail",
     "mexicoTrackingSummary",
+    "mexicoTrackingApproverStats",
     "mexicoTrackingFilterOptions",
     "startMexicoTrackingSync",
     "mexicoTrackingSyncRun",
@@ -71,11 +72,26 @@ test("tracking renders every current approver and supports one-row attachments",
 
 test("Mexico approval desktop table keeps readable columns and visible overflow", () => {
   assert.match(styleSource, /\.mexico-table-wrap\s*\{[^}]*overflow-x:\s*auto/s);
-  assert.match(styleSource, /\.mexico-tracking-table\s*\{[^}]*min-width:\s*1720px/s);
+  assert.match(styleSource, /\.mexico-tracking-table\s*\{[^}]*min-width:\s*1400px/s);
   assert.doesNotMatch(styleSource, /\.mexico-table-wrap\s*\{[^}]*overflow:\s*hidden/s);
-  assert.match(styleSource, /\.mexico-tracking-table th:nth-child\(5\)\s*\{[^}]*width:\s*320px/s);
-  assert.match(styleSource, /\.mexico-tracking-table th:nth-child\(7\)\s*\{[^}]*width:\s*240px/s);
+  assert.match(pageSource, /mexico-request-cell/);
+  assert.match(pageSource, /mexico-current-task-cell/);
+  assert.match(pageSource, /className="mexico-company-clamp" title=/);
+  assert.match(pageSource, /className="mexico-summary-clamp" title=/);
+  assert.match(styleSource, /\.mexico-company-clamp[\s\S]*-webkit-line-clamp:\s*2/);
+  assert.match(styleSource, /\.mexico-summary-clamp[\s\S]*-webkit-line-clamp:\s*2/);
   assert.match(styleSource, /\.mexico-approver-list/);
+  assert.doesNotMatch(styleSource, /\.mexico-tracking-table tr\.warning-red\s*\{[^}]*background:/s);
+});
+
+test("Mexico tracking switches between the approval list and approver statistics", () => {
+  assert.match(pageSource, /type MexicoPageMode = "list" \| "approvers"/);
+  assert.match(pageSource, /mexico-view-tabs/);
+  assert.match(pageSource, /mexico-approver-stats/);
+  assert.match(pageSource, /api\.mexicoTrackingApproverStats\(\)/);
+  assert.match(pageSource, /function applyApproverStat/);
+  assert.match(pageSource, /setMode\("list"\)/);
+  assert.match(pageSource, /approver:\s*approverName/);
 });
 
 test("Mexico tracking navigation and actions include Spanish translations", () => {

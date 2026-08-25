@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  BarChart3,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -9,6 +10,7 @@ import {
   ExternalLink,
   FileText,
   History,
+  ListChecks,
   LoaderCircle,
   MapPin,
   Paperclip,
@@ -21,6 +23,7 @@ import {
 } from "lucide-react";
 import {
   api,
+  MexicoApproverStat,
   MexicoSyncRun,
   MexicoTrackingDetail,
   MexicoTrackingFilterOptions,
@@ -45,6 +48,8 @@ type Props = {
   user: User;
   setMessage: (message: string) => void;
 };
+
+type MexicoPageMode = "list" | "approvers";
 
 type Filters = {
   keyword: string;
@@ -135,6 +140,7 @@ function CurrentNodes({ item }: { item: MexicoTrackingItem }) {
 
 export function MexicoTrackingPage({ user, setMessage }: Props) {
   const { language, t } = useLanguage();
+  const [mode, setMode] = useState<MexicoPageMode>("list");
   const [view, setView] = useState<MexicoTrackingView>("pending");
   const [filters, setFilters] = useState<Filters>(emptyFilters);
   const [appliedFilters, setAppliedFilters] = useState<Filters>(emptyFilters);
@@ -143,6 +149,9 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
   const [summary, setSummary] = useState<MexicoTrackingSummary>(emptySummary);
   const [options, setOptions] = useState<MexicoTrackingFilterOptions>(emptyOptions);
   const [settings, setSettings] = useState<MexicoTrackingSettings | null>(null);
+  const [approverStats, setApproverStats] = useState<MexicoApproverStat[]>([]);
+  const [approverStatsLoading, setApproverStatsLoading] = useState(true);
+  const [approverStatsError, setApproverStatsError] = useState("");
   const [page, setPage] = useState(1);
   const [pages, setPages] = useState(1);
   const [total, setTotal] = useState(0);
@@ -209,9 +218,22 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
     }
   }, []);
 
+  const loadApproverStats = useCallback(async () => {
+    setApproverStatsLoading(true);
+    setApproverStatsError("");
+    try {
+      const response = await api.mexicoTrackingApproverStats();
+      setApproverStats(response.items);
+    } catch (reason) {
+      setApproverStatsError((reason as Error).message);
+    } finally {
+      setApproverStatsLoading(false);
+    }
+  }, []);
+
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadList(), loadOverview()]);
-  }, [loadList, loadOverview]);
+    await Promise.all([loadList(), loadOverview(), loadApproverStats()]);
+  }, [loadApproverStats, loadList, loadOverview]);
 
   const reloadDetail = useCallback(async (id: number, closeOnError = false) => {
     setDetailLoading(true);
@@ -237,6 +259,10 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
   useEffect(() => {
     loadOverview();
   }, [loadOverview]);
+
+  useEffect(() => {
+    loadApproverStats();
+  }, [loadApproverStats]);
 
   const startSync = useCallback(async (manual: boolean) => {
     try {
@@ -324,6 +350,26 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
     setPage(1);
   }
 
+  function applyWarningFilter(warning: "yellow" | "red") {
+    const nextFilters: Filters = {
+      ...emptyFilters,
+      approver: appliedFilters.approver,
+      warning,
+    };
+    setFilters(nextFilters);
+    setAppliedFilters(nextFilters);
+    setMode("list");
+    changeView("pending");
+  }
+
+  function applyApproverStat(approverName: string) {
+    const nextFilters: Filters = { ...emptyFilters, approver: approverName };
+    setFilters(nextFilters);
+    setAppliedFilters(nextFilters);
+    setMode("list");
+    changeView("pending");
+  }
+
   async function copyReminder(item: MexicoTrackingItem) {
     const text = formatReminder(item, language);
     if (!text) return;
@@ -381,14 +427,88 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
         </div>
       )}
 
+      <div className="mexico-view-tabs" role="tablist" aria-label={t("墨西哥审批视图", "Vistas de aprobaciones de México")}>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === "list"}
+          className={mode === "list" ? "active" : ""}
+          onClick={() => setMode("list")}
+        >
+          <ListChecks size={17} />
+          <span>{t("审批列表", "Lista de aprobaciones")}</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === "approvers"}
+          className={mode === "approvers" ? "active" : ""}
+          onClick={() => setMode("approvers")}
+        >
+          <BarChart3 size={17} />
+          <span>{t("审批人统计", "Resumen por aprobador")}</span>
+        </button>
+      </div>
+
+      {mode === "approvers" && (
+        <section className="mexico-approver-stats">
+          <header>
+            <div>
+              <h3>{t("当前审批人工作量", "Carga actual por aprobador")}</h3>
+              <p>{t(
+                "点击审批人即可返回审批列表并筛选其当前待办。多人审批会分别计入，同一单重复任务只计算一次。",
+                "Seleccione un aprobador para volver a la lista y filtrar sus tareas actuales.",
+              )}</p>
+            </div>
+            <span>{approverStats.length} {t("位审批人", "aprobadores")}</span>
+          </header>
+          {approverStatsError && (
+            <div className="mexico-error" role="alert">
+              {approverStatsError}
+              <button type="button" onClick={loadApproverStats}>{t("重试", "Reintentar")}</button>
+            </div>
+          )}
+          {approverStatsLoading ? (
+            <div className="mexico-stats-loading"><LoaderCircle className="spin" />{t("正在统计审批人", "Calculando aprobadores")}</div>
+          ) : (
+            <div className="mexico-approver-stat-grid">
+              <button className="mexico-approver-stat-card all" type="button" onClick={() => applyApproverStat("")}>
+                <span className="mexico-stat-person"><UserRound size={18} />{t("全部审批人", "Todos los aprobadores")}</span>
+                <strong>{summary.pending}</strong>
+                <small>{t("当前待审批总数", "pendientes actuales")}</small>
+              </button>
+              {approverStats.map((stat) => (
+                <button
+                  key={stat.approver_name}
+                  className={`mexico-approver-stat-card ${stat.severe > 0 ? "severe" : stat.overdue > 0 ? "overdue" : "normal"}`}
+                  type="button"
+                  onClick={() => applyApproverStat(stat.approver_name)}
+                >
+                  <span className="mexico-stat-person"><UserRound size={18} />{stat.approver_name}</span>
+                  <span className="mexico-stat-metrics">
+                    <span><small>{t("待审批", "Pendientes")}</small><strong>{stat.pending}</strong></span>
+                    <span className="overdue"><small>{t("已超时", "Vencidas")}</small><strong>{stat.overdue}</strong></span>
+                    <span className="severe"><small>{t("严重超时", "Urgentes")}</small><strong>{stat.severe}</strong></span>
+                  </span>
+                </button>
+              ))}
+              {!approverStats.length && !approverStatsError && (
+                <div className="mexico-stats-empty"><CheckCircle2 />{t("当前没有待审批任务", "No hay tareas pendientes")}</div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      {mode === "list" && <>
       <div className="mexico-kpi-grid">
         <button className={view === "pending" && !appliedFilters.warning ? "active" : ""} onClick={() => selectView("pending")}>
           <Clock3 /> <span>{t("待审批", "Pendientes")}</span><strong>{summary.pending}</strong>
         </button>
-        <button className={view === "pending" && appliedFilters.warning === "yellow" ? "active warning-yellow" : "warning-yellow"} onClick={() => { setFilters({ ...emptyFilters, warning: "yellow" }); setAppliedFilters({ ...emptyFilters, warning: "yellow" }); changeView("pending"); }}>
+        <button className={view === "pending" && appliedFilters.warning === "yellow" ? "active warning-yellow" : "warning-yellow"} onClick={() => applyWarningFilter("yellow")}>
           <AlertTriangle /> <span>{t("超过关注时限", "Requieren atención")}</span><strong>{summary.yellow}</strong>
         </button>
-        <button className={view === "pending" && appliedFilters.warning === "red" ? "active warning-red" : "warning-red"} onClick={() => { setFilters({ ...emptyFilters, warning: "red" }); setAppliedFilters({ ...emptyFilters, warning: "red" }); changeView("pending"); }}>
+        <button className={view === "pending" && appliedFilters.warning === "red" ? "active warning-red" : "warning-red"} onClick={() => applyWarningFilter("red")}>
           <AlertTriangle /> <span>{t("严重超时", "Urgentes")}</span><strong>{summary.red}</strong>
         </button>
         <button className={view === "history" ? "active" : ""} onClick={() => selectView("history")}>
@@ -443,18 +563,19 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
         {items.length > 0 && (
           <>
             <table className="mexico-tracking-table">
-              <thead><tr><th>{t("预警", "Alerta")}</th><th>{t("钉钉单号", "N.º DingTalk")}</th><th>{t("子公司", "Empresa")}</th><th>{t("申请人", "Solicitante")}</th><th>{t("摘要", "Concepto")}</th><th>{t("当前节点", "Etapa actual")}</th><th>{t("当前审批人", "Aprobador actual")}</th><th>{t("停留", "Tiempo")}</th><th>{t("操作", "Acciones")}</th></tr></thead>
+              <thead><tr><th>{t("预警", "Alerta")}</th><th>{t("审批单", "Solicitud")}</th><th>{t("申请信息", "Solicitante y empresa")}</th><th>{t("摘要", "Concepto")}</th><th>{t("当前待办", "Tarea actual")}</th><th>{t("停留 / 操作", "Tiempo / Acciones")}</th></tr></thead>
               <tbody>{items.map((item) => (
                 <tr key={item.id} className={`mexico-row warning-${item.warning_level}`} onDoubleClick={() => openDetail(item.id)}>
                   <td><span className={`mexico-warning-chip ${item.warning_level}`}>{warningLabel(item.warning_level, language)}</span></td>
                   <td><button className="link-button" onClick={() => openDetail(item.id)}>{item.approval_no}</button><small>{mexicoSourceLabel(item.source_type, language)} · {item.request_date || "—"}</small></td>
-                  <td>{item.company_name || item.source_sheet || "—"}</td>
-                  <td>{item.applicant_name || "—"}<small>{item.applicant_department || ""}</small></td>
-                  <td className="mexico-summary-cell"><span>{item.summary || "—"}</span><small>{formatOriginalMoney(item.amount, item.currency, language)}</small></td>
-                  <td><CurrentNodes item={item} /><small>{workflowStatusLabel(item.workflow_status, language)}</small></td>
-                  <td><CurrentApprovers item={item} /></td>
-                  <td><strong>{item.age_days} {t("天", "días")}</strong><small>{compactDateTime(item.current_node_entered_at, language)}</small></td>
-                  <td className="mexico-row-actions"><button onClick={() => openDetail(item.id)}>{t("查看审批", "Ver aprobación")}</button>{item.reminder && <button title={t("复制双语提醒", "Copiar recordatorio bilingüe")} onClick={() => copyReminder(item)}><ClipboardCopy size={15} /></button>}</td>
+                  <td className="mexico-request-cell">
+                    <strong title={item.applicant_name || "—"}>{item.applicant_name || "—"}</strong>
+                    <span className="mexico-company-clamp" title={item.company_name || item.source_sheet || "—"}>{item.company_name || item.source_sheet || "—"}</span>
+                    {item.applicant_department && <small title={item.applicant_department}>{item.applicant_department}</small>}
+                  </td>
+                  <td className="mexico-summary-cell"><span className="mexico-summary-clamp" title={item.summary || "—"}>{item.summary || "—"}</span><small>{formatOriginalMoney(item.amount, item.currency, language)}</small></td>
+                  <td className="mexico-current-task-cell"><CurrentNodes item={item} /><CurrentApprovers item={item} /><small>{workflowStatusLabel(item.workflow_status, language)}</small></td>
+                  <td className="mexico-duration-actions"><div><strong>{item.age_days} {t("天", "días")}</strong><small>{compactDateTime(item.current_node_entered_at, language)}</small></div><div className="mexico-row-actions"><button onClick={() => openDetail(item.id)}>{t("查看", "Ver")}</button>{item.reminder && <button title={t("复制双语提醒", "Copiar recordatorio bilingüe")} onClick={() => copyReminder(item)}><ClipboardCopy size={15} /></button>}</div></td>
                 </tr>
               ))}</tbody>
             </table>
@@ -472,6 +593,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
       </div>
 
       {pages > 1 && <div className="mexico-pagination"><button disabled={page <= 1} onClick={() => setPage((value) => value - 1)}><ChevronLeft /></button><span>{page} / {pages}</span><button disabled={page >= pages} onClick={() => setPage((value) => value + 1)}><ChevronRight /></button></div>}
+      </>}
 
       {selectedId !== null && (
         <MexicoDetailDrawer
