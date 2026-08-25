@@ -3007,6 +3007,12 @@ def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
     )
     assert purchase["amount"] == 100.25
     assert purchase["beneficiary"] == "供应商A 账号1 / 供应商B 账号2"
+    assert purchase["request_data"]["payee_name"] == purchase["beneficiary"]
+    assert purchase["request_data"]["payee_account"] == purchase["beneficiary"]
+    assert (
+        purchase["request_data"]["raw_extra"]["external_source"]["beneficiary"]
+        == purchase["beneficiary"]
+    )
     assert purchase["summary"] == "采购测试摘要"
     assert purchase["needed_payment_date"] == "2026-07-20"
     assert "存在多个收款人，请确认" in purchase["warnings"]
