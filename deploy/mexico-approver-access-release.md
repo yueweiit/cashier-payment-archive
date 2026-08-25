@@ -71,7 +71,7 @@ git checkout <release-commit>
 npm ci
 npm run build
 sudo systemctl start cashier-payment
-curl -fsS http://127.0.0.1:8011/api/health
+test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8011/)" = 200
 sudo systemctl stop cashier-payment
 ```
 
@@ -109,7 +109,7 @@ sudo -u www env PAYMENT_APP_DATA_DIR="$PAYMENT_APP_DATA_DIR" PAYMENT_APP_DB="$PA
 ```bash
 sudo systemctl start cashier-payment
 sudo systemctl status cashier-payment --no-pager
-curl -fsS http://127.0.0.1:8011/api/health
+test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8011/)" = 200
 ```
 
 按以下顺序验收：
@@ -147,7 +147,7 @@ sudo -u www env PAYMENT_APP_DATA_DIR="$PAYMENT_APP_DATA_DIR" PAYMENT_APP_DB="$PA
 npm ci
 npm run build
 sudo systemctl start cashier-payment
-curl -fsS http://127.0.0.1:8011/api/health
+test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8011/)" = 200
 ```
 
 回滚后重新验证登录、工作台、每日应付和导出。失败版本数据库副本保留用于排查，不要直接删除。
