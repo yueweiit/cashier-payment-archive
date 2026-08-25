@@ -5255,11 +5255,14 @@ textarea {
 .mexico-table-wrap {
   position: relative;
   min-height: 150px;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-gutter: stable;
 }
 
 .mexico-tracking-table {
   width: 100%;
+  min-width: 1720px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -5273,20 +5276,47 @@ textarea {
   background: #edf5f4;
 }
 
-.mexico-tracking-table th:nth-child(1) { width: 92px; }
-.mexico-tracking-table th:nth-child(2) { width: 190px; }
-.mexico-tracking-table th:nth-child(3) { width: 180px; }
-.mexico-tracking-table th:nth-child(4) { width: 150px; }
-.mexico-tracking-table th:nth-child(6) { width: 150px; }
-.mexico-tracking-table th:nth-child(7) { width: 150px; }
-.mexico-tracking-table th:nth-child(8) { width: 105px; }
-.mexico-tracking-table th:nth-child(9) { width: 90px; }
+.mexico-tracking-table th:nth-child(1) { width: 90px; }
+.mexico-tracking-table th:nth-child(2) { width: 210px; }
+.mexico-tracking-table th:nth-child(3) { width: 240px; }
+.mexico-tracking-table th:nth-child(4) { width: 180px; }
+.mexico-tracking-table th:nth-child(5) { width: 320px; }
+.mexico-tracking-table th:nth-child(6) { width: 200px; }
+.mexico-tracking-table th:nth-child(7) { width: 240px; }
+.mexico-tracking-table th:nth-child(8) { width: 110px; }
+.mexico-tracking-table th:nth-child(9) { width: 130px; }
 
 .mexico-tracking-table td {
   padding: 12px 10px;
   border-top: 1px solid #e3eaed;
   color: #33464f;
   vertical-align: middle;
+}
+
+.mexico-tracking-table td:nth-child(2),
+.mexico-tracking-table td:nth-child(8),
+.mexico-row-actions { white-space: nowrap; }
+
+.mexico-tracking-table td:nth-child(3),
+.mexico-tracking-table td:nth-child(4),
+.mexico-tracking-table td:nth-child(5) { overflow-wrap: anywhere; }
+
+.mexico-approver-list,
+.mexico-node-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.mexico-approver-list > span,
+.mexico-node-list > span {
+  display: inline-flex;
+  max-width: 100%;
+  padding: 3px 7px;
+  border-radius: 999px;
+  overflow-wrap: anywhere;
+  color: #315c55;
+  background: #e9f4f1;
 }
 
 .mexico-tracking-table tr:hover { background: #f8fbfb; }
@@ -5497,6 +5527,27 @@ textarea {
 .mexico-timeline-card > small { display: flex; align-items: center; gap: 5px; margin-top: 8px; color: #73868e; }
 
 .mexico-attachment-list { display: grid; gap: 7px; }
+.mexico-attachments-section > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 13px;
+}
+.mexico-attachments-section > header h3 { margin: 0; }
+.mexico-attachment-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+.mexico-attachment-actions small { color: #71838c; }
+.mexico-attachment-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
 .mexico-attachment-list > a,
 .mexico-attachment-list > div { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 10px 12px; border: 1px solid #dfe7ea; border-radius: 7px; color: #354a53; }
 .mexico-attachment-list > a:hover { border-color: #84bcaf; background: #f7fbfa; }
@@ -5641,8 +5692,6 @@ textarea {
   .mexico-kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .mexico-filter-main { grid-template-columns: minmax(250px, 1.5fr) minmax(170px, 1fr) minmax(170px, 1fr) auto auto; }
   .mexico-filter-extra { grid-template-columns: repeat(3, minmax(160px, 1fr)); }
-  .mexico-table-wrap { overflow-x: auto; }
-  .mexico-tracking-table { min-width: 1260px; }
 }
 
 @media (max-width: 980px) {

@@ -7,6 +7,7 @@ const apiSource = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8"
 const i18nSource = readFileSync(new URL("../src/i18n.tsx", import.meta.url), "utf8");
 const helperSource = readFileSync(new URL("../src/mexicoTracking.ts", import.meta.url), "utf8");
 const pageSource = readFileSync(new URL("../src/MexicoTrackingPage.tsx", import.meta.url), "utf8");
+const styleSource = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
 
 test("Mexico approval tracking has a stable navigation destination", () => {
   assert.match(appSource, /type Tab =[\s\S]*"mexico-tracking"/);
@@ -65,6 +66,15 @@ test("tracking renders every current approver and supports one-row attachments",
   assert.match(pageSource, /current_approvers\.map/);
   assert.match(pageSource, /加载此单附件/);
   assert.match(pageSource, /attachmentRun/);
+});
+
+test("Mexico approval desktop table keeps readable columns and visible overflow", () => {
+  assert.match(styleSource, /\.mexico-table-wrap\s*\{[^}]*overflow-x:\s*auto/s);
+  assert.match(styleSource, /\.mexico-tracking-table\s*\{[^}]*min-width:\s*1720px/s);
+  assert.doesNotMatch(styleSource, /\.mexico-table-wrap\s*\{[^}]*overflow:\s*hidden/s);
+  assert.match(styleSource, /\.mexico-tracking-table th:nth-child\(5\)\s*\{[^}]*width:\s*320px/s);
+  assert.match(styleSource, /\.mexico-tracking-table th:nth-child\(7\)\s*\{[^}]*width:\s*240px/s);
+  assert.match(styleSource, /\.mexico-approver-list/);
 });
 
 test("Mexico tracking navigation and actions include Spanish translations", () => {
