@@ -6,6 +6,7 @@ const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8
 const i18nSource = readFileSync(new URL("../src/i18n.tsx", import.meta.url), "utf8");
 
 test("payee name uses the concise Chinese label and keeps its Spanish translation", () => {
+  assert.match(appSource, /payee_name:\s*"收款人"/);
   assert.match(
     appSource,
     /key:\s*"payee_name",\s*labelZh:\s*"收款人",\s*labelEs:\s*"Nombre del beneficiario"/,

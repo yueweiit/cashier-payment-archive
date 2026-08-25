@@ -3882,6 +3882,22 @@ def test_general_manager_approval_uses_latest_decision_and_ignores_department_ma
         }
     ]) is None
 
+    for stage_name in (
+        "副总经理审批",
+        "总经理助理审批",
+        "Subgerente General",
+        "CEO助理审批",
+    ):
+        assert general_manager_approval_from_workflow_events([
+            {
+                "event_type": "EXECUTE_TASK_NORMAL",
+                "stage_name": stage_name,
+                "result": "AGREE",
+                "event_time": "2026-08-24T09:00:00+08:00",
+                "sequence_index": 1,
+            }
+        ]) is None
+
     assert general_manager_approval_from_workflow_events([
         {
             "event_type": "EXECUTE_TASK_NORMAL",
@@ -3896,6 +3912,33 @@ def test_general_manager_approval_uses_latest_decision_and_ignores_department_ma
             "result": "REFUSE",
             "event_time": "2026-08-24T09:00:00+08:00",
             "sequence_index": 2,
+        },
+    ]) is None
+
+    assert general_manager_approval_from_workflow_events([
+        {
+            "event_type": "EXECUTE_TASK_NORMAL",
+            "stage_name": "CEO审批",
+            "result": "AGREE",
+            "event_time": "2026-08-23T09:00:00+08:00",
+            "sequence_index": 1,
+        },
+        {
+            "event_type": "EXECUTE_TASK_NORMAL",
+            "stage_name": "CEO审批",
+            "result": "REFUSE",
+            "event_time": None,
+            "sequence_index": 2,
+        },
+    ]) is None
+
+    assert general_manager_approval_from_workflow_events([
+        {
+            "event_type": "EXECUTE_TASK_NORMAL",
+            "stage_name": "CEO审批",
+            "result": "AGREE",
+            "event_time": "not-a-date",
+            "sequence_index": 1,
         },
     ]) is None
 

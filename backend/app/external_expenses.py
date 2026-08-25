@@ -67,7 +67,14 @@ SOURCE_TABLES = {
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 FINANCE_STAGE_RE = re.compile(r"(财务|出纳|会计|付款|financ|cajer|tesorer|contab)", re.IGNORECASE)
 GENERAL_MANAGER_STAGE_RE = re.compile(
-    r"(?:(?<![A-Za-z])CEO(?![A-Za-z])|总经理|gerente\s+general|direcci[oó]n\s+general)",
+    r"(?:(?<![A-Za-z])CEO(?![A-Za-z])|总经理|"
+    r"(?<![A-Za-z])gerente\s+general(?![A-Za-z])|"
+    r"(?<![A-Za-z])direcci[oó]n\s+general(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+GENERAL_MANAGER_STAGE_EXCLUSION_RE = re.compile(
+    r"(?:副\s*总经理|总经理\s*助理|副\s*CEO|CEO\s*助理|助理\s*CEO|"
+    r"subgerente|assistant|asistente|adjunt[oa])",
     re.IGNORECASE,
 )
 PAID_PHRASE_RE = re.compile(r"(已支付|已经支付|已付款|已经付款|付款完成|支付完成|打款完成|款已付|款项已付)")
@@ -1310,20 +1317,22 @@ def general_manager_approval_from_workflow_events(
         for event in events
         if str(event.get("event_type") or "").upper() == "EXECUTE_TASK_NORMAL"
         and GENERAL_MANAGER_STAGE_RE.search(str(event.get("stage_name") or ""))
+        and not GENERAL_MANAGER_STAGE_EXCLUSION_RE.search(str(event.get("stage_name") or ""))
     ]
     if not candidates:
         return None
     latest = max(
         candidates,
         key=lambda event: (
-            str(event.get("event_time") or ""),
             int(event.get("sequence_index") or 0),
+            str(event.get("event_time") or ""),
         ),
     )
     event_time = str(latest.get("event_time") or "").strip()
-    if str(latest.get("result") or "").upper() != "AGREE" or not event_time:
+    approval_date = _date_text(event_time)
+    if str(latest.get("result") or "").upper() != "AGREE" or not approval_date:
         return None
-    return "同意付款", event_time[:10]
+    return "同意付款", approval_date
 
 
 def _json_list(value: Any) -> list[Any]:

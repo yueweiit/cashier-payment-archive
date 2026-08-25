@@ -153,7 +153,7 @@ const fieldLabels: Record<string, string> = {
   project: "项目归属",
   bu: "BU归属",
   payee_account: "收款账户/账号",
-  payee_name: "账户名",
+  payee_name: "收款人",
   bank_name: "开户行",
   invoice_status: "开票情况",
   needed_payment_date: "需求付款日期",
