@@ -1980,8 +1980,9 @@ def _mexico_tracking_where(
             "(EXISTS (SELECT 1 FROM mexico_approval_current_tasks current_task "
             "WHERE current_task.approval_no = mexico_approval_tracking.approval_no "
             "AND TRIM(COALESCE(current_task.approver_name, '')) = ?) "
-            "OR (NOT EXISTS (SELECT 1 FROM mexico_approval_current_tasks any_task "
-            "WHERE any_task.approval_no = mexico_approval_tracking.approval_no) "
+            "OR (NOT EXISTS (SELECT 1 FROM mexico_approval_current_tasks named_task "
+            "WHERE named_task.approval_no = mexico_approval_tracking.approval_no "
+            "AND TRIM(COALESCE(named_task.approver_name, '')) <> '') "
             "AND TRIM(COALESCE(mexico_approval_tracking.current_approver_name, '')) = ?))"
         )
         params.extend([str(approver).strip()] * 2)
@@ -1990,8 +1991,9 @@ def _mexico_tracking_where(
             "(EXISTS (SELECT 1 FROM mexico_approval_current_tasks current_task "
             "WHERE current_task.approval_no = mexico_approval_tracking.approval_no "
             "AND TRIM(COALESCE(current_task.node_name, '')) = ?) "
-            "OR (NOT EXISTS (SELECT 1 FROM mexico_approval_current_tasks any_task "
-            "WHERE any_task.approval_no = mexico_approval_tracking.approval_no) "
+            "OR (NOT EXISTS (SELECT 1 FROM mexico_approval_current_tasks named_task "
+            "WHERE named_task.approval_no = mexico_approval_tracking.approval_no "
+            "AND TRIM(COALESCE(named_task.node_name, '')) <> '') "
             "AND TRIM(COALESCE(mexico_approval_tracking.current_node_name, '')) = ?))"
         )
         params.extend([str(node).strip()] * 2)
@@ -2359,22 +2361,24 @@ def mexico_tracking_filter_options(
     for row in rows:
         approval_no = str(row["approval_no"])
         tasks = tasks_by_approval.get(approval_no, [])
-        if tasks:
-            approvers.update(
-                str(task["approver_name"]).strip()
-                for task in tasks
-                if task.get("approver_name") and str(task["approver_name"]).strip()
-            )
-            nodes.update(
-                str(task["node_name"]).strip()
-                for task in tasks
-                if task.get("node_name") and str(task["node_name"]).strip()
-            )
-        else:
-            if row["current_approver_name"] and str(row["current_approver_name"]).strip():
-                approvers.add(str(row["current_approver_name"]).strip())
-            if row["current_node_name"] and str(row["current_node_name"]).strip():
-                nodes.add(str(row["current_node_name"]).strip())
+        task_approvers = {
+            str(task["approver_name"]).strip()
+            for task in tasks
+            if task.get("approver_name") and str(task["approver_name"]).strip()
+        }
+        task_nodes = {
+            str(task["node_name"]).strip()
+            for task in tasks
+            if task.get("node_name") and str(task["node_name"]).strip()
+        }
+        if task_approvers:
+            approvers.update(task_approvers)
+        elif row["current_approver_name"] and str(row["current_approver_name"]).strip():
+            approvers.add(str(row["current_approver_name"]).strip())
+        if task_nodes:
+            nodes.update(task_nodes)
+        elif row["current_node_name"] and str(row["current_node_name"]).strip():
+            nodes.add(str(row["current_node_name"]).strip())
 
     return {
         "companies": distinct("company_name"),

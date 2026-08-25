@@ -1624,6 +1624,17 @@ def test_mexico_legacy_approver_and_node_fallbacks_match_stat_filters(
             sheet="Fallback company",
             approver="Fallback Ana",
         )
+        timestamp = "2026-08-24T12:00:00.000000+08:00"
+        conn.execute(
+            """
+            INSERT INTO mexico_approval_current_tasks (
+                approval_no, task_key, node_name, approver_name,
+                entered_at, synced_at, created_at, updated_at
+            ) VALUES ('MX-STATS-FALLBACK', 'legacy:blank', '', '', ?, ?, ?, ?)
+            """,
+            (timestamp, timestamp, timestamp, timestamp),
+        )
+        conn.commit()
 
         stats = summarize_mexico_approvers(conn)
         by_approver = list_mexico_tracking(
@@ -1636,6 +1647,7 @@ def test_mexico_legacy_approver_and_node_fallbacks_match_stat_filters(
             view="pending",
             node="Director approval",
         )
+        options = mexico_tracking_filter_options(conn)
 
         assert stats == [
             {
@@ -1651,6 +1663,8 @@ def test_mexico_legacy_approver_and_node_fallbacks_match_stat_filters(
         assert [item["approval_no"] for item in by_node["items"]] == [
             "MX-STATS-FALLBACK"
         ]
+        assert options["approvers"] == ["Fallback Ana"]
+        assert options["nodes"] == ["Director approval"]
 
 
 def test_mexico_tracking_detail_returns_timeline_attachments_and_links(isolated_db) -> None:

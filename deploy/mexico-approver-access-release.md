@@ -41,6 +41,8 @@ release_env.write_text(
 release_env.chmod(0o600)
 print(f"PAYMENT_APP_DB={db_path}")
 PY
+sudo chown "$(id -u):$(id -g)" "$RELEASE_ENV_FILE"
+chmod 600 "$RELEASE_ENV_FILE"
 . "$RELEASE_ENV_FILE"
 sudo -u www env PAYMENT_APP_DATA_DIR="$PAYMENT_APP_DATA_DIR" PAYMENT_APP_DB="$PAYMENT_APP_DB" \
   .venv/bin/python -c 'from backend.app.db import DB_PATH; print(f"已确认生产数据库: {DB_PATH.resolve()}"); assert DB_PATH.resolve().is_file()'

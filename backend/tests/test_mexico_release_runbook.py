@@ -18,3 +18,6 @@ def test_mexico_release_runbook_reuses_the_live_service_database_path() -> None:
     assert 'cp "$PAYMENT_APP_DB"' in content
     assert '"${PAYMENT_APP_DB}-wal"' in content
     assert '"${PAYMENT_APP_DB}-shm"' in content
+    ownership_handoff = 'sudo chown "$(id -u):$(id -g)" "$RELEASE_ENV_FILE"'
+    assert ownership_handoff in content
+    assert content.index(ownership_handoff) < content.index('. "$RELEASE_ENV_FILE"')
