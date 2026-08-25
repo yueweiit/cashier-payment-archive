@@ -5,7 +5,6 @@ import {
   AlertTriangle,
   ArrowRight,
   Archive,
-  CalendarDays,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -17,7 +16,6 @@ import {
   LayoutList,
   Languages,
   LogOut,
-  MapPinned,
   MoreHorizontal,
   MessageSquareText,
   Paperclip,
@@ -73,9 +71,10 @@ import {
 } from "./api";
 import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
 import { buildDirtyGridPayload, sameSheetOrder } from "./gridSave";
+import { AppNavigation, type AppTab } from "./AppNavigation";
 import { MexicoTrackingPage } from "./MexicoTrackingPage";
 
-type Tab = "workspace" | "daily-payables" | "mexico-tracking" | "archive" | "admin";
+type Tab = AppTab;
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
 type PendingEditorNavigation =
   | { kind: "close" }
@@ -478,30 +477,11 @@ function Shell({
           <FileSpreadsheet />
           <strong>{t("出纳请款明细", "Detalle de solicitudes de pago de tesorería")}</strong>
         </div>
-        <nav className="app-nav">
-          <button className={tab === "workspace" ? "active" : ""} onPointerDown={() => setTab("workspace")} onClick={() => setTab("workspace")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("workspace"))}>
-            <FileSpreadsheet size={16} />
-            工作台
-          </button>
-          <button className={tab === "daily-payables" ? "active" : ""} onPointerDown={() => setTab("daily-payables")} onClick={() => setTab("daily-payables")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("daily-payables"))}>
-            <CalendarDays size={16} />
-            每日应付
-          </button>
-          <button data-page="mexico-tracking" className={tab === "mexico-tracking" ? "active" : ""} onPointerDown={() => setTab("mexico-tracking")} onClick={() => setTab("mexico-tracking")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("mexico-tracking"))}>
-            <MapPinned size={16} />
-            墨西哥审批
-          </button>
-          <button className={tab === "archive" ? "active" : ""} onPointerDown={() => setTab("archive")} onClick={() => setTab("archive")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("archive"))}>
-            <Archive size={16} />
-            归档
-          </button>
-          {isPrivilegedRole(user.role) && (
-            <button className={tab === "admin" ? "active" : ""} onPointerDown={() => setTab("admin")} onClick={() => setTab("admin")} onKeyDown={(event) => activateButtonByKeyboard(event, () => setTab("admin"))}>
-              <Users size={16} />
-              管理
-            </button>
-          )}
-        </nav>
+        <AppNavigation
+          tab={tab}
+          canAdmin={isPrivilegedRole(user.role)}
+          onSelect={setTab}
+        />
         <div className="app-userbar">
           <button className="icon-text language-button" type="button" onClick={toggleLanguage} title={language === "zh" ? "Cambiar a español" : "切换为中文"}>
             <Languages size={15} />{language === "zh" ? "Español" : "中文"}

@@ -214,13 +214,45 @@ textarea {
 .app-nav {
   flex: 1 1 auto;
   min-width: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: none;
+  position: relative;
 }
 
-.app-nav::-webkit-scrollbar {
-  display: none;
+.app-nav-list,
+.app-nav-measure {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.app-nav-measure {
+  position: fixed;
+  top: -10000px;
+  left: -10000px;
+  visibility: hidden;
+}
+
+.app-nav-more-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.app-nav-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 220px;
+  padding: 6px;
+  border: 1px solid #49616b;
+  border-radius: 8px;
+  background: #20343f;
+  box-shadow: 0 14px 30px rgba(15, 35, 45, 0.28);
+}
+
+.app-nav-menu button {
+  width: 100%;
+  justify-content: flex-start;
 }
 
 .app-nav button {
@@ -3705,7 +3737,7 @@ textarea {
   .app-nav {
     order: 3;
     flex-basis: 100%;
-    overflow-x: auto;
+    width: 100%;
   }
 
   .app-userbar {

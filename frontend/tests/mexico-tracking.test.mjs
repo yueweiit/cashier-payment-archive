@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+const navigationSource = readFileSync(new URL("../src/AppNavigation.tsx", import.meta.url), "utf8");
 const apiSource = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
 const i18nSource = readFileSync(new URL("../src/i18n.tsx", import.meta.url), "utf8");
 const helperSource = readFileSync(new URL("../src/mexicoTracking.ts", import.meta.url), "utf8");
@@ -10,8 +11,8 @@ const pageSource = readFileSync(new URL("../src/MexicoTrackingPage.tsx", import.
 const styleSource = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
 
 test("Mexico approval tracking has a stable navigation destination", () => {
-  assert.match(appSource, /type Tab =[\s\S]*"mexico-tracking"/);
-  assert.match(appSource, /data-page="mexico-tracking"/);
+  assert.match(navigationSource, /type AppTab =[\s\S]*"mexico-tracking"/);
+  assert.match(navigationSource, /data-page=\{item\.tab === "mexico-tracking"/);
   assert.match(appSource, /<MexicoTrackingPage/);
   assert.match(appSource, /tab !== "mexico-tracking" && \(\s*<header className="topbar">/);
 });
