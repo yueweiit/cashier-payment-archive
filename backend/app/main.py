@@ -112,6 +112,7 @@ from .mexico_tracking import (
     prioritize_mexico_attachments,
     resolve_mexico_tracking_region,
     sheet_region,
+    summarize_mexico_approvers,
     summarize_mexico_tracking,
     summarize_mexico_attachment_queue,
     update_mexico_tracking_settings,
@@ -6811,6 +6812,20 @@ def get_mexico_tracking_filter_options(
     with connect() as conn:
         return {
             "options": mexico_tracking_filter_options(
+                conn,
+                participant_name=participant_name,
+            )
+        }
+
+
+@app.get("/api/mexico-tracking/approver-stats")
+def get_mexico_approver_stats(
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> Dict[str, Any]:
+    participant_name = mexico_tracking_participant_name(user)
+    with connect() as conn:
+        return {
+            "items": summarize_mexico_approvers(
                 conn,
                 participant_name=participant_name,
             )

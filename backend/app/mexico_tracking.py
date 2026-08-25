@@ -2236,6 +2236,79 @@ def summarize_mexico_tracking(
     return counts
 
 
+def summarize_mexico_approvers(
+    conn: sqlite3.Connection,
+    *,
+    allowed_sheets: Optional[set[str]] = None,
+    participant_name: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> list[Dict[str, Any]]:
+    """Aggregate visible pending approvals once per current approver."""
+
+    where, params = _mexico_tracking_where(
+        view="pending",
+        allowed_sheets=allowed_sheets,
+        participant_name=participant_name,
+    )
+    rows = conn.execute(
+        f"""
+        SELECT approval_no, current_approver_name, current_node_entered_at
+        FROM mexico_approval_tracking
+        WHERE {where}
+        """,
+        params,
+    ).fetchall()
+    tasks_by_approval = _load_mexico_current_tasks(
+        conn,
+        (str(row["approval_no"]) for row in rows),
+    )
+    settings = get_mexico_tracking_settings(conn)
+    totals: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        approval_no = str(row["approval_no"])
+        tasks = tasks_by_approval.get(approval_no, [])
+        approvers = {
+            str(task.get("approver_name") or "").strip()
+            for task in tasks
+            if str(task.get("approver_name") or "").strip()
+        }
+        if not approvers:
+            fallback = str(row["current_approver_name"] or "").strip()
+            if fallback:
+                approvers.add(fallback)
+        entered_at = _parse_datetime(row["current_node_entered_at"])
+        age_days = node_age_days(entered_at, now=now) if entered_at is not None else 0
+        level = warning_level(
+            age_days,
+            yellow_days=int(settings["yellow_days"]),
+            red_days=int(settings["red_days"]),
+        )
+        for approver_name in approvers:
+            item = totals.setdefault(
+                approver_name,
+                {
+                    "approver_name": approver_name,
+                    "pending": 0,
+                    "overdue": 0,
+                    "severe": 0,
+                },
+            )
+            item["pending"] += 1
+            if level in {"yellow", "red"}:
+                item["overdue"] += 1
+            if level == "red":
+                item["severe"] += 1
+    return sorted(
+        totals.values(),
+        key=lambda item: (
+            -int(item["severe"]),
+            -int(item["overdue"]),
+            -int(item["pending"]),
+            str(item["approver_name"]),
+        ),
+    )
+
+
 def mexico_tracking_filter_options(
     conn: sqlite3.Connection,
     *,

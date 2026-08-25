@@ -29,6 +29,7 @@ from backend.app.mexico_tracking import (
     mexico_tracking_filter_options,
     resolve_mexico_tracking_region,
     summarize_mexico_tracking,
+    summarize_mexico_approvers,
     list_mexico_attachment_download_candidates,
     mark_mexico_attachment_failed,
     mark_mexico_attachment_ready,
@@ -1564,6 +1565,53 @@ def test_mexico_tracking_summary_and_warning_filter_use_configured_thresholds(
         assert summary["yellow"] == 1
         assert summary["red"] == 1
         assert [item["approval_no"] for item in red["items"]] == ["MX-RED"]
+
+
+def test_mexico_approver_stats_deduplicate_tasks_and_respect_participant_scope(
+    isolated_db,
+) -> None:
+    now = datetime.fromisoformat("2026-08-24T12:00:00+08:00")
+    timestamp = "2026-08-24T12:00:00.000000+08:00"
+    with isolated_db.connect() as conn:
+        update_mexico_tracking_settings(conn, yellow_days=1, red_days=3)
+        for approval_no, entered_at, applicant in (
+            ("MX-STATS-RED-TEAM", "2026-08-19T09:00:00+08:00", "Ana"),
+            ("MX-STATS-YELLOW", "2026-08-22T09:00:00+08:00", "Ana"),
+            ("MX-STATS-RED-DUPLICATE", "2026-08-18T09:00:00+08:00", "Ana"),
+            ("MX-STATS-HIDDEN", "2026-08-18T09:00:00+08:00", "Someone Else"),
+        ):
+            _insert_tracking_case(
+                conn,
+                approval_no=approval_no,
+                sheet=f"{approval_no} company",
+                node_entered_at=entered_at,
+                applicant=applicant,
+                approver="Legacy Approver",
+            )
+        conn.executemany(
+            """
+            INSERT INTO mexico_approval_current_tasks (
+                approval_no, task_key, node_name, approver_name,
+                entered_at, synced_at, created_at, updated_at
+            ) VALUES (?, ?, 'Finance', ?, ?, ?, ?, ?)
+            """,
+            [
+                ("MX-STATS-RED-TEAM", "red-team:ana", "Ana", "2026-08-19T09:00:00+08:00", timestamp, timestamp, timestamp),
+                ("MX-STATS-RED-TEAM", "red-team:bruno", "Bruno", "2026-08-19T09:00:00+08:00", timestamp, timestamp, timestamp),
+                ("MX-STATS-YELLOW", "yellow:ana", "Ana", "2026-08-22T09:00:00+08:00", timestamp, timestamp, timestamp),
+                ("MX-STATS-RED-DUPLICATE", "duplicate:ana:1", "Ana", "2026-08-18T09:00:00+08:00", timestamp, timestamp, timestamp),
+                ("MX-STATS-RED-DUPLICATE", "duplicate:ana:2", "Ana", "2026-08-18T09:00:00+08:00", timestamp, timestamp, timestamp),
+                ("MX-STATS-HIDDEN", "hidden:zelda", "Zelda", "2026-08-18T09:00:00+08:00", timestamp, timestamp, timestamp),
+            ],
+        )
+        conn.commit()
+
+        stats = summarize_mexico_approvers(conn, participant_name="Ana", now=now)
+
+        assert stats == [
+            {"approver_name": "Ana", "pending": 3, "overdue": 3, "severe": 2},
+            {"approver_name": "Bruno", "pending": 1, "overdue": 1, "severe": 1},
+        ]
 
 
 def test_mexico_tracking_detail_returns_timeline_attachments_and_links(isolated_db) -> None:

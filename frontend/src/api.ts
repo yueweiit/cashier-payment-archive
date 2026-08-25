@@ -132,6 +132,13 @@ export type MexicoTrackingSummary = {
   red: number;
 };
 
+export type MexicoApproverStat = {
+  approver_name: string;
+  pending: number;
+  overdue: number;
+  severe: number;
+};
+
 export type MexicoTrackingFilterOptions = {
   companies: string[];
   sheets: string[];
@@ -1052,6 +1059,8 @@ export const api = {
     }),
   mexicoTrackingSummary: () =>
     request<{ summary: MexicoTrackingSummary }>("/api/mexico-tracking/summary"),
+  mexicoTrackingApproverStats: () =>
+    request<{ items: MexicoApproverStat[] }>("/api/mexico-tracking/approver-stats"),
   mexicoTrackingFilterOptions: () =>
     request<{ options: MexicoTrackingFilterOptions }>("/api/mexico-tracking/filter-options"),
   startMexicoTrackingSync: (onlyIfStaleSeconds = 300, triggerType: "manual" | "automatic" = "manual") =>

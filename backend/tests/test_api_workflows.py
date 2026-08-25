@@ -4917,6 +4917,66 @@ def test_mexico_tracking_api_enforces_mexico_access_scope_and_participation():
         ).status_code == 403
 
 
+def test_mexico_approver_stats_api_uses_participant_visibility():
+    token = uuid.uuid4().hex
+    username = f"mexico-stats-{token}"
+    identity = f"Stats Ana {token}"
+    approver = f"Stats Bruno {token}"
+    approval_no = f"MX-STATS-API-{token}"
+    with TestClient(app) as admin_client, TestClient(app) as participant_client:
+        login(admin_client)
+        created = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": username,
+                "password": "Yuewei123",
+                "display_name": username,
+                "role": "business",
+                "active": True,
+                "sheet_permissions": [],
+                "mexico_access_scope": "participant",
+                "mexico_identity_name": identity,
+            },
+        )
+        assert created.status_code == 200, created.text
+        timestamp = now_iso()
+        with connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO mexico_approval_tracking (
+                    approval_no, source_type, resolved_region,
+                    region_resolution_source, region_review_status,
+                    applicant_name, company_name, workflow_status,
+                    current_node_entered_at, created_at, updated_at
+                ) VALUES (?, 'purchase', 'mexico', 'execution_region', 'resolved',
+                          ?, 'Stats company', 'RUNNING', ?, ?, ?)
+                """,
+                (approval_no, identity, timestamp, timestamp, timestamp),
+            )
+            conn.execute(
+                """
+                INSERT INTO mexico_approval_current_tasks (
+                    approval_no, task_key, node_name, approver_name,
+                    entered_at, synced_at, created_at, updated_at
+                ) VALUES (?, 'stats-task', 'Finance', ?, ?, ?, ?, ?)
+                """,
+                (approval_no, approver, timestamp, timestamp, timestamp, timestamp),
+            )
+
+        login(participant_client, username, "Yuewei123")
+        response = participant_client.get("/api/mexico-tracking/approver-stats")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["items"] == [
+            {
+                "approver_name": approver,
+                "pending": 1,
+                "overdue": 0,
+                "severe": 0,
+            }
+        ]
+
+
 def test_mexico_tracking_row_attachment_sync_is_idempotent_and_authorized(
     monkeypatch: pytest.MonkeyPatch,
 ):
