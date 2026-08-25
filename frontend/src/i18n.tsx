@@ -155,7 +155,7 @@ const zhToEs: Record<string, string> = {
   "已支付金额": "Monto pagado",
   "货币类型": "Tipo de moneda",
   "项目归属": "Proyecto al que pertenece",
-  "收款人名称": "Nombre del beneficiario",
+  "收款人": "Nombre del beneficiario",
   "收款账号": "Cuenta del beneficiario",
   "收款行": "Banco / Sucursal del beneficiario",
   "是否开具发票": "¿Factura emitida?",

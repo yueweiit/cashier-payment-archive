@@ -207,7 +207,7 @@ const gridColumns: GridColumn[] = [
   { key: "currency", labelZh: "货币类型", labelEs: "Tipo de moneda", width: 140 },
   { key: "project", labelZh: "项目归属", labelEs: "Proyecto al que pertenece", width: 210 },
   { key: "bu", labelZh: "BU 归属", labelEs: "Unidad de negocio", width: 180 },
-  { key: "payee_name", labelZh: "收款人名称", labelEs: "Nombre del beneficiario", width: 200 },
+  { key: "payee_name", labelZh: "收款人", labelEs: "Nombre del beneficiario", width: 200 },
   { key: "payee_account", labelZh: "收款账号", labelEs: "Cuenta del beneficiario", width: 220 },
   { key: "bank_name", labelZh: "收款行", labelEs: "Banco / Sucursal del beneficiario", width: 240 },
   { key: "invoice_status", labelZh: "是否开具发票", labelEs: "¿Factura emitida?", width: 180 },
