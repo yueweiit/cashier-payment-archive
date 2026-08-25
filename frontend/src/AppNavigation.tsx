@@ -21,6 +21,7 @@ export type AppTab = "workspace" | "daily-payables" | "mexico-tracking" | "archi
 export type AppNavigationProps = {
   tab: AppTab;
   canAdmin: boolean;
+  canMexico: boolean;
   onSelect: (tab: AppTab) => void;
 };
 
@@ -30,18 +31,18 @@ type NavigationItem = {
   icon: typeof FileSpreadsheet;
 };
 
-export function AppNavigation({ tab, canAdmin, onSelect }: AppNavigationProps) {
+export function AppNavigation({ tab, canAdmin, canMexico, onSelect }: AppNavigationProps) {
   const { t } = useLanguage();
   const items = useMemo<NavigationItem[]>(() => {
     const available: NavigationItem[] = [
       { tab: "workspace", label: t("工作台", "Panel de trabajo"), icon: FileSpreadsheet },
       { tab: "daily-payables", label: t("每日应付", "Pagos diarios pendientes"), icon: CalendarDays },
-      { tab: "mexico-tracking", label: t("墨西哥审批", "Aprobaciones de México"), icon: MapPinned },
-      { tab: "archive", label: t("归档", "Archivo"), icon: Archive },
     ];
+    if (canMexico) available.push({ tab: "mexico-tracking", label: t("墨西哥审批", "Aprobaciones de México"), icon: MapPinned });
+    available.push({ tab: "archive", label: t("归档", "Archivo"), icon: Archive });
     if (canAdmin) available.push({ tab: "admin", label: t("管理", "Administración"), icon: Users });
     return available;
-  }, [canAdmin, t]);
+  }, [canAdmin, canMexico, t]);
   const rootRef = useRef<HTMLElement | null>(null);
   const measureRef = useRef<HTMLDivElement | null>(null);
   const measureItemRefs = useRef<Array<HTMLButtonElement | null>>([]);

@@ -82,3 +82,14 @@ test("Mexico tracking navigation and actions include Spanish translations", () =
   assert.match(i18nSource, /"墨西哥审批跟进":\s*"Seguimiento de aprobaciones de México"/);
   assert.match(i18nSource, /"复制双语提醒":\s*"Copiar recordatorio bilingüe"/);
 });
+
+test("user administration exposes Mexico-specific scope and DingTalk identity", () => {
+  assert.match(apiSource, /export type MexicoAccessScope = "all" \| "participant" \| "none"/);
+  assert.match(apiSource, /mexico_access_scope:\s*MexicoAccessScope/);
+  assert.match(apiSource, /mexico_identity_name:\s*string \| null/);
+  assert.match(appSource, /墨西哥审批权限/);
+  assert.match(appSource, /钉钉审批姓名/);
+  assert.match(appSource, /mexico_access_scope:\s*draft\.mexico_access_scope/);
+  assert.match(appSource, /mexico_identity_name:\s*draft\.mexico_access_scope === "none"/);
+  assert.match(appSource, /userForm\.mexico_access_scope === "participant"/);
+});

@@ -29,3 +29,9 @@ test("translated navigation exposes hidden destinations through an overflow menu
   assert.match(navigationSource, /event\.key === "Escape"/);
   assert.doesNotMatch(styleSource, /\.app-nav\s*\{[^}]*overflow-x:\s*auto/s);
 });
+
+test("Mexico navigation is only available to users with Mexico access", () => {
+  assert.match(navigationSource, /canMexico:\s*boolean/);
+  assert.match(navigationSource, /if \(canMexico\)[\s\S]*tab:\s*"mexico-tracking"/);
+  assert.match(appSource, /canMexico=\{user\.role === "admin" \|\| user\.mexico_access_scope !== "none"\}/);
+});

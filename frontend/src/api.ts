@@ -1,5 +1,7 @@
 import { translateKnownError } from "./i18n";
 
+export type MexicoAccessScope = "all" | "participant" | "none";
+
 export type User = {
   id: number;
   username: string;
@@ -7,6 +9,8 @@ export type User = {
   role: "business" | "finance" | "general_manager" | "admin";
   active: boolean;
   sheet_permissions: string[];
+  mexico_access_scope: MexicoAccessScope;
+  mexico_identity_name: string | null;
 };
 
 export type MexicoTrackingView = "pending" | "history" | "review";
@@ -789,8 +793,13 @@ export type UserPayload = {
   display_name: string;
   active: boolean;
   sheet_permissions: string[];
+  mexico_access_scope: MexicoAccessScope;
+  mexico_identity_name: string | null;
 };
-export type UserUpdatePayload = Partial<Pick<User, "role" | "display_name" | "active" | "sheet_permissions">> & { password?: string };
+export type UserUpdatePayload = Partial<Pick<User,
+  "role" | "display_name" | "active" | "sheet_permissions" |
+  "mexico_access_scope" | "mexico_identity_name"
+>> & { password?: string };
 export type ChangePasswordPayload = {
   current_password: string;
   new_password: string;

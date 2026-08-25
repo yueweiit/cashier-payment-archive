@@ -46,6 +46,7 @@ import {
   DailyPayableTrend,
   ForeignAmountCorrectionPreview,
   HistoricalCurrencyRestorePreview,
+  MexicoAccessScope,
   DingtalkWorkflow,
   EmployeeDepartmentImportResult,
   ExternalExpenseImportResult,
@@ -448,6 +449,7 @@ function Shell({
   const [workspaceRefreshToken, setWorkspaceRefreshToken] = useState(0);
   const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
   const [accountNotice, setAccountNotice] = useState("");
+  const canMexico = user.role === "admin" || user.mexico_access_scope !== "none";
 
   const selectedBatch = batches.find((batch) => batch.id === selectedBatchId) || batches[0] || null;
 
@@ -465,6 +467,10 @@ function Shell({
     loadBatches().catch((err) => setMessage((err as Error).message));
   }, []);
 
+  useEffect(() => {
+    if (!canMexico && tab === "mexico-tracking") setTab("workspace");
+  }, [canMexico, tab]);
+
   async function logout() {
     await api.logout();
     onLogout();
@@ -480,6 +486,7 @@ function Shell({
         <AppNavigation
           tab={tab}
           canAdmin={isPrivilegedRole(user.role)}
+          canMexico={user.role === "admin" || user.mexico_access_scope !== "none"}
           onSelect={setTab}
         />
         <div className="app-userbar">
@@ -521,7 +528,7 @@ function Shell({
           />
         )}
         {tab === "daily-payables" && <DailyPayablesView setMessage={setMessage} />}
-        {tab === "mexico-tracking" && <MexicoTrackingPage user={user} setMessage={setMessage} />}
+        {tab === "mexico-tracking" && canMexico && <MexicoTrackingPage user={user} setMessage={setMessage} />}
         {tab === "archive" && (
           <ArchiveView
             user={user}
@@ -5840,6 +5847,8 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
     display_name: string;
     active: boolean;
     sheet_permissions: string[];
+    mexico_access_scope: MexicoAccessScope;
+    mexico_identity_name: string;
   };
   type UserDraft = {
     display_name: string;
@@ -5847,6 +5856,8 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
     active: boolean;
     password: string;
     sheet_permissions: string[];
+    mexico_access_scope: MexicoAccessScope;
+    mexico_identity_name: string;
   };
   const [users, setUsers] = useState<User[]>([]);
   const [availableSheets, setAvailableSheets] = useState<string[]>([]);
@@ -5857,6 +5868,8 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
     display_name: "",
     active: true,
     sheet_permissions: [],
+    mexico_access_scope: "none",
+    mexico_identity_name: "",
   });
   const [userForm, setUserForm] = useState<UserForm>(emptyUserForm);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
@@ -5869,7 +5882,15 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
     if (!query) return users;
     return users.filter((item) => {
       const roleLabel = roleLabels[item.role] || item.role;
-      return [item.username, item.display_name, item.role, roleLabel, ...(item.sheet_permissions || [])]
+      return [
+        item.username,
+        item.display_name,
+        item.role,
+        roleLabel,
+        item.mexico_access_scope,
+        item.mexico_identity_name,
+        ...(item.sheet_permissions || []),
+      ]
         .some((value) => String(value || "").toLowerCase().includes(query));
     });
   }, [users, userQuery]);
@@ -5884,6 +5905,8 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
       active: item.active,
       password: "",
       sheet_permissions: item.sheet_permissions || [],
+      mexico_access_scope: item.mexico_access_scope,
+      mexico_identity_name: item.mexico_identity_name || "",
     }])));
   }
 
@@ -5919,6 +5942,11 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
       setCreateUserError("初始密码至少需要 6 位");
       return;
     }
+    const mexicoIdentityName = userForm.mexico_identity_name.trim();
+    if (userForm.mexico_access_scope === "participant" && !mexicoIdentityName) {
+      setCreateUserError("仅本人参与权限必须填写钉钉审批姓名");
+      return;
+    }
     setCreatingUser(true);
     setCreateUserError("");
     try {
@@ -5927,6 +5955,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
         username,
         display_name: displayName,
         sheet_permissions: userForm.role === "business" ? userForm.sheet_permissions : [],
+        mexico_identity_name: userForm.mexico_access_scope === "none" ? null : mexicoIdentityName || null,
       });
       await load();
       setCreateDialogOpen(false);
@@ -5948,11 +5977,18 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
   async function saveUser(item: User) {
     const draft = userDrafts[item.id];
     if (!draft) return;
+    const mexicoIdentityName = draft.mexico_identity_name.trim();
+    if (draft.mexico_access_scope === "participant" && !mexicoIdentityName) {
+      setMessage("仅本人参与权限必须填写钉钉审批姓名");
+      return;
+    }
     await api.updateUser(item.id, {
       display_name: draft.display_name,
       role: draft.role,
       active: draft.active,
       sheet_permissions: draft.sheet_permissions,
+      mexico_access_scope: draft.mexico_access_scope,
+      mexico_identity_name: draft.mexico_access_scope === "none" ? null : mexicoIdentityName || null,
       ...(draft.password ? { password: draft.password } : {}),
     });
     await load();
@@ -6001,7 +6037,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
         </div>
         <div className="table-wrap">
           <table className="data-table">
-            <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>Sheet 权限</th><th>状态</th><th>修改密码</th><th>操作</th></tr></thead>
+            <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>Sheet 权限</th><th>墨西哥审批权限</th><th>钉钉审批姓名</th><th>状态</th><th>修改密码</th><th>操作</th></tr></thead>
             <tbody>
               {visibleUsers.map((item) => {
                 const draft = userDrafts[item.id] || {
@@ -6010,6 +6046,8 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
                   active: item.active,
                   password: "",
                   sheet_permissions: item.sheet_permissions || [],
+                  mexico_access_scope: item.mexico_access_scope,
+                  mexico_identity_name: item.mexico_identity_name || "",
                 };
                 return (
                   <tr key={item.id}>
@@ -6026,6 +6064,30 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
                         options={availableSheets}
                         disabled={draft.role !== "business"}
                         onChange={(sheet_permissions) => updateUserDraft(item.id, { sheet_permissions })}
+                      />
+                    </td>
+                    <td>
+                      <select
+                        value={draft.mexico_access_scope}
+                        onChange={(event) => {
+                          const mexico_access_scope = event.target.value as MexicoAccessScope;
+                          updateUserDraft(item.id, {
+                            mexico_access_scope,
+                            ...(mexico_access_scope === "none" ? { mexico_identity_name: "" } : {}),
+                          });
+                        }}
+                      >
+                        <option value="none">不可访问</option>
+                        <option value="participant">仅本人参与</option>
+                        <option value="all">全部审批</option>
+                      </select>
+                    </td>
+                    <td>
+                      <input
+                        value={draft.mexico_identity_name}
+                        placeholder={draft.mexico_access_scope === "participant" ? "必填：钉钉审批姓名" : "选填"}
+                        disabled={draft.mexico_access_scope === "none"}
+                        onChange={(event) => updateUserDraft(item.id, { mexico_identity_name: event.target.value })}
                       />
                     </td>
                     <td>
@@ -6101,6 +6163,39 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
               >
                 {Object.entries(roleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
+            </label>
+            <label>
+              墨西哥审批权限
+              <select
+                value={userForm.mexico_access_scope}
+                onChange={(event) => {
+                  const mexico_access_scope = event.target.value as MexicoAccessScope;
+                  setUserForm({
+                    ...userForm,
+                    mexico_access_scope,
+                    mexico_identity_name: mexico_access_scope === "none" ? "" : userForm.mexico_identity_name,
+                  });
+                }}
+                disabled={creatingUser}
+              >
+                <option value="none">不可访问</option>
+                <option value="participant">仅本人参与</option>
+                <option value="all">全部审批</option>
+              </select>
+            </label>
+            <label>
+              钉钉审批姓名
+              <input
+                value={userForm.mexico_identity_name}
+                onChange={(event) => setUserForm({ ...userForm, mexico_identity_name: event.target.value })}
+                placeholder={userForm.mexico_access_scope === "participant" ? "必填，需与审批流程姓名完全一致" : "选填"}
+                disabled={creatingUser || userForm.mexico_access_scope === "none"}
+              />
+              <small>
+                {userForm.mexico_access_scope === "participant"
+                  ? "仅显示申请、审批或抄送中本人参与的流程。"
+                  : "全部审批权限可选填，方便记录对应身份。"}
+              </small>
             </label>
             <label className="span-2">
               Sheet 权限
