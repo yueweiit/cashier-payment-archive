@@ -362,6 +362,27 @@ def ensure_mexico_tracking_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_mexico_events_approval_time
         ON mexico_approval_events(approval_no, event_time, sequence_index, id);
 
+        CREATE TABLE IF NOT EXISTS mexico_approval_current_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_no TEXT NOT NULL REFERENCES mexico_approval_tracking(approval_no)
+                ON DELETE CASCADE,
+            task_key TEXT NOT NULL,
+            task_id TEXT,
+            activity_id TEXT,
+            node_name TEXT,
+            approver_id TEXT,
+            approver_name TEXT,
+            entered_at TEXT,
+            synced_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(approval_no, task_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mexico_current_tasks_approver
+        ON mexico_approval_current_tasks(approver_id, approver_name);
+        CREATE INDEX IF NOT EXISTS idx_mexico_current_tasks_node
+        ON mexico_approval_current_tasks(node_name, entered_at);
+
         CREATE TABLE IF NOT EXISTS mexico_approval_request_links (
             approval_no TEXT NOT NULL REFERENCES mexico_approval_tracking(approval_no)
                 ON DELETE CASCADE,
@@ -987,6 +1008,69 @@ def cache_mexico_workflow_snapshots(
             summary["links_added"] += len(added_links)
             summary["links_removed"] += len(removed_links)
 
+            desired_tasks: Dict[str, Dict[str, Any]] = {}
+            for task in workflow.get("current_tasks") or []:
+                if not isinstance(task, dict):
+                    continue
+                task_key = str(task.get("task_key") or "").strip()
+                if not task_key:
+                    continue
+                desired_tasks[task_key] = {
+                    "task_id": task.get("task_id"),
+                    "activity_id": task.get("activity_id"),
+                    "node_name": task.get("node_name"),
+                    "approver_id": task.get("approver_id"),
+                    "approver_name": task.get("approver_name"),
+                    "entered_at": task.get("entered_at"),
+                }
+            existing_tasks = {
+                str(row["task_key"]): row
+                for row in conn.execute(
+                    "SELECT * FROM mexico_approval_current_tasks WHERE approval_no = ?",
+                    (approval_no,),
+                ).fetchall()
+            }
+            stale_task_keys = set(existing_tasks) - set(desired_tasks)
+            task_changed = bool(stale_task_keys or set(desired_tasks) - set(existing_tasks))
+            if not task_changed:
+                task_changed = any(
+                    any(existing_tasks[task_key][key] != value for key, value in values.items())
+                    for task_key, values in desired_tasks.items()
+                )
+            if stale_task_keys:
+                conn.executemany(
+                    "DELETE FROM mexico_approval_current_tasks "
+                    "WHERE approval_no = ? AND task_key = ?",
+                    [(approval_no, task_key) for task_key in sorted(stale_task_keys)],
+                )
+            for task_key, values in desired_tasks.items():
+                conn.execute(
+                    """
+                    INSERT INTO mexico_approval_current_tasks (
+                        approval_no, task_key, task_id, activity_id, node_name,
+                        approver_id, approver_name, entered_at, synced_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(approval_no, task_key) DO UPDATE SET
+                        task_id = excluded.task_id,
+                        activity_id = excluded.activity_id,
+                        node_name = excluded.node_name,
+                        approver_id = excluded.approver_id,
+                        approver_name = excluded.approver_name,
+                        entered_at = excluded.entered_at,
+                        synced_at = excluded.synced_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        approval_no,
+                        task_key,
+                        *values.values(),
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+
             workflow_values = {
                 "process_instance_id": workflow.get("process_instance_id"),
                 "workflow_status": str(workflow.get("status") or "").upper(),
@@ -1001,7 +1085,7 @@ def cache_mexico_workflow_snapshots(
             }
             workflow_changed = any(
                 tracking[key] != value for key, value in workflow_values.items()
-            ) or bool(added_links or removed_links)
+            ) or bool(added_links or removed_links or task_changed)
             if workflow_changed:
                 conn.execute(
                     """
@@ -1576,22 +1660,38 @@ def _mexico_tracking_where(
                     "summary",
                     "company_name",
                     "source_sheet",
-                    "current_approver_name",
-                    "current_node_name",
                 )
-            ) + ")"
+            )
+            + " OR EXISTS ("
+            "SELECT 1 FROM mexico_approval_current_tasks current_task "
+            "WHERE current_task.approval_no = mexico_approval_tracking.approval_no "
+            "AND (COALESCE(current_task.approver_name, '') LIKE ? "
+            "OR COALESCE(current_task.node_name, '') LIKE ?)"
+            "))"
         )
         params.extend([token] * 7)
     for value, column in (
         (company, "company_name"),
         (source_type, "source_type"),
         (applicant, "applicant_name"),
-        (approver, "current_approver_name"),
-        (node, "current_node_name"),
     ):
         if value and str(value).strip():
             clauses.append(f"COALESCE({column}, '') = ?")
             params.append(str(value).strip())
+    if approver and str(approver).strip():
+        clauses.append(
+            "EXISTS (SELECT 1 FROM mexico_approval_current_tasks current_task "
+            "WHERE current_task.approval_no = mexico_approval_tracking.approval_no "
+            "AND COALESCE(current_task.approver_name, '') = ?)"
+        )
+        params.append(str(approver).strip())
+    if node and str(node).strip():
+        clauses.append(
+            "EXISTS (SELECT 1 FROM mexico_approval_current_tasks current_task "
+            "WHERE current_task.approval_no = mexico_approval_tracking.approval_no "
+            "AND COALESCE(current_task.node_name, '') = ?)"
+        )
+        params.append(str(node).strip())
     if request_date_from and str(request_date_from).strip():
         clauses.append("request_date >= ?")
         params.append(str(request_date_from).strip())
@@ -1632,6 +1732,63 @@ def _mexico_tracking_public(
         payload["reminder"] = None
     payload.pop("raw_summary_json", None)
     return payload
+
+
+def _load_mexico_current_tasks(
+    conn: sqlite3.Connection,
+    approval_nos: Iterable[str],
+) -> Dict[str, list[Dict[str, Any]]]:
+    normalized = list(
+        dict.fromkeys(
+            str(approval_no).strip()
+            for approval_no in approval_nos
+            if str(approval_no).strip()
+        )
+    )
+    if not normalized:
+        return {}
+    placeholders = ", ".join("?" for _ in normalized)
+    rows = conn.execute(
+        f"""
+        SELECT approval_no, task_key, task_id, activity_id, node_name,
+               approver_id, approver_name, entered_at
+        FROM mexico_approval_current_tasks
+        WHERE approval_no IN ({placeholders})
+        ORDER BY approval_no,
+                 CASE WHEN entered_at IS NULL OR TRIM(entered_at) = '' THEN 1 ELSE 0 END,
+                 entered_at, node_name, approver_name, id
+        """,
+        normalized,
+    ).fetchall()
+    tasks_by_approval: Dict[str, list[Dict[str, Any]]] = {}
+    for row in rows:
+        item = dict(row)
+        approval_no = str(item.pop("approval_no"))
+        tasks_by_approval.setdefault(approval_no, []).append(item)
+    return tasks_by_approval
+
+
+def _attach_mexico_current_tasks(
+    payloads: Iterable[Dict[str, Any]],
+    tasks_by_approval: Dict[str, list[Dict[str, Any]]],
+) -> None:
+    for payload in payloads:
+        tasks = tasks_by_approval.get(str(payload.get("approval_no") or ""), [])
+        payload["current_tasks"] = tasks
+        payload["current_approvers"] = list(
+            dict.fromkeys(
+                str(task["approver_name"])
+                for task in tasks
+                if task.get("approver_name")
+            )
+        )
+        payload["current_nodes"] = list(
+            dict.fromkeys(
+                str(task["node_name"])
+                for task in tasks
+                if task.get("node_name")
+            )
+        )
 
 
 def list_mexico_tracking(
@@ -1693,6 +1850,13 @@ def list_mexico_tracking(
         _mexico_tracking_public(row, settings=settings, now=now)
         for row in rows
     ]
+    _attach_mexico_current_tasks(
+        items,
+        _load_mexico_current_tasks(
+            conn,
+            (str(item.get("approval_no") or "") for item in items),
+        ),
+    )
     requested_warning = str(warning or "").strip().lower()
     if requested_warning:
         if requested_warning not in {"normal", "yellow", "red"}:
@@ -1775,7 +1939,7 @@ def mexico_tracking_filter_options(
     )
     rows = conn.execute(
         f"""
-        SELECT company_name, source_sheet, source_type, applicant_name,
+        SELECT approval_no, company_name, source_sheet, source_type, applicant_name,
                current_approver_name, current_node_name
         FROM mexico_approval_tracking
         WHERE {where}
@@ -1792,13 +1956,39 @@ def mexico_tracking_filter_options(
             }
         )
 
+    tasks_by_approval = _load_mexico_current_tasks(
+        conn,
+        (str(row["approval_no"]) for row in rows),
+    )
+    approvers: set[str] = set()
+    nodes: set[str] = set()
+    for row in rows:
+        approval_no = str(row["approval_no"])
+        tasks = tasks_by_approval.get(approval_no, [])
+        if tasks:
+            approvers.update(
+                str(task["approver_name"]).strip()
+                for task in tasks
+                if task.get("approver_name") and str(task["approver_name"]).strip()
+            )
+            nodes.update(
+                str(task["node_name"]).strip()
+                for task in tasks
+                if task.get("node_name") and str(task["node_name"]).strip()
+            )
+        else:
+            if row["current_approver_name"] and str(row["current_approver_name"]).strip():
+                approvers.add(str(row["current_approver_name"]).strip())
+            if row["current_node_name"] and str(row["current_node_name"]).strip():
+                nodes.add(str(row["current_node_name"]).strip())
+
     return {
         "companies": distinct("company_name"),
         "sheets": distinct("source_sheet"),
         "source_types": distinct("source_type"),
         "applicants": distinct("applicant_name"),
-        "approvers": distinct("current_approver_name"),
-        "nodes": distinct("current_node_name"),
+        "approvers": sorted(approvers),
+        "nodes": sorted(nodes),
     }
 
 
@@ -1827,6 +2017,10 @@ def get_mexico_tracking_detail(
         raise PermissionError("sheet access denied")
     settings = get_mexico_tracking_settings(conn)
     payload = _mexico_tracking_public(row, settings=settings, now=now)
+    _attach_mexico_current_tasks(
+        [payload],
+        _load_mexico_current_tasks(conn, [str(row["approval_no"])]),
+    )
     events = conn.execute(
         """
         SELECT * FROM mexico_approval_events

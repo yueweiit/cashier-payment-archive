@@ -219,6 +219,7 @@ def test_mexico_tracking_schema_and_migration_are_idempotent(isolated_db) -> Non
         assert {
             "mexico_approval_tracking",
             "mexico_approval_events",
+            "mexico_approval_current_tasks",
             "mexico_approval_request_links",
             "mexico_approval_attachments",
             "mexico_sync_runs",
@@ -261,6 +262,10 @@ def test_mexico_tracking_schema_has_required_unique_constraints_and_indexes(isol
             "idx_mexico_tracking_last_synced",
         } <= tracking_indexes
         assert "idx_mexico_events_approval_time" in _indexes(conn, "mexico_approval_events")
+        assert {
+            "idx_mexico_current_tasks_approver",
+            "idx_mexico_current_tasks_node",
+        } <= _indexes(conn, "mexico_approval_current_tasks")
 
         unique_tracking = {
             row["name"]
@@ -282,10 +287,16 @@ def test_mexico_tracking_schema_has_required_unique_constraints_and_indexes(isol
             for row in conn.execute("PRAGMA index_list(mexico_approval_attachments)")
             if row["unique"]
         }
+        unique_current_tasks = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(mexico_approval_current_tasks)")
+            if row["unique"]
+        }
         assert unique_tracking
         assert unique_events
         assert unique_links
         assert unique_attachments
+        assert unique_current_tasks
 
         attachment_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mexico_approval_attachments'"
@@ -865,7 +876,7 @@ def test_workflow_snapshot_keeps_stable_distinct_event_keys_when_comments_reorde
     assert len(set(first_keys.values())) == 2
 
 
-def test_workflow_snapshot_uses_latest_active_task_for_current_node_and_approver() -> None:
+def test_workflow_snapshot_keeps_all_current_tasks_and_assignees() -> None:
     instance = {
         "approval_no": "202608240100",
         "process_instance_id": "process-100",
@@ -875,18 +886,20 @@ def test_workflow_snapshot_uses_latest_active_task_for_current_node_and_approver
         "operation_records": [],
         "tasks": [
             {
-                "activityId": "old-node",
-                "activityName": "主管审批",
-                "userId": "old-user",
-                "status": "COMPLETED",
-                "createTime": "2026-08-22T08:00:00Z",
-            },
-            {
+                "taskId": "finance-task",
                 "activityId": "finance-node",
                 "activityName": "财务审批",
-                "userId": "finance-user",
+                "assigneeUserIds": ["finance-a", "finance-b"],
                 "status": "RUNNING",
                 "createTime": "2026-08-24T01:00:00Z",
+            },
+            {
+                "taskId": "legal-task",
+                "activityId": "legal-node",
+                "activityName": "法务会签",
+                "userId": "legal-a",
+                "status": "PENDING",
+                "createTime": "2026-08-24T00:30:00Z",
             },
         ],
         "updated_at": "2026-08-24T01:02:00Z",
@@ -894,13 +907,20 @@ def test_workflow_snapshot_uses_latest_active_task_for_current_node_and_approver
 
     snapshot = parse_dingtalk_workflow_instance(
         instance,
-        {"finance-user": "吴嘉洪"},
+        {"finance-a": "Ana", "finance-b": "Bruno", "legal-a": "Carla"},
     )
 
-    assert snapshot["current_node_name"] == "财务审批"
-    assert snapshot["current_approver_id"] == "finance-user"
-    assert snapshot["current_approver_name"] == "吴嘉洪"
-    assert snapshot["current_node_entered_at"] == "2026-08-24T09:00:00+08:00"
+    assert [
+        (task["node_name"], task["approver_name"])
+        for task in snapshot["current_tasks"]
+    ] == [
+        ("法务会签", "Carla"),
+        ("财务审批", "Ana"),
+        ("财务审批", "Bruno"),
+    ]
+    assert snapshot["current_node_name"] == "法务会签、财务审批"
+    assert snapshot["current_approver_name"] == "Carla、Ana、Bruno"
+    assert snapshot["current_node_entered_at"] == "2026-08-24T08:30:00+08:00"
 
 
 def test_workflow_snapshot_keeps_unknown_current_approver_id() -> None:
@@ -925,8 +945,8 @@ def test_workflow_snapshot_keeps_unknown_current_approver_id() -> None:
         {},
     )
 
-    assert snapshot["current_approver_id"] == "unknown-user-id"
-    assert snapshot["current_approver_name"] == "未识别人员"
+    assert snapshot["current_tasks"][0]["approver_id"] == "unknown-user-id"
+    assert snapshot["current_tasks"][0]["approver_name"] == "未识别人员（unknown-user-id）"
 
 
 def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
@@ -956,6 +976,35 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
         },
         {"ceo-user": "Eduardo Gómez"},
     )
+    workflow["current_tasks"] = [
+        {
+            "task_key": "t1:a",
+            "task_id": "t1",
+            "activity_id": "n1",
+            "node_name": "Finance",
+            "approver_id": "a",
+            "approver_name": "Ana",
+            "entered_at": "2026-08-24T08:00:00+08:00",
+        },
+        {
+            "task_key": "t1:b",
+            "task_id": "t1",
+            "activity_id": "n1",
+            "node_name": "Finance",
+            "approver_id": "b",
+            "approver_name": "Bruno",
+            "entered_at": "2026-08-24T08:00:00+08:00",
+        },
+        {
+            "task_key": "t2:c",
+            "task_id": "t2",
+            "activity_id": "n2",
+            "node_name": "Legal",
+            "approver_id": "c",
+            "approver_name": "Carla",
+            "entered_at": "2026-08-24T07:00:00+08:00",
+        },
+    ]
     timestamp = "2026-08-24T12:00:00.000000+08:00"
 
     with isolated_db.connect() as conn:
@@ -1030,8 +1079,34 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
             "SELECT COUNT(*) AS count FROM mexico_approval_request_links WHERE approval_no = ?",
             (approval_no,),
         ).fetchone()["count"] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM mexico_approval_current_tasks WHERE approval_no = ?",
+            (approval_no,),
+        ).fetchone()["count"] == 3
+        bruno_items = list_mexico_tracking(
+            conn,
+            view="history",
+            approver="Bruno",
+        )["items"]
+        assert [item["approval_no"] for item in bruno_items] == [approval_no]
+        assert len(bruno_items[0]["current_tasks"]) == 3
+        assert bruno_items[0]["current_approvers"] == ["Carla", "Ana", "Bruno"]
+        reduced = {
+            **workflow,
+            "current_tasks": [workflow["current_tasks"][0], workflow["current_tasks"][2]],
+        }
+        reduced_result = cache_mexico_workflow_snapshots(
+            conn,
+            [reduced],
+            synced_at="2026-08-24T12:08:00.000000+08:00",
+        )
+        assert reduced_result["workflows_changed"] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM mexico_approval_current_tasks WHERE approval_no = ?",
+            (approval_no,),
+        ).fetchone()["count"] == 2
 
-        resumed = {**workflow, "status": "RUNNING", "result": ""}
+        resumed = {**reduced, "status": "RUNNING", "result": ""}
         cache_mexico_workflow_snapshots(
             conn,
             [resumed],
@@ -1042,7 +1117,7 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
             "WHERE approval_no = ?",
             (approval_no,),
         ).fetchone()
-        assert tuple(restored) == ("RUNNING", "", 3)
+        assert tuple(restored) == ("RUNNING", "", 4)
 
 
 def test_mexico_sync_run_reuses_active_task_and_recent_completion(isolated_db) -> None:
@@ -1417,6 +1492,40 @@ def test_mexico_tracking_detail_returns_timeline_attachments_and_links(isolated_
             "INSERT INTO mexico_approval_request_links (approval_no, request_id, is_primary, created_at) VALUES ('MX-DETAIL', ?, 1, ?)",
             (request_id, timestamp),
         )
+        conn.executemany(
+            """
+            INSERT INTO mexico_approval_current_tasks (
+                approval_no, task_key, task_id, activity_id, node_name,
+                approver_id, approver_name, entered_at, synced_at, created_at, updated_at
+            ) VALUES ('MX-DETAIL', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "finance:ana",
+                    "finance",
+                    "finance-node",
+                    "Finance",
+                    "ana",
+                    "Ana",
+                    "2026-08-24T08:00:00+08:00",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    "legal:carla",
+                    "legal",
+                    "legal-node",
+                    "Legal",
+                    "carla",
+                    "Carla",
+                    "2026-08-24T07:00:00+08:00",
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            ],
+        )
         conn.commit()
 
         detail = get_mexico_tracking_detail(conn, tracking_id)
@@ -1425,6 +1534,15 @@ def test_mexico_tracking_detail_returns_timeline_attachments_and_links(isolated_
         assert detail["events"][0]["comment"] == "Reviewed"
         assert detail["attachments"][0]["file_name"] == "invoice.pdf"
         assert detail["linked_requests"][0]["id"] == request_id
+        assert [task["approver_name"] for task in detail["current_tasks"]] == [
+            "Carla",
+            "Ana",
+        ]
+        assert detail["current_approvers"] == ["Carla", "Ana"]
+        assert detail["current_nodes"] == ["Legal", "Finance"]
+        options = mexico_tracking_filter_options(conn)
+        assert options["approvers"] == ["Ana", "Carla"]
+        assert options["nodes"] == ["Finance", "Legal"]
 
 
 def test_admin_region_resolution_is_versioned_and_auditable(isolated_db) -> None:

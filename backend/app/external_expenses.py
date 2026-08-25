@@ -1474,58 +1474,70 @@ def _task_assignee_ids(task: Dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(filter(None, (_text(value) for value in values))))
 
 
-def _current_workflow_task(
+def _current_workflow_tasks(
+    process_instance_id: str,
     tasks: list[Dict[str, Any]],
     events: list[Dict[str, Any]],
     user_names: Dict[str, str],
-) -> Dict[str, Optional[str]]:
-    active: list[tuple[str, int, Dict[str, Any]]] = []
+) -> list[Dict[str, Optional[str]]]:
+    current: list[Dict[str, Optional[str]]] = []
     for index, task in enumerate(tasks):
         status = (_text(task.get("status")) or "").upper()
         if status not in {"RUNNING", "PROCESSING", "PENDING"}:
             continue
+        activity_id = _text(task.get("activityId")) or ""
+        task_id = (
+            _text(task.get("taskId") or task.get("id"))
+            or f"{activity_id}:{index}"
+        )
         entered_at = _workflow_event_time(
             task.get("startTime")
             or task.get("createTime")
             or task.get("createdAt")
             or task.get("updatedAt")
         )
-        active.append((entered_at or "", index, task))
-    if not active:
-        return {
-            "current_node_name": None,
-            "current_approver_id": None,
-            "current_approver_name": None,
-            "current_node_entered_at": None,
-        }
-
-    entered_at, _, task = max(active, key=lambda item: (item[0], item[1]))
-    activity_id = _text(task.get("activityId")) or ""
-    node_name = (
-        _text(task.get("activityName"))
-        or _text(task.get("showName"))
-        or _text(task.get("name"))
-        or next(
-            (
-                _text(event.get("stage_name"))
-                for event in reversed(events)
-                if activity_id and _text(event.get("activity_id")) == activity_id
-            ),
-            None,
+        node_name = (
+            _text(task.get("activityName"))
+            or _text(task.get("showName"))
+            or _text(task.get("name"))
+            or next(
+                (
+                    _text(event.get("stage_name"))
+                    for event in reversed(events)
+                    if activity_id
+                    and _text(event.get("activity_id")) == activity_id
+                ),
+                None,
+            )
+            or "待审批节点"
         )
-    )
-    assignee_ids = _task_assignee_ids(task)
-    approver_id = assignee_ids[0] if assignee_ids else None
-    return {
-        "current_node_name": node_name,
-        "current_approver_id": approver_id,
-        "current_approver_name": (
-            user_names.get(approver_id) or "未识别人员"
-            if approver_id
-            else None
+        assignee_ids = _task_assignee_ids(task) or [""]
+        for approver_id in assignee_ids:
+            if approver_id:
+                approver_name = user_names.get(approver_id) or f"未识别人员（{approver_id}）"
+            else:
+                approver_name = "待识别待办人"
+            current.append(
+                {
+                    "task_key": hashlib.sha256(
+                        f"{process_instance_id}|{task_id}|{approver_id}".encode("utf-8")
+                    ).hexdigest(),
+                    "task_id": task_id,
+                    "activity_id": activity_id or None,
+                    "node_name": node_name,
+                    "approver_id": approver_id or None,
+                    "approver_name": approver_name,
+                    "entered_at": entered_at or None,
+                }
+            )
+    return sorted(
+        current,
+        key=lambda item: (
+            item.get("entered_at") or "",
+            item.get("node_name") or "",
+            item.get("approver_name") or "",
         ),
-        "current_node_entered_at": entered_at or None,
-    }
+    )
 
 
 def parse_dingtalk_workflow_instance(
@@ -1556,7 +1568,38 @@ def parse_dingtalk_workflow_instance(
         current_activity_ids,
         user_names,
     )
-    current_task = _current_workflow_task(tasks, events, user_names)
+    current_tasks = _current_workflow_tasks(
+        process_instance_id,
+        tasks,
+        events,
+        user_names,
+    )
+    current_nodes = list(
+        dict.fromkeys(
+            str(task["node_name"])
+            for task in current_tasks
+            if task.get("node_name")
+        )
+    )
+    current_approver_ids = list(
+        dict.fromkeys(
+            str(task["approver_id"])
+            for task in current_tasks
+            if task.get("approver_id")
+        )
+    )
+    current_approvers = list(
+        dict.fromkeys(
+            str(task["approver_name"])
+            for task in current_tasks
+            if task.get("approver_name")
+        )
+    )
+    entered_times = [
+        str(task["entered_at"])
+        for task in current_tasks
+        if task.get("entered_at")
+    ]
     return {
         "approval_no": _text(instance.get("approval_no")) or "",
         "process_instance_id": process_instance_id,
@@ -1565,7 +1608,11 @@ def parse_dingtalk_workflow_instance(
         "title": _text(instance.get("title")),
         "updated_at": _workflow_event_time(instance.get("updated_at")),
         "events": events,
-        **current_task,
+        "current_tasks": current_tasks,
+        "current_node_name": "、".join(current_nodes) or None,
+        "current_approver_id": "、".join(current_approver_ids) or None,
+        "current_approver_name": "、".join(current_approvers) or None,
+        "current_node_entered_at": min(entered_times) if entered_times else None,
     }
 
 
