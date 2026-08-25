@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from threading import Lock
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -94,7 +94,9 @@ from .mexico_tracking import (
     acquire_or_reuse_mexico_sync_run,
     cache_mexico_discovery_candidates,
     cache_mexico_workflow_snapshots,
+    claim_next_mexico_attachment,
     collect_mexico_attachment_candidates,
+    complete_mexico_attachment_run_if_empty,
     complete_mexico_sync_run,
     fail_mexico_sync_run,
     get_mexico_tracking_detail,
@@ -107,9 +109,11 @@ from .mexico_tracking import (
     mark_mexico_attachments_downloading,
     mexico_tracking_filter_options,
     persist_request_region,
+    prioritize_mexico_attachments,
     resolve_mexico_tracking_region,
     sheet_region,
     summarize_mexico_tracking,
+    summarize_mexico_attachment_queue,
     update_mexico_tracking_settings,
     upsert_mexico_attachment_candidates,
     update_mexico_sync_run,
@@ -141,6 +145,12 @@ _DINGTALK_SYNC_FUTURES_LOCK = Lock()
 _MEXICO_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mexico-sync")
 _MEXICO_SYNC_FUTURES: Dict[str, Any] = {}
 _MEXICO_SYNC_FUTURES_LOCK = Lock()
+_MEXICO_ATTACHMENT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="mexico-attachments",
+)
+_MEXICO_ATTACHMENT_FUTURES: Dict[str, Any] = {}
+_MEXICO_ATTACHMENT_FUTURES_LOCK = Lock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -6457,137 +6467,21 @@ def _run_mexico_tracking_sync(run_id: str, user: Dict[str, Any]) -> None:
 
         attachment_inventory_started = perf_counter()
         with connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                inventory_summary = upsert_mexico_attachment_candidates(
-                    conn,
-                    attachment_candidates,
-                    manage_transaction=False,
-                )
-                pending_attachments = list_mexico_attachment_download_candidates(
-                    conn,
-                    workflow_approval_nos,
-                )
-                mark_mexico_attachments_downloading(
-                    conn,
-                    [int(item["attachment_id"]) for item in pending_attachments],
-                    manage_transaction=False,
-                )
-                if workflow_approval_nos:
-                    ready_placeholders = ",".join(
-                        "?" for _ in workflow_approval_nos
-                    )
-                    ready_existing = int(
-                        conn.execute(
-                            f"""
-                            SELECT COUNT(*) AS total
-                            FROM mexico_approval_attachments
-                            WHERE status = 'ready'
-                              AND approval_no IN ({ready_placeholders})
-                            """,
-                            tuple(sorted(workflow_approval_nos)),
-                        ).fetchone()["total"]
-                    )
-                else:
-                    ready_existing = 0
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+            inventory_summary = upsert_mexico_attachment_candidates(
+                conn,
+                attachment_candidates,
+            )
+            attachment_queue = summarize_mexico_attachment_queue(conn)
+            attachment_run, attachment_run_reused = acquire_or_reuse_mexico_sync_run(
+                conn,
+                actor_id=user.get("id"),
+                trigger_type="automatic",
+                kind="mexico-attachments",
+            )
         timings["attachment_inventory_seconds"] = round(
             perf_counter() - attachment_inventory_started, 3
         )
-
-        with connect() as conn:
-            update_mexico_sync_run(
-                conn,
-                run_id,
-                phase="syncing_attachments",
-                processed_count=len(workflows),
-                total_count=len(workflow_approval_nos),
-                attachment_processed_count=0,
-                attachment_total_count=len(pending_attachments),
-                stage_timings=timings,
-            )
-
-        attachment_download_started = perf_counter()
-        concurrency = max(
-            1,
-            min(
-                5,
-                int(
-                    os.getenv(
-                        "DINGTALK_ATTACHMENT_DOWNLOAD_CONCURRENCY", "4"
-                    )
-                    or 4
-                ),
-            ),
-        )
-
-        def report_mexico_attachment_progress(current: int, total: int) -> None:
-            with connect() as progress_conn:
-                update_mexico_sync_run(
-                    progress_conn,
-                    run_id,
-                    phase="syncing_attachments",
-                    processed_count=len(workflows),
-                    total_count=len(workflow_approval_nos),
-                    attachment_processed_count=current,
-                    attachment_total_count=total,
-                    stage_timings=timings,
-                )
-
-        downloaded_attachments, download_failed, download_errors = (
-            download_dingtalk_attachment_candidates(
-                pending_attachments,
-                max_workers=concurrency,
-                progress_callback=report_mexico_attachment_progress,
-            )
-        )
-        timings["attachment_download_seconds"] = round(
-            perf_counter() - attachment_download_started, 3
-        )
-
-        attachment_commit_started = perf_counter()
-        with connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                for attachment in downloaded_attachments:
-                    file_object = register_file_object(conn, attachment)
-                    mark_mexico_attachment_ready(
-                        conn,
-                        int(attachment["attachment_id"]),
-                        file_object_id=int(file_object["id"]),
-                        manage_transaction=False,
-                    )
-                for attachment_error in download_errors:
-                    attachment_id = attachment_error.get("attachment_id")
-                    if attachment_id is None:
-                        continue
-                    mark_mexico_attachment_failed(
-                        conn,
-                        int(attachment_id),
-                        str(attachment_error.get("message") or "附件下载失败"),
-                        manage_transaction=False,
-                    )
-                if workflow_approval_nos:
-                    placeholders = ",".join("?" for _ in workflow_approval_nos)
-                    synced_at = now_iso()
-                    conn.execute(
-                        f"""
-                        UPDATE mexico_approval_tracking
-                        SET last_attachment_synced_at = ?, updated_at = ?
-                        WHERE approval_no IN ({placeholders})
-                        """,
-                        (synced_at, synced_at, *sorted(workflow_approval_nos)),
-                    )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-        timings["attachment_commit_seconds"] = round(
-            perf_counter() - attachment_commit_started, 3
-        )
+        _submit_mexico_attachment_task(str(attachment_run["id"]))
         timings["total_seconds"] = round(perf_counter() - started, 3)
         result = {
             "discovered": len(discovery.candidates),
@@ -6597,11 +6491,10 @@ def _run_mexico_tracking_sync(run_id: str, user: Dict[str, Any]) -> None:
             "workflow": workflow_summary,
             "attachments": {
                 **inventory_summary,
-                "ready": len(downloaded_attachments),
-                "failed": download_failed,
-                "existing": ready_existing,
+                **attachment_queue,
+                "run_id": attachment_run["id"],
+                "run_reused": attachment_run_reused,
                 "query_error": attachment_query_error,
-                "errors": download_errors[:20],
             },
         }
         with connect() as conn:
@@ -6634,6 +6527,136 @@ def _submit_mexico_sync_task(run_id: str, user: Dict[str, Any]) -> None:
         )
         _MEXICO_SYNC_FUTURES[run_id] = future
         future.add_done_callback(lambda _: _discard_mexico_sync_future(run_id))
+
+
+def _run_mexico_attachment_queue(run_id: str) -> None:
+    processed = 0
+    total = 0
+    try:
+        with connect() as conn:
+            initial = summarize_mexico_attachment_queue(conn)
+            total = int(initial["queued"] + initial["downloading"])
+            update_mexico_sync_run(
+                conn,
+                run_id,
+                phase="syncing_attachments",
+                attachment_processed_count=processed,
+                attachment_total_count=total,
+            )
+
+        while True:
+            claim_token = uuid.uuid4().hex
+            with connect() as conn:
+                candidate = claim_next_mexico_attachment(
+                    conn,
+                    claim_token=claim_token,
+                )
+            if candidate is None:
+                with connect() as conn:
+                    if complete_mexico_attachment_run_if_empty(conn, run_id):
+                        break
+                sleep(0.1)
+                continue
+
+            try:
+                downloaded, failed, errors = download_dingtalk_attachment_candidates(
+                    [candidate],
+                    max_workers=1,
+                )
+                if failed or not downloaded:
+                    raise RuntimeError(
+                        str(errors[0].get("message"))
+                        if errors
+                        else "附件下载失败"
+                    )
+                with connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        file_object = register_file_object(conn, downloaded[0])
+                        mark_mexico_attachment_ready(
+                            conn,
+                            int(candidate["attachment_id"]),
+                            file_object_id=int(file_object["id"]),
+                            claim_token=claim_token,
+                            manage_transaction=False,
+                        )
+                        synced_at = now_iso()
+                        conn.execute(
+                            """
+                            UPDATE mexico_approval_tracking
+                            SET last_attachment_synced_at = ?, updated_at = ?
+                            WHERE approval_no = ?
+                            """,
+                            (synced_at, synced_at, candidate["approval_no"]),
+                        )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+            except Exception as exc:
+                with connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        mark_mexico_attachment_failed(
+                            conn,
+                            int(candidate["attachment_id"]),
+                            str(exc),
+                            claim_token=claim_token,
+                            manage_transaction=False,
+                        )
+                        synced_at = now_iso()
+                        conn.execute(
+                            """
+                            UPDATE mexico_approval_tracking
+                            SET last_attachment_synced_at = ?, updated_at = ?
+                            WHERE approval_no = ?
+                            """,
+                            (synced_at, synced_at, candidate["approval_no"]),
+                        )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+
+            processed += 1
+            with connect() as conn:
+                queue = summarize_mexico_attachment_queue(conn)
+                total = max(
+                    total,
+                    processed + int(queue["queued"] + queue["downloading"]),
+                )
+                update_mexico_sync_run(
+                    conn,
+                    run_id,
+                    phase="syncing_attachments",
+                    attachment_processed_count=processed,
+                    attachment_total_count=total,
+                )
+    except BaseException as exc:
+        try:
+            with connect() as conn:
+                fail_mexico_sync_run(conn, run_id, str(exc))
+        except Exception:
+            pass
+
+
+def _discard_mexico_attachment_future(run_id: str) -> None:
+    with _MEXICO_ATTACHMENT_FUTURES_LOCK:
+        _MEXICO_ATTACHMENT_FUTURES.pop(run_id, None)
+
+
+def _submit_mexico_attachment_task(run_id: str) -> None:
+    with _MEXICO_ATTACHMENT_FUTURES_LOCK:
+        if run_id in _MEXICO_ATTACHMENT_FUTURES:
+            return
+        future = _MEXICO_ATTACHMENT_EXECUTOR.submit(
+            _run_mexico_attachment_queue,
+            run_id,
+        )
+        _MEXICO_ATTACHMENT_FUTURES[run_id] = future
+        future.add_done_callback(
+            lambda _: _discard_mexico_attachment_future(run_id)
+        )
 
 
 def _fresh_dingtalk_sync_result(batch_id: int, stale_seconds: int) -> Optional[Dict[str, Any]]:
@@ -6900,6 +6923,48 @@ def get_mexico_tracking_item(
         except PermissionError:
             raise HTTPException(status_code=403, detail="无权查看该审批记录")
     return {"item": item}
+
+
+@app.post("/api/mexico-tracking/{tracking_id}/attachments/sync")
+def sync_mexico_tracking_row_attachments(
+    tracking_id: int,
+    user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
+) -> JSONResponse:
+    with connect() as conn:
+        try:
+            detail = get_mexico_tracking_detail(
+                conn,
+                tracking_id,
+                allowed_sheets=mexico_tracking_allowed_sheets(conn, user),
+                allow_review=user["role"] == ROLE_ADMIN,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="墨西哥审批记录不存在")
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="无权查看该审批记录")
+
+    approval_no = str(detail["approval_no"])
+    workflows = fetch_dingtalk_workflows([approval_no])
+    source_rows = fetch_external_expense_attachments([approval_no])
+    candidates = collect_mexico_attachment_candidates(workflows, source_rows)
+    with connect() as conn:
+        upsert_mexico_attachment_candidates(conn, candidates)
+        attachment_status = prioritize_mexico_attachments(conn, approval_no)
+        run, reused = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=user.get("id"),
+            trigger_type="manual",
+            kind="mexico-attachments",
+        )
+    _submit_mexico_attachment_task(str(run["id"]))
+    return JSONResponse(
+        status_code=202,
+        content={
+            "run": run,
+            "reused": reused,
+            "attachment_status": attachment_status,
+        },
+    )
 
 
 @app.get("/api/mexico-tracking/{tracking_id}/attachments/{attachment_id}/content")

@@ -17,7 +17,9 @@ from backend.app.mexico_tracking import (
     cache_mexico_workflow_snapshots,
     backfill_request_regions,
     build_bilingual_reminder,
+    claim_next_mexico_attachment,
     collect_mexico_attachment_candidates,
+    complete_mexico_attachment_run_if_empty,
     complete_mexico_sync_run,
     fail_mexico_sync_run,
     get_mexico_sync_run,
@@ -33,7 +35,9 @@ from backend.app.mexico_tracking import (
     mark_mexico_attachments_downloading,
     node_age_days,
     persist_request_region,
+    prioritize_mexico_attachments,
     resolve_region,
+    summarize_mexico_attachments,
     upsert_mexico_attachment_candidates,
     update_mexico_sync_run,
     update_mexico_tracking_settings,
@@ -267,6 +271,14 @@ def test_mexico_tracking_schema_has_required_unique_constraints_and_indexes(isol
             "idx_mexico_current_tasks_approver",
             "idx_mexico_current_tasks_node",
         } <= _indexes(conn, "mexico_approval_current_tasks")
+        assert "idx_mexico_attachments_queue" in _indexes(
+            conn,
+            "mexico_approval_attachments",
+        )
+        assert {"priority", "requested_at", "claim_token", "claimed_at"} <= _columns(
+            conn,
+            "mexico_approval_attachments",
+        )
 
         unique_tracking = {
             row["name"]
@@ -1699,6 +1711,111 @@ def test_mexico_attachment_inventory_is_idempotent_and_failed_rows_retry(isolate
         ).fetchone()
         assert tuple(stored) == ("ready", 2, file_object_id)
         assert list_mexico_attachment_download_candidates(conn, [approval_no]) == []
+
+
+def test_mexico_attachment_claim_prefers_requested_row_and_is_exclusive(
+    isolated_db,
+) -> None:
+    with isolated_db.connect() as conn:
+        _insert_mexico_tracking_row(conn, "MX-NORMAL")
+        _insert_mexico_tracking_row(conn, "MX-PRIORITY")
+        upsert_mexico_attachment_candidates(
+            conn,
+            [
+                {
+                    "approval_no": "MX-NORMAL",
+                    "source_file_id": "normal",
+                    "file_name": "normal.pdf",
+                },
+                {
+                    "approval_no": "MX-PRIORITY",
+                    "source_file_id": "priority",
+                    "file_name": "priority.pdf",
+                },
+            ],
+        )
+        prioritize_mexico_attachments(
+            conn,
+            "MX-PRIORITY",
+            requested_at="2026-08-25T09:00:00+08:00",
+        )
+
+        claimed = claim_next_mexico_attachment(conn, claim_token="worker-a")
+        duplicate = claim_next_mexico_attachment(
+            conn,
+            claim_token="worker-b",
+            approval_nos=["MX-PRIORITY"],
+        )
+
+        assert claimed is not None
+        assert claimed["approval_no"] == "MX-PRIORITY"
+        assert claimed["claim_token"] == "worker-a"
+        assert duplicate is None
+
+
+def test_mexico_attachment_summary_reports_queue_states(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        _insert_mexico_tracking_row(conn, "MX-SUMMARY")
+        upsert_mexico_attachment_candidates(
+            conn,
+            [
+                {"approval_no": "MX-SUMMARY", "source_file_id": "one"},
+                {"approval_no": "MX-SUMMARY", "source_file_id": "two"},
+            ],
+        )
+        claim_next_mexico_attachment(conn, claim_token="worker")
+        summary = summarize_mexico_attachments(conn, "MX-SUMMARY")
+        assert summary == {
+            "total": 2,
+            "ready": 0,
+            "queued": 1,
+            "downloading": 1,
+            "failed": 0,
+            "complete": False,
+        }
+
+
+def test_mexico_attachment_run_completes_only_after_queue_drains(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        tracking_run, _ = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="automatic",
+        )
+        attachment_run, reused = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="manual",
+            kind="mexico-attachments",
+        )
+        assert reused is False
+        assert attachment_run["id"] != tracking_run["id"]
+
+        _insert_mexico_tracking_row(conn, "MX-RUN")
+        upsert_mexico_attachment_candidates(
+            conn,
+            [{"approval_no": "MX-RUN", "source_file_id": "one"}],
+        )
+        assert complete_mexico_attachment_run_if_empty(
+            conn,
+            attachment_run["id"],
+        ) is False
+
+        claimed = claim_next_mexico_attachment(conn, claim_token="worker")
+        assert claimed is not None
+        mark_mexico_attachment_failed(
+            conn,
+            int(claimed["attachment_id"]),
+            "download failed",
+            claim_token="worker",
+        )
+        assert complete_mexico_attachment_run_if_empty(
+            conn,
+            attachment_run["id"],
+        ) is True
+        completed = get_mexico_sync_run(conn, attachment_run["id"])
+        assert completed["status"] == "completed"
+        assert completed["result"]["attachments"]["failed"] == 1
 
 
 def test_stale_mexico_attachment_download_is_retried_after_interruption(isolated_db) -> None:

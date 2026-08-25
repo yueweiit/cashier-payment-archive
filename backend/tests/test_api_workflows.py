@@ -466,7 +466,12 @@ def test_dingtalk_task_commits_status_before_slow_attachment_inventory(monkeypat
         batch = client.post("/api/batches", json={"name": "状态优先于附件"}).json()["batch"]
         request_row = client.post(
             f"/api/batches/{batch['id']}/requests",
-            json={"dingding_id": approval_no, "summary": "同步前", "amount": 100},
+            json={
+                "dingding_id": approval_no,
+                "summary": "同步前",
+                "amount": 100,
+                "source_sheet": "凌翔产品&开发",
+            },
         ).json()["request"]
         started = client.post(
             f"/api/batches/{batch['id']}/external-expenses/sync-metadata",
@@ -2331,7 +2336,7 @@ def test_image_attachment_upload_and_export():
                 "dingding_id": "IMG-1",
                 "summary": "带图片附件",
                 "amount": 100,
-                "source_sheet": "图片测试",
+                "source_sheet": "凌翔产品&开发",
                 "general_manager_approval_date": "2026-07-10",
             },
         )
@@ -2356,7 +2361,7 @@ def test_image_attachment_upload_and_export():
         exported = client.get(f"/api/batches/{batch_id}/export.xlsx")
         assert exported.status_code == 200
         workbook = load_workbook(io.BytesIO(exported.content))
-        worksheet = workbook["图片测试"]
+        worksheet = workbook["凌翔产品&开发"]
         headers = [cell.value for cell in next(worksheet.iter_rows(max_row=1))]
         assert "图片附件" in headers
         assert "财务付款时间" in headers
@@ -2378,7 +2383,12 @@ def test_restore_draft_baseline_restores_saved_rows_and_attachments():
         batch_id = batch["id"]
         created = client.post(
             f"/api/batches/{batch_id}/requests",
-            json={"dingding_id": "RESTORE-1", "summary": "基线记录", "amount": 100, "source_sheet": "还原测试"},
+            json={
+                "dingding_id": "RESTORE-1",
+                "summary": "基线记录",
+                "amount": 100,
+                "source_sheet": "凌翔产品&开发",
+            },
         )
         assert created.status_code == 200
         request_id = created.json()["request"]["id"]
@@ -4561,7 +4571,7 @@ def test_historical_currency_restore_can_be_rolled_back():
         assert restored["paid_amount"] == 340
 
 
-def test_execution_region_filter_and_legacy_mexico_currency_restore():
+def test_execution_region_filter_respects_china_workbench_isolation():
     with TestClient(app) as client:
         login(client)
         batch = client.post(
@@ -4614,10 +4624,13 @@ def test_execution_region_filter_and_legacy_mexico_currency_restore():
                     "base_currency_amount": 400,
                 }}), explicit_cny["id"]),
             )
+            main_module.persist_request_region(conn, china["id"], actor_id=None)
+            main_module.persist_request_region(conn, mexico["id"], actor_id=None)
+            main_module.persist_request_region(conn, explicit_cny["id"], actor_id=None)
 
         mexico_rows = client.get(f"/api/batches/{batch['id']}/requests?execution_region=mexico")
         assert mexico_rows.status_code == 200, mexico_rows.text
-        assert {row["dingding_id"] for row in mexico_rows.json()["requests"]} == {"REGION-MX", "REGION-MX-CNY"}
+        assert mexico_rows.json()["requests"] == []
         china_rows = client.get(f"/api/batches/{batch['id']}/requests?execution_region=china")
         assert china_rows.status_code == 200, china_rows.text
         assert [row["dingding_id"] for row in china_rows.json()["requests"]] == ["REGION-CN"]
@@ -4626,10 +4639,8 @@ def test_execution_region_filter_and_legacy_mexico_currency_restore():
         preview = client.get(f"/api/batches/{batch['id']}/historical-currency-restore/preview")
         assert preview.status_code == 200, preview.text
         candidates = {row["dingding_id"]: row for row in preview.json()["rows"]}
-        assert candidates["REGION-MX"]["status"] == "recoverable"
-        assert candidates["REGION-MX"]["source_currency"] == "MXN"
-        assert candidates["REGION-MX"]["currency_source"] == "execution_region_legacy"
-        assert candidates["REGION-MX-CNY"]["status"] == "already_restored"
+        assert "REGION-MX" not in candidates
+        assert "REGION-MX-CNY" not in candidates
 
 
 def test_historical_currency_restore_uses_explicit_peso_total_in_summary():
@@ -4763,6 +4774,130 @@ def test_mexico_tracking_api_enforces_review_and_sheet_permissions():
                 "china_region_isolation_enabled": False,
             },
         ).status_code == 403
+
+
+def test_mexico_tracking_row_attachment_sync_is_idempotent_and_authorized(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    username = f"mexico-row-attachments-{uuid.uuid4().hex}"
+    password = "Yuewei123"
+    with TestClient(app) as admin_client, TestClient(app) as business_client:
+        login(admin_client)
+        created_user = admin_client.post(
+            "/api/admin/users",
+            json={
+                "username": username,
+                "password": password,
+                "display_name": "墨西哥附件用户",
+                "role": "business",
+                "active": True,
+                "sheet_permissions": ["YW MOLDES MX模具"],
+            },
+        )
+        assert created_user.status_code == 200, created_user.text
+        timestamp = now_iso()
+        allowed_no = f"MX-ROW-ALLOWED-{uuid.uuid4().hex}"
+        denied_no = f"MX-ROW-DENIED-{uuid.uuid4().hex}"
+        with connect() as conn:
+            allowed_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO mexico_approval_tracking (
+                        approval_no, source_type, process_instance_id,
+                        resolved_region, region_resolution_source,
+                        region_review_status, source_sheet, workflow_status,
+                        created_at, updated_at
+                    ) VALUES (?, 'purchase', ?, 'mexico', 'execution_region',
+                              'resolved', 'YW MOLDES MX模具', 'RUNNING', ?, ?)
+                    """,
+                    (allowed_no, f"process-{allowed_no}", timestamp, timestamp),
+                ).lastrowid
+            )
+            denied_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO mexico_approval_tracking (
+                        approval_no, source_type, process_instance_id,
+                        resolved_region, region_resolution_source,
+                        region_review_status, source_sheet, workflow_status,
+                        created_at, updated_at
+                    ) VALUES (?, 'purchase', ?, 'mexico', 'execution_region',
+                              'resolved', 'UV IMPRESION MX彩印', 'RUNNING', ?, ?)
+                    """,
+                    (denied_no, f"process-{denied_no}", timestamp, timestamp),
+                ).lastrowid
+            )
+
+        def fake_workflows(approval_nos):
+            approval_no = next(iter(approval_nos))
+            return [
+                {
+                    "approval_no": approval_no,
+                    "process_instance_id": f"process-{approval_no}",
+                    "events": [
+                        {
+                            "event_key": "event-1",
+                            "attachments": [
+                                {"fileId": "row-file-1", "fileName": "invoice.pdf"}
+                            ],
+                            "images": [],
+                        }
+                    ],
+                }
+            ]
+
+        submitted: list[str] = []
+        monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", fake_workflows)
+        monkeypatch.setattr(
+            main_module,
+            "fetch_external_expense_attachments",
+            lambda approval_nos: [],
+        )
+        monkeypatch.setattr(
+            main_module,
+            "_submit_mexico_attachment_task",
+            lambda run_id: submitted.append(run_id),
+            raising=False,
+        )
+
+        login(business_client, username, password)
+        first = business_client.post(
+            f"/api/mexico-tracking/{allowed_id}/attachments/sync"
+        )
+        assert first.status_code == 202, first.text
+        assert first.json()["attachment_status"]["queued"] == 1
+        assert first.json()["run"]["kind"] == "mexico-attachments"
+
+        second = business_client.post(
+            f"/api/mexico-tracking/{allowed_id}/attachments/sync"
+        )
+        assert second.status_code == 202, second.text
+        assert second.json()["run"]["id"] == first.json()["run"]["id"]
+        assert business_client.post(
+            f"/api/mexico-tracking/{denied_id}/attachments/sync"
+        ).status_code == 403
+
+        with connect() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM mexico_approval_attachments WHERE approval_no = ?",
+                (allowed_no,),
+            ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT COUNT(*) FROM mexico_sync_runs "
+                "WHERE kind = 'mexico-attachments' AND status IN ('queued', 'running')"
+            ).fetchone()[0] == 1
+        assert submitted == [first.json()["run"]["id"], first.json()["run"]["id"]]
+        with connect() as conn:
+            conn.execute(
+                "UPDATE mexico_approval_attachments SET status = 'failed' "
+                "WHERE approval_no = ?",
+                (allowed_no,),
+            )
+            conn.execute(
+                "UPDATE mexico_sync_runs SET status = 'completed', phase = 'complete', "
+                "completed_at = ?, lease_until = NULL WHERE id = ?",
+                (now_iso(), first.json()["run"]["id"]),
+            )
 
 
 def test_china_region_isolation_filters_workbench_totals_sheets_and_export():

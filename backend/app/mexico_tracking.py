@@ -77,6 +77,7 @@ def acquire_or_reuse_mexico_sync_run(
     *,
     actor_id: Optional[int],
     trigger_type: str,
+    kind: str = "mexico-tracking",
     only_if_stale_seconds: int = 0,
     lease_seconds: int = 1800,
 ) -> tuple[Dict[str, Any], bool]:
@@ -88,6 +89,7 @@ def acquire_or_reuse_mexico_sync_run(
     """
 
     timestamp = _now_iso()
+    run_kind = str(kind or "mexico-tracking").strip()
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
@@ -96,18 +98,19 @@ def acquire_or_reuse_mexico_sync_run(
             SET status = 'interrupted', phase = 'interrupted', completed_at = ?,
                 error_message = COALESCE(error_message, '任务租约过期，已由后续同步接管'),
                 updated_at = ?
-            WHERE kind = 'mexico-tracking'
+            WHERE kind = ?
               AND status IN ('queued', 'running')
               AND lease_until IS NOT NULL AND lease_until <= ?
             """,
-            (timestamp, timestamp, timestamp),
+            (timestamp, timestamp, run_kind, timestamp),
         )
         active = conn.execute(
             """
             SELECT * FROM mexico_sync_runs
-            WHERE kind = 'mexico-tracking' AND status IN ('queued', 'running')
+            WHERE kind = ? AND status IN ('queued', 'running')
             ORDER BY created_at DESC LIMIT 1
-            """
+            """,
+            (run_kind,),
         ).fetchone()
         if active is not None:
             conn.commit()
@@ -117,9 +120,10 @@ def acquire_or_reuse_mexico_sync_run(
             latest = conn.execute(
                 """
                 SELECT * FROM mexico_sync_runs
-                WHERE kind = 'mexico-tracking' AND status = 'completed'
+                WHERE kind = ? AND status = 'completed'
                 ORDER BY completed_at DESC LIMIT 1
-                """
+                """,
+                (run_kind,),
             ).fetchone()
             if latest is not None and latest["completed_at"]:
                 completed_at = datetime.fromisoformat(str(latest["completed_at"]))
@@ -135,10 +139,11 @@ def acquire_or_reuse_mexico_sync_run(
             INSERT INTO mexico_sync_runs (
                 id, kind, trigger_type, triggered_by, status, phase,
                 lease_owner, lease_until, created_at, updated_at
-            ) VALUES (?, 'mexico-tracking', ?, ?, 'queued', 'queued', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)
             """,
             (
                 run_id,
+                run_kind,
                 str(trigger_type or "manual"),
                 actor_id,
                 run_id,
@@ -415,6 +420,10 @@ def ensure_mexico_tracking_schema(conn: sqlite3.Connection) -> None:
             status TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'downloading', 'ready', 'failed')),
             attempts INTEGER NOT NULL DEFAULT 0,
+            priority INTEGER NOT NULL DEFAULT 0,
+            requested_at TEXT,
+            claim_token TEXT,
+            claimed_at TEXT,
             last_error TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -467,6 +476,17 @@ def ensure_mexico_tracking_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "payable_history_versions", "resolved_region", "TEXT")
     _ensure_column(conn, "payable_history_versions", "region_review_status", "TEXT")
     _ensure_column(conn, "mexico_sync_runs", "state_committed_at", "TEXT")
+    for column, definition in (
+        ("priority", "INTEGER NOT NULL DEFAULT 0"),
+        ("requested_at", "TEXT"),
+        ("claim_token", "TEXT"),
+        ("claimed_at", "TEXT"),
+    ):
+        _ensure_column(conn, "mexico_approval_attachments", column, definition)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mexico_attachments_queue "
+        "ON mexico_approval_attachments(status, priority DESC, requested_at, id)"
+    )
 
     timestamp = _now_iso()
     for key, value in MEXICO_TRACKING_SETTING_DEFAULTS.items():
@@ -1438,6 +1458,238 @@ def upsert_mexico_attachment_candidates(
     return summary
 
 
+def _mexico_attachment_status_summary(
+    conn: sqlite3.Connection,
+    approval_no: Optional[str] = None,
+) -> Dict[str, int | bool]:
+    where = ""
+    params: tuple[Any, ...] = ()
+    if approval_no is not None:
+        where = "WHERE approval_no = ?"
+        params = (str(approval_no),)
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) AS ready,
+               SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS queued,
+               SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) AS downloading,
+               SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+        FROM mexico_approval_attachments
+        {where}
+        """,
+        params,
+    ).fetchone()
+    summary: Dict[str, int | bool] = {
+        "total": int(row["total"] or 0),
+        "ready": int(row["ready"] or 0),
+        "queued": int(row["queued"] or 0),
+        "downloading": int(row["downloading"] or 0),
+        "failed": int(row["failed"] or 0),
+    }
+    summary["complete"] = summary["total"] == summary["ready"]
+    return summary
+
+
+def summarize_mexico_attachments(
+    conn: sqlite3.Connection,
+    approval_no: str,
+) -> Dict[str, int | bool]:
+    return _mexico_attachment_status_summary(conn, str(approval_no))
+
+
+def summarize_mexico_attachment_queue(
+    conn: sqlite3.Connection,
+) -> Dict[str, int]:
+    summary = _mexico_attachment_status_summary(conn)
+    return {
+        key: int(summary[key])
+        for key in ("total", "ready", "queued", "downloading", "failed")
+    }
+
+
+def complete_mexico_attachment_run_if_empty(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    now: Optional[str] = None,
+    stale_after_seconds: int = 1800,
+) -> bool:
+    current = datetime.fromisoformat(now) if now else datetime.now(tz=SHANGHAI_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SHANGHAI_TZ)
+    timestamp = current.isoformat(timespec="microseconds")
+    stale_before = (current - timedelta(seconds=max(1, stale_after_seconds))).isoformat(
+        timespec="microseconds"
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """
+            UPDATE mexico_approval_attachments
+            SET status = 'pending', claim_token = NULL, claimed_at = NULL,
+                updated_at = ?
+            WHERE status = 'downloading'
+              AND COALESCE(claimed_at, updated_at) <= ?
+            """,
+            (timestamp, stale_before),
+        )
+        outstanding = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM mexico_approval_attachments "
+                "WHERE status IN ('pending', 'downloading')"
+            ).fetchone()[0]
+        )
+        if outstanding:
+            conn.commit()
+            return False
+        result = {"attachments": summarize_mexico_attachment_queue(conn)}
+        changed = conn.execute(
+            """
+            UPDATE mexico_sync_runs
+            SET status = 'completed', phase = 'complete', result_json = ?,
+                completed_at = ?, heartbeat_at = ?, lease_until = NULL,
+                updated_at = ?
+            WHERE id = ? AND kind = 'mexico-attachments'
+              AND status IN ('queued', 'running')
+            """,
+            (
+                json.dumps(result, ensure_ascii=False, default=str),
+                timestamp,
+                timestamp,
+                timestamp,
+                str(run_id),
+            ),
+        )
+        conn.commit()
+        return changed.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def prioritize_mexico_attachments(
+    conn: sqlite3.Connection,
+    approval_no: str,
+    *,
+    priority: int = 100,
+    requested_at: Optional[str] = None,
+) -> Dict[str, int | bool]:
+    timestamp = requested_at or _now_iso()
+    conn.execute(
+        """
+        UPDATE mexico_approval_attachments
+        SET priority = MAX(priority, ?), requested_at = ?,
+            status = CASE WHEN status = 'failed' THEN 'pending' ELSE status END,
+            last_error = CASE WHEN status = 'failed' THEN NULL ELSE last_error END,
+            claim_token = CASE WHEN status = 'failed' THEN NULL ELSE claim_token END,
+            claimed_at = CASE WHEN status = 'failed' THEN NULL ELSE claimed_at END,
+            updated_at = ?
+        WHERE approval_no = ? AND status <> 'ready'
+        """,
+        (max(0, int(priority)), timestamp, timestamp, str(approval_no)),
+    )
+    conn.commit()
+    return summarize_mexico_attachments(conn, str(approval_no))
+
+
+def claim_next_mexico_attachment(
+    conn: sqlite3.Connection,
+    *,
+    claim_token: str,
+    approval_nos: Optional[Iterable[str]] = None,
+    now: Optional[str] = None,
+    stale_after_seconds: int = 1800,
+) -> Optional[Dict[str, Any]]:
+    token = str(claim_token or "").strip()
+    if not token:
+        raise ValueError("claim_token is required")
+    current = datetime.fromisoformat(now) if now else datetime.now(tz=SHANGHAI_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SHANGHAI_TZ)
+    timestamp = current.isoformat(timespec="microseconds")
+    stale_before = (current - timedelta(seconds=max(1, stale_after_seconds))).isoformat(
+        timespec="microseconds"
+    )
+    normalized = None
+    if approval_nos is not None:
+        normalized = sorted(
+            {
+                str(value or "").strip()
+                for value in approval_nos
+                if str(value or "").strip()
+            }
+        )
+        if not normalized:
+            return None
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """
+            UPDATE mexico_approval_attachments
+            SET status = 'pending', claim_token = NULL, claimed_at = NULL,
+                updated_at = ?
+            WHERE status = 'downloading'
+              AND COALESCE(claimed_at, updated_at) <= ?
+            """,
+            (timestamp, stale_before),
+        )
+        filter_sql = ""
+        params: list[Any] = []
+        if normalized is not None:
+            placeholders = ", ".join("?" for _ in normalized)
+            filter_sql = f"AND a.approval_no IN ({placeholders})"
+            params.extend(normalized)
+        row = conn.execute(
+            f"""
+            SELECT a.id
+            FROM mexico_approval_attachments AS a
+            JOIN mexico_approval_tracking AS t ON t.approval_no = a.approval_no
+            WHERE a.status = 'pending'
+              {filter_sql}
+            ORDER BY a.priority DESC,
+                     CASE WHEN a.requested_at IS NULL OR TRIM(a.requested_at) = '' THEN 1 ELSE 0 END,
+                     a.requested_at, a.id
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        attachment_id = int(row["id"])
+        changed = conn.execute(
+            """
+            UPDATE mexico_approval_attachments
+            SET status = 'downloading', attempts = attempts + 1,
+                claim_token = ?, claimed_at = ?, last_error = NULL, updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (token, timestamp, timestamp, attachment_id),
+        )
+        if changed.rowcount != 1:
+            conn.rollback()
+            return None
+        claimed = conn.execute(
+            """
+            SELECT a.id AS attachment_id, a.approval_no, a.event_key,
+                   a.source_file_id, a.source_file_id AS file_id,
+                   a.file_name, a.mime_type, a.size_bytes, a.source_url,
+                   a.status, a.attempts, a.priority, a.requested_at,
+                   a.claim_token, a.claimed_at, t.process_instance_id
+            FROM mexico_approval_attachments AS a
+            JOIN mexico_approval_tracking AS t ON t.approval_no = a.approval_no
+            WHERE a.id = ?
+            """,
+            (attachment_id,),
+        ).fetchone()
+        conn.commit()
+        return dict(claimed) if claimed is not None else None
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def list_mexico_attachment_download_candidates(
     conn: sqlite3.Connection,
     approval_nos: Iterable[str],
@@ -1513,17 +1765,24 @@ def mark_mexico_attachment_failed(
     attachment_id: int,
     error_message: str,
     *,
+    claim_token: Optional[str] = None,
     timestamp: Optional[str] = None,
     manage_transaction: bool = True,
 ) -> None:
     changed_at = timestamp or _now_iso()
+    where = "id = ?"
+    params: list[Any] = [str(error_message)[:2000], changed_at, int(attachment_id)]
+    if claim_token is not None:
+        where += " AND claim_token = ?"
+        params.append(str(claim_token))
     conn.execute(
-        """
+        f"""
         UPDATE mexico_approval_attachments
-        SET status = 'failed', last_error = ?, updated_at = ?
-        WHERE id = ?
+        SET status = 'failed', last_error = ?, claim_token = NULL,
+            claimed_at = NULL, updated_at = ?
+        WHERE {where}
         """,
-        (str(error_message)[:2000], changed_at, int(attachment_id)),
+        params,
     )
     if manage_transaction:
         conn.commit()
@@ -1534,17 +1793,24 @@ def mark_mexico_attachment_ready(
     attachment_id: int,
     *,
     file_object_id: int,
+    claim_token: Optional[str] = None,
     timestamp: Optional[str] = None,
     manage_transaction: bool = True,
 ) -> None:
     changed_at = timestamp or _now_iso()
+    where = "id = ?"
+    params: list[Any] = [int(file_object_id), changed_at, int(attachment_id)]
+    if claim_token is not None:
+        where += " AND claim_token = ?"
+        params.append(str(claim_token))
     conn.execute(
-        """
+        f"""
         UPDATE mexico_approval_attachments
-        SET status = 'ready', file_object_id = ?, last_error = NULL, updated_at = ?
-        WHERE id = ?
+        SET status = 'ready', file_object_id = ?, last_error = NULL,
+            claim_token = NULL, claimed_at = NULL, updated_at = ?
+        WHERE {where}
         """,
-        (int(file_object_id), changed_at, int(attachment_id)),
+        params,
     )
     if manage_transaction:
         conn.commit()
@@ -2067,6 +2333,10 @@ def get_mexico_tracking_detail(
             else None
         )
         payload["attachments"].append(item)
+    payload["attachment_status"] = summarize_mexico_attachments(
+        conn,
+        str(row["approval_no"]),
+    )
     payload["linked_requests"] = [
         dict(linked)
         for linked in conn.execute(
