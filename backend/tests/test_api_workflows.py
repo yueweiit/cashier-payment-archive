@@ -4774,62 +4774,83 @@ def test_historical_currency_restore_uses_explicit_peso_total_in_summary():
         assert candidate["currency_source"] == "summary_text"
 
 
-def test_mexico_tracking_api_enforces_review_and_sheet_permissions():
-    with TestClient(app) as admin_client, TestClient(app) as business_client:
+def test_mexico_tracking_api_enforces_mexico_access_scope_and_participation():
+    with (
+        TestClient(app) as admin_client,
+        TestClient(app) as participant_client,
+        TestClient(app) as all_client,
+        TestClient(app) as none_client,
+    ):
         login(admin_client)
-        created_user = admin_client.post(
-            "/api/admin/users",
-            json={
-                "username": "mexico-tracking-sheet-user",
-                "password": "Yuewei123",
-                "display_name": "墨西哥跟进用户",
-                "role": "business",
-                "active": True,
-                "sheet_permissions": ["YW MOLDES MX模具"],
-            },
-        )
-        assert created_user.status_code == 200, created_user.text
+        for username, scope, identity in (
+            ("mexico-participant", "participant", "Ana"),
+            ("mexico-all", "all", None),
+            ("mexico-none", "none", None),
+        ):
+            created_user = admin_client.post(
+                "/api/admin/users",
+                json={
+                    "username": username,
+                    "password": "Yuewei123",
+                    "display_name": username,
+                    "role": "business",
+                    "active": True,
+                    "sheet_permissions": [],
+                    "mexico_access_scope": scope,
+                    "mexico_identity_name": identity,
+                },
+            )
+            assert created_user.status_code == 200, created_user.text
         timestamp = now_iso()
         with connect() as conn:
+            tracking_ids: dict[str, int] = {}
+            for approval_no, applicant_name, company_name in (
+                ("MX-API-APPLICANT", "Ana", "Applicant Company"),
+                ("MX-API-TASK", "Bruno", "Task Company"),
+                ("MX-API-EVENT", "Carla", "Event Company"),
+                ("MX-API-DENIED", "Diego", "Hidden Company"),
+            ):
+                tracking_ids[approval_no] = int(
+                    conn.execute(
+                        """
+                        INSERT INTO mexico_approval_tracking (
+                            approval_no, source_type, resolved_region,
+                            region_resolution_source, region_review_status,
+                            source_sheet, company_name, applicant_name, summary,
+                            workflow_status, current_node_name, current_approver_name,
+                            current_node_entered_at, created_at, updated_at
+                        ) VALUES (?, 'purchase', 'mexico', 'execution_region', 'resolved',
+                                  'NO CHINA SHEET', ?, ?, ?, 'RUNNING', '审批',
+                                  'Otro', ?, ?, ?)
+                        """,
+                        (
+                            approval_no,
+                            company_name,
+                            applicant_name,
+                            approval_no,
+                            timestamp,
+                            timestamp,
+                            timestamp,
+                        ),
+                    ).lastrowid
+                )
             conn.execute(
                 """
-                INSERT INTO mexico_approval_tracking (
-                    approval_no, source_type, resolved_region,
-                    region_resolution_source, region_review_status,
-                    source_sheet, company_name, applicant_name, summary,
-                    workflow_status, current_node_name, current_approver_name,
-                    current_node_entered_at, created_at, updated_at
-                ) VALUES (?, 'purchase', 'mexico', 'execution_region', 'resolved',
-                          ?, ?, '甲', '待审批', 'RUNNING', '会计', '乙', ?, ?, ?)
+                INSERT INTO mexico_approval_current_tasks (
+                    approval_no, task_key, node_name, approver_name,
+                    entered_at, synced_at, created_at, updated_at
+                ) VALUES ('MX-API-TASK', 'task-ana', '财务审批', 'Ana', ?, ?, ?, ?)
                 """,
-                (
-                    "MX-API-AUTHORIZED",
-                    "YW MOLDES MX模具",
-                    "YW MOLDES MX模具",
-                    timestamp,
-                    timestamp,
-                    timestamp,
-                ),
+                (timestamp, timestamp, timestamp, timestamp),
             )
             conn.execute(
                 """
-                INSERT INTO mexico_approval_tracking (
-                    approval_no, source_type, resolved_region,
-                    region_resolution_source, region_review_status,
-                    source_sheet, company_name, applicant_name, summary,
-                    workflow_status, current_node_name, current_approver_name,
-                    current_node_entered_at, created_at, updated_at
-                ) VALUES (?, 'operation', 'mexico', 'execution_region', 'resolved',
-                          ?, ?, '丙', '无权记录', 'RUNNING', '审批', '丁', ?, ?, ?)
+                INSERT INTO mexico_approval_events (
+                    approval_no, event_key, sequence_index, event_type,
+                    operator_name, event_time, is_current, created_at, updated_at
+                ) VALUES ('MX-API-EVENT', 'event-ana', 1, 'CC', 'Ana', ?, 0, ?, ?)
                 """,
-                (
-                    "MX-API-DENIED",
-                    "UV IMPRESION MX彩印",
-                    "UV IMPRESION MX彩印",
-                    timestamp,
-                    timestamp,
-                    timestamp,
-                ),
+                (timestamp, timestamp, timestamp),
             )
             conn.execute(
                 """
@@ -4843,18 +4864,49 @@ def test_mexico_tracking_api_enforces_review_and_sheet_permissions():
                 ("MX-API-REVIEW", "YW MOLDES MX模具", timestamp, timestamp),
             )
 
-        login(business_client, "mexico-tracking-sheet-user", "Yuewei123")
-        listed = business_client.get("/api/mexico-tracking?view=pending")
+        login(participant_client, "mexico-participant", "Yuewei123")
+        listed = participant_client.get("/api/mexico-tracking?view=pending")
         assert listed.status_code == 200, listed.text
-        assert [item["approval_no"] for item in listed.json()["items"]] == [
-            "MX-API-AUTHORIZED"
-        ]
-        assert business_client.get("/api/mexico-tracking?view=review").status_code == 403
+        assert {item["approval_no"] for item in listed.json()["items"]} == {
+            "MX-API-APPLICANT",
+            "MX-API-TASK",
+            "MX-API-EVENT",
+        }
+        summary = participant_client.get("/api/mexico-tracking/summary")
+        assert summary.status_code == 200, summary.text
+        assert summary.json()["summary"]["pending"] == 3
+        options = participant_client.get("/api/mexico-tracking/filter-options")
+        assert options.status_code == 200, options.text
+        assert "Hidden Company" not in options.json()["options"]["companies"]
+        assert participant_client.get(
+            f"/api/mexico-tracking/{tracking_ids['MX-API-EVENT']}"
+        ).status_code == 200
+        assert participant_client.get(
+            f"/api/mexico-tracking/{tracking_ids['MX-API-DENIED']}"
+        ).status_code == 404
+        assert participant_client.get("/api/mexico-tracking?view=review").status_code == 403
+
+        login(all_client, "mexico-all", "Yuewei123")
+        all_items = all_client.get("/api/mexico-tracking?view=pending")
+        assert all_items.status_code == 200, all_items.text
+        assert all_items.json()["total"] == 4
+
+        login(none_client, "mexico-none", "Yuewei123")
+        for method, path in (
+            ("get", "/api/mexico-tracking"),
+            ("get", "/api/mexico-tracking/summary"),
+            ("get", "/api/mexico-tracking/filter-options"),
+            ("get", "/api/mexico-tracking/settings"),
+            ("get", f"/api/mexico-tracking/{tracking_ids['MX-API-APPLICANT']}"),
+            ("post", "/api/mexico-tracking/sync"),
+        ):
+            response = getattr(none_client, method)(path)
+            assert response.status_code == 403, (path, response.text)
 
         review = admin_client.get("/api/mexico-tracking?view=review")
         assert review.status_code == 200, review.text
         assert any(item["approval_no"] == "MX-API-REVIEW" for item in review.json()["items"])
-        assert business_client.put(
+        assert participant_client.put(
             "/api/mexico-tracking/settings",
             json={
                 "yellow_days": 2,
@@ -4880,7 +4932,9 @@ def test_mexico_tracking_row_attachment_sync_is_idempotent_and_authorized(
                 "display_name": "墨西哥附件用户",
                 "role": "business",
                 "active": True,
-                "sheet_permissions": ["YW MOLDES MX模具"],
+                "sheet_permissions": [],
+                "mexico_access_scope": "participant",
+                "mexico_identity_name": "Attachment Ana",
             },
         )
         assert created_user.status_code == 200, created_user.text
@@ -4891,13 +4945,13 @@ def test_mexico_tracking_row_attachment_sync_is_idempotent_and_authorized(
             allowed_id = int(
                 conn.execute(
                     """
-                    INSERT INTO mexico_approval_tracking (
-                        approval_no, source_type, process_instance_id,
-                        resolved_region, region_resolution_source,
-                        region_review_status, source_sheet, workflow_status,
-                        created_at, updated_at
-                    ) VALUES (?, 'purchase', ?, 'mexico', 'execution_region',
-                              'resolved', 'YW MOLDES MX模具', 'RUNNING', ?, ?)
+                        INSERT INTO mexico_approval_tracking (
+                            approval_no, source_type, process_instance_id,
+                            resolved_region, region_resolution_source,
+                            region_review_status, source_sheet, applicant_name, workflow_status,
+                            created_at, updated_at
+                        ) VALUES (?, 'purchase', ?, 'mexico', 'execution_region',
+                                  'resolved', 'NO CHINA SHEET', 'Attachment Ana', 'RUNNING', ?, ?)
                     """,
                     (allowed_no, f"process-{allowed_no}", timestamp, timestamp),
                 ).lastrowid
@@ -4905,13 +4959,13 @@ def test_mexico_tracking_row_attachment_sync_is_idempotent_and_authorized(
             denied_id = int(
                 conn.execute(
                     """
-                    INSERT INTO mexico_approval_tracking (
-                        approval_no, source_type, process_instance_id,
-                        resolved_region, region_resolution_source,
-                        region_review_status, source_sheet, workflow_status,
-                        created_at, updated_at
-                    ) VALUES (?, 'purchase', ?, 'mexico', 'execution_region',
-                              'resolved', 'UV IMPRESION MX彩印', 'RUNNING', ?, ?)
+                        INSERT INTO mexico_approval_tracking (
+                            approval_no, source_type, process_instance_id,
+                            resolved_region, region_resolution_source,
+                            region_review_status, source_sheet, applicant_name, workflow_status,
+                            created_at, updated_at
+                        ) VALUES (?, 'purchase', ?, 'mexico', 'execution_region',
+                                  'resolved', 'NO CHINA SHEET', 'Somebody Else', 'RUNNING', ?, ?)
                     """,
                     (denied_no, f"process-{denied_no}", timestamp, timestamp),
                 ).lastrowid
@@ -4964,7 +5018,7 @@ def test_mexico_tracking_row_attachment_sync_is_idempotent_and_authorized(
         assert second.json()["run"]["id"] == first.json()["run"]["id"]
         assert business_client.post(
             f"/api/mexico-tracking/{denied_id}/attachments/sync"
-        ).status_code == 403
+        ).status_code == 404
 
         with connect() as conn:
             assert conn.execute(

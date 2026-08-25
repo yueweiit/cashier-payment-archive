@@ -1450,6 +1450,94 @@ def test_mexico_tracking_list_respects_business_sheet_permissions(isolated_db) -
         assert options["companies"] == ["YW MOLDES MX模具"]
 
 
+def test_mexico_tracking_participant_visibility_covers_every_participation_path(
+    isolated_db,
+) -> None:
+    timestamp = "2026-08-24T12:00:00.000000+08:00"
+    with isolated_db.connect() as conn:
+        applicant_id = _insert_tracking_case(
+            conn,
+            approval_no="MX-PARTICIPANT-APPLICANT",
+            sheet="Applicant company",
+            applicant="Ana",
+            approver="Someone Else",
+        )
+        task_id = _insert_tracking_case(
+            conn,
+            approval_no="MX-PARTICIPANT-TASK",
+            sheet="Task company",
+            applicant="Someone Else",
+            approver="Legacy Approver",
+        )
+        history_id = _insert_tracking_case(
+            conn,
+            approval_no="MX-PARTICIPANT-HISTORY",
+            sheet="History company",
+            status="COMPLETED",
+            result="agree",
+            applicant="Someone Else",
+            approver="Someone Else",
+        )
+        cc_id = _insert_tracking_case(
+            conn,
+            approval_no="MX-PARTICIPANT-CC",
+            sheet="CC company",
+            applicant="Someone Else",
+            approver="Someone Else",
+        )
+        unrelated_id = _insert_tracking_case(
+            conn,
+            approval_no="MX-PARTICIPANT-HIDDEN",
+            sheet="Hidden company",
+            applicant="Nobody",
+            approver="Nobody",
+        )
+        conn.execute(
+            """
+            INSERT INTO mexico_approval_current_tasks (
+                approval_no, task_key, node_name, approver_name,
+                entered_at, synced_at, created_at, updated_at
+            ) VALUES ('MX-PARTICIPANT-TASK', 'task:ana', 'Finance', 'Ana', ?, ?, ?, ?)
+            """,
+            (timestamp, timestamp, timestamp, timestamp),
+        )
+        conn.executemany(
+            """
+            INSERT INTO mexico_approval_events (
+                approval_no, event_key, sequence_index, event_type,
+                operator_name, event_time, is_current, created_at, updated_at
+            ) VALUES (?, ?, 1, ?, 'Ana', ?, 0, ?, ?)
+            """,
+            [
+                ("MX-PARTICIPANT-HISTORY", "history:ana", "TASK", timestamp, timestamp, timestamp),
+                ("MX-PARTICIPANT-CC", "cc:ana", "CC", timestamp, timestamp, timestamp),
+            ],
+        )
+        conn.commit()
+
+        pending = list_mexico_tracking(conn, view="pending", participant_name="Ana")
+        history = list_mexico_tracking(conn, view="history", participant_name="Ana")
+        summary = summarize_mexico_tracking(conn, participant_name="Ana")
+        options = mexico_tracking_filter_options(conn, participant_name="Ana")
+
+        assert {item["id"] for item in pending["items"]} == {applicant_id, task_id, cc_id}
+        assert [item["id"] for item in history["items"]] == [history_id]
+        assert summary["pending"] == 3
+        assert summary["history"] == 1
+        assert set(options["companies"]) == {"Applicant company", "Task company", "CC company"}
+        assert get_mexico_tracking_detail(
+            conn,
+            task_id,
+            participant_name="Ana",
+        )["id"] == task_id
+        with pytest.raises(PermissionError):
+            get_mexico_tracking_detail(
+                conn,
+                unrelated_id,
+                participant_name="Ana",
+            )
+
+
 def test_mexico_tracking_summary_and_warning_filter_use_configured_thresholds(
     isolated_db,
 ) -> None:

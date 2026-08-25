@@ -373,6 +373,8 @@ def ensure_mexico_tracking_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_mexico_events_approval_time
         ON mexico_approval_events(approval_no, event_time, sequence_index, id);
+        CREATE INDEX IF NOT EXISTS idx_mexico_events_operator
+        ON mexico_approval_events(operator_name, approval_no);
 
         CREATE TABLE IF NOT EXISTS mexico_approval_current_tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1903,6 +1905,7 @@ def _mexico_tracking_where(
     *,
     view: str,
     allowed_sheets: Optional[set[str]] = None,
+    participant_name: Optional[str] = None,
     keyword: Optional[str] = None,
     company: Optional[str] = None,
     source_type: Optional[str] = None,
@@ -1924,6 +1927,25 @@ def _mexico_tracking_where(
                 f"COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') IN ({placeholders})"
             )
             params.extend(sheets)
+    if participant_name is not None:
+        identity = str(participant_name).strip()
+        if not identity:
+            clauses.append("0 = 1")
+        else:
+            clauses.append(
+                "(TRIM(COALESCE(applicant_name, '')) = ? "
+                "OR TRIM(COALESCE(current_approver_name, '')) = ? "
+                "OR EXISTS ("
+                "SELECT 1 FROM mexico_approval_current_tasks participant_task "
+                "WHERE participant_task.approval_no = mexico_approval_tracking.approval_no "
+                "AND TRIM(COALESCE(participant_task.approver_name, '')) = ?"
+                ") OR EXISTS ("
+                "SELECT 1 FROM mexico_approval_events participant_event "
+                "WHERE participant_event.approval_no = mexico_approval_tracking.approval_no "
+                "AND TRIM(COALESCE(participant_event.operator_name, '')) = ?"
+                "))"
+            )
+            params.extend([identity] * 4)
     if keyword and str(keyword).strip():
         token = f"%{str(keyword).strip()}%"
         clauses.append(
@@ -2073,6 +2095,7 @@ def list_mexico_tracking(
     page: int = 1,
     page_size: int = 50,
     allowed_sheets: Optional[set[str]] = None,
+    participant_name: Optional[str] = None,
     keyword: Optional[str] = None,
     company: Optional[str] = None,
     source_type: Optional[str] = None,
@@ -2091,6 +2114,7 @@ def list_mexico_tracking(
     where, params = _mexico_tracking_where(
         view=view,
         allowed_sheets=allowed_sheets,
+        participant_name=participant_name,
         keyword=keyword,
         company=company,
         source_type=source_type,
@@ -2152,6 +2176,7 @@ def summarize_mexico_tracking(
     conn: sqlite3.Connection,
     *,
     allowed_sheets: Optional[set[str]] = None,
+    participant_name: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, int]:
     pending = list_mexico_tracking(
@@ -2160,13 +2185,16 @@ def summarize_mexico_tracking(
         page=1,
         page_size=100,
         allowed_sheets=allowed_sheets,
+        participant_name=participant_name,
         now=now,
     )
     # Summary must not be truncated by the public page-size ceiling.
     pending_items = pending["items"]
     if pending["total"] > len(pending_items):
         where, params = _mexico_tracking_where(
-            view="pending", allowed_sheets=allowed_sheets
+            view="pending",
+            allowed_sheets=allowed_sheets,
+            participant_name=participant_name,
         )
         settings = get_mexico_tracking_settings(conn)
         rows = conn.execute(
@@ -2176,10 +2204,14 @@ def summarize_mexico_tracking(
             _mexico_tracking_public(row, settings=settings, now=now) for row in rows
         ]
     history_where, history_params = _mexico_tracking_where(
-        view="history", allowed_sheets=allowed_sheets
+        view="history",
+        allowed_sheets=allowed_sheets,
+        participant_name=participant_name,
     )
     review_where, review_params = _mexico_tracking_where(
-        view="review", allowed_sheets=allowed_sheets
+        view="review",
+        allowed_sheets=allowed_sheets,
+        participant_name=participant_name,
     )
     counts = {"normal": 0, "yellow": 0, "red": 0}
     for item in pending_items:
@@ -2208,9 +2240,12 @@ def mexico_tracking_filter_options(
     conn: sqlite3.Connection,
     *,
     allowed_sheets: Optional[set[str]] = None,
+    participant_name: Optional[str] = None,
 ) -> Dict[str, list[str]]:
     where, params = _mexico_tracking_where(
-        view="pending", allowed_sheets=allowed_sheets
+        view="pending",
+        allowed_sheets=allowed_sheets,
+        participant_name=participant_name,
     )
     rows = conn.execute(
         f"""
@@ -2272,6 +2307,7 @@ def get_mexico_tracking_detail(
     tracking_id: int,
     *,
     allowed_sheets: Optional[set[str]] = None,
+    participant_name: Optional[str] = None,
     allow_review: bool = True,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
@@ -2290,6 +2326,32 @@ def get_mexico_tracking_detail(
         raise PermissionError("review item is restricted")
     if allowed_sheets is not None and str(row["source_sheet"] or "").strip() not in allowed_sheets:
         raise PermissionError("sheet access denied")
+    if participant_name is not None:
+        identity = str(participant_name).strip()
+        is_participant = bool(identity) and (
+            str(row["applicant_name"] or "").strip() == identity
+            or str(row["current_approver_name"] or "").strip() == identity
+            or conn.execute(
+                """
+                SELECT 1 FROM mexico_approval_current_tasks
+                WHERE approval_no = ? AND TRIM(COALESCE(approver_name, '')) = ?
+                LIMIT 1
+                """,
+                (row["approval_no"], identity),
+            ).fetchone()
+            is not None
+            or conn.execute(
+                """
+                SELECT 1 FROM mexico_approval_events
+                WHERE approval_no = ? AND TRIM(COALESCE(operator_name, '')) = ?
+                LIMIT 1
+                """,
+                (row["approval_no"], identity),
+            ).fetchone()
+            is not None
+        )
+        if not is_participant:
+            raise PermissionError("participant access denied")
     settings = get_mexico_tracking_settings(conn)
     payload = _mexico_tracking_public(row, settings=settings, now=now)
     _attach_mexico_current_tasks(

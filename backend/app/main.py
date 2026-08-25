@@ -732,16 +732,19 @@ def china_workbench_scope(conn, column_prefix: str = "") -> str:
     )
 
 
-def mexico_tracking_allowed_sheets(
-    conn,
-    user: Dict[str, Any],
-) -> Optional[set[str]]:
-    if not user_has_restricted_sheet_access(user):
+def mexico_tracking_participant_name(user: Dict[str, Any]) -> Optional[str]:
+    """Return the bound identity for participant scope, failing closed otherwise."""
+
+    if user.get("role") == ROLE_ADMIN:
         return None
-    return {
-        canonical_sheet_name(sheet_name)
-        for sheet_name in load_user_sheet_permissions(conn, int(user["id"]))
-    }
+    scope = str(user.get("mexico_access_scope") or "none").strip().lower()
+    if scope == "all":
+        return None
+    if scope == "participant":
+        identity = str(user.get("mexico_identity_name") or "").strip()
+        if identity:
+            return identity
+    raise HTTPException(status_code=403, detail="无权访问墨西哥审批")
 
 
 def ensure_sheet_access(
@@ -6754,6 +6757,7 @@ def start_mexico_tracking_sync(
     trigger_type: str = Query(default="manual", pattern="^(manual|automatic)$"),
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Any:
+    mexico_tracking_participant_name(user)
     with connect() as conn:
         run, reused = acquire_or_reuse_mexico_sync_run(
             conn,
@@ -6776,6 +6780,7 @@ def get_mexico_tracking_sync_status(
     run_id: str,
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
+    mexico_tracking_participant_name(user)
     with connect() as conn:
         try:
             run = get_mexico_sync_run(conn, run_id)
@@ -6788,21 +6793,26 @@ def get_mexico_tracking_sync_status(
 def get_mexico_tracking_summary(
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
+    participant_name = mexico_tracking_participant_name(user)
     with connect() as conn:
-        allowed_sheets = mexico_tracking_allowed_sheets(conn, user)
-        return {"summary": summarize_mexico_tracking(conn, allowed_sheets=allowed_sheets)}
+        return {
+            "summary": summarize_mexico_tracking(
+                conn,
+                participant_name=participant_name,
+            )
+        }
 
 
 @app.get("/api/mexico-tracking/filter-options")
 def get_mexico_tracking_filter_options(
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
+    participant_name = mexico_tracking_participant_name(user)
     with connect() as conn:
-        allowed_sheets = mexico_tracking_allowed_sheets(conn, user)
         return {
             "options": mexico_tracking_filter_options(
                 conn,
-                allowed_sheets=allowed_sheets,
+                participant_name=participant_name,
             )
         }
 
@@ -6811,6 +6821,7 @@ def get_mexico_tracking_filter_options(
 def get_mexico_settings(
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
+    mexico_tracking_participant_name(user)
     with connect() as conn:
         return {"settings": get_mexico_tracking_settings(conn)}
 
@@ -6859,17 +6870,17 @@ def get_mexico_tracking_list(
     request_date_to: Optional[str] = Query(default=None),
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
+    participant_name = mexico_tracking_participant_name(user)
     if view == "review" and user["role"] != ROLE_ADMIN:
         raise HTTPException(status_code=403, detail="仅管理员可查看地区待核对记录")
     with connect() as conn:
-        allowed_sheets = mexico_tracking_allowed_sheets(conn, user)
         try:
             return list_mexico_tracking(
                 conn,
                 view=view,
                 page=page,
                 page_size=page_size,
-                allowed_sheets=allowed_sheets,
+                participant_name=participant_name,
                 keyword=keyword,
                 company=company,
                 source_type=source_type,
@@ -6927,18 +6938,19 @@ def get_mexico_tracking_item(
     tracking_id: int,
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
+    participant_name = mexico_tracking_participant_name(user)
     with connect() as conn:
         try:
             item = get_mexico_tracking_detail(
                 conn,
                 tracking_id,
-                allowed_sheets=mexico_tracking_allowed_sheets(conn, user),
+                participant_name=participant_name,
                 allow_review=user["role"] == ROLE_ADMIN,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="墨西哥审批记录不存在")
         except PermissionError:
-            raise HTTPException(status_code=403, detail="无权查看该审批记录")
+            raise HTTPException(status_code=404, detail="墨西哥审批记录不存在")
     return {"item": item}
 
 
@@ -6947,18 +6959,19 @@ def sync_mexico_tracking_row_attachments(
     tracking_id: int,
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> JSONResponse:
+    participant_name = mexico_tracking_participant_name(user)
     with connect() as conn:
         try:
             detail = get_mexico_tracking_detail(
                 conn,
                 tracking_id,
-                allowed_sheets=mexico_tracking_allowed_sheets(conn, user),
+                participant_name=participant_name,
                 allow_review=user["role"] == ROLE_ADMIN,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="墨西哥审批记录不存在")
         except PermissionError:
-            raise HTTPException(status_code=403, detail="无权查看该审批记录")
+            raise HTTPException(status_code=404, detail="墨西哥审批记录不存在")
 
     approval_no = str(detail["approval_no"])
     workflows = fetch_dingtalk_workflows([approval_no])
@@ -6990,7 +7003,17 @@ def get_mexico_tracking_attachment(
     attachment_id: int,
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> FileResponse:
+    participant_name = mexico_tracking_participant_name(user)
     with connect() as conn:
+        try:
+            get_mexico_tracking_detail(
+                conn,
+                tracking_id,
+                participant_name=participant_name,
+                allow_review=user["role"] == ROLE_ADMIN,
+            )
+        except (KeyError, PermissionError):
+            raise HTTPException(status_code=404, detail="附件不存在")
         row = conn.execute(
             """
             SELECT a.*, t.source_sheet, t.resolved_region, t.region_review_status
@@ -7002,12 +7025,6 @@ def get_mexico_tracking_attachment(
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="附件不存在")
-        if (
-            str(row["resolved_region"] or "") == "review"
-            or str(row["region_review_status"] or "") == "pending"
-        ) and user["role"] != ROLE_ADMIN:
-            raise HTTPException(status_code=403, detail="无权查看待核对记录附件")
-        ensure_sheet_access(conn, user, row["source_sheet"])
         if row["status"] != "ready" or not row["file_object_id"]:
             raise HTTPException(status_code=404, detail="附件尚未同步完成")
         path, _ = resolve_attachment_path(row, conn)
