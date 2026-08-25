@@ -4802,13 +4802,6 @@ def test_china_region_isolation_filters_workbench_totals_sheets_and_export():
                 )
                 assert created.status_code == 200, created.text
 
-            before = client.get(f"/api/batches/{batch['id']}/requests").json()
-            assert before["totals"]["count"] == 3
-            assert before["totals"]["amount"] == 600
-
-            settings_payload["china_region_isolation_enabled"] = True
-            assert client.put("/api/mexico-tracking/settings", json=settings_payload).status_code == 200
-
             listed = client.get(f"/api/batches/{batch['id']}/requests")
             assert listed.status_code == 200, listed.text
             assert [row["dingding_id"] for row in listed.json()["requests"]] == ["CN-ISOLATION"]

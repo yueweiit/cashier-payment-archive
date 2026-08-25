@@ -270,7 +270,7 @@ class MexicoTrackingSettingsIn(BaseModel):
     yellow_days: int = Field(ge=0, le=365)
     red_days: int = Field(ge=1, le=365)
     cache_stale_seconds: int = Field(ge=0, le=86400)
-    china_region_isolation_enabled: bool = False
+    china_region_isolation_enabled: bool = True
 
 
 class MexicoRegionResolutionIn(BaseModel):
@@ -702,14 +702,12 @@ def daily_payables_allowed_sheets(conn, user: Dict[str, Any]) -> Optional[set[st
 
 
 def china_region_isolation_enabled(conn) -> bool:
-    return bool(
-        get_mexico_tracking_settings(conn).get("china_region_isolation_enabled")
-    )
+    del conn
+    return True
 
 
 def china_workbench_scope(conn, column_prefix: str = "") -> str:
-    if not china_region_isolation_enabled(conn):
-        return "1 = 1"
+    del conn
     prefix = f"{column_prefix}." if column_prefix else ""
     return (
         f"LOWER(TRIM(COALESCE({prefix}resolved_region, ''))) = 'china' "
@@ -829,27 +827,26 @@ def batch_public_for_user(
     access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
     active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
     region_sql = china_workbench_scope(conn, "p")
-    if china_region_isolation_enabled(conn):
-        visible_sheet_rows = conn.execute(
-            f"""
-            SELECT DISTINCT COALESCE(NULLIF(TRIM(p.source_sheet), ''), '未分 Sheet') AS sheet_name
-            FROM payment_requests p
-            WHERE p.batch_id = ? AND {access_sql} AND {active_sql} AND {region_sql}
-            ORDER BY p.id
-            """,
-            [data["id"], *access_params],
-        ).fetchall()
-        visible_row_sheets = [canonical_sheet_name(item["sheet_name"]) for item in visible_sheet_rows]
-        visible_row_sheet_set = set(visible_row_sheets)
-        filtered_order = [
-            sheet_name
-            for sheet_name in data["sheet_order"]
-            if sheet_region(sheet_name) == "china" or sheet_name in visible_row_sheet_set
-        ]
-        filtered_order.extend(
-            sheet_name for sheet_name in visible_row_sheets if sheet_name not in filtered_order
-        )
-        data["sheet_order"] = filtered_order
+    visible_sheet_rows = conn.execute(
+        f"""
+        SELECT DISTINCT COALESCE(NULLIF(TRIM(p.source_sheet), ''), '未分 Sheet') AS sheet_name
+        FROM payment_requests p
+        WHERE p.batch_id = ? AND {access_sql} AND {active_sql} AND {region_sql}
+        ORDER BY p.id
+        """,
+        [data["id"], *access_params],
+    ).fetchall()
+    visible_row_sheets = [canonical_sheet_name(item["sheet_name"]) for item in visible_sheet_rows]
+    visible_row_sheet_set = set(visible_row_sheets)
+    filtered_order = [
+        sheet_name
+        for sheet_name in data["sheet_order"]
+        if sheet_region(sheet_name) == "china" or sheet_name in visible_row_sheet_set
+    ]
+    filtered_order.extend(
+        sheet_name for sheet_name in visible_row_sheets if sheet_name not in filtered_order
+    )
+    data["sheet_order"] = filtered_order
     currency_rows = conn.execute(
         f"""
         SELECT UPPER(COALESCE(NULLIF(TRIM(p.currency), ''), 'CNY')) AS currency,
@@ -1173,7 +1170,7 @@ def get_daily_payables_summary(
                 conn,
                 selected_date,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
-                china_only=china_region_isolation_enabled(conn),
+                china_only=True,
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1195,7 +1192,7 @@ def get_daily_payables_details(
                 selected_date,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
                 include_details=True,
-                china_only=china_region_isolation_enabled(conn),
+                china_only=True,
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1220,7 +1217,7 @@ def get_daily_payables_trend(
                 start,
                 end,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
-                china_only=china_region_isolation_enabled(conn),
+                china_only=True,
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc

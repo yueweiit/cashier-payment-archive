@@ -467,35 +467,37 @@ def test_daily_payables_rejects_dates_before_baseline_and_long_trends():
 def test_daily_payables_can_exclude_mexico_and_region_review_history():
     with TestClient(app) as client:
         login(client)
+        selected = date.today()
+        selected_iso = selected.isoformat()
         china = create_request(
             client,
             amount=100,
             source_sheet="凌翔产品&开发",
-            needed_payment_date="2026-08-24",
+            needed_payment_date=selected_iso,
         )
         mexico = create_request(
             client,
             amount=200,
             source_sheet="YW MOLDES MX模具",
-            needed_payment_date="2026-08-24",
+            needed_payment_date=selected_iso,
         )
         review = create_request(
             client,
             amount=300,
             source_sheet=f"地区待核对-{uuid.uuid4().hex}",
-            needed_payment_date="2026-08-24",
+            needed_payment_date=selected_iso,
         )
 
         with connect() as conn:
             all_regions = daily_snapshot(
                 conn,
-                date(2026, 8, 24),
+                selected,
                 include_details=True,
                 china_only=False,
             )
             china_only = daily_snapshot(
                 conn,
-                date(2026, 8, 24),
+                selected,
                 include_details=True,
                 china_only=True,
             )

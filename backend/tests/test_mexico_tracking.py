@@ -102,29 +102,30 @@ def test_explicit_execution_region_takes_priority_without_conflict() -> None:
     assert decision.execution_region_raw == "墨西哥 Mexico"
 
 
-def test_execution_region_and_sheet_conflict_requires_review() -> None:
-    decision = resolve_region(
+def test_explicit_execution_region_overrides_conflicting_sheet_mapping() -> None:
+    mexico = resolve_region(
+        execution_region="Mexico",
+        source_sheet="悦为智能 YW Tech_Ai",
+    )
+    china = resolve_region(
         execution_region="中国 China",
         source_sheet="YW MOLDES MX模具",
     )
 
-    assert decision.region == "review"
-    assert decision.source == "conflict"
-    assert decision.sheet_region == "mexico"
-    assert decision.conflict_reason
+    assert (mexico.region, mexico.source) == ("mexico", "execution_region")
+    assert mexico.sheet_region == "china"
+    assert (china.region, china.source) == ("china", "execution_region")
+    assert china.sheet_region == "mexico"
 
 
-def test_admin_resolution_is_kept_when_new_raw_fact_conflicts() -> None:
+def test_explicit_execution_region_supersedes_stale_admin_override() -> None:
     decision = resolve_region(
         execution_region="Mexico",
-        source_sheet="YW MOLDES MX模具",
+        source_sheet="悦为智能 YW Tech_Ai",
         admin_region="china",
     )
 
-    assert decision.region == "china"
-    assert decision.source == "admin_override"
-    assert decision.conflict_reason
-    assert "Mexico" in decision.conflict_reason
+    assert (decision.region, decision.source) == ("mexico", "execution_region")
 
 
 def test_currency_alone_never_decides_region() -> None:
@@ -299,7 +300,7 @@ def test_mexico_tracking_settings_have_safe_defaults_and_validation(isolated_db)
             "yellow_days": 2,
             "red_days": 5,
             "cache_stale_seconds": 300,
-            "china_region_isolation_enabled": False,
+            "china_region_isolation_enabled": True,
         }
 
         updated = update_mexico_tracking_settings(
@@ -315,6 +316,10 @@ def test_mexico_tracking_settings_have_safe_defaults_and_validation(isolated_db)
             "cache_stale_seconds": 600,
             "china_region_isolation_enabled": True,
         }
+        assert update_mexico_tracking_settings(
+            conn,
+            china_region_isolation_enabled=False,
+        )["china_region_isolation_enabled"] is True
         conn.commit()
 
         with pytest.raises(ValueError):
@@ -405,30 +410,30 @@ def test_region_persist_prefers_external_execution_region_and_falls_back_to_shee
         assert tuple(stored) == ("mexico", "execution_region", "resolved")
 
 
-def test_region_persist_marks_conflict_for_review(isolated_db) -> None:
+def test_region_persist_uses_explicit_execution_region_over_sheet(isolated_db) -> None:
     with isolated_db.connect() as conn:
         request_id = _insert_region_request(
             conn,
-            source_sheet="YW MOLDES MX模具",
-            execution_region="中国 China",
+            source_sheet="悦为智能 YW Tech_Ai",
+            execution_region="Mexico",
         )
 
         decision = persist_request_region(conn, request_id, actor_id=None)
 
-        assert decision.region == "review"
+        assert decision.region == "mexico"
         stored = conn.execute(
             "SELECT resolved_region, region_resolution_source, region_review_status "
             "FROM payment_requests WHERE id = ?",
             (request_id,),
         ).fetchone()
-        assert tuple(stored) == ("review", "conflict", "pending")
+        assert tuple(stored) == ("mexico", "execution_region", "resolved")
 
 
-def test_region_persist_preserves_admin_override(isolated_db) -> None:
+def test_region_persist_replaces_stale_admin_override_with_explicit_region(isolated_db) -> None:
     with isolated_db.connect() as conn:
         request_id = _insert_region_request(
             conn,
-            source_sheet="YW MOLDES MX模具",
+            source_sheet="悦为智能 YW Tech_Ai",
             execution_region="Mexico",
             resolved_region="china",
             resolution_source="admin_override",
@@ -437,13 +442,13 @@ def test_region_persist_preserves_admin_override(isolated_db) -> None:
 
         decision = persist_request_region(conn, request_id, actor_id=1)
 
-        assert (decision.region, decision.source) == ("china", "admin_override")
+        assert (decision.region, decision.source) == ("mexico", "execution_region")
         stored = conn.execute(
             "SELECT resolved_region, region_resolution_source, region_review_status "
             "FROM payment_requests WHERE id = ?",
             (request_id,),
         ).fetchone()
-        assert tuple(stored) == ("china", "admin_override", "resolved")
+        assert tuple(stored) == ("mexico", "execution_region", "resolved")
 
 
 def test_region_backfill_counts_and_history_snapshot(isolated_db) -> None:
@@ -459,6 +464,7 @@ def test_region_backfill_counts_and_history_snapshot(isolated_db) -> None:
             "mexico": 1,
             "review": 1,
             "preserved_override": 0,
+            "reclassified": 2,
         }
         assert record_request_state(
             conn,
@@ -472,6 +478,49 @@ def test_region_backfill_counts_and_history_snapshot(isolated_db) -> None:
         ).fetchone()
         assert tuple(history) == ("mexico", "resolved")
         assert china_id != review_id
+
+
+def test_region_v2_backfill_reclassifies_yuewei_mexico_and_appends_history(
+    isolated_db,
+) -> None:
+    with isolated_db.connect() as conn:
+        request_id = _insert_region_request(
+            conn,
+            source_sheet="悦为智能 YW Tech_Ai",
+            execution_region="Mexico",
+            resolved_region="review",
+            resolution_source="conflict",
+            review_status="pending",
+        )
+        record_request_state(
+            conn,
+            request_id,
+            event_type="baseline",
+            event_key=f"baseline:{request_id}",
+        )
+
+        result = backfill_request_regions(
+            conn,
+            append_history=True,
+            event_key_prefix="mexico-request-region-v2",
+        )
+
+        stored = conn.execute(
+            "SELECT resolved_region, region_review_status "
+            "FROM payment_requests WHERE id = ?",
+            (request_id,),
+        ).fetchone()
+        history = conn.execute(
+            "SELECT event_type, resolved_region FROM payable_history_versions "
+            "WHERE source_request_id = ? ORDER BY id",
+            (request_id,),
+        ).fetchall()
+        assert tuple(stored) == ("mexico", "resolved")
+        assert [tuple(row) for row in history][-1] == (
+            "request.region_reclassified",
+            "mexico",
+        )
+        assert result["reclassified"] == 1
 
 
 def test_request_write_helpers_persist_region_and_history(isolated_db) -> None:

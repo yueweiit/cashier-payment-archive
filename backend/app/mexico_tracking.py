@@ -16,7 +16,7 @@ MEXICO_TRACKING_SETTING_DEFAULTS = {
     "mexico_warning_yellow_days": "2",
     "mexico_warning_red_days": "5",
     "mexico_tracking_cache_stale_seconds": "300",
-    "china_region_isolation_enabled": "false",
+    "china_region_isolation_enabled": "true",
 }
 
 CHINA_SHEETS = frozenset(
@@ -467,12 +467,7 @@ def get_mexico_tracking_settings(conn: sqlite3.Connection) -> Dict[str, Any]:
                 defaults["mexico_tracking_cache_stale_seconds"],
             )
         ),
-        "china_region_isolation_enabled": _setting_value(
-            conn,
-            "china_region_isolation_enabled",
-            defaults["china_region_isolation_enabled"],
-        ).lower()
-        == "true",
+        "china_region_isolation_enabled": True,
     }
 
 
@@ -488,18 +483,17 @@ def update_mexico_tracking_settings(
     yellow = current["yellow_days"] if yellow_days is None else yellow_days
     red = current["red_days"] if red_days is None else red_days
     stale = current["cache_stale_seconds"] if cache_stale_seconds is None else cache_stale_seconds
-    isolation = (
-        current["china_region_isolation_enabled"]
-        if china_region_isolation_enabled is None
-        else china_region_isolation_enabled
-    )
+    isolation = True
     if isinstance(yellow, bool) or isinstance(red, bool) or not isinstance(yellow, int) or not isinstance(red, int):
         raise ValueError("warning days must be integers")
     if not 0 <= yellow < red <= 365:
         raise ValueError("warning days must satisfy 0 <= yellow < red <= 365")
     if isinstance(stale, bool) or not isinstance(stale, int) or stale < 0:
         raise ValueError("cache_stale_seconds must be a non-negative integer")
-    if not isinstance(isolation, bool):
+    if (
+        china_region_isolation_enabled is not None
+        and not isinstance(china_region_isolation_enabled, bool)
+    ):
         raise ValueError("china_region_isolation_enabled must be boolean")
 
     values = {
@@ -565,8 +559,8 @@ def resolve_region(
 ) -> RegionDecision:
     """Resolve the application region without treating currency as proof.
 
-    An administrator's prior resolution remains authoritative, while newly
-    observed conflicting facts are retained in ``conflict_reason`` for audit.
+    The explicit execution region from the external workflow is authoritative.
+    An administrator's prior resolution is only used when that field is absent.
     """
 
     del currency  # A currency is only a review hint and never decides a region.
@@ -575,37 +569,30 @@ def resolve_region(
     mapped_sheet_region = sheet_region(source_sheet)
     override = _normalized_token(admin_region)
 
-    if override in {"china", "mexico"}:
-        facts = []
-        if explicit_region and explicit_region != override:
-            facts.append(f"execution_region={raw_region}")
-        if mapped_sheet_region and mapped_sheet_region != override:
-            facts.append(f"sheet_region={mapped_sheet_region}")
-        return RegionDecision(
-            region=override,
-            source="admin_override",
-            execution_region_raw=raw_region,
-            sheet_region=mapped_sheet_region,
-            conflict_reason=("管理员结论与新来源事实不一致: " + ", ".join(facts)) if facts else None,
-        )
-
-    if explicit_region and mapped_sheet_region and explicit_region != mapped_sheet_region:
-        return RegionDecision(
-            region="review",
-            source="conflict",
-            execution_region_raw=raw_region,
-            sheet_region=mapped_sheet_region,
-            conflict_reason=(
-                f"execution_region={raw_region} 与 Sheet 判定={mapped_sheet_region} 不一致"
-            ),
-        )
-
     if explicit_region:
         return RegionDecision(
             region=explicit_region,
             source="execution_region",
             execution_region_raw=raw_region,
             sheet_region=mapped_sheet_region,
+            conflict_reason=(
+                f"execution_region={raw_region} 覆盖 Sheet 判定={mapped_sheet_region}"
+                if mapped_sheet_region and mapped_sheet_region != explicit_region
+                else None
+            ),
+        )
+
+    if override in {"china", "mexico"}:
+        return RegionDecision(
+            region=override,
+            source="admin_override",
+            execution_region_raw=raw_region,
+            sheet_region=mapped_sheet_region,
+            conflict_reason=(
+                f"管理员结论与 Sheet 判定={mapped_sheet_region} 不一致"
+                if mapped_sheet_region and mapped_sheet_region != override
+                else None
+            ),
         )
 
     if mapped_sheet_region:
@@ -700,14 +687,22 @@ def persist_request_region(
     return decision
 
 
-def backfill_request_regions(conn: sqlite3.Connection) -> Dict[str, int]:
+def backfill_request_regions(
+    conn: sqlite3.Connection,
+    *,
+    append_history: bool = False,
+    event_key_prefix: str = "mexico-request-region-backfill",
+) -> Dict[str, int]:
     """Classify every existing request and report the migration outcome."""
+
+    from .payable_history import record_request_state
 
     counts = {
         "china": 0,
         "mexico": 0,
         "review": 0,
         "preserved_override": 0,
+        "reclassified": 0,
     }
     rows = conn.execute(
         """
@@ -717,6 +712,10 @@ def backfill_request_regions(conn: sqlite3.Connection) -> Dict[str, int]:
         """
     ).fetchall()
     for row in rows:
+        previous = (
+            str(row["resolved_region"] or ""),
+            str(row["region_review_status"] or ""),
+        )
         was_override = (
             str(row["region_resolution_source"] or "") == "admin_override"
             and str(row["region_review_status"] or "") == "resolved"
@@ -726,6 +725,19 @@ def backfill_request_regions(conn: sqlite3.Connection) -> Dict[str, int]:
         counts[decision.region] += 1
         if was_override and decision.source == "admin_override":
             counts["preserved_override"] += 1
+        current = (
+            decision.region,
+            "pending" if decision.region == "review" else "resolved",
+        )
+        if current != previous:
+            counts["reclassified"] += 1
+            if append_history:
+                record_request_state(
+                    conn,
+                    int(row["id"]),
+                    event_type="request.region_reclassified",
+                    event_key=f"{event_key_prefix}:{row['id']}:{decision.region}",
+                )
     return counts
 
 

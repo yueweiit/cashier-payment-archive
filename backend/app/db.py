@@ -475,6 +475,30 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             (migration_key, now_iso()),
         )
 
+    isolation_key = "mexico_request_region_and_china_isolation_v2"
+    if not conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE key = ?",
+        (isolation_key,),
+    ).fetchone():
+        backfill_request_regions(
+            conn,
+            append_history=True,
+            event_key_prefix=isolation_key,
+        )
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ('china_region_isolation_enabled', 'true', ?)
+            ON CONFLICT(key) DO UPDATE
+            SET value = 'true', updated_at = excluded.updated_at
+            """,
+            (now_iso(),),
+        )
+        conn.execute(
+            "INSERT INTO schema_migrations (key, applied_at) VALUES (?, ?)",
+            (isolation_key, now_iso()),
+        )
+
 
 def get_daily_payables_history_start_date(conn: sqlite3.Connection) -> Optional[str]:
     row = conn.execute(
