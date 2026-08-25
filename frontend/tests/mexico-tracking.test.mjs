@@ -55,6 +55,18 @@ test("tracking refreshes once when approval state commits before attachments fin
   assert.match(pageSource, /附件正在后台处理/);
 });
 
+test("tracking renders every current approver and supports one-row attachments", () => {
+  assert.match(apiSource, /export type MexicoCurrentTask/);
+  assert.match(apiSource, /current_tasks: MexicoCurrentTask\[\]/);
+  assert.match(apiSource, /current_approvers: string\[\]/);
+  assert.match(apiSource, /attachment_status: MexicoAttachmentStatus/);
+  assert.match(apiSource, /syncMexicoTrackingAttachments:/);
+  assert.match(pageSource, /mexico-approver-list/);
+  assert.match(pageSource, /current_approvers\.map/);
+  assert.match(pageSource, /加载此单附件/);
+  assert.match(pageSource, /attachmentRun/);
+});
+
 test("Mexico tracking navigation and actions include Spanish translations", () => {
   assert.match(i18nSource, /"墨西哥审批跟进":\s*"Seguimiento de aprobaciones de México"/);
   assert.match(i18nSource, /"复制双语提醒":\s*"Copiar recordatorio bilingüe"/);

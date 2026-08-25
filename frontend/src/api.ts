@@ -17,6 +17,26 @@ export type MexicoTrackingReminder = {
   es: string;
 };
 
+export type MexicoCurrentTask = {
+  id?: number;
+  task_key: string;
+  task_id?: string | null;
+  activity_id?: string | null;
+  node_name: string;
+  approver_id?: string | null;
+  approver_name: string;
+  entered_at?: string | null;
+};
+
+export type MexicoAttachmentStatus = {
+  total: number;
+  ready: number;
+  queued: number;
+  downloading: number;
+  failed: number;
+  complete: boolean;
+};
+
 export type MexicoTrackingItem = {
   id: number;
   approval_no: string;
@@ -37,6 +57,9 @@ export type MexicoTrackingItem = {
   workflow_result?: string | null;
   current_node_name?: string | null;
   current_approver_name?: string | null;
+  current_tasks: MexicoCurrentTask[];
+  current_approvers: string[];
+  current_nodes: string[];
   current_node_entered_at?: string | null;
   workflow_url?: string | null;
   last_state_synced_at?: string | null;
@@ -97,6 +120,7 @@ export type MexicoTrackingDetail = MexicoTrackingItem & {
   events: MexicoTrackingEvent[];
   attachments: MexicoTrackingAttachment[];
   linked_requests: MexicoTrackingLinkedRequest[];
+  attachment_status: MexicoAttachmentStatus;
 };
 
 export type MexicoTrackingSummary = {
@@ -1018,6 +1042,14 @@ export const api = {
   },
   mexicoTrackingDetail: (trackingId: number) =>
     request<{ item: MexicoTrackingDetail }>(`/api/mexico-tracking/${trackingId}`),
+  syncMexicoTrackingAttachments: (trackingId: number) =>
+    request<{
+      run: MexicoSyncRun;
+      reused: boolean;
+      attachment_status: MexicoAttachmentStatus;
+    }>(`/api/mexico-tracking/${trackingId}/attachments/sync`, {
+      method: "POST",
+    }),
   mexicoTrackingSummary: () =>
     request<{ summary: MexicoTrackingSummary }>("/api/mexico-tracking/summary"),
   mexicoTrackingFilterOptions: () =>

@@ -111,6 +111,28 @@ function formatReminder(item: MexicoTrackingItem, language: "zh" | "es") {
   return `${item.reminder.zh}\n\n${item.reminder.es}`;
 }
 
+function CurrentApprovers({ item }: { item: MexicoTrackingItem }) {
+  const { t } = useLanguage();
+  return (
+    <div className="mexico-approver-list">
+      {item.current_approvers?.length
+        ? item.current_approvers.map((name) => <span key={name}>{name}</span>)
+        : <span>{item.current_approver_name || t("待识别待办人", "Responsable por identificar")}</span>}
+    </div>
+  );
+}
+
+function CurrentNodes({ item }: { item: MexicoTrackingItem }) {
+  const { t } = useLanguage();
+  return (
+    <div className="mexico-node-list">
+      {item.current_nodes?.length
+        ? item.current_nodes.map((node) => <span key={node}>{node}</span>)
+        : <span>{item.current_node_name || t("待审批节点", "Etapa pendiente")}</span>}
+    </div>
+  );
+}
+
 export function MexicoTrackingPage({ user, setMessage }: Props) {
   const { language, t } = useLanguage();
   const [view, setView] = useState<MexicoTrackingView>("pending");
@@ -203,6 +225,10 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
       setDetailLoading(false);
     }
   }, [setMessage]);
+
+  const reloadSelectedDetail = useCallback(async () => {
+    if (selectedId !== null) await reloadDetail(selectedId);
+  }, [reloadDetail, selectedId]);
 
   useEffect(() => {
     loadList();
@@ -425,10 +451,10 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
                   <td>{item.company_name || item.source_sheet || "—"}</td>
                   <td>{item.applicant_name || "—"}<small>{item.applicant_department || ""}</small></td>
                   <td className="mexico-summary-cell"><span>{item.summary || "—"}</span><small>{formatOriginalMoney(item.amount, item.currency, language)}</small></td>
-                  <td><strong>{item.current_node_name || "—"}</strong><small>{workflowStatusLabel(item.workflow_status, language)}</small></td>
-                  <td>{item.current_approver_name || "—"}</td>
+                  <td><CurrentNodes item={item} /><small>{workflowStatusLabel(item.workflow_status, language)}</small></td>
+                  <td><CurrentApprovers item={item} /></td>
                   <td><strong>{item.age_days} {t("天", "días")}</strong><small>{compactDateTime(item.current_node_entered_at, language)}</small></td>
-                  <td className="mexico-row-actions"><button onClick={() => openDetail(item.id)}>{t("查看", "Ver")}</button>{item.reminder && <button title={t("复制双语提醒", "Copiar recordatorio bilingüe")} onClick={() => copyReminder(item)}><ClipboardCopy size={15} /></button>}</td>
+                  <td className="mexico-row-actions"><button onClick={() => openDetail(item.id)}>{t("查看审批", "Ver aprobación")}</button>{item.reminder && <button title={t("复制双语提醒", "Copiar recordatorio bilingüe")} onClick={() => copyReminder(item)}><ClipboardCopy size={15} /></button>}</td>
                 </tr>
               ))}</tbody>
             </table>
@@ -437,7 +463,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
                 <header><span className={`mexico-warning-chip ${item.warning_level}`}>{warningLabel(item.warning_level, language)}</span><strong>{item.age_days} {t("天", "días")}</strong></header>
                 <h3>{item.summary || item.approval_no}</h3>
                 <p>{item.company_name || item.source_sheet || "—"}</p>
-                <dl><div><dt>{t("申请人", "Solicitante")}</dt><dd>{item.applicant_name || "—"}</dd></div><div><dt>{t("当前节点", "Etapa")}</dt><dd>{item.current_node_name || "—"}</dd></div><div><dt>{t("当前审批人", "Aprobador")}</dt><dd>{item.current_approver_name || "—"}</dd></div><div><dt>{t("金额", "Importe")}</dt><dd>{formatOriginalMoney(item.amount, item.currency, language)}</dd></div></dl>
+                <dl><div><dt>{t("申请人", "Solicitante")}</dt><dd>{item.applicant_name || "—"}</dd></div><div><dt>{t("当前节点", "Etapa")}</dt><dd><CurrentNodes item={item} /></dd></div><div><dt>{t("当前审批人", "Aprobador")}</dt><dd><CurrentApprovers item={item} /></dd></div><div><dt>{t("金额", "Importe")}</dt><dd>{formatOriginalMoney(item.amount, item.currency, language)}</dd></div></dl>
                 <footer><span>{item.approval_no}</span><div>{item.reminder && <button onClick={(event) => { event.stopPropagation(); copyReminder(item); }}><ClipboardCopy size={15} />{t("提醒", "Recordar")}</button>}<button>{t("查看", "Ver")}</button></div></footer>
               </article>
             ))}</div>
@@ -455,6 +481,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
           language={language}
           onClose={() => { setSelectedId(null); setDetail(null); }}
           onCopy={() => detail && copyReminder(detail)}
+          onReload={reloadSelectedDetail}
           onResolved={async (resolved) => {
             setDetail((current) => current ? { ...current, ...resolved } : current);
             await refreshAll();
@@ -477,6 +504,7 @@ function MexicoDetailDrawer({
   language,
   onClose,
   onCopy,
+  onReload,
   onResolved,
   setMessage,
 }: {
@@ -486,11 +514,68 @@ function MexicoDetailDrawer({
   language: "zh" | "es";
   onClose: () => void;
   onCopy: () => void;
+  onReload: () => Promise<void>;
   onResolved: (item: MexicoTrackingItem) => Promise<void>;
   setMessage: (message: string) => void;
 }) {
   const { t } = useLanguage();
   const [resolving, setResolving] = useState(false);
+  const [attachmentRun, setAttachmentRun] = useState<MexicoSyncRun | null>(null);
+  const [attachmentStarting, setAttachmentStarting] = useState(false);
+  const attachmentPollInFlight = useRef(false);
+
+  const attachmentStatusText = item?.attachment_status.complete
+    ? t("附件已完成", "Archivos completos")
+    : (item?.attachment_status.failed || 0) > 0
+      ? t("部分附件失败，可重试", "Algunos archivos fallaron; puede reintentar")
+      : (item?.attachment_status.downloading || 0) > 0
+        ? t("附件加载中", "Cargando archivos")
+        : (item?.attachment_status.queued || 0) > 0
+          ? t("附件已排队", "Archivos en cola")
+          : t("附件尚未加载", "Archivos aún no cargados");
+
+  async function startAttachments() {
+    if (!item) return;
+    setAttachmentStarting(true);
+    try {
+      const response = await api.syncMexicoTrackingAttachments(item.id);
+      setAttachmentRun(response.run);
+      await onReload();
+      setMessage(response.reused
+        ? t("已加入现有附件任务", "Se añadió a la tarea de archivos existente")
+        : t("本单附件已开始加载", "Se inició la carga de archivos de esta solicitud"));
+    } catch (reason) {
+      setMessage((reason as Error).message);
+    } finally {
+      setAttachmentStarting(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!attachmentRun || terminalSyncStates.has(attachmentRun.status)) return;
+    const timer = window.setInterval(async () => {
+      if (attachmentPollInFlight.current) return;
+      attachmentPollInFlight.current = true;
+      try {
+        const response = await api.mexicoTrackingSyncRun(attachmentRun.id);
+        setAttachmentRun(response.run);
+        if (terminalSyncStates.has(response.run.status)) {
+          await onReload();
+          setMessage(response.run.status === "completed"
+            ? t("本单附件状态已更新", "El estado de los archivos se actualizó")
+            : response.run.error_message || t("附件加载失败", "Falló la carga de archivos"));
+        }
+      } catch (reason) {
+        setMessage((reason as Error).message);
+      } finally {
+        attachmentPollInFlight.current = false;
+      }
+    }, 1200);
+    return () => {
+      window.clearInterval(timer);
+      attachmentPollInFlight.current = false;
+    };
+  }, [attachmentRun?.id, attachmentRun?.status, onReload, setMessage, t]);
 
   async function resolveRegion(region: "china" | "mexico") {
     if (!item) return;
@@ -514,7 +599,7 @@ function MexicoDetailDrawer({
         {item && (
           <div className="mexico-detail-content">
             <section className="mexico-detail-overview">
-              <div><span>{t("钉钉单号", "N.º DingTalk")}</span><strong>{item.approval_no}</strong></div><div><span>{t("状态", "Estado")}</span><strong>{workflowStatusLabel(item.workflow_status, language)}</strong></div><div><span>{t("当前节点", "Etapa actual")}</span><strong>{item.current_node_name || "—"}</strong></div><div><span>{t("当前审批人", "Aprobador actual")}</span><strong>{item.current_approver_name || "—"}</strong></div><div><span>{t("停留时长", "Tiempo en etapa")}</span><strong>{item.age_days} {t("天", "días")}</strong></div><div><span>{t("金额", "Importe")}</span><strong>{formatOriginalMoney(item.amount, item.currency, language)}</strong></div>
+              <div><span>{t("钉钉单号", "N.º DingTalk")}</span><strong>{item.approval_no}</strong></div><div><span>{t("状态", "Estado")}</span><strong>{workflowStatusLabel(item.workflow_status, language)}</strong></div><div><span>{t("当前节点", "Etapa actual")}</span><CurrentNodes item={item} /></div><div><span>{t("当前审批人", "Aprobador actual")}</span><CurrentApprovers item={item} /></div><div><span>{t("停留时长", "Tiempo en etapa")}</span><strong>{item.age_days} {t("天", "días")}</strong></div><div><span>{t("金额", "Importe")}</span><strong>{formatOriginalMoney(item.amount, item.currency, language)}</strong></div>
             </section>
             {item.reminder && <section className="mexico-reminder-box"><div><strong>{t("双语催办提醒", "Recordatorio bilingüe")}</strong><span>{t("复制后可直接发给流程负责人", "Listo para enviar al responsable")}</span></div><button onClick={onCopy}><ClipboardCopy size={16} />{t("复制双语提醒", "Copiar recordatorio bilingüe")}</button></section>}
             {canAdmin && item.region_review_status === "pending" && <section className="mexico-region-review"><AlertTriangle /><div><strong>{t("执行地区待核对", "Región por revisar")}</strong><p>{item.region_conflict_reason || t("来源信息存在冲突，请人工确认。", "La información de origen es inconsistente.")}</p></div><div><button disabled={resolving} onClick={() => resolveRegion("china")}>{t("归为中国", "Asignar a China")}</button><button className="primary" disabled={resolving} onClick={() => resolveRegion("mexico")}>{t("归为墨西哥", "Asignar a México")}</button></div></section>}
@@ -524,7 +609,7 @@ function MexicoDetailDrawer({
               {item.workflow_url && <a className="mexico-workflow-link" href={item.workflow_url} target="_blank" rel="noreferrer"><ExternalLink size={15} />{t("在钉钉中查看流程", "Ver flujo en DingTalk")}</a>}
             </section>
             <section className="mexico-timeline-section"><h3>{t("审批时间线", "Línea de aprobación")} <span>{item.events.length}</span></h3>{!item.events.length ? <div className="mexico-inline-empty">{t("尚未同步到流程节点", "Todavía no hay etapas sincronizadas")}</div> : <ol className="mexico-timeline">{item.events.map((event) => <li key={event.event_key || event.id} className={event.is_current ? "current" : ""}><i /><div className="mexico-timeline-card"><header><div><strong>{event.node_name || event.event_type || t("流程事件", "Evento")}</strong>{event.is_current && <span>{t("当前节点", "Actual")}</span>}</div><time>{compactDateTime(event.event_time, language)}</time></header><p className="mexico-event-operator"><UserRound size={14} />{event.operator_name || "—"}{event.result && ` · ${event.result}`}</p>{event.remark && <blockquote>{event.remark}</blockquote>}{((event.images?.length || 0) + (event.attachments?.length || 0)) > 0 && <small><Paperclip size={13} />{t("流程包含附件", "El evento contiene archivos")} {event.images?.length || 0} + {event.attachments?.length || 0}</small>}</div></li>)}</ol>}</section>
-            <section className="mexico-attachments-section"><h3>{t("流程附件", "Archivos del flujo")} <span>{item.attachments.length}</span></h3>{!item.attachments.length ? <div className="mexico-inline-empty">{t("暂无已同步附件", "No hay archivos sincronizados")}</div> : <div className="mexico-attachment-list">{item.attachments.map((attachment) => attachment.content_url ? <a key={attachment.id} href={attachment.content_url} target="_blank" rel="noreferrer"><FileText /><span><strong>{attachment.file_name}</strong><small>{attachment.mime_type || attachment.status}</small></span><ExternalLink /></a> : <div key={attachment.id} className="disabled"><FileText /><span><strong>{attachment.file_name}</strong><small>{attachment.last_error || attachment.status}</small></span></div>)}</div>}</section>
+            <section className="mexico-attachments-section"><header><h3>{t("流程附件", "Archivos del flujo")} <span>{item.attachments.length}</span></h3><div className="mexico-attachment-actions"><small>{attachmentStatusText}</small><button disabled={attachmentStarting} onClick={startAttachments}>{attachmentStarting ? <LoaderCircle className="spin" size={15} /> : <Paperclip size={15} />}{t("加载此单附件", "Cargar archivos de esta solicitud")}</button></div></header>{!item.attachments.length ? <div className="mexico-inline-empty">{t("暂无已同步附件", "No hay archivos sincronizados")}</div> : <div className="mexico-attachment-list">{item.attachments.map((attachment) => attachment.content_url ? <a key={attachment.id} href={attachment.content_url} target="_blank" rel="noreferrer"><FileText /><span><strong>{attachment.file_name}</strong><small>{attachment.mime_type || attachment.status}</small></span><ExternalLink /></a> : <div key={attachment.id} className="disabled"><FileText /><span><strong>{attachment.file_name}</strong><small>{attachment.last_error || attachment.status}</small></span></div>)}</div>}</section>
             {item.linked_requests.length > 0 && <section className="mexico-linked-section"><h3>{t("关联请款", "Solicitudes relacionadas")} <span>{item.linked_requests.length}</span></h3>{item.linked_requests.map((request) => <div key={request.id}><span>{request.batch_name}</span><strong>{request.summary || request.dingding_id}</strong><small>{formatOriginalMoney(request.amount, request.currency, language)}</small></div>)}</section>}
           </div>
         )}
