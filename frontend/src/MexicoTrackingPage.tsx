@@ -134,6 +134,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
   const requestSequence = useRef(0);
   const autoSyncStarted = useRef(false);
   const syncPollInFlight = useRef(false);
+  const lastRefreshedStateCommit = useRef<string | null>(null);
 
   const canAdmin = user.role === "admin";
 
@@ -190,6 +191,19 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
     await Promise.all([loadList(), loadOverview()]);
   }, [loadList, loadOverview]);
 
+  const reloadDetail = useCallback(async (id: number, closeOnError = false) => {
+    setDetailLoading(true);
+    try {
+      const response = await api.mexicoTrackingDetail(id);
+      setDetail(response.item);
+    } catch (reason) {
+      setMessage((reason as Error).message);
+      if (closeOnError) setSelectedId(null);
+    } finally {
+      setDetailLoading(false);
+    }
+  }, [setMessage]);
+
   useEffect(() => {
     loadList();
   }, [loadList]);
@@ -227,6 +241,16 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
       try {
         const response = await api.mexicoTrackingSyncRun(syncRun.id);
         setSyncRun(response.run);
+        const stateCommit = response.run.state_committed_at || null;
+        if (stateCommit && stateCommit !== lastRefreshedStateCommit.current) {
+          lastRefreshedStateCommit.current = stateCommit;
+          await refreshAll();
+          if (selectedId !== null) await reloadDetail(selectedId);
+          setMessage(t(
+            "审批状态已更新，附件正在后台处理",
+            "El estado ya está actualizado; los archivos continúan en segundo plano",
+          ));
+        }
         if (response.run.status === "completed") {
           await refreshAll();
           setMessage(t("墨西哥审批同步完成", "Sincronización de México completada"));
@@ -243,21 +267,12 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
       window.clearInterval(timer);
       syncPollInFlight.current = false;
     };
-  }, [syncRun?.id, syncRun?.status, refreshAll, setMessage, t]);
+  }, [syncRun?.id, syncRun?.status, refreshAll, reloadDetail, selectedId, setMessage, t]);
 
   async function openDetail(id: number) {
     setSelectedId(id);
     setDetail(null);
-    setDetailLoading(true);
-    try {
-      const response = await api.mexicoTrackingDetail(id);
-      setDetail(response.item);
-    } catch (reason) {
-      setMessage((reason as Error).message);
-      setSelectedId(null);
-    } finally {
-      setDetailLoading(false);
-    }
+    await reloadDetail(id, true);
   }
 
   function changeView(next: MexicoTrackingView) {
@@ -296,6 +311,9 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
 
   const activeFilterCount = Object.values(appliedFilters).filter(Boolean).length;
   const syncActive = Boolean(syncRun && !terminalSyncStates.has(syncRun.status));
+  const attachmentSyncActive = Boolean(
+    syncRun && ["querying_attachments", "syncing_attachments"].includes(syncRun.phase),
+  );
   const syncPercent = syncRun?.total_count
     ? Math.min(100, Math.round((syncRun.processed_count / syncRun.total_count) * 100))
     : syncRun?.attachment_total_count
@@ -322,7 +340,12 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
       {syncRun && (syncActive || syncRun.status === "failed") && (
         <div className={`mexico-sync-status ${syncRun.status}`} role="status">
           <div className="mexico-sync-status-head">
-            <span>{syncActive && <LoaderCircle className="spin" size={15} />}{mexicoSyncPhaseLabel(syncRun.phase, language)}</span>
+            <span>
+              {syncActive && <LoaderCircle className="spin" size={15} />}
+              {attachmentSyncActive
+                ? t("附件正在后台处理", "Los archivos se procesan en segundo plano")
+                : mexicoSyncPhaseLabel(syncRun.phase, language)}
+            </span>
             <strong>{syncRun.phase === "syncing_attachments"
               ? `${syncRun.attachment_processed_count}/${syncRun.attachment_total_count}`
               : `${syncRun.processed_count}/${syncRun.total_count}`}</strong>

@@ -35,6 +35,7 @@ from backend.app.mexico_tracking import (
     persist_request_region,
     resolve_region,
     upsert_mexico_attachment_candidates,
+    update_mexico_sync_run,
     update_mexico_tracking_settings,
     warning_level,
 )
@@ -1161,6 +1162,32 @@ def test_mexico_sync_run_reuses_active_task_and_recent_completion(isolated_db) -
         assert fresh_reused is True
         assert fresh["id"] == first["id"]
         assert fresh["fresh"] is True
+
+
+def test_mexico_sync_run_records_state_commit_before_completion(isolated_db) -> None:
+    with isolated_db.connect() as conn:
+        run, _ = acquire_or_reuse_mexico_sync_run(
+            conn,
+            actor_id=1,
+            trigger_type="manual",
+        )
+        committed = update_mexico_sync_run(
+            conn,
+            run["id"],
+            phase="querying_attachments",
+            processed_count=2,
+            total_count=2,
+            state_committed=True,
+        )
+        assert committed["status"] == "running"
+        assert committed["state_committed_at"]
+        same_marker = update_mexico_sync_run(
+            conn,
+            run["id"],
+            phase="syncing_attachments",
+            state_committed=True,
+        )
+        assert same_marker["state_committed_at"] == committed["state_committed_at"]
 
 
 def test_mexico_sync_run_takes_over_expired_lease(isolated_db) -> None:

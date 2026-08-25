@@ -176,6 +176,7 @@ def update_mexico_sync_run(
     attachment_processed_count: int = 0,
     attachment_total_count: int = 0,
     stage_timings: Optional[Dict[str, Any]] = None,
+    state_committed: bool = False,
     lease_seconds: int = 1800,
 ) -> Dict[str, Any]:
     timestamp = _now_iso()
@@ -185,6 +186,10 @@ def update_mexico_sync_run(
         SET status = 'running', phase = ?, processed_count = ?, total_count = ?,
             attachment_processed_count = ?, attachment_total_count = ?,
             stage_timings_json = COALESCE(?, stage_timings_json),
+            state_committed_at = CASE
+                WHEN ? THEN COALESCE(state_committed_at, ?)
+                ELSE state_committed_at
+            END,
             started_at = COALESCE(started_at, ?), heartbeat_at = ?,
             lease_until = ?, updated_at = ?
         WHERE id = ? AND status IN ('queued', 'running')
@@ -198,6 +203,8 @@ def update_mexico_sync_run(
             json.dumps(stage_timings, ensure_ascii=False, default=str)
             if stage_timings is not None
             else None,
+            int(bool(state_committed)),
+            timestamp,
             timestamp,
             timestamp,
             _lease_until(lease_seconds),
@@ -436,6 +443,7 @@ def ensure_mexico_tracking_schema(conn: sqlite3.Connection) -> None:
             lease_until TEXT,
             started_at TEXT,
             heartbeat_at TEXT,
+            state_committed_at TEXT,
             completed_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -458,6 +466,7 @@ def ensure_mexico_tracking_schema(conn: sqlite3.Connection) -> None:
 
     _ensure_column(conn, "payable_history_versions", "resolved_region", "TEXT")
     _ensure_column(conn, "payable_history_versions", "region_review_status", "TEXT")
+    _ensure_column(conn, "mexico_sync_runs", "state_committed_at", "TEXT")
 
     timestamp = _now_iso()
     for key, value in MEXICO_TRACKING_SETTING_DEFAULTS.items():

@@ -134,6 +134,7 @@ export type MexicoSyncRun = {
   total_count: number;
   attachment_processed_count: number;
   attachment_total_count: number;
+  state_committed_at?: string | null;
   error_message?: string | null;
   stage_timings?: Record<string, unknown>;
   result?: Record<string, unknown>;

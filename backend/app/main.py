@@ -6432,6 +6432,7 @@ def _run_mexico_tracking_sync(run_id: str, user: Dict[str, Any]) -> None:
                 processed_count=len(workflows),
                 total_count=len(workflow_approval_nos),
                 stage_timings=timings,
+                state_committed=True,
             )
 
         attachment_query_started = perf_counter()

@@ -46,6 +46,15 @@ test("tracking page is lightweight, filterable and task-aware", () => {
   assert.match(pageSource, /selectView\("review"\)/);
 });
 
+test("tracking refreshes once when approval state commits before attachments finish", () => {
+  assert.match(apiSource, /state_committed_at\?: string \| null/);
+  assert.match(pageSource, /lastRefreshedStateCommit/);
+  assert.match(pageSource, /response\.run\.state_committed_at/);
+  assert.match(pageSource, /await refreshAll\(\)/);
+  assert.match(pageSource, /审批状态已更新/);
+  assert.match(pageSource, /附件正在后台处理/);
+});
+
 test("Mexico tracking navigation and actions include Spanish translations", () => {
   assert.match(i18nSource, /"墨西哥审批跟进":\s*"Seguimiento de aprobaciones de México"/);
   assert.match(i18nSource, /"复制双语提醒":\s*"Copiar recordatorio bilingüe"/);
