@@ -3774,7 +3774,7 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
             "source_type": "purchase",
             "source_label": "采购支出",
             "source_id": str(index),
-            "approval_status": "RUNNING",
+            "approval_status": "RUNNING" if index == 1 else "TERMINATED",
             "approval_result": "agree",
             "beneficiary": "钉钉收款人",
         }
@@ -3835,7 +3835,10 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
 
         response = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
         assert response.status_code == 200
-        rows = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+        rows = client.get(
+            f"/api/batches/{batch['id']}/requests",
+            params={"dingtalk_lifecycle": "all"},
+        ).json()["requests"]
         by_id = {row["id"]: row for row in rows}
 
     blank_row = by_id[blank["id"]]

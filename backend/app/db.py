@@ -1230,7 +1230,7 @@ def refresh_payment_summaries(
         external_status = str((external_source or {}).get("approval_status") or "").strip().upper()
         manager_approval = str(request["general_manager_approval"] or "").strip() or None
         if external_status == "TERMINATED":
-            manager_approval = "无需审批"
+            manager_approval = manager_approval or "无需审批"
         else:
             if manager_approval == "无需审批":
                 manager_approval = None
