@@ -70,12 +70,12 @@ export function AppNavigation({ tab, canAdmin, onSelect }: AppNavigationProps) {
       let used = moreMeasureRef.current?.offsetWidth || 0;
       let count = 0;
       for (const width of widths) {
-        const next = used + (count > 0 ? gap : 0) + width;
-        if (count > 0 && next > available) break;
+        const next = used + gap + width;
+        if (next > available) break;
         used = next;
         count += 1;
       }
-      setVisibleCount(Math.max(1, Math.min(count, widths.length - 1)));
+      setVisibleCount(Math.min(count, widths.length - 1));
     };
 
     calculate();
