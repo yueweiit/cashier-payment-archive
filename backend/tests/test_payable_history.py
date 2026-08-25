@@ -29,21 +29,27 @@ def create_request(
     source_sheet: str = "每日应付测试公司",
     needed_payment_date: str | None = "2026-08-21",
     currency: str = "CNY",
+    execution_region: str | None = "China",
 ) -> dict:
     batch = client.post(
         "/api/batches",
         json={"name": f"每日应付-{uuid.uuid4().hex}", "start_date": "2026-08-21", "end_date": "2026-08-28"},
     ).json()["batch"]
+    payload = {
+        "source_sheet": source_sheet,
+        "summary": "历史状态测试",
+        "applicant": "测试申请人",
+        "amount": amount,
+        "currency": currency,
+        "needed_payment_date": needed_payment_date,
+    }
+    if execution_region is not None:
+        payload["raw_extra"] = {
+            "external_source": {"execution_region": execution_region}
+        }
     return client.post(
         f"/api/batches/{batch['id']}/requests",
-        json={
-            "source_sheet": source_sheet,
-            "summary": "历史状态测试",
-            "applicant": "测试申请人",
-            "amount": amount,
-            "currency": currency,
-            "needed_payment_date": needed_payment_date,
-        },
+        json=payload,
     ).json()["request"]
 
 
@@ -469,23 +475,28 @@ def test_daily_payables_can_exclude_mexico_and_region_review_history():
         login(client)
         selected = date.today()
         selected_iso = selected.isoformat()
+        china_sheet = f"中国地区-{uuid.uuid4().hex}"
+        mexico_sheet = f"墨西哥地区-{uuid.uuid4().hex}"
+        review_sheet = f"地区待核对-{uuid.uuid4().hex}"
         china = create_request(
             client,
             amount=100,
-            source_sheet="凌翔产品&开发",
+            source_sheet=china_sheet,
             needed_payment_date=selected_iso,
         )
         mexico = create_request(
             client,
             amount=200,
-            source_sheet="YW MOLDES MX模具",
+            source_sheet=mexico_sheet,
             needed_payment_date=selected_iso,
+            execution_region="Mexico",
         )
         review = create_request(
             client,
             amount=300,
-            source_sheet=f"地区待核对-{uuid.uuid4().hex}",
+            source_sheet=review_sheet,
             needed_payment_date=selected_iso,
+            execution_region=None,
         )
 
         with connect() as conn:
@@ -494,12 +505,14 @@ def test_daily_payables_can_exclude_mexico_and_region_review_history():
                 selected,
                 include_details=True,
                 china_only=False,
+                allowed_sheets={china_sheet, mexico_sheet, review_sheet},
             )
             china_only = daily_snapshot(
                 conn,
                 selected,
                 include_details=True,
                 china_only=True,
+                allowed_sheets={china_sheet, mexico_sheet, review_sheet},
             )
 
         assert all_regions["totals_cny"]["due_today"] == 600
