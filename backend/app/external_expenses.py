@@ -67,7 +67,7 @@ SOURCE_TABLES = {
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 FINANCE_STAGE_RE = re.compile(r"(财务|出纳|会计|付款|financ|cajer|tesorer|contab)", re.IGNORECASE)
 GENERAL_MANAGER_STAGE_RE = re.compile(
-    r"(?:\bCEO\b|总经理|gerente\s+general|direcci[oó]n\s+general)",
+    r"(?:(?<![A-Za-z])CEO(?![A-Za-z])|总经理|gerente\s+general|direcci[oó]n\s+general)",
     re.IGNORECASE,
 )
 PAID_PHRASE_RE = re.compile(r"(已支付|已经支付|已付款|已经付款|付款完成|支付完成|打款完成|款已付|款项已付)")

@@ -3853,7 +3853,7 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
 
 @pytest.mark.parametrize(
     "stage_name",
-    ["悦为智能 CEO 审批", "总经理审批", "Gerente General", "Dirección General"],
+    ["悦为智能CEO审批", "悦为智能 CEO 审批", "总经理审批", "Gerente General", "Dirección General"],
 )
 def test_general_manager_approval_uses_latest_explicit_manager_node(stage_name):
     result = general_manager_approval_from_workflow_events([
