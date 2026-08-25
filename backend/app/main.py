@@ -78,6 +78,7 @@ from .external_expenses import (
     fetch_external_expense_attachments,
     fetch_external_expense_metadata,
     fetch_external_expenses,
+    general_manager_approval_from_workflow_events,
     preview_external_expenses,
 )
 from .fx_rates import (
@@ -5798,13 +5799,49 @@ def _sync_external_expense_metadata_blocking(
                     "metadata_synced_at": timestamp,
                 }
             raw_extra["external_source"] = external_source
+            beneficiary = (
+                str(external_source.get("beneficiary") or "").strip()
+                if approval_no in matched
+                else ""
+            )
+            payee_name = (
+                row["payee_name"]
+                if str(row["payee_name"] or "").strip()
+                else beneficiary or None
+            )
+            payee_account = (
+                row["payee_account"]
+                if str(row["payee_account"] or "").strip()
+                else beneficiary or None
+            )
+            manager_approval = row["general_manager_approval"]
+            manager_approval_date = row["general_manager_approval_date"]
+            if not str(manager_approval or "").strip() and len(request_workflows) == 1:
+                derived_manager = general_manager_approval_from_workflow_events(
+                    request_workflows[0].get("events") or []
+                )
+                if derived_manager:
+                    manager_approval = derived_manager[0]
+                    manager_approval_date = manager_approval_date or derived_manager[1]
             conn.execute(
                 """
                 UPDATE payment_requests
-                SET raw_extra_json = ?, updated_by = ?, updated_at = ?, version = version + 1
+                SET raw_extra_json = ?, payee_name = ?, payee_account = ?,
+                    general_manager_approval = ?, general_manager_approval_date = ?,
+                    updated_by = ?, updated_at = ?, version = version + 1
                 WHERE id = ? AND batch_id = ?
                 """,
-                (json.dumps(raw_extra, ensure_ascii=False, default=str), user["id"], timestamp, request_id, batch_id),
+                (
+                    json.dumps(raw_extra, ensure_ascii=False, default=str),
+                    payee_name,
+                    payee_account,
+                    manager_approval,
+                    manager_approval_date,
+                    user["id"],
+                    timestamp,
+                    request_id,
+                    batch_id,
+                ),
             )
             persist_request_region(conn, request_id, actor_id=int(user["id"]))
             refresh_payment_summaries(conn, request_id)

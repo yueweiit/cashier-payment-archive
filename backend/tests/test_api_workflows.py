@@ -3766,6 +3766,91 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         assert unchanged["raw_extra"] == {"kept": True}
 
 
+def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_manual_values(monkeypatch):
+    approval_nos = ("SYNC-FILL-BLANK", "SYNC-KEEP-MANUAL")
+    metadata = [
+        {
+            "approval_no": approval_no,
+            "source_type": "purchase",
+            "source_label": "采购支出",
+            "source_id": str(index),
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "beneficiary": "钉钉收款人",
+        }
+        for index, approval_no in enumerate(approval_nos, start=1)
+    ]
+    workflows = [
+        {
+            "approval_no": approval_no,
+            "process_instance_id": f"process-{index}",
+            "status": "RUNNING",
+            "result": "agree",
+            "events": [
+                {
+                    "event_key": f"manager-{index}",
+                    "process_instance_id": f"process-{index}",
+                    "activity_id": "ceo-node",
+                    "event_type": "EXECUTE_TASK_NORMAL",
+                    "stage_name": "悦为智能 CEO 审批",
+                    "result": "AGREE",
+                    "operator_id": "ceo-user",
+                    "operator_name": "CEO",
+                    "event_time": "2026-08-24T16:20:00+08:00",
+                    "sequence_index": 3,
+                    "comment": None,
+                    "images": [],
+                    "attachments": [],
+                    "trusted_finance": False,
+                    "current": False,
+                }
+            ],
+            "current_tasks": [],
+        }
+        for index, approval_no in enumerate(approval_nos, start=1)
+    ]
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda values: metadata)
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda values: workflows)
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda values: [])
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "sync-fill-fields"}).json()["batch"]
+        blank = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={"dingding_id": approval_nos[0], "source_sheet": "悦为智能", "amount": 100},
+        ).json()["request"]
+        manual = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={
+                "dingding_id": approval_nos[1],
+                "source_sheet": "悦为智能",
+                "amount": 200,
+                "payee_name": "人工收款人",
+                "payee_account": "人工账号",
+                "general_manager_approval": "存在争议",
+                "general_manager_approval_date": "2026-08-20",
+            },
+        ).json()["request"]
+
+        response = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+        assert response.status_code == 200
+        rows = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+        by_id = {row["id"]: row for row in rows}
+
+    blank_row = by_id[blank["id"]]
+    assert blank_row["payee_name"] == "钉钉收款人"
+    assert blank_row["payee_account"] == "钉钉收款人"
+    assert blank_row["general_manager_approval"] == "同意付款"
+    assert blank_row["general_manager_approval_date"] == "2026-08-24"
+
+    manual_row = by_id[manual["id"]]
+    assert manual_row["payee_name"] == "人工收款人"
+    assert manual_row["payee_account"] == "人工账号"
+    assert manual_row["general_manager_approval"] == "存在争议"
+    assert manual_row["general_manager_approval_date"] == "2026-08-20"
+
+
 @pytest.mark.parametrize(
     "stage_name",
     ["悦为智能 CEO 审批", "总经理审批", "Gerente General", "Dirección General"],
