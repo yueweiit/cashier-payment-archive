@@ -234,7 +234,7 @@ def _snapshot_payload(
             currency_totals[currency]["paid_today"] += paid_today
             base_totals["paid_today"] += base_paid_today
 
-        if include_details and (due_date == selected_iso or pending > 0):
+        if include_details and (due_date == selected_iso or pending > 0 or paid_today != 0):
             details.append(
                 {
                     "logical_request_id": logical_id,

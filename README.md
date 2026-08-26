@@ -80,6 +80,8 @@ npm run dev
 - `payable_history_versions` 是只追加的业务历史表。请款、付款、币种和钉钉流程状态变更会在原业务事务中同步追加版本，不应手工修改或删除。
 - CNY、USD、MXN 原币金额分开显示，折合人民币仅作补充；业务人员的汇总和明细继续受 Sheet 权限限制。
 - 查询每日应付只读取本地 SQLite 历史，不触发钉钉、附件或外部 PostgreSQL 查询。
+- “导出数据”可按区间生成包含“每日汇总”和“逐日明细”的 Excel；默认最近 30 天，单次区间必须短于六个自然月。
+- 导出默认最多 25 万条明细、200MB 文件和 2 个并发任务；可分别通过 `PAYMENT_DAILY_EXPORT_MAX_ROWS`、`PAYMENT_DAILY_EXPORT_MAX_BYTES` 和 `PAYMENT_DAILY_EXPORT_MAX_CONCURRENT` 调整。
 - 中国工作台、每日应付和默认导出固定只包含已确认执行地区为中国的请款；执行地区优先于 Sheet 映射。
 - 墨西哥审批状态先于附件显示，支持全部当前待办人和单行附件优先加载。
 - 线上迁移或备份 SQLite 时应先停服务，或使用 SQLite Backup API 生成一致性副本；启用 WAL 后不要在服务运行时只复制 `app.db`。

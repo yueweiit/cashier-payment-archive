@@ -737,7 +737,11 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
       case "EXPORT_RANGE_TOO_LARGE":
         return t("日期区间最多为六个自然月", "El intervalo máximo es de seis meses naturales");
       case "EXPORT_TOO_LARGE":
-        return t("明细超过 Excel 单表上限，请缩短日期区间", "El detalle supera el límite de Excel; reduzca el intervalo");
+        return t("明细超过单次导出容量上限，请缩短日期区间", "El detalle supera el límite de una exportación; reduzca el intervalo");
+      case "EXPORT_BUSY":
+        return t("当前导出任务较多，请稍后重试", "Hay varias exportaciones en curso; inténtelo de nuevo más tarde");
+      case "INVALID_EXPORT_DATA":
+        return t("历史数据包含无效日期，请联系管理员处理", "Los datos históricos contienen una fecha no válida; contacte al administrador");
       default:
         return t("导出失败，请稍后重试", "No se pudo exportar. Inténtelo de nuevo más tarde");
     }

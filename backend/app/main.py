@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from time import perf_counter, sleep
 from typing import Any, Dict, Optional
 from urllib.parse import quote
@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from .attachment_io import save_embedded_image_attachments, save_embedded_payment_vouchers
@@ -56,7 +57,7 @@ from .daily_payables import (
     iter_daily_snapshots,
     validate_daily_export_range,
 )
-from .daily_payables_export import export_daily_payables_workbook
+from .daily_payables_export import MAX_CONCURRENT_EXPORTS, export_daily_payables_workbook
 from .excel_io import (
     CORE_FIELDS,
     EXPORT_FORMAT_VERSION,
@@ -160,6 +161,7 @@ _MEXICO_ATTACHMENT_EXECUTOR = ThreadPoolExecutor(
 )
 _MEXICO_ATTACHMENT_FUTURES: Dict[str, Any] = {}
 _MEXICO_ATTACHMENT_FUTURES_LOCK = Lock()
+_DAILY_PAYABLES_EXPORT_SLOTS = BoundedSemaphore(MAX_CONCURRENT_EXPORTS)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1267,11 +1269,17 @@ def export_daily_payables(
     start: date,
     end: date,
     user: Dict[str, Any] = Depends(current_user),
-) -> StreamingResponse:
+) -> FileResponse:
+    if not _DAILY_PAYABLES_EXPORT_SLOTS.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "EXPORT_BUSY", "message": "当前导出任务较多，请稍后重试"},
+        )
+    output_path: Optional[Path] = None
     try:
         with connect() as conn:
             validate_daily_export_range(conn, start, end)
-            content = export_daily_payables_workbook(
+            output_path = export_daily_payables_workbook(
                 iter_daily_snapshots(
                     conn,
                     start,
@@ -1282,12 +1290,30 @@ def export_daily_payables(
                 )
             )
     except DailyPayablesError as exc:
+        if output_path:
+            output_path.unlink(missing_ok=True)
+        _DAILY_PAYABLES_EXPORT_SLOTS.release()
         raise daily_payables_http_error(exc) from exc
+    except Exception:
+        if output_path:
+            output_path.unlink(missing_ok=True)
+        _DAILY_PAYABLES_EXPORT_SLOTS.release()
+        raise
+
+    assert output_path is not None
+
+    def cleanup_export() -> None:
+        try:
+            output_path.unlink(missing_ok=True)
+        finally:
+            _DAILY_PAYABLES_EXPORT_SLOTS.release()
+
     filename = f"每日应付_{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}.xlsx"
-    return StreamingResponse(
-        iter([content]),
+    return FileResponse(
+        output_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+        background=BackgroundTask(cleanup_export),
     )
 
 

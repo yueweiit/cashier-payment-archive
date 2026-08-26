@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import io
+import os
+import tempfile
 from datetime import date
+from pathlib import Path
 from typing import Any, Iterable
 
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -16,6 +19,25 @@ SUMMARY_SHEET = "每日汇总"
 DETAIL_SHEET = "逐日明细"
 SUPPORTED_CURRENCIES = ("CNY", "USD", "MXN")
 EXCEL_MAX_ROWS = 1_048_576
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+MAX_EXPORT_DETAIL_ROWS = min(
+    _positive_env_int("PAYMENT_DAILY_EXPORT_MAX_ROWS", 250_000),
+    EXCEL_MAX_ROWS - 1,
+)
+MAX_EXPORT_FILE_BYTES = _positive_env_int(
+    "PAYMENT_DAILY_EXPORT_MAX_BYTES",
+    200 * 1024 * 1024,
+)
+MAX_CONCURRENT_EXPORTS = _positive_env_int("PAYMENT_DAILY_EXPORT_MAX_CONCURRENT", 2)
 
 SUMMARY_HEADERS = [
     "统计日期",
@@ -76,6 +98,10 @@ def _data_cells(
 ) -> list[WriteOnlyCell]:
     cells: list[WriteOnlyCell] = []
     for column, value in enumerate(values, start=1):
+        if isinstance(value, str):
+            value = ILLEGAL_CHARACTERS_RE.sub("", value)
+            if value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")):
+                value = f"'{value}"
         cell = WriteOnlyCell(worksheet, value=value)
         cell.alignment = Alignment(vertical="top", wrap_text=True)
         if column in date_columns and value is not None:
@@ -109,7 +135,15 @@ def _discard_write_only_workbook(workbook: Workbook) -> None:
 
 def _date_value(value: Any) -> date | None:
     raw = str(value or "").strip()[:10]
-    return date.fromisoformat(raw) if raw else None
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as exc:
+        raise DailyPayablesError(
+            "INVALID_EXPORT_DATA",
+            f"每日应付历史包含无效日期：{raw}",
+        ) from exc
 
 
 def _currency_totals(snapshot: dict[str, Any], currency: str) -> dict[str, float]:
@@ -120,6 +154,8 @@ def _currency_totals(snapshot: dict[str, Any], currency: str) -> dict[str, float
 
 
 def _detail_status(item: dict[str, Any]) -> str:
+    if float(item.get("paid_today") or 0) > 0 and float(item.get("pending_amount") or 0) <= 0:
+        return "当日付清"
     if item.get("is_due_today"):
         return "当日到期"
     if item.get("is_overdue"):
@@ -127,23 +163,27 @@ def _detail_status(item: dict[str, Any]) -> str:
     return "待付"
 
 
-def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> bytes:
-    workbook = Workbook(write_only=True)
-    summary = workbook.create_sheet(SUMMARY_SHEET)
-    detail = workbook.create_sheet(DETAIL_SHEET)
-    summary.freeze_panes = "A2"
-    detail.freeze_panes = "A2"
-    summary.sheet_view.showGridLines = False
-    detail.sheet_view.showGridLines = False
-    _set_column_widths(summary, [13, 13, 13, 13] + [19] * (len(SUMMARY_HEADERS) - 4))
-    _set_column_widths(detail, [13, 12, 14, 24, 24, 18, 42, 15] + [15] * 9 + [18, 18])
-    detail.column_dimensions["C"].hidden = True
-    summary.append(_header_cells(summary, SUMMARY_HEADERS))
-    detail.append(_header_cells(detail, DETAIL_HEADERS))
-
-    summary_rows = 1
-    detail_rows = 1
+def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(prefix="daily-payables-", suffix=".xlsx")
+    os.close(descriptor)
+    output_path = Path(raw_path)
+    workbook: Workbook | None = None
     try:
+        workbook = Workbook(write_only=True)
+        summary = workbook.create_sheet(SUMMARY_SHEET)
+        detail = workbook.create_sheet(DETAIL_SHEET)
+        summary.freeze_panes = "A2"
+        detail.freeze_panes = "A2"
+        summary.sheet_view.showGridLines = False
+        detail.sheet_view.showGridLines = False
+        _set_column_widths(summary, [13, 13, 13, 13] + [19] * (len(SUMMARY_HEADERS) - 4))
+        _set_column_widths(detail, [13, 12, 14, 24, 24, 18, 42, 15] + [15] * 9 + [18, 18])
+        detail.column_dimensions["C"].hidden = True
+        summary.append(_header_cells(summary, SUMMARY_HEADERS))
+        detail.append(_header_cells(detail, DETAIL_HEADERS))
+
+        summary_rows = 1
+        detail_rows = 1
         for snapshot in snapshots:
             selected = _date_value(snapshot.get("date"))
             totals = snapshot["totals_cny"]
@@ -174,10 +214,10 @@ def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> bytes
             summary_rows += 1
 
             for item in snapshot.get("items", []):
-                if detail_rows >= EXCEL_MAX_ROWS:
+                if detail_rows >= min(EXCEL_MAX_ROWS, MAX_EXPORT_DETAIL_ROWS + 1):
                     raise DailyPayablesError(
                         "EXPORT_TOO_LARGE",
-                        "导出明细超过 Excel 单表上限，请缩短日期区间",
+                        "导出明细超过单次容量上限，请缩短日期区间",
                     )
                 detail_values = [
                     selected,
@@ -209,12 +249,17 @@ def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> bytes
                     )
                 )
                 detail_rows += 1
+        summary.auto_filter.ref = f"A1:{get_column_letter(len(SUMMARY_HEADERS))}{summary_rows}"
+        detail.auto_filter.ref = f"A1:{get_column_letter(len(DETAIL_HEADERS))}{detail_rows}"
+        workbook.save(output_path)
+        if output_path.stat().st_size > MAX_EXPORT_FILE_BYTES:
+            raise DailyPayablesError(
+                "EXPORT_TOO_LARGE",
+                "导出文件超过服务器容量上限，请缩短日期区间",
+            )
+        return output_path
     except Exception:
-        _discard_write_only_workbook(workbook)
+        if workbook is not None:
+            _discard_write_only_workbook(workbook)
+        output_path.unlink(missing_ok=True)
         raise
-
-    summary.auto_filter.ref = f"A1:{get_column_letter(len(SUMMARY_HEADERS))}{summary_rows}"
-    detail.auto_filter.ref = f"A1:{get_column_letter(len(DETAIL_HEADERS))}{detail_rows}"
-    output = io.BytesIO()
-    workbook.save(output)
-    return output.getvalue()
