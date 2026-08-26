@@ -860,9 +860,11 @@ def test_daily_payables_export_cleans_files_and_slots_when_response_send_fails(m
     else:
         raise AssertionError("The simulated send failure must propagate")
 
-    response.cleanup()
     assert not output_path.exists()
     assert slots.acquired is True
+    assert slots.release_count == 1
+
+    response.cleanup()
     assert slots.release_count == 1
 
 
