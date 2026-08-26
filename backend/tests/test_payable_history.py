@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import gc
+import io
 import json
 import sys
 import uuid
+from calendar import monthrange
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 
+from backend.app import daily_payables_export
 from backend.app.db import connect, get_daily_payables_history_start_date, now_iso
 from backend.app.main import app
 from backend.app.daily_payables import daily_snapshot, daily_trend
@@ -20,6 +26,34 @@ from backend.app.security import hash_password
 def login(client: TestClient) -> None:
     response = client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
     assert response.status_code == 200
+
+
+def login_business_for_sheets(client: TestClient, *sheet_names: str) -> str:
+    username = f"daily-business-{uuid.uuid4().hex}"
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO users (username, password_hash, role, display_name, active, created_at)
+            VALUES (?, ?, 'business', ?, 1, ?)
+            """,
+            (username, hash_password("daily123"), username, now_iso()),
+        )
+        user_id = int(cursor.lastrowid)
+        for sheet_name in sheet_names:
+            conn.execute(
+                """
+                INSERT INTO user_sheet_permissions (user_id, sheet_name, created_by, created_at)
+                VALUES (?, ?, 1, ?)
+                """,
+                (user_id, sheet_name, now_iso()),
+            )
+    client.post("/api/auth/logout")
+    response = client.post(
+        "/api/auth/login",
+        json={"username": username, "password": "daily123"},
+    )
+    assert response.status_code == 200
+    return username
 
 
 def create_request(
@@ -55,6 +89,13 @@ def create_request(
         f"/api/batches/{batch['id']}/requests",
         json=payload,
     ).json()["request"]
+
+
+def shift_calendar_months(value: date, months: int) -> date:
+    month_index = value.year * 12 + value.month - 1 + months
+    year, month_zero = divmod(month_index, 12)
+    month = month_zero + 1
+    return value.replace(year=year, month=month, day=min(value.day, monthrange(year, month)[1]))
 
 
 def test_record_request_state_is_idempotent_and_keeps_full_state():
@@ -316,6 +357,329 @@ def test_daily_payables_deduplicates_reimports_by_dingtalk_business_id():
         assert snapshot["counts"]["end_pending"] == 1
         assert trend["points"][0]["totals_cny"]["end_pending"] == 290
         assert trend["points"][0]["counts"]["end_pending"] == 1
+
+
+def test_daily_payables_export_generates_summary_and_detail_workbook():
+    with TestClient(app) as client:
+        login(client)
+        selected = date.today()
+        selected_iso = selected.isoformat()
+        source_sheet = f"每日应付导出-{uuid.uuid4().hex}"
+        request = create_request(
+            client,
+            amount=290,
+            source_sheet=source_sheet,
+            needed_payment_date=selected_iso,
+            dingding_id=f"daily-export-{uuid.uuid4().hex}",
+            summary="中转站290",
+        )
+        login_business_for_sheets(client, source_sheet)
+
+        response = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": selected_iso, "end": selected_iso},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"].startswith(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        assert f"每日应付_{selected.strftime('%Y%m%d')}-{selected.strftime('%Y%m%d')}.xlsx" in unquote(
+            response.headers["content-disposition"]
+        )
+        workbook = load_workbook(io.BytesIO(response.content), data_only=True)
+        assert workbook.sheetnames == ["每日汇总", "逐日明细"]
+
+        summary = workbook["每日汇总"]
+        summary_headers = [cell.value for cell in summary[1]]
+        assert summary_headers[:8] == [
+            "统计日期",
+            "当日到期数量",
+            "日终未付数量",
+            "逾期数量",
+            "当天新增到期（折合人民币）",
+            "当日支付（折合人民币）",
+            "日终待付（折合人民币）",
+            "逾期待付（折合人民币）",
+        ]
+        assert summary.cell(2, 1).value.strftime("%Y-%m-%d") == selected_iso
+        assert [summary.cell(2, column).value for column in range(2, 9)] == [1, 1, 0, 290, 0, 290, 0]
+        cny_pending_column = summary_headers.index("CNY 日终待付") + 1
+        assert summary.cell(2, cny_pending_column).value == 290
+
+        detail = workbook["逐日明细"]
+        detail_headers = [cell.value for cell in detail[1]]
+        assert detail_headers == [
+            "统计日期",
+            "状态",
+            "请款标识",
+            "钉钉申请单号",
+            "应付款公司（来源 Sheet）",
+            "申请人",
+            "摘要",
+            "需求付款日期",
+            "应付金额",
+            "累计已付",
+            "当日支付",
+            "日终待付",
+            "币种",
+            "折合人民币应付金额",
+            "折合人民币累计已付",
+            "折合人民币当日支付",
+            "折合人民币日终待付",
+            "审批状态",
+            "审批结果",
+        ]
+        detail_row = [cell.value for cell in detail[2]]
+        assert detail_row[0].strftime("%Y-%m-%d") == selected_iso
+        assert detail_row[1] == "当日到期"
+        assert detail_row[2] == request["logical_request_id"]
+        assert detail_row[4] == source_sheet
+        assert detail_row[6] == "中转站290"
+        assert detail_row[8:13] == [290, 0, 0, 290, "CNY"]
+
+
+def test_daily_payables_export_validates_historical_six_month_range():
+    with TestClient(app) as client:
+        login(client)
+        today = date.today()
+        start = shift_calendar_months(today, -6)
+        valid_end = today - timedelta(days=1)
+        with connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES ('daily_payables_history_start_date', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (start.isoformat(), now_iso()),
+            )
+
+        valid = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": start.isoformat(), "end": valid_end.isoformat()},
+        )
+        assert valid.status_code == 200, valid.text
+
+        too_large = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": start.isoformat(), "end": today.isoformat()},
+        )
+        assert too_large.status_code == 422
+        assert too_large.json()["detail"]["code"] == "EXPORT_RANGE_TOO_LARGE"
+
+        future = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": today.isoformat(), "end": (today + timedelta(days=1)).isoformat()},
+        )
+        assert future.status_code == 422
+        assert future.json()["detail"]["code"] == "FUTURE_EXPORT_DATE"
+
+        inverted = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": today.isoformat(), "end": valid_end.isoformat()},
+        )
+        assert inverted.status_code == 422
+        assert inverted.json()["detail"]["code"] == "INVALID_EXPORT_RANGE"
+
+        before_history = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": (start - timedelta(days=1)).isoformat(), "end": start.isoformat()},
+        )
+        assert before_history.status_code == 422
+        assert before_history.json()["detail"]["code"] == "HISTORY_NOT_AVAILABLE"
+
+
+def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_excel():
+    with TestClient(app) as client:
+        login(client)
+        second_day = date.today()
+        first_day = second_day - timedelta(days=1)
+        source_sheet = f"每日应付区间导出-{uuid.uuid4().hex}"
+        dingding_id = f"daily-range-{uuid.uuid4().hex}"
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE app_settings SET value = ?, updated_at = ?
+                WHERE key = 'daily_payables_history_start_date'
+                """,
+                (first_day.isoformat(), now_iso()),
+            )
+        older = create_request(
+            client,
+            amount=100,
+            source_sheet=source_sheet,
+            needed_payment_date=first_day.isoformat(),
+            dingding_id=dingding_id,
+            summary="区间去重测试",
+        )
+        newer = create_request(
+            client,
+            amount=100,
+            source_sheet=source_sheet,
+            needed_payment_date=first_day.isoformat(),
+            dingding_id=dingding_id,
+            summary="区间去重测试",
+        )
+
+        with connect() as conn:
+            conn.execute(
+                "UPDATE payable_history_versions SET effective_at = ? WHERE logical_request_id = ?",
+                (f"{first_day.isoformat()}T08:00:00.000000", older["logical_request_id"]),
+            )
+            conn.execute(
+                "UPDATE payable_history_versions SET effective_at = ? WHERE logical_request_id = ?",
+                (f"{first_day.isoformat()}T09:00:00.000000", newer["logical_request_id"]),
+            )
+            conn.execute(
+                "UPDATE payment_requests SET paid_amount = 40, pending_amount = 60 WHERE id = ?",
+                (newer["id"],),
+            )
+            record_request_state(
+                conn,
+                newer["id"],
+                event_type="payment.create",
+                event_key=f"test:{uuid.uuid4().hex}",
+                effective_at=f"{second_day.isoformat()}T10:00:00.000000",
+                actor_id=1,
+            )
+        login_business_for_sheets(client, source_sheet)
+
+        response = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": first_day.isoformat(), "end": second_day.isoformat()},
+        )
+        assert response.status_code == 200, response.text
+        workbook = load_workbook(io.BytesIO(response.content), data_only=True)
+        summary = workbook["每日汇总"]
+        detail = workbook["逐日明细"]
+
+        assert summary.max_row == 3
+        assert summary.cell(2, 7).value == 100
+        assert summary.cell(3, 6).value == 40
+        assert summary.cell(3, 7).value == 60
+        assert summary.cell(3, 8).value == 60
+        assert summary.cell(2, 5).number_format == "#,##0.00"
+        assert summary.freeze_panes == "A2"
+        assert summary.auto_filter.ref == f"A1:T{summary.max_row}"
+
+        assert detail.max_row == 3
+        first_detail = [cell.value for cell in detail[2]]
+        second_detail = [cell.value for cell in detail[3]]
+        assert first_detail[1] == "当日到期"
+        assert first_detail[2] == newer["logical_request_id"]
+        assert second_detail[1] == "逾期待付"
+        assert second_detail[2] == newer["logical_request_id"]
+        assert second_detail[9:12] == [40, 40, 60]
+        assert second_detail[14:17] == [40, 40, 60]
+        assert detail.cell(2, 9).number_format == "#,##0.00"
+        assert detail.freeze_panes == "A2"
+        assert detail.auto_filter.ref == f"A1:S{detail.max_row}"
+
+
+def test_daily_payables_export_respects_sheet_permissions_and_china_region():
+    with TestClient(app) as client:
+        login(client)
+        selected = date.today()
+        selected_iso = selected.isoformat()
+        visible_sheet = f"每日导出授权-{uuid.uuid4().hex}"
+        hidden_sheet = f"每日导出无权-{uuid.uuid4().hex}"
+        mexico_sheet = f"每日导出墨西哥-{uuid.uuid4().hex}"
+        visible = create_request(
+            client,
+            amount=100,
+            source_sheet=visible_sheet,
+            needed_payment_date=selected_iso,
+            summary="可导出记录",
+        )
+        create_request(
+            client,
+            amount=200,
+            source_sheet=hidden_sheet,
+            needed_payment_date=selected_iso,
+            summary="无权记录",
+        )
+        create_request(
+            client,
+            amount=300,
+            source_sheet=mexico_sheet,
+            needed_payment_date=selected_iso,
+            execution_region="Mexico",
+            summary="墨西哥记录",
+        )
+        username = f"daily-export-{uuid.uuid4().hex}"
+        with connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (username, password_hash, role, display_name, active, created_at)
+                VALUES (?, ?, 'business', ?, 1, ?)
+                """,
+                (username, hash_password("daily123"), username, now_iso()),
+            )
+            user_id = int(cursor.lastrowid)
+            for sheet_name in (visible_sheet, mexico_sheet):
+                conn.execute(
+                    """
+                    INSERT INTO user_sheet_permissions (user_id, sheet_name, created_by, created_at)
+                    VALUES (?, ?, 1, ?)
+                    """,
+                    (user_id, sheet_name, now_iso()),
+                )
+
+        client.post("/api/auth/logout")
+        login_response = client.post(
+            "/api/auth/login",
+            json={"username": username, "password": "daily123"},
+        )
+        assert login_response.status_code == 200
+        response = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": selected_iso, "end": selected_iso},
+        )
+        assert response.status_code == 200, response.text
+        workbook = load_workbook(io.BytesIO(response.content), data_only=True)
+        summary = workbook["每日汇总"]
+        detail = workbook["逐日明细"]
+        assert summary.cell(2, 7).value == 100
+        assert detail.max_row == 2
+        assert detail.cell(2, 3).value == visible["logical_request_id"]
+        assert detail.cell(2, 7).value == "可导出记录"
+
+
+def test_daily_payables_export_rejects_excel_detail_overflow(monkeypatch):
+    with TestClient(app) as client:
+        login(client)
+        selected = date.today()
+        selected_iso = selected.isoformat()
+        source_sheet = f"每日导出上限-{uuid.uuid4().hex}"
+        create_request(
+            client,
+            amount=100,
+            source_sheet=source_sheet,
+            needed_payment_date=selected_iso,
+        )
+        create_request(
+            client,
+            amount=200,
+            source_sheet=source_sheet,
+            needed_payment_date=selected_iso,
+        )
+        login_business_for_sheets(client, source_sheet)
+        monkeypatch.setattr(daily_payables_export, "EXCEL_MAX_ROWS", 2)
+        unraisable: list[BaseException] = []
+        monkeypatch.setattr(sys, "unraisablehook", lambda args: unraisable.append(args.exc_value))
+
+        response = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": selected_iso, "end": selected_iso},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "EXPORT_TOO_LARGE"
+        gc.collect()
+        assert unraisable == []
 
 
 def test_daily_trend_does_not_apply_future_dingtalk_identity_to_past():

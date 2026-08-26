@@ -860,6 +860,37 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
+async function downloadBlob(url: string, fallbackFilename: string): Promise<{ blob: Blob; filename: string }> {
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    let data: Record<string, unknown> = {};
+    try {
+      data = await response.json();
+    } catch {
+      // Keep the standard fallback when a proxy returns a non-JSON error page.
+    }
+    const detail = data?.detail;
+    const payload: ApiErrorPayload =
+      detail && typeof detail === "object"
+        ? detail as ApiErrorPayload
+        : { message: typeof detail === "string" ? detail : "请求失败" };
+    throw new ApiError(response.status, payload, "请求失败");
+  }
+
+  const disposition = response.headers.get("content-disposition") || "";
+  const encodedFilename = disposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  const plainFilename = disposition.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1];
+  let filename = plainFilename || fallbackFilename;
+  if (encodedFilename) {
+    try {
+      filename = decodeURIComponent(encodedFilename);
+    } catch {
+      filename = fallbackFilename;
+    }
+  }
+  return { blob: await response.blob(), filename };
+}
+
 export const api = {
   login: (username: string, password: string) =>
     request<{ user: User }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
@@ -877,6 +908,11 @@ export const api = {
   dailyPayablesTrend: (start: string, end: string) => {
     const query = new URLSearchParams({ start, end });
     return request<DailyPayableTrend>(`/api/daily-payables/trend?${query}`);
+  },
+  dailyPayablesExport: async (start: string, end: string) => {
+    const query = new URLSearchParams({ start, end });
+    const fallbackFilename = `每日应付_${start.replaceAll("-", "")}-${end.replaceAll("-", "")}.xlsx`;
+    return downloadBlob(`/api/daily-payables/export.xlsx?${query}`, fallbackFilename);
   },
   batches: () => request<{ batches: Batch[] }>("/api/batches"),
   createBatch: (payload: Partial<Batch>) => request<{ batch: Batch }>("/api/batches", { method: "POST", body: JSON.stringify(payload) }),

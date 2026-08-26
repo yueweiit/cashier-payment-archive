@@ -74,6 +74,7 @@ import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
 import { buildDirtyGridPayload, sameSheetOrder } from "./gridSave";
 import { AppNavigation, type AppTab } from "./AppNavigation";
 import { MexicoTrackingPage } from "./MexicoTrackingPage";
+import { defaultDailyPayablesExportRange, validateDailyPayablesExportRange } from "./dailyPayablesExport";
 
 type Tab = AppTab;
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
@@ -672,6 +673,11 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
   const [detailCurrency, setDetailCurrency] = useState<"" | CurrencyCode>("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportStart, setExportStart] = useState("");
+  const [exportEnd, setExportEnd] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
 
   function selectQueryDate(value: string) {
     setSelectedDate(value);
@@ -714,8 +720,63 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
   }), [trend, trendCurrency]);
 
   const historyStart = snapshot?.history_start_date || trend?.history_start_date || selectedDate;
+  const today = localIsoDate(new Date());
   const currencyCards: CurrencyCode[] = ["CNY", "USD", "MXN"];
   const dateLocale = language === "es" ? "es-MX" : "zh-CN";
+
+  function exportErrorMessage(code: string) {
+    switch (code) {
+      case "EXPORT_DATE_REQUIRED":
+        return t("请选择开始和结束日期", "Seleccione las fechas de inicio y fin");
+      case "HISTORY_NOT_AVAILABLE":
+        return t(`开始日期不得早于 ${historyStart}`, `La fecha inicial no puede ser anterior a ${historyStart}`);
+      case "INVALID_EXPORT_RANGE":
+        return t("开始日期不得晚于结束日期", "La fecha inicial no puede ser posterior a la fecha final");
+      case "FUTURE_EXPORT_DATE":
+        return t("结束日期不得晚于今天", "La fecha final no puede ser posterior a hoy");
+      case "EXPORT_RANGE_TOO_LARGE":
+        return t("日期区间最多为六个自然月", "El intervalo máximo es de seis meses naturales");
+      case "EXPORT_TOO_LARGE":
+        return t("明细超过 Excel 单表上限，请缩短日期区间", "El detalle supera el límite de Excel; reduzca el intervalo");
+      default:
+        return t("导出失败，请稍后重试", "No se pudo exportar. Inténtelo de nuevo más tarde");
+    }
+  }
+
+  function openExportDialog() {
+    const range = defaultDailyPayablesExportRange(selectedDate, historyStart, today);
+    setExportStart(range.start);
+    setExportEnd(range.end);
+    setExportError("");
+    setExportOpen(true);
+  }
+
+  async function exportDailyPayables() {
+    const validationError = validateDailyPayablesExportRange(exportStart, exportEnd, historyStart, today);
+    if (validationError) {
+      setExportError(exportErrorMessage(validationError));
+      return;
+    }
+    setExporting(true);
+    setExportError("");
+    try {
+      const result = await api.dailyPayablesExport(exportStart, exportEnd);
+      const url = URL.createObjectURL(result.blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = result.filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      setExportOpen(false);
+    } catch (err) {
+      const code = isApiError(err) ? err.code : undefined;
+      setExportError(code ? exportErrorMessage(code) : (err as Error).message || exportErrorMessage(""));
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <section className="daily-payables-page">
@@ -724,10 +785,16 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
           <strong>{t("查看日期", "Fecha de consulta")}</strong>
           <span>{t("按当天结束时的状态计算，不受以后付款影响", "Calculado al cierre del día, sin alterarse por pagos posteriores")}</span>
         </div>
-        <label>
-          <span>{t("选择日期", "Seleccionar fecha")}</span>
-          <input type="date" min={historyStart} value={selectedDate} onChange={(event) => selectQueryDate(event.target.value)} />
-        </label>
+        <div className="daily-payables-toolbar-actions">
+          <label>
+            <span>{t("选择日期", "Seleccionar fecha")}</span>
+            <input type="date" min={historyStart} max={today} value={selectedDate} onChange={(event) => selectQueryDate(event.target.value)} />
+          </label>
+          <button className="ghost-button daily-export-button" type="button" onClick={openExportDialog} disabled={!snapshot}>
+            <Download size={17} />
+            {t("导出数据", "Exportar datos")}
+          </button>
+        </div>
       </div>
 
       <div className="daily-history-note">
@@ -829,6 +896,48 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
           <div className="daily-empty">{t("当天没有应付或逾期待付记录", "No hay pagos con vencimiento ni pendientes vencidos para este día")}</div>
         )}
       </div>
+
+      {exportOpen && (
+        <Modal
+          title={t("导出每日应付", "Exportar pagos diarios")}
+          className="daily-export-modal"
+          onClose={() => { if (!exporting) setExportOpen(false); }}
+        >
+          <div className="daily-export-form">
+            <label>
+              <span>{t("开始日期", "Fecha inicial")}</span>
+              <input
+                type="date"
+                min={historyStart}
+                max={today}
+                value={exportStart}
+                onChange={(event) => { setExportStart(event.target.value); setExportError(""); }}
+                disabled={exporting}
+              />
+            </label>
+            <label>
+              <span>{t("结束日期", "Fecha final")}</span>
+              <input
+                type="date"
+                min={historyStart}
+                max={today}
+                value={exportEnd}
+                onChange={(event) => { setExportEnd(event.target.value); setExportError(""); }}
+                disabled={exporting}
+              />
+            </label>
+            <p className="daily-export-hint">{t("默认最近 30 天，最多选择六个自然月", "De forma predeterminada se seleccionan los últimos 30 días; el máximo es de seis meses naturales")}</p>
+            {exportError && <div className="daily-export-error" role="alert">{exportError}</div>}
+            <div className="daily-export-actions">
+              <button className="ghost-button" type="button" onClick={() => setExportOpen(false)} disabled={exporting}>{t("取消", "Cancelar")}</button>
+              <button className="primary-button" type="button" onClick={exportDailyPayables} disabled={exporting}>
+                <Download size={17} />
+                {exporting ? t("生成中", "Generando") : t("导出 Excel", "Exportar Excel")}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </section>
   );
 }

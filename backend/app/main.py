@@ -49,7 +49,14 @@ from .db import (
     rows_to_dicts,
     write_audit,
 )
-from .daily_payables import DailyPayablesError, daily_snapshot, daily_trend
+from .daily_payables import (
+    DailyPayablesError,
+    daily_snapshot,
+    daily_trend,
+    iter_daily_snapshots,
+    validate_daily_export_range,
+)
+from .daily_payables_export import export_daily_payables_workbook
 from .excel_io import (
     CORE_FIELDS,
     EXPORT_FORMAT_VERSION,
@@ -1253,6 +1260,35 @@ def get_daily_payables_trend(
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
+
+
+@app.get("/api/daily-payables/export.xlsx")
+def export_daily_payables(
+    start: date,
+    end: date,
+    user: Dict[str, Any] = Depends(current_user),
+) -> StreamingResponse:
+    try:
+        with connect() as conn:
+            validate_daily_export_range(conn, start, end)
+            content = export_daily_payables_workbook(
+                iter_daily_snapshots(
+                    conn,
+                    start,
+                    end,
+                    allowed_sheets=daily_payables_allowed_sheets(conn, user),
+                    include_details=True,
+                    china_only=True,
+                )
+            )
+    except DailyPayablesError as exc:
+        raise daily_payables_http_error(exc) from exc
+    filename = f"每日应付_{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}.xlsx"
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
 
 
 @app.get("/api/batches")

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import sqlite3
+from calendar import monthrange
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 from .db import get_daily_payables_history_start_date
 from .sheet_names import canonical_sheet_name
 
 
 MAX_TREND_DAYS = 93
+MAX_EXPORT_MONTHS = 6
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class DailyPayablesError(ValueError):
@@ -36,6 +40,28 @@ def _validate_date(conn: sqlite3.Connection, selected: date) -> date:
         raise DailyPayablesError(
             "HISTORY_NOT_AVAILABLE",
             f"每日应付历史从 {history_start.isoformat()} 开始记录",
+        )
+    return history_start
+
+
+def _shift_calendar_months(value: date, months: int) -> date:
+    month_index = value.year * 12 + value.month - 1 + months
+    year, month_zero = divmod(month_index, 12)
+    month = month_zero + 1
+    return value.replace(year=year, month=month, day=min(value.day, monthrange(year, month)[1]))
+
+
+def validate_daily_export_range(conn: sqlite3.Connection, start: date, end: date) -> date:
+    history_start = _validate_date(conn, start)
+    if end < start:
+        raise DailyPayablesError("INVALID_EXPORT_RANGE", "结束日期不能早于开始日期")
+    today = datetime.now(SHANGHAI_TZ).date()
+    if end > today:
+        raise DailyPayablesError("FUTURE_EXPORT_DATE", "导出结束日期不能晚于今天")
+    if end >= _shift_calendar_months(start, MAX_EXPORT_MONTHS):
+        raise DailyPayablesError(
+            "EXPORT_RANGE_TOO_LARGE",
+            "单次导出最多选择六个自然月",
         )
     return history_start
 
@@ -226,6 +252,7 @@ def _snapshot_payload(
                     "currency": currency,
                     "base_amount_cny": round(base_amount, 2),
                     "base_paid_amount_cny": round(base_paid, 2),
+                    "base_paid_today_cny": round(base_paid_today, 2),
                     "base_pending_amount_cny": round(base_pending, 2),
                     "approval_status": state.get("approval_status"),
                     "approval_result": state.get("approval_result"),
@@ -303,13 +330,44 @@ def daily_trend(
             f"单次趋势最多查询 {MAX_TREND_DAYS} 天",
         )
 
+    points = list(
+        iter_daily_snapshots(
+            conn,
+            start,
+            end,
+            allowed_sheets=allowed_sheets,
+            include_details=False,
+            china_only=china_only,
+        )
+    )
+
+    return {
+        "history_start_date": history_start.isoformat(),
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "points": points,
+    }
+
+
+def iter_daily_snapshots(
+    conn: sqlite3.Connection,
+    start: date,
+    end: date,
+    *,
+    allowed_sheets: Optional[set[str]] = None,
+    include_details: bool = False,
+    china_only: bool = False,
+) -> Iterable[Dict[str, Any]]:
+    _validate_date(conn, start)
+    if end < start:
+        raise DailyPayablesError("INVALID_EXPORT_RANGE", "结束日期不能早于开始日期")
+
     events = _load_events(conn, end)
     states: Dict[int, Dict[str, Any]] = {}
     deltas: Dict[tuple[str, int], Dict[str, float]] = defaultdict(
         lambda: {"paid": 0.0, "base_paid": 0.0}
     )
     cursor = 0
-    points: list[Dict[str, Any]] = []
     selected = start
     while selected <= end:
         end_iso = _day_end(selected)
@@ -329,20 +387,12 @@ def daily_trend(
                 )
             states[logical_id] = event
             cursor += 1
-        point = _snapshot_payload(
+        yield _snapshot_payload(
             selected,
             states,
             deltas,
             allowed_sheets,
-            include_details=False,
+            include_details=include_details,
             china_only=china_only,
         )
-        points.append(point)
         selected += timedelta(days=1)
-
-    return {
-        "history_start_date": history_start.isoformat(),
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "points": points,
-    }
