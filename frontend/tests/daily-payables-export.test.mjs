@@ -41,6 +41,11 @@ test("daily-payables export defaults to the latest available 30 days", () => {
   );
 });
 
+test("daily-payables export uses the Asia/Shanghai calendar date", () => {
+  assert.equal(helpers.shanghaiIsoDate(new Date("2026-08-25T15:59:59Z")), "2026-08-25");
+  assert.equal(helpers.shanghaiIsoDate(new Date("2026-08-25T16:00:00Z")), "2026-08-26");
+});
+
 test("daily-payables export validates history, ordering, future dates and six calendar months", () => {
   assert.ok(helpers, "dailyPayablesExport.ts should exist");
   assert.equal(helpers.validateDailyPayablesExportRange("2026-02-26", "2026-08-25", "2026-02-26", "2026-08-26"), null);

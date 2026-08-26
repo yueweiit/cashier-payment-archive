@@ -74,7 +74,7 @@ import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
 import { buildDirtyGridPayload, sameSheetOrder } from "./gridSave";
 import { AppNavigation, type AppTab } from "./AppNavigation";
 import { MexicoTrackingPage } from "./MexicoTrackingPage";
-import { defaultDailyPayablesExportRange, validateDailyPayablesExportRange } from "./dailyPayablesExport";
+import { defaultDailyPayablesExportRange, shanghaiIsoDate, validateDailyPayablesExportRange } from "./dailyPayablesExport";
 
 type Tab = AppTab;
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
@@ -720,7 +720,7 @@ function DailyPayablesView({ setMessage }: { setMessage: (message: string) => vo
   }), [trend, trendCurrency]);
 
   const historyStart = snapshot?.history_start_date || trend?.history_start_date || selectedDate;
-  const today = localIsoDate(new Date());
+  const today = shanghaiIsoDate();
   const currencyCards: CurrencyCode[] = ["CNY", "USD", "MXN"];
   const dateLocale = language === "es" ? "es-MX" : "zh-CN";
 

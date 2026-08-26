@@ -28,6 +28,17 @@ function shiftCalendarMonths(value: string, months: number) {
   return formatIsoDate(targetMonthStart);
 }
 
+export function shanghaiIsoDate(value = new Date()) {
+  const parts = new Intl.DateTimeFormat("en", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(value);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
 export function defaultDailyPayablesExportRange(selectedDate: string, historyStart: string, today: string) {
   const end = selectedDate && selectedDate < today ? selectedDate : today;
   const candidateStart = shiftDays(end, -29);
