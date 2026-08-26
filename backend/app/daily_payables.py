@@ -112,6 +112,27 @@ def _payment_event(event_type: Any) -> bool:
     return normalized.startswith("payment.") or normalized == "import.rollback_payment"
 
 
+def _dingtalk_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _state_order(state: Dict[str, Any]) -> tuple[str, int]:
+    return str(state.get("effective_at") or ""), int(state.get("id") or 0)
+
+
+def _deduplicated_states(
+    states: Dict[int, Dict[str, Any]],
+) -> list[tuple[int, Dict[str, Any]]]:
+    grouped: Dict[str, tuple[int, Dict[str, Any]]] = {}
+    for logical_id, state in states.items():
+        dingding_id = _dingtalk_id(state.get("dingding_id"))
+        identity = f"dingtalk:{dingding_id}" if dingding_id else f"logical:{logical_id}"
+        current = grouped.get(identity)
+        if current is None or _state_order(state) > _state_order(current[1]):
+            grouped[identity] = (logical_id, state)
+    return list(grouped.values())
+
+
 def _states_and_payment_deltas(
     events: Iterable[Dict[str, Any]],
 ) -> tuple[Dict[int, Dict[str, Any]], Dict[tuple[str, int], Dict[str, float]]]:
@@ -153,7 +174,7 @@ def _snapshot_payload(
     pending_count = 0
     overdue_count = 0
 
-    for logical_id, state in states.items():
+    for logical_id, state in _deduplicated_states(states):
         if not _visible(state, allowed_sheets, china_only=china_only):
             continue
         due_date = str(state.get("needed_payment_date") or "").strip()[:10]

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from backend.app.db import connect, get_daily_payables_history_start_date, now_iso
 from backend.app.main import app
-from backend.app.daily_payables import daily_snapshot
+from backend.app.daily_payables import daily_snapshot, daily_trend
 from backend.app.payable_history import payment_effective_at, record_request_state
 from backend.app.security import hash_password
 
@@ -30,6 +30,8 @@ def create_request(
     needed_payment_date: str | None = "2026-08-21",
     currency: str = "CNY",
     execution_region: str | None = "China",
+    dingding_id: str | None = None,
+    summary: str = "历史状态测试",
 ) -> dict:
     batch = client.post(
         "/api/batches",
@@ -37,12 +39,14 @@ def create_request(
     ).json()["batch"]
     payload = {
         "source_sheet": source_sheet,
-        "summary": "历史状态测试",
+        "summary": summary,
         "applicant": "测试申请人",
         "amount": amount,
         "currency": currency,
         "needed_payment_date": needed_payment_date,
     }
+    if dingding_id is not None:
+        payload["dingding_id"] = dingding_id
     if execution_region is not None:
         payload["raw_extra"] = {
             "external_source": {"execution_region": execution_region}
@@ -259,6 +263,222 @@ def test_rollover_inherits_logical_request_id_without_duplicate_identity():
         target_requests = client.get(f"/api/batches/{target_batch['id']}/requests").json()["requests"]
         copied = next(item for item in target_requests if item["copied_from_request_id"] == request["id"])
         assert copied["logical_request_id"] == request["id"]
+
+
+def test_daily_payables_deduplicates_reimports_by_dingtalk_business_id():
+    with TestClient(app) as client:
+        login(client)
+        selected = date.today()
+        due_date = (selected - timedelta(days=1)).isoformat()
+        dingding_id = f"daily-dedup-{uuid.uuid4().hex}"
+        source_sheet = f"每日应付去重-{uuid.uuid4().hex}"
+        older = create_request(
+            client,
+            amount=290,
+            source_sheet=source_sheet,
+            needed_payment_date=due_date,
+            dingding_id=dingding_id,
+            summary="跨周重复导入",
+        )
+        newer = create_request(
+            client,
+            amount=290,
+            source_sheet=source_sheet,
+            needed_payment_date=due_date,
+            dingding_id=dingding_id,
+            summary="跨周重复导入",
+        )
+
+        with connect() as conn:
+            snapshot = daily_snapshot(
+                conn,
+                selected,
+                allowed_sheets={source_sheet},
+                include_details=True,
+                china_only=True,
+            )
+            trend = daily_trend(
+                conn,
+                selected,
+                selected,
+                allowed_sheets={source_sheet},
+                china_only=True,
+            )
+
+        matches = [
+            item for item in snapshot["items"]
+            if item["dingding_id"] == dingding_id
+        ]
+        assert len(matches) == 1
+        assert matches[0]["logical_request_id"] == newer["logical_request_id"]
+        assert matches[0]["source_request_id"] == newer["id"]
+        assert snapshot["totals_cny"]["end_pending"] == 290
+        assert snapshot["counts"]["end_pending"] == 1
+        assert trend["points"][0]["totals_cny"]["end_pending"] == 290
+        assert trend["points"][0]["counts"]["end_pending"] == 1
+
+
+def test_daily_trend_does_not_apply_future_dingtalk_identity_to_past():
+    with TestClient(app) as client:
+        login(client)
+        first_day = date.today()
+        second_day = first_day + timedelta(days=1)
+        due_date = (first_day - timedelta(days=1)).isoformat()
+        source_sheet = f"每日应付未来身份-{uuid.uuid4().hex}"
+        older = create_request(
+            client,
+            amount=100,
+            source_sheet=source_sheet,
+            needed_payment_date=due_date,
+        )
+        newer = create_request(
+            client,
+            amount=200,
+            source_sheet=source_sheet,
+            needed_payment_date=due_date,
+        )
+        dingding_id = f"daily-future-{uuid.uuid4().hex}"
+
+        with connect() as conn:
+            for sequence, request in enumerate((older, newer), start=10):
+                conn.execute(
+                    "UPDATE payment_requests SET dingding_id = ? WHERE id = ?",
+                    (dingding_id, request["id"]),
+                )
+                record_request_state(
+                    conn,
+                    request["id"],
+                    event_type="dingtalk.linked",
+                    event_key=f"test:{uuid.uuid4().hex}",
+                    effective_at=f"{second_day.isoformat()}T{sequence}:00:00.000000",
+                    actor_id=1,
+                )
+            trend = daily_trend(
+                conn,
+                first_day,
+                second_day,
+                allowed_sheets={source_sheet},
+                china_only=True,
+            )
+
+        assert trend["points"][0]["totals_cny"]["end_pending"] == 300
+        assert trend["points"][0]["counts"]["end_pending"] == 2
+        assert trend["points"][1]["totals_cny"]["end_pending"] == 200
+        assert trend["points"][1]["counts"]["end_pending"] == 1
+
+
+def test_daily_payables_treats_cleared_dingtalk_ids_as_independent():
+    with TestClient(app) as client:
+        login(client)
+        selected = date.today()
+        due_date = (selected - timedelta(days=1)).isoformat()
+        source_sheet = f"每日应付清空身份-{uuid.uuid4().hex}"
+        dingding_id = f"daily-cleared-{uuid.uuid4().hex}"
+        requests = [
+            create_request(
+                client,
+                amount=amount,
+                source_sheet=source_sheet,
+                needed_payment_date=due_date,
+                dingding_id=dingding_id,
+            )
+            for amount in (100, 200)
+        ]
+
+        with connect() as conn:
+            for sequence, request in enumerate(requests, start=20):
+                conn.execute(
+                    "UPDATE payment_requests SET dingding_id = NULL WHERE id = ?",
+                    (request["id"],),
+                )
+                record_request_state(
+                    conn,
+                    request["id"],
+                    event_type="request.update",
+                    event_key=f"test:{uuid.uuid4().hex}",
+                    effective_at=f"{selected.isoformat()}T{sequence}:00:00.000000",
+                    actor_id=1,
+                )
+            snapshot = daily_snapshot(
+                conn,
+                selected,
+                allowed_sheets={source_sheet},
+                include_details=True,
+                china_only=True,
+            )
+
+        assert snapshot["totals_cny"]["end_pending"] == 300
+        assert snapshot["counts"]["end_pending"] == 2
+        assert {item["logical_request_id"] for item in snapshot["items"]} == {
+            request["logical_request_id"] for request in requests
+        }
+
+
+def test_daily_payables_uses_only_winning_logical_payment_delta():
+    with TestClient(app) as client:
+        login(client)
+        selected = date.today()
+        due_date = (selected - timedelta(days=1)).isoformat()
+        source_sheet = f"每日应付付款去重-{uuid.uuid4().hex}"
+        dingding_id = f"daily-payment-{uuid.uuid4().hex}"
+        older = create_request(
+            client,
+            amount=100,
+            source_sheet=source_sheet,
+            needed_payment_date=due_date,
+            dingding_id=dingding_id,
+        )
+        newer = create_request(
+            client,
+            amount=100,
+            source_sheet=source_sheet,
+            needed_payment_date=due_date,
+            dingding_id=dingding_id,
+        )
+
+        with connect() as conn:
+            for request, reset_hour, payment_hour in (
+                (older, 20, 21),
+                (newer, 22, 23),
+            ):
+                conn.execute(
+                    "UPDATE payment_requests SET paid_amount = 0, pending_amount = 100 WHERE id = ?",
+                    (request["id"],),
+                )
+                record_request_state(
+                    conn,
+                    request["id"],
+                    event_type="request.update",
+                    event_key=f"test:{uuid.uuid4().hex}",
+                    effective_at=f"{selected.isoformat()}T{reset_hour}:00:00.000000",
+                    actor_id=1,
+                )
+                conn.execute(
+                    "UPDATE payment_requests SET paid_amount = 50, pending_amount = 50 WHERE id = ?",
+                    (request["id"],),
+                )
+                record_request_state(
+                    conn,
+                    request["id"],
+                    event_type="payment.create",
+                    event_key=f"test:{uuid.uuid4().hex}",
+                    effective_at=f"{selected.isoformat()}T{payment_hour}:00:00.000000",
+                    actor_id=1,
+                )
+            snapshot = daily_snapshot(
+                conn,
+                selected,
+                allowed_sheets={source_sheet},
+                include_details=True,
+                china_only=True,
+            )
+
+        assert snapshot["counts"]["end_pending"] == 1
+        assert snapshot["totals_cny"]["end_pending"] == 50
+        assert snapshot["totals_cny"]["paid_today"] == 50
+        assert len(snapshot["items"]) == 1
+        assert snapshot["items"][0]["logical_request_id"] == newer["logical_request_id"]
+        assert snapshot["items"][0]["paid_today"] == 50
 
 
 def test_daily_payables_summary_details_trend_and_sheet_permissions():
