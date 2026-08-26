@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import io
 import json
@@ -789,6 +790,80 @@ def test_daily_payables_export_rejects_concurrent_over_capacity(monkeypatch):
 
     assert response.status_code == 429
     assert response.json()["detail"]["code"] == "EXPORT_BUSY"
+
+
+def test_daily_payables_export_cleans_files_and_slots_after_invalid_range():
+    temp_directory = Path(tempfile.gettempdir())
+    before = set(temp_directory.glob("daily-payables-*.xlsx"))
+    selected = date.today().isoformat()
+    with TestClient(app) as client:
+        login(client)
+        for _ in range(daily_payables_export.MAX_CONCURRENT_EXPORTS):
+            response = client.get(
+                "/api/daily-payables/export.xlsx",
+                params={"start": selected, "end": selected},
+                headers={"Range": "bytes=invalid"},
+            )
+            assert response.status_code == 400
+
+        normal = client.get(
+            "/api/daily-payables/export.xlsx",
+            params={"start": selected, "end": selected},
+        )
+
+    assert normal.status_code == 200, normal.text
+    assert set(temp_directory.glob("daily-payables-*.xlsx")) == before
+
+
+def test_daily_payables_export_cleans_files_and_slots_when_response_send_fails(monkeypatch):
+    class TrackingExportSlots:
+        def __init__(self) -> None:
+            self.acquired = False
+            self.release_count = 0
+
+        def acquire(self, *, blocking: bool) -> bool:
+            assert blocking is False
+            self.acquired = True
+            return True
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    slots = TrackingExportSlots()
+    monkeypatch.setattr(main_module, "_DAILY_PAYABLES_EXPORT_SLOTS", slots)
+    selected = date.today()
+    response = main_module.export_daily_payables(
+        start=selected,
+        end=selected,
+        user={"id": 1, "role": "admin"},
+    )
+    output_path = Path(response.path)
+    assert output_path.exists()
+
+    async def receive() -> dict:
+        return {"type": "http.disconnect"}
+
+    async def failing_send(_: dict) -> None:
+        raise RuntimeError("simulated client disconnect")
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/daily-payables/export.xlsx",
+        "headers": [],
+        "extensions": {},
+    }
+    try:
+        asyncio.run(response(scope, receive, failing_send))
+    except RuntimeError as exc:
+        assert str(exc) == "simulated client disconnect"
+    else:
+        raise AssertionError("The simulated send failure must propagate")
+
+    response.cleanup()
+    assert not output_path.exists()
+    assert slots.acquired is True
+    assert slots.release_count == 1
 
 
 def test_daily_payables_workbook_reports_invalid_historical_dates_and_cleans_temp_files():

@@ -24,7 +24,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from .attachment_io import save_embedded_image_attachments, save_embedded_payment_vouchers
@@ -162,6 +161,18 @@ _MEXICO_ATTACHMENT_EXECUTOR = ThreadPoolExecutor(
 _MEXICO_ATTACHMENT_FUTURES: Dict[str, Any] = {}
 _MEXICO_ATTACHMENT_FUTURES_LOCK = Lock()
 _DAILY_PAYABLES_EXPORT_SLOTS = BoundedSemaphore(MAX_CONCURRENT_EXPORTS)
+
+
+class GuaranteedCleanupFileResponse(FileResponse):
+    def __init__(self, *args: Any, cleanup, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cleanup = cleanup
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.cleanup()
 
 app.add_middleware(
     CORSMiddleware,
@@ -1302,18 +1313,26 @@ def export_daily_payables(
 
     assert output_path is not None
 
+    cleanup_lock = Lock()
+    cleaned = False
+
     def cleanup_export() -> None:
+        nonlocal cleaned
+        with cleanup_lock:
+            if cleaned:
+                return
+            cleaned = True
         try:
             output_path.unlink(missing_ok=True)
         finally:
             _DAILY_PAYABLES_EXPORT_SLOTS.release()
 
     filename = f"每日应付_{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}.xlsx"
-    return FileResponse(
+    return GuaranteedCleanupFileResponse(
         output_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
-        background=BackgroundTask(cleanup_export),
+        cleanup=cleanup_export,
     )
 
 
