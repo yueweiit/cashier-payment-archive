@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 from backend.app import daily_payables_export
 import backend.app.main as main_module
@@ -572,8 +573,19 @@ def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_
         assert summary.cell(3, 7).value == 60
         assert summary.cell(3, 8).value == 60
         assert summary.cell(2, 5).number_format == "#,##0.00"
-        assert summary.freeze_panes == "A2"
+        assert summary.freeze_panes == "E2"
+        assert summary.row_dimensions[1].height == 36
         assert summary.auto_filter.ref == f"A1:T{summary.max_row}"
+        assert summary.sheet_properties.outlinePr.summaryRight is True
+        for column_index in range(9, 21):
+            column = get_column_letter(column_index)
+            assert summary.column_dimensions[column].hidden is True
+            assert summary.column_dimensions[column].outline_level == 1
+        assert summary.cell(1, 9).fill.fgColor.rgb == "002E7D32"
+        assert summary.cell(1, 13).fill.fgColor.rgb == "002563EB"
+        assert summary.cell(1, 17).fill.fgColor.rgb == "00D97706"
+        assert summary.column_dimensions["A"].width == 13
+        assert summary.column_dimensions["E"].width == 20
 
         assert detail.max_row == 3
         first_detail = [cell.value for cell in detail[2]]
@@ -585,8 +597,16 @@ def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_
         assert second_detail[9:12] == [40, 40, 60]
         assert second_detail[14:17] == [40, 40, 60]
         assert detail.cell(2, 9).number_format == "#,##0.00"
-        assert detail.freeze_panes == "A2"
+        assert detail.freeze_panes == "G2"
+        assert detail.row_dimensions[1].height == 36
+        assert detail.row_dimensions[2].height == 28
+        assert detail.row_dimensions[3].height == 28
         assert detail.auto_filter.ref == f"A1:S{detail.max_row}"
+        assert detail.column_dimensions["C"].hidden is True
+        assert detail.column_dimensions["G"].width == 48
+        assert detail.cell(2, 7).alignment.wrap_text is False
+        assert detail.cell(2, 7).alignment.vertical == "center"
+        assert detail.cell(2, 7).value == "区间去重测试"
 
 
 def test_daily_payables_export_includes_prior_due_items_paid_in_full_that_day():
