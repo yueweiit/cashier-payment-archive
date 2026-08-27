@@ -19,6 +19,13 @@ SUMMARY_SHEET = "每日汇总"
 DETAIL_SHEET = "逐日明细"
 SUPPORTED_CURRENCIES = ("CNY", "USD", "MXN")
 EXCEL_MAX_ROWS = 1_048_576
+DEFAULT_HEADER_FILL = "1F6F6D"
+CURRENCY_HEADER_FILLS = {"CNY": "2E7D32", "USD": "2563EB", "MXN": "D97706"}
+HEADER_ROW_HEIGHT = 36
+SUMMARY_DATA_ROW_HEIGHT = 22
+DETAIL_DATA_ROW_HEIGHT = 28
+SUMMARY_WIDTHS = [13, 13, 13, 13, 20, 20, 20, 20] + [18] * 12
+DETAIL_WIDTHS = [13, 12, 14, 24, 24, 18, 48, 15] + [15] * 9 + [18, 18]
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -77,12 +84,21 @@ DETAIL_HEADERS = [
 ]
 
 
-def _header_cells(worksheet, headers: list[str]) -> list[WriteOnlyCell]:
-    fill = PatternFill("solid", fgColor="1F6F6D")
+def _header_cells(
+    worksheet,
+    headers: list[str],
+    column_fills: dict[int, str] | None = None,
+) -> list[WriteOnlyCell]:
+    default_fill = PatternFill("solid", fgColor=DEFAULT_HEADER_FILL)
+    column_fills = column_fills or {}
     cells: list[WriteOnlyCell] = []
-    for value in headers:
+    for column, value in enumerate(headers, start=1):
         cell = WriteOnlyCell(worksheet, value=value)
-        cell.fill = fill
+        cell.fill = (
+            PatternFill("solid", fgColor=column_fills[column])
+            if column in column_fills
+            else default_fill
+        )
         cell.font = Font(color="FFFFFF", bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cells.append(cell)
@@ -103,7 +119,7 @@ def _data_cells(
             if value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")):
                 value = f"'{value}"
         cell = WriteOnlyCell(worksheet, value=value)
-        cell.alignment = Alignment(vertical="top", wrap_text=True)
+        cell.alignment = Alignment(vertical="center", wrap_text=False)
         if column in date_columns and value is not None:
             cell.number_format = "yyyy-mm-dd"
         elif column in money_columns:
@@ -115,6 +131,22 @@ def _data_cells(
 def _set_column_widths(worksheet, widths: list[int]) -> None:
     for column, width in enumerate(widths, start=1):
         worksheet.column_dimensions[get_column_letter(column)].width = width
+
+
+def _summary_header_fills() -> dict[int, str]:
+    return {
+        column: CURRENCY_HEADER_FILLS[currency]
+        for currency, columns in (("CNY", range(9, 13)), ("USD", range(13, 17)), ("MXN", range(17, 21)))
+        for column in columns
+    }
+
+
+def _collapse_summary_currency_columns(worksheet) -> None:
+    worksheet.sheet_properties.outlinePr.summaryRight = True
+    for column in range(9, 21):
+        dimension = worksheet.column_dimensions[get_column_letter(column)]
+        dimension.hidden = True
+        dimension.outlineLevel = 1
 
 
 def _discard_write_only_workbook(workbook: Workbook) -> None:
@@ -172,14 +204,17 @@ def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> Path:
         workbook = Workbook(write_only=True)
         summary = workbook.create_sheet(SUMMARY_SHEET)
         detail = workbook.create_sheet(DETAIL_SHEET)
-        summary.freeze_panes = "A2"
-        detail.freeze_panes = "A2"
+        summary.freeze_panes = "E2"
+        detail.freeze_panes = "G2"
         summary.sheet_view.showGridLines = False
         detail.sheet_view.showGridLines = False
-        _set_column_widths(summary, [13, 13, 13, 13] + [19] * (len(SUMMARY_HEADERS) - 4))
-        _set_column_widths(detail, [13, 12, 14, 24, 24, 18, 42, 15] + [15] * 9 + [18, 18])
+        summary.row_dimensions[1].height = HEADER_ROW_HEIGHT
+        detail.row_dimensions[1].height = HEADER_ROW_HEIGHT
+        _set_column_widths(summary, SUMMARY_WIDTHS)
+        _set_column_widths(detail, DETAIL_WIDTHS)
+        _collapse_summary_currency_columns(summary)
         detail.column_dimensions["C"].hidden = True
-        summary.append(_header_cells(summary, SUMMARY_HEADERS))
+        summary.append(_header_cells(summary, SUMMARY_HEADERS, _summary_header_fills()))
         detail.append(_header_cells(detail, DETAIL_HEADERS))
 
         summary_rows = 1
@@ -203,6 +238,7 @@ def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> Path:
                     for key in ("due_today", "paid_today", "end_pending", "overdue_pending")
                 ],
             ]
+            summary.row_dimensions[summary_rows + 1].height = SUMMARY_DATA_ROW_HEIGHT
             summary.append(
                 _data_cells(
                     summary,
@@ -240,6 +276,7 @@ def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> Path:
                     item.get("approval_status"),
                     item.get("approval_result"),
                 ]
+                detail.row_dimensions[detail_rows + 1].height = DETAIL_DATA_ROW_HEIGHT
                 detail.append(
                     _data_cells(
                         detail,
