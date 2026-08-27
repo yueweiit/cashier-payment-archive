@@ -46,7 +46,7 @@ MAX_EXPORT_FILE_BYTES = _positive_env_int(
 )
 MAX_CONCURRENT_EXPORTS = _positive_env_int("PAYMENT_DAILY_EXPORT_MAX_CONCURRENT", 2)
 
-SUMMARY_HEADERS = [
+SUMMARY_BASE_HEADERS = [
     "统计日期",
     "当日到期数量",
     "日终未付数量",
@@ -55,11 +55,24 @@ SUMMARY_HEADERS = [
     "当日支付（折合人民币）",
     "日终待付（折合人民币）",
     "逾期待付（折合人民币）",
-] + [
+]
+SUMMARY_CURRENCY_LABELS = ("当天新增到期", "当日支付", "日终待付", "逾期待付")
+CURRENCY_TOTAL_FIELDS = ("due_today", "paid_today", "end_pending", "overdue_pending")
+SUMMARY_HEADERS = SUMMARY_BASE_HEADERS + [
     f"{currency} {label}"
     for currency in SUPPORTED_CURRENCIES
-    for label in ("当天新增到期", "当日支付", "日终待付", "逾期待付")
+    for label in SUMMARY_CURRENCY_LABELS
 ]
+SUMMARY_CURRENCY_COLUMNS_PER_CURRENCY = (
+    len(SUMMARY_HEADERS) - len(SUMMARY_BASE_HEADERS)
+) // len(SUPPORTED_CURRENCIES)
+SUMMARY_CURRENCY_FIRST_COLUMN = (
+    len(SUMMARY_HEADERS)
+    - len(SUPPORTED_CURRENCIES) * SUMMARY_CURRENCY_COLUMNS_PER_CURRENCY
+    + 1
+)
+SUMMARY_CURRENCY_LAST_COLUMN = len(SUMMARY_HEADERS)
+SUMMARY_CURRENCY_CONTROL_COLUMN = SUMMARY_CURRENCY_LAST_COLUMN + 1
 
 DETAIL_HEADERS = [
     "统计日期",
@@ -134,19 +147,39 @@ def _set_column_widths(worksheet, widths: list[int]) -> None:
 
 
 def _summary_header_fills() -> dict[int, str]:
-    return {
-        column: CURRENCY_HEADER_FILLS[currency]
-        for currency, columns in (("CNY", range(9, 13)), ("USD", range(13, 17)), ("MXN", range(17, 21)))
-        for column in columns
-    }
+    fills: dict[int, str] = {}
+    column = SUMMARY_CURRENCY_FIRST_COLUMN
+    for currency in SUPPORTED_CURRENCIES:
+        for _ in range(SUMMARY_CURRENCY_COLUMNS_PER_CURRENCY):
+            fills[column] = CURRENCY_HEADER_FILLS[currency]
+            column += 1
+    return fills
 
 
 def _collapse_summary_currency_columns(worksheet) -> None:
     worksheet.sheet_properties.outlinePr.summaryRight = True
-    for column in range(9, 21):
+    for column in range(SUMMARY_CURRENCY_FIRST_COLUMN, SUMMARY_CURRENCY_LAST_COLUMN + 1):
         dimension = worksheet.column_dimensions[get_column_letter(column)]
         dimension.hidden = True
         dimension.outlineLevel = 1
+    control_dimension = worksheet.column_dimensions[
+        get_column_letter(SUMMARY_CURRENCY_CONTROL_COLUMN)
+    ]
+    control_dimension.collapsed = True
+    control_dimension.hidden = False
+
+
+def _append_styled_row(
+    worksheet,
+    row_index: int,
+    cells: list[WriteOnlyCell],
+    row_height: int,
+) -> None:
+    worksheet.row_dimensions[row_index].height = row_height
+    try:
+        worksheet.append(cells)
+    finally:
+        del worksheet.row_dimensions[row_index]
 
 
 def _discard_write_only_workbook(workbook: Workbook) -> None:
@@ -181,7 +214,7 @@ def _date_value(value: Any) -> date | None:
 def _currency_totals(snapshot: dict[str, Any], currency: str) -> dict[str, float]:
     return next(
         (item for item in snapshot.get("currency_totals", []) if item.get("currency") == currency),
-        {"due_today": 0, "paid_today": 0, "end_pending": 0, "overdue_pending": 0},
+        {field: 0 for field in CURRENCY_TOTAL_FIELDS},
     )
 
 
@@ -235,17 +268,19 @@ def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> Path:
                 *[
                     _currency_totals(snapshot, currency)[key]
                     for currency in SUPPORTED_CURRENCIES
-                    for key in ("due_today", "paid_today", "end_pending", "overdue_pending")
+                    for key in CURRENCY_TOTAL_FIELDS
                 ],
             ]
-            summary.row_dimensions[summary_rows + 1].height = SUMMARY_DATA_ROW_HEIGHT
-            summary.append(
+            _append_styled_row(
+                summary,
+                summary_rows + 1,
                 _data_cells(
                     summary,
                     summary_values,
                     date_columns={1},
                     money_columns=set(range(5, len(SUMMARY_HEADERS) + 1)),
-                )
+                ),
+                SUMMARY_DATA_ROW_HEIGHT,
             )
             summary_rows += 1
 
@@ -276,14 +311,16 @@ def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> Path:
                     item.get("approval_status"),
                     item.get("approval_result"),
                 ]
-                detail.row_dimensions[detail_rows + 1].height = DETAIL_DATA_ROW_HEIGHT
-                detail.append(
+                _append_styled_row(
+                    detail,
+                    detail_rows + 1,
                     _data_cells(
                         detail,
                         detail_values,
                         date_columns={1, 8},
                         money_columns={9, 10, 11, 12, 14, 15, 16, 17},
-                    )
+                    ),
+                    DETAIL_DATA_ROW_HEIGHT,
                 )
                 detail_rows += 1
         summary.auto_filter.ref = f"A1:{get_column_letter(len(SUMMARY_HEADERS))}{summary_rows}"

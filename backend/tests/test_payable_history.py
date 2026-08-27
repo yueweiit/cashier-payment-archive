@@ -15,7 +15,7 @@ from urllib.parse import unquote
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fastapi.testclient import TestClient
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
 from backend.app import daily_payables_export
@@ -582,16 +582,28 @@ def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_
         assert summary.row_dimensions[1].height == 36
         assert summary.auto_filter.ref == f"A1:T{summary.max_row}"
         assert summary.sheet_properties.outlinePr.summaryRight is True
-        for column_index in range(9, 21):
+        for column_index in range(
+            daily_payables_export.SUMMARY_CURRENCY_FIRST_COLUMN,
+            daily_payables_export.SUMMARY_CURRENCY_LAST_COLUMN + 1,
+        ):
             column = get_column_letter(column_index)
             assert summary.column_dimensions[column].hidden is True
             assert summary.column_dimensions[column].outline_level == 1
-        for column_index in range(9, 13):
-            assert summary.cell(1, column_index).fill.fgColor.rgb == "002E7D32"
-        for column_index in range(13, 17):
-            assert summary.cell(1, column_index).fill.fgColor.rgb == "002563EB"
-        for column_index in range(17, 21):
-            assert summary.cell(1, column_index).fill.fgColor.rgb == "00D97706"
+        control_column = get_column_letter(daily_payables_export.SUMMARY_CURRENCY_CONTROL_COLUMN)
+        assert summary.column_dimensions[control_column].collapsed is True
+        assert summary.column_dimensions[control_column].hidden is not True
+        for currency_index, currency in enumerate(daily_payables_export.SUPPORTED_CURRENCIES):
+            first_currency_column = (
+                daily_payables_export.SUMMARY_CURRENCY_FIRST_COLUMN
+                + currency_index * daily_payables_export.SUMMARY_CURRENCY_COLUMNS_PER_CURRENCY
+            )
+            for column_index in range(
+                first_currency_column,
+                first_currency_column + daily_payables_export.SUMMARY_CURRENCY_COLUMNS_PER_CURRENCY,
+            ):
+                assert summary.cell(1, column_index).fill.fgColor.rgb == (
+                    f"00{daily_payables_export.CURRENCY_HEADER_FILLS[currency]}"
+                )
         assert summary.column_dimensions["A"].width == 13
         assert summary.column_dimensions["E"].width == 20
 
@@ -615,6 +627,28 @@ def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_
         assert detail.cell(2, 7).alignment.wrap_text is not True
         assert detail.cell(2, 7).alignment.vertical == "center"
         assert detail.cell(2, 7).value == long_summary
+
+
+def test_daily_payables_export_keeps_write_only_data_row_dimensions_bounded():
+    workbook = Workbook(write_only=True)
+    worksheet = workbook.create_sheet()
+    row_count = 300
+    row_height = 22
+
+    for row_index in range(1, row_count + 1):
+        daily_payables_export._append_styled_row(
+            worksheet,
+            row_index,
+            [row_index],
+            row_height,
+        )
+
+    assert not worksheet.row_dimensions
+    output = io.BytesIO()
+    workbook.save(output)
+    reloaded = load_workbook(output, data_only=True).active
+    for row_index in (1, row_count // 2, row_count):
+        assert reloaded.row_dimensions[row_index].height == row_height
 
 
 def test_daily_payables_export_includes_prior_due_items_paid_in_full_that_day():
