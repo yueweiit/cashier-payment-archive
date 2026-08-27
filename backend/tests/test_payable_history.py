@@ -518,13 +518,18 @@ def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_
                 """,
                 (first_day.isoformat(), now_iso()),
             )
+        long_summary = (
+            "付款申请用于验证每日应付导出摘要在长文本场景下完整保留，包含付款用途、业务背景、收款方信息、"
+            "预算归属、审批依据、付款时间窗口及核验说明。"
+            * 20
+        )
         older = create_request(
             client,
             amount=100,
             source_sheet=source_sheet,
             needed_payment_date=first_day.isoformat(),
             dingding_id=dingding_id,
-            summary="区间去重测试",
+            summary=long_summary,
         )
         newer = create_request(
             client,
@@ -532,7 +537,7 @@ def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_
             source_sheet=source_sheet,
             needed_payment_date=first_day.isoformat(),
             dingding_id=dingding_id,
-            summary="区间去重测试",
+            summary=long_summary,
         )
 
         with connect() as conn:
@@ -581,9 +586,12 @@ def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_
             column = get_column_letter(column_index)
             assert summary.column_dimensions[column].hidden is True
             assert summary.column_dimensions[column].outline_level == 1
-        assert summary.cell(1, 9).fill.fgColor.rgb == "002E7D32"
-        assert summary.cell(1, 13).fill.fgColor.rgb == "002563EB"
-        assert summary.cell(1, 17).fill.fgColor.rgb == "00D97706"
+        for column_index in range(9, 13):
+            assert summary.cell(1, column_index).fill.fgColor.rgb == "002E7D32"
+        for column_index in range(13, 17):
+            assert summary.cell(1, column_index).fill.fgColor.rgb == "002563EB"
+        for column_index in range(17, 21):
+            assert summary.cell(1, column_index).fill.fgColor.rgb == "00D97706"
         assert summary.column_dimensions["A"].width == 13
         assert summary.column_dimensions["E"].width == 20
 
@@ -604,9 +612,9 @@ def test_daily_payables_export_replays_deduplicated_payment_history_and_formats_
         assert detail.auto_filter.ref == f"A1:S{detail.max_row}"
         assert detail.column_dimensions["C"].hidden is True
         assert detail.column_dimensions["G"].width == 48
-        assert detail.cell(2, 7).alignment.wrap_text is False
+        assert detail.cell(2, 7).alignment.wrap_text is not True
         assert detail.cell(2, 7).alignment.vertical == "center"
-        assert detail.cell(2, 7).value == "区间去重测试"
+        assert detail.cell(2, 7).value == long_summary
 
 
 def test_daily_payables_export_includes_prior_due_items_paid_in_full_that_day():
