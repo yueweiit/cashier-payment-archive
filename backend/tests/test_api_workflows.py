@@ -3414,7 +3414,7 @@ def test_external_expense_preview_excludes_mexico_monthly_rows_and_applicants(mo
         "9301",
         "MONTHLY-CN",
         "china-user",
-        "悦为智能 YW Tech_Ai",
+        "YW MOLDES MX模具",
         "中国China",
     )
     mexico_instance = instance(
@@ -3470,7 +3470,7 @@ def test_external_expense_preview_excludes_mexico_monthly_rows_and_applicants(mo
         {
             "id": "china-user",
             "name": "中国申请人",
-            "department": "悦为智能 YW Tech_Ai",
+            "department": "YW MOLDES MX模具",
             "count": 1,
         }
     ]

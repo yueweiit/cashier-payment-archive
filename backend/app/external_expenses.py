@@ -30,6 +30,8 @@ STANDARD_SOURCE_TYPES = ("operation", "purchase")
 MONTHLY_PAYMENT_PROCESS_CODE = "PROC-EE85EDD4-5CF2-4C08-B948-1690A6ACC51C"
 ALLOWED_APPROVAL_STATUSES = ("COMPLETED", "RUNNING")
 ALLOWED_EXECUTION_REGION_PATTERN = r"(中国|china|墨西哥|m[eé]xico)"
+CHINA_WORKBENCH_EXECUTION_REGION_PATTERN = r"(中国|china)"
+CHINA_WORKBENCH_REGION_ERROR = "执行地区为墨西哥，不允许导入中国请款工作台"
 CHINA_EXECUTION_REGION_RE = re.compile(r"(中国|china)", re.IGNORECASE)
 MEXICO_EXECUTION_REGION_RE = re.compile(r"(墨西哥|m[eé]xico)", re.IGNORECASE)
 CURRENCY_COMPONENT_PREFIXES = ("币种", "货币", "currency", "moneda", "tipo de moneda")
@@ -718,6 +720,18 @@ def _form_component_value(form_values: Iterable[Dict[str, Any]], *prefixes: str)
     return None
 
 
+def _monthly_payment_allowed_in_china_workbench(instance: Dict[str, Any]) -> bool:
+    raw_payload = _json_object(instance.get("raw_payload"))
+    execution_region = _form_component_value(
+        _form_values(raw_payload),
+        *EXECUTION_REGION_COMPONENT_PREFIXES,
+    )
+    return china_workbench_source_allowed(
+        execution_region,
+        raw_payload.get("originatorDeptName"),
+    )
+
+
 def currency_from_execution_region(value: Any) -> Optional[str]:
     region = _text(value) or ""
     if MEXICO_EXECUTION_REGION_RE.search(region):
@@ -1024,7 +1038,7 @@ def _preview_conditions(
     params: list[Any] = [
         normalized_sources,
         list(ALLOWED_APPROVAL_STATUSES),
-        ALLOWED_EXECUTION_REGION_PATTERN,
+        CHINA_WORKBENCH_EXECUTION_REGION_PATTERN,
         DISALLOWED_APPROVAL_RESULT_PATTERN,
     ]
     normalized_approval_no = approval_no.strip()
@@ -1066,9 +1080,14 @@ def preview_external_expenses(
         """
         option_query = f"""
             {SOURCE_ROWS_CTE}
-            SELECT creator_name, applicant_department, approval_title, COUNT(*) AS count FROM source_rows
-            WHERE {option_sql} AND creator_name IS NOT NULL AND BTRIM(creator_name) <> ''
-            GROUP BY creator_name, applicant_department, approval_title
+            SELECT creator_name, applicant_department, approval_title,
+                   execution_region, COUNT(*) AS count
+            FROM source_rows
+            WHERE {option_sql}
+              AND creator_name IS NOT NULL
+              AND BTRIM(creator_name) <> ''
+            GROUP BY creator_name, applicant_department, approval_title,
+                     execution_region
             ORDER BY creator_name, count DESC
         """
         with source_connection() as conn:
@@ -1089,14 +1108,36 @@ def preview_external_expenses(
             approval_no=approval_no,
             applicant_ids=[],
         )
+        monthly_rows = [
+            row
+            for row in monthly_rows
+            if _monthly_payment_allowed_in_china_workbench(row)
+        ]
+        monthly_option_rows = [
+            row
+            for row in monthly_option_rows
+            if _monthly_payment_allowed_in_china_workbench(row)
+        ]
         for instance in monthly_option_rows:
             raw_payload = _json_object(instance.get("raw_payload"))
             applicant_rows.append({
                 "creator_name": _text(raw_payload.get("originatorUserId")),
                 "applicant_department": _text(raw_payload.get("originatorDeptName")),
                 "approval_title": _first_text(instance.get("title"), raw_payload.get("title")),
+                "execution_region": _form_component_value(
+                    _form_values(raw_payload),
+                    *EXECUTION_REGION_COMPONENT_PREFIXES,
+                ),
                 "count": 1,
             })
+    applicant_rows = [
+        row
+        for row in applicant_rows
+        if china_workbench_source_allowed(
+            row.get("execution_region"),
+            row.get("applicant_department"),
+        )
+    ]
     user_names = fetch_dingtalk_user_names(
         [
             *[row.get("creator_name") for row in [*rows, *applicant_rows]],
@@ -1108,6 +1149,11 @@ def preview_external_expenses(
     )
     mapped_rows = [map_external_expense(row, user_names) for row in rows]
     mapped_rows.extend(map_monthly_payment(instance, user_names) for instance in monthly_rows)
+    mapped_rows = [
+        row
+        for row in mapped_rows
+        if china_workbench_external_expense_allowed(row)
+    ]
     mapped_rows.sort(
         key=lambda row: (row.get("application_date") or "", row.get("approval_no") or "", row.get("source_type") or ""),
         reverse=True,
@@ -2016,6 +2062,35 @@ def approval_result_is_disallowed(value: Any) -> bool:
 
 def execution_region_is_allowed(value: Any) -> bool:
     return bool(re.search(ALLOWED_EXECUTION_REGION_PATTERN, _text(value) or "", re.IGNORECASE))
+
+
+def china_workbench_source_allowed(
+    execution_region: Any,
+    source_sheet: Any,
+) -> bool:
+    decision = resolve_region(
+        execution_region=_text(execution_region),
+        source_sheet=_text(source_sheet),
+    )
+    return decision.region != "mexico"
+
+
+def china_workbench_external_expense_allowed(row: Dict[str, Any]) -> bool:
+    request_data = row.get("request_data") if isinstance(row.get("request_data"), dict) else {}
+    raw_extra = request_data.get("raw_extra") if isinstance(request_data.get("raw_extra"), dict) else {}
+    external_source = raw_extra.get("external_source") if isinstance(raw_extra.get("external_source"), dict) else {}
+    return china_workbench_source_allowed(
+        external_source.get("execution_region"),
+        row.get("applicant_department") or request_data.get("source_sheet"),
+    )
+
+
+def mark_china_workbench_external_expense(row: Dict[str, Any]) -> None:
+    if china_workbench_external_expense_allowed(row):
+        return
+    errors = row.setdefault("errors", [])
+    if CHINA_WORKBENCH_REGION_ERROR not in errors:
+        errors.append(CHINA_WORKBENCH_REGION_ERROR)
 
 
 def applicant_name_from_title(value: Any) -> str:
