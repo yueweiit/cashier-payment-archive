@@ -86,6 +86,7 @@ from .external_expenses import (
     fetch_external_expense_metadata,
     fetch_external_expenses,
     general_manager_approval_from_workflow_events,
+    mark_china_workbench_external_expense,
     preview_external_expenses,
 )
 from .fx_rates import (
@@ -5270,6 +5271,9 @@ def import_external_expense_rows(
         source_rows = fetch_external_expenses(keys)
     except ExternalExpenseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    for source_row in source_rows:
+        mark_china_workbench_external_expense(source_row)
 
     rows_by_key = {(row["source_type"], row["source_id"]): row for row in source_rows}
     missing_keys = [key for key in seen_keys if key not in rows_by_key]
