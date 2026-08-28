@@ -369,8 +369,8 @@ Expected: all selected backend tests pass. The deselected test is the known unre
 Run:
 
 ```bash
-npm --prefix frontend test -- --run
-npm --prefix frontend run build
+npm run test:frontend
+npm run build
 ```
 
 Expected: all frontend tests pass and the production build completes successfully.
@@ -404,7 +404,7 @@ Run:
 
 ```bash
 python3 -m pytest -q backend/tests/test_api_workflows.py -k 'dingtalk_sync or external_expense_metadata_sync'
-npm --prefix frontend run build
+npm run build
 git push origin main
 ```
 
