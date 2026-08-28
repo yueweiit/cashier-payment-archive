@@ -1164,6 +1164,18 @@ def preview_external_expenses(
     }
 
 
+def _external_expense_metadata(mapped: Dict[str, Any]) -> Dict[str, Any]:
+    external_source = mapped["request_data"]["raw_extra"]["external_source"]
+    return {
+        "approval_no": mapped["approval_no"],
+        "source_type": mapped["source_type"],
+        "source_label": mapped["source_label"],
+        "source_id": mapped["source_id"],
+        **external_source,
+        "needed_payment_date": mapped.get("needed_payment_date"),
+    }
+
+
 def fetch_external_expense_metadata(approval_nos: Iterable[str]) -> list[Dict[str, Any]]:
     normalized = sorted({str(value or "").strip() for value in approval_nos if str(value or "").strip()})
     if not normalized:
@@ -1209,25 +1221,13 @@ def fetch_external_expense_metadata(approval_nos: Iterable[str]) -> list[Dict[st
     ])
     metadata: list[Dict[str, Any]] = []
     for source_row in source_rows:
-        mapped = map_external_expense(source_row, user_names)
-        external_source = mapped["request_data"]["raw_extra"]["external_source"]
-        metadata.append({
-            "approval_no": mapped["approval_no"],
-            "source_type": mapped["source_type"],
-            "source_label": mapped["source_label"],
-            "source_id": mapped["source_id"],
-            **external_source,
-        })
+        metadata.append(
+            _external_expense_metadata(map_external_expense(source_row, user_names))
+        )
     for monthly_row in monthly_rows:
-        mapped = map_monthly_payment(monthly_row, user_names)
-        external_source = mapped["request_data"]["raw_extra"]["external_source"]
-        metadata.append({
-            "approval_no": mapped["approval_no"],
-            "source_type": mapped["source_type"],
-            "source_label": mapped["source_label"],
-            "source_id": mapped["source_id"],
-            **external_source,
-        })
+        metadata.append(
+            _external_expense_metadata(map_monthly_payment(monthly_row, user_names))
+        )
     return metadata
 
 

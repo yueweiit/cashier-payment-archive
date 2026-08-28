@@ -30,6 +30,7 @@ from backend.app import external_expenses as external_expenses_module
 from backend.app.external_expenses import (
     CHINA_WORKBENCH_REGION_ERROR,
     ExternalExpenseError,
+    _external_expense_metadata,
     _parse_workflow_events,
     _preview_conditions,
     approval_result_is_disallowed,
@@ -53,6 +54,30 @@ from backend.app.rebuild_weekly_data import rebuild_weekly_data
 
 
 SAMPLE = Path("/Users/smk/Downloads/20260626~20260707请款明细.xlsx")
+
+
+def test_external_expense_metadata_exposes_mapped_needed_payment_date():
+    mapped = {
+        "approval_no": "META-DATE-1",
+        "source_type": "purchase",
+        "source_label": "采购支出",
+        "source_id": "9778",
+        "needed_payment_date": "2026-07-24",
+        "request_data": {
+            "raw_extra": {
+                "external_source": {
+                    "approval_status": "RUNNING",
+                    "needed_payment_date": "stale-value",
+                }
+            }
+        },
+    }
+
+    metadata = _external_expense_metadata(mapped)
+
+    assert metadata["approval_no"] == "META-DATE-1"
+    assert metadata["source_id"] == "9778"
+    assert metadata["needed_payment_date"] == "2026-07-24"
 
 
 def login(client: TestClient, username: str = "admin", password: str = "admin123") -> None:
