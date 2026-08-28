@@ -26,15 +26,19 @@ from openpyxl import Workbook, load_workbook
 
 from backend.app.db import backup_database, connect, migrate_sheet_registry_and_names, now_iso
 from backend.app import db as db_module
+from backend.app import external_expenses as external_expenses_module
 from backend.app.external_expenses import (
+    CHINA_WORKBENCH_REGION_ERROR,
     ExternalExpenseError,
     _parse_workflow_events,
     _preview_conditions,
     approval_result_is_disallowed,
+    china_workbench_external_expense_allowed,
     execution_region_is_allowed,
     general_manager_approval_from_workflow_events,
     applicant_name_from_title,
     classify_dingtalk_payment_event,
+    mark_china_workbench_external_expense,
     map_monthly_payment,
     map_external_expense,
     _monthly_attachments,
@@ -1592,8 +1596,14 @@ def external_expense_test_row(
     amount: float = 123.45,
     beneficiary: str = "测试收款信息",
     warnings=None,
+    execution_region: str = "",
+    source_sheet: str = "测试部门",
 ) -> dict:
-    source_label = "运营支出" if source_type == "operation" else "采购支出"
+    source_label = {
+        "operation": "运营支出",
+        "purchase": "采购支出",
+        "monthly": "月结付款",
+    }[source_type]
     request_data = {
         "dingding_id": approval_no,
         "expense_type": "测试支出",
@@ -1601,7 +1611,7 @@ def external_expense_test_row(
         "amount": amount,
         "currency": "CNY",
         "payee_account": beneficiary or None,
-        "source_sheet": "测试部门",
+        "source_sheet": source_sheet,
         "raw_extra": {
             "external_source": {
                 "system": "dingtalk_expense_database",
@@ -1611,8 +1621,9 @@ def external_expense_test_row(
                 "approval_status": status,
                 "applicant_id": "test-user-id",
                 "applicant": "测试申请人",
-                "applicant_department": "测试部门",
+                "applicant_department": source_sheet,
                 "application_date": "2026-07-15",
+                "execution_region": execution_region,
             }
         },
     }
@@ -1624,7 +1635,7 @@ def external_expense_test_row(
         "approval_no": approval_no,
         "applicant_id": "test-user-id",
         "applicant": "测试申请人",
-        "applicant_department": "测试部门",
+        "applicant_department": source_sheet,
         "approval_status": status,
         "approval_result": "agree",
         "summary": "中间表测试",
@@ -3345,13 +3356,124 @@ def test_external_expense_exact_approval_number_ignores_dates():
     assert "base_currency_amount <> 0" in exact_sql
     assert "execution_region" in exact_sql
     assert "BTRIM(COALESCE(execution_region, '')) = ''" in exact_sql
-    assert exact_params[-3] == r"(中国|china|墨西哥|m[eé]xico)"
+    assert exact_params[-3] == r"(中国|china)"
     assert "!~* %s" in exact_sql
     assert exact_params[-1] == "202607071704000140246"
 
     dated_sql, dated_params = _preview_conditions(date(2026, 7, 1), date(2026, 7, 15), ["operation"], "", [])
     assert "effective_date BETWEEN %s AND %s" in dated_sql
     assert dated_params[:2] == [date(2026, 7, 1), date(2026, 7, 15)]
+
+
+def test_china_workbench_external_expense_region_boundary():
+    explicit_china = external_expense_test_row(
+        "REGION-CN",
+        "9101",
+        execution_region="中国China",
+        source_sheet="YW MOLDES MX模具",
+    )
+    explicit_mexico = external_expense_test_row(
+        "REGION-MX",
+        "9102",
+        execution_region="墨西哥México",
+        source_sheet="悦为智能 YW Tech_Ai",
+    )
+    mexico_sheet_fallback = external_expense_test_row(
+        "REGION-MX-SHEET",
+        "9103",
+        source_sheet="YW MOLDES MX模具",
+    )
+    unknown_legacy = external_expense_test_row("REGION-LEGACY", "9104")
+
+    assert china_workbench_external_expense_allowed(explicit_china)
+    assert not china_workbench_external_expense_allowed(explicit_mexico)
+    assert not china_workbench_external_expense_allowed(mexico_sheet_fallback)
+    assert china_workbench_external_expense_allowed(unknown_legacy)
+
+    mark_china_workbench_external_expense(explicit_mexico)
+    mark_china_workbench_external_expense(explicit_mexico)
+    assert explicit_mexico["errors"].count(CHINA_WORKBENCH_REGION_ERROR) == 1
+
+
+def test_external_expense_preview_excludes_mexico_monthly_rows_and_applicants(monkeypatch):
+    def instance(source_id: str, approval_no: str, user_id: str, department: str, region: str) -> dict:
+        return {
+            "source_id": source_id,
+            "status": "RUNNING",
+            "result": "agree",
+            "title": f"{user_id} submitted monthly payment",
+            "raw_payload": {
+                "businessId": approval_no,
+                "originatorUserId": user_id,
+                "originatorDeptName": department,
+                "formComponentValues": [{"name": "执行地区", "value": region}],
+            },
+        }
+
+    china_instance = instance(
+        "9301",
+        "MONTHLY-CN",
+        "china-user",
+        "悦为智能 YW Tech_Ai",
+        "中国China",
+    )
+    mexico_instance = instance(
+        "9302",
+        "MONTHLY-MX",
+        "mexico-user",
+        "YW MOLDES MX模具",
+        "墨西哥México",
+    )
+
+    monkeypatch.setattr(
+        external_expenses_module,
+        "_monthly_payment_query",
+        lambda **kwargs: [china_instance, mexico_instance],
+    )
+    monkeypatch.setattr(
+        external_expenses_module,
+        "fetch_dingtalk_user_names",
+        lambda user_ids: {
+            "china-user": "中国申请人",
+            "mexico-user": "Mexico Applicant",
+        },
+    )
+
+    def fake_map_monthly(row, user_names):
+        raw_payload = row["raw_payload"]
+        region = raw_payload["formComponentValues"][0]["value"]
+        return external_expense_test_row(
+            raw_payload["businessId"],
+            row["source_id"],
+            source_type="monthly",
+            execution_region=region,
+            source_sheet=raw_payload["originatorDeptName"],
+        ) | {
+            "applicant_id": raw_payload["originatorUserId"],
+            "applicant": user_names[raw_payload["originatorUserId"]],
+        }
+
+    monkeypatch.setattr(
+        external_expenses_module,
+        "map_monthly_payment",
+        fake_map_monthly,
+    )
+
+    result = external_expenses_module.preview_external_expenses(
+        date_from=date(2026, 8, 25),
+        date_to=date(2026, 8, 25),
+        source_types=["monthly"],
+    )
+
+    assert [row["approval_no"] for row in result["rows"]] == ["MONTHLY-CN"]
+    assert result["applicant_options"] == [
+        {
+            "id": "china-user",
+            "name": "中国申请人",
+            "department": "悦为智能 YW Tech_Ai",
+            "count": 1,
+        }
+    ]
 
 
 def test_external_expense_zero_amount_is_not_importable():
@@ -3507,6 +3629,51 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
         assert rolled_back.status_code == 200
         assert rolled_back.json()["deleted_requests"] == 1
         assert client.get(f"/api/batches/{target_id}/requests").json()["totals"]["count"] == 0
+
+
+def test_external_expense_import_rejects_mexico_after_source_refetch(monkeypatch):
+    mexico_row = external_expense_test_row(
+        "IMPORT-MX-GUARD",
+        "9201",
+        execution_region="墨西哥México",
+        source_sheet="YW MOLDES MX模具",
+    )
+    monkeypatch.setattr(
+        main_module,
+        "fetch_external_expenses",
+        lambda items: [mexico_row],
+    )
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post(
+            "/api/batches",
+            json={
+                "name": "Mexico import guard",
+                "start_date": "2026-08-25",
+                "end_date": "2026-08-25",
+            },
+        ).json()["batch"]
+        response = client.post(
+            f"/api/batches/{batch['id']}/imports/external-expenses",
+            json={"items": [{"source_type": "operation", "source_id": "9201"}]},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["imported_rows"] == 0
+        assert payload["invalid_rows"] == 1
+        assert payload["job_id"] is None
+        assert payload["errors"] == [
+            {
+                "source_type": "operation",
+                "source_id": "9201",
+                "messages": [CHINA_WORKBENCH_REGION_ERROR],
+            }
+        ]
+        assert client.get(
+            f"/api/batches/{batch['id']}/requests"
+        ).json()["requests"] == []
 
 
 def test_external_expense_concurrent_dedupe_and_source_failure_are_atomic(monkeypatch):
