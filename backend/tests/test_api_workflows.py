@@ -3959,7 +3959,12 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
 
 
 def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_manual_values(monkeypatch):
-    approval_nos = ("SYNC-FILL-BLANK", "SYNC-KEEP-MANUAL")
+    approval_nos = (
+        "SYNC-FILL-BLANK",
+        "SYNC-KEEP-MANUAL",
+        "SYNC-IGNORE-INVALID-DATE",
+    )
+    source_dates = ("2026-07-24", "2026-07-25", "not-a-date")
     metadata = [
         {
             "approval_no": approval_no,
@@ -3969,6 +3974,8 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
             "approval_status": "RUNNING" if index == 1 else "TERMINATED",
             "approval_result": "agree",
             "beneficiary": "钉钉收款人",
+            "execution_region": "中国China",
+            "needed_payment_date": source_dates[index - 1],
         }
         for index, approval_no in enumerate(approval_nos, start=1)
     ]
@@ -4020,8 +4027,17 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
                 "amount": 200,
                 "payee_name": "人工收款人",
                 "payee_account": "人工账号",
+                "needed_payment_date": "2026-08-20",
                 "general_manager_approval": "存在争议",
                 "general_manager_approval_date": "2026-08-20",
+            },
+        ).json()["request"]
+        invalid_source = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={
+                "dingding_id": approval_nos[2],
+                "source_sheet": "悦为智能",
+                "amount": 300,
             },
         ).json()["request"]
 
@@ -4032,6 +4048,44 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
             params={"dingtalk_lifecycle": "all"},
         ).json()["requests"]
         by_id = {row["id"]: row for row in rows}
+
+        assert by_id[blank["id"]]["needed_payment_date"] == "2026-07-24"
+        assert by_id[manual["id"]]["needed_payment_date"] == "2026-08-20"
+        assert by_id[invalid_source["id"]]["needed_payment_date"] is None
+
+        with connect() as conn:
+            history = conn.execute(
+                """
+                SELECT needed_payment_date
+                FROM payable_history_versions
+                WHERE source_request_id = ? AND event_type = 'dingtalk.sync'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (blank["id"],),
+            ).fetchone()
+        assert history["needed_payment_date"] == "2026-07-24"
+
+        details = client.get(
+            "/api/daily-payables/details",
+            params={"date": date.today().isoformat()},
+        )
+        assert details.status_code == 200
+        assert any(
+            item["dingding_id"] == "SYNC-FILL-BLANK"
+            for item in details.json()["items"]
+        )
+
+        second = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+        assert second.status_code == 200
+        second_rows = client.get(
+            f"/api/batches/{batch['id']}/requests",
+            params={"dingtalk_lifecycle": "all"},
+        ).json()["requests"]
+        second_by_id = {row["id"]: row for row in second_rows}
+        assert second_by_id[blank["id"]]["needed_payment_date"] == "2026-07-24"
+        assert second_by_id[manual["id"]]["needed_payment_date"] == "2026-08-20"
+        assert second_by_id[invalid_source["id"]]["needed_payment_date"] is None
 
     blank_row = by_id[blank["id"]]
     assert blank_row["payee_name"] == "钉钉收款人"

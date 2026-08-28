@@ -202,7 +202,7 @@ with connect() as conn:
         """
         SELECT needed_payment_date
         FROM payable_history_versions
-        WHERE request_id = ? AND event_type = 'dingtalk.sync'
+        WHERE source_request_id = ? AND event_type = 'dingtalk.sync'
         ORDER BY id DESC
         LIMIT 1
         """,

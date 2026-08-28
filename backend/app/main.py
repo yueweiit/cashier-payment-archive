@@ -5554,6 +5554,16 @@ def download_dingtalk_attachment_candidates(
     return downloaded_attachments, len(attachment_errors), attachment_errors
 
 
+def external_needed_payment_date(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
+
+
 def _sync_external_expense_metadata_blocking(
     batch_id: int,
     only_if_stale_seconds: int,
@@ -5908,10 +5918,19 @@ def _sync_external_expense_metadata_blocking(
                 if derived_manager:
                     manager_approval = derived_manager[0]
                     manager_approval_date = manager_approval_date or derived_manager[1]
+            needed_payment_date = row["needed_payment_date"]
+            if not str(needed_payment_date or "").strip() and approval_no in matched:
+                needed_payment_date = (
+                    external_needed_payment_date(
+                        metadata_by_approval[approval_no][0].get("needed_payment_date")
+                    )
+                    or needed_payment_date
+                )
             conn.execute(
                 """
                 UPDATE payment_requests
                 SET raw_extra_json = ?, payee_name = ?, payee_account = ?,
+                    needed_payment_date = ?,
                     general_manager_approval = ?, general_manager_approval_date = ?,
                     updated_by = ?, updated_at = ?, version = version + 1
                 WHERE id = ? AND batch_id = ?
@@ -5920,6 +5939,7 @@ def _sync_external_expense_metadata_blocking(
                     json.dumps(raw_extra, ensure_ascii=False, default=str),
                     payee_name,
                     payee_account,
+                    needed_payment_date,
                     manager_approval,
                     manager_approval_date,
                     user["id"],
