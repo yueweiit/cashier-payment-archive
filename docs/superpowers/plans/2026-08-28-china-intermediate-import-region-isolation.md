@@ -280,6 +280,8 @@ Then filter the option and monthly input collections before fetching names or ma
     ]
 ```
 
+When converting each monthly option into `applicant_rows`, also carry the extracted `execution_region`; otherwise the following common filter would incorrectly fall back to the Sheet and discard an explicit China record whose Sheet name is mapped to Mexico.
+
 - [ ] **Step 5: Apply a final mapped-row filter**
 
 After mapping all standard and monthly preview rows, retain only rows for which `china_workbench_external_expense_allowed(row)` is true. This final pass is required even when SQL already filtered standard sources because it covers blank-region Mexico Sheets and source format differences.
@@ -312,7 +314,7 @@ def test_external_expense_preview_excludes_mexico_monthly_rows_and_applicants(mo
             },
         }
 
-    china_instance = instance("9301", "MONTHLY-CN", "china-user", "悦为智能 YW Tech_Ai", "中国China")
+    china_instance = instance("9301", "MONTHLY-CN", "china-user", "YW MOLDES MX模具", "中国China")
     mexico_instance = instance("9302", "MONTHLY-MX", "mexico-user", "YW MOLDES MX模具", "墨西哥México")
 
     monkeypatch.setattr(
@@ -352,7 +354,7 @@ def test_external_expense_preview_excludes_mexico_monthly_rows_and_applicants(mo
     assert result["applicant_options"] == [{
         "id": "china-user",
         "name": "中国申请人",
-        "department": "悦为智能 YW Tech_Ai",
+        "department": "YW MOLDES MX模具",
         "count": 1,
     }]
 ```
