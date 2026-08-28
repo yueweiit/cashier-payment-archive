@@ -410,7 +410,7 @@ git push origin main
 
 Expected: tests and build pass, then `origin/main` advances to the verified commit.
 
-- [ ] **Step 7: Capture a pre-sync checksum of existing nonblank production dates**
+- [ ] **Step 7: Capture the pre-sync set of existing nonblank production dates**
 
 Using the running production container's actual database path, execute a read-only ordered query over the current batch:
 
@@ -422,7 +422,7 @@ WHERE batch_id = :current_batch_id
 ORDER BY id;
 ```
 
-Hash the exact ordered output with `shasum -a 256` and retain the hash in the deployment log for the after-sync comparison.
+Save the exact ordered `id -> needed_payment_date` output in the deployment log. This is the protected set: every listed row must retain the same date after synchronization.
 
 - [ ] **Step 8: Stop the service and make a unique full production backup**
 
@@ -459,7 +459,7 @@ Confirm production request `202607221050000501984` now has:
 执行地区: 中国（已核定）
 ```
 
-Re-run the ordered nonblank-date query from Step 7 and hash it. Expected: the pre-existing nonblank rows and values are identical; the only allowed difference in the full dataset is a formerly blank row gaining its source date.
+Re-run the ordered nonblank-date query from Step 7. Expected: every pre-sync `id -> needed_payment_date` pair is still present and identical, while the target formerly blank row is newly present with `2026-07-24`. No other date change is allowed.
 
 - [ ] **Step 12: Verify Daily Payables and production logs**
 
