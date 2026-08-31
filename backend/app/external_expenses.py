@@ -2248,14 +2248,19 @@ def _form_component_value_prefixes(
     preserve_raw: bool = False,
 ) -> Optional[str]:
     normalized_prefixes = tuple(prefix.casefold() for prefix in prefixes)
+    blank_value: Optional[str] = None
     for item in form_values:
         name = _text(item.get("name")) or ""
         if not any(name.casefold().startswith(prefix) for prefix in normalized_prefixes):
             continue
-        value = str(item.get("value")) if preserve_raw and item.get("value") is not None else _text(item.get("value"))
-        if value is not None:
-            return value
-    return None
+        raw_value = str(item.get("value")) if item.get("value") is not None else None
+        value = raw_value if preserve_raw else _text(item.get("value"))
+        if _text(raw_value) is None:
+            if preserve_raw and blank_value is None and raw_value is not None:
+                blank_value = raw_value
+            continue
+        return value
+    return blank_value if preserve_raw else None
 
 
 def _invoice_payment_account(value: Any) -> Optional[str]:

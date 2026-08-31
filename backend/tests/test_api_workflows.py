@@ -124,6 +124,21 @@ def test_external_expense_maps_case_insensitive_spanish_invoice_prefix():
     assert mapped["request_data"]["raw_extra"]["external_source"]["invoice_value"] == "No."
 
 
+def test_external_expense_skips_blank_first_bilingual_invoice_component():
+    mapped = map_external_expense({
+        "source_type": "operation", "source_id": "invoice-blank-first", "effective_date": "2026-08-01",
+        "approval_no": "INVOICE-BLANK-FIRST", "approval_status": "RUNNING", "approval_result": "agree",
+        "execution_region": "中国China", "beneficiary": "收款人", "base_currency_amount": 10,
+        "raw_data": {"formComponentValues": [
+            {"name": "是否有发票", "value": ""},
+            {"name": "EXISTE FACTURA", "value": "Yes"},
+        ]},
+    })
+    external = mapped["request_data"]["raw_extra"]["external_source"]
+    assert mapped["payment_account"] == "公户"
+    assert external["invoice_value"] == "Yes"
+
+
 def test_external_expense_project_falls_back_to_source_row_for_purchase_and_monthly():
     for source_type in ("purchase", "monthly"):
         mapped = map_external_expense({
