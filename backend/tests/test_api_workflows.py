@@ -108,7 +108,7 @@ def test_external_expense_maps_invoice_choice_and_project(invoice_value, expecte
     external = mapped["request_data"]["raw_extra"]["external_source"]
     assert external["payment_account"] == expected_account
     assert external["project"] == "表单项目"
-    assert external["invoice_value"] == invoice_value or (invoice_value == "" and external["invoice_value"] == "")
+    assert external["invoice_value"] == invoice_value.strip()
 
 
 def test_external_expense_maps_case_insensitive_spanish_invoice_prefix():
@@ -137,6 +137,38 @@ def test_external_expense_skips_blank_first_bilingual_invoice_component():
     external = mapped["request_data"]["raw_extra"]["external_source"]
     assert mapped["payment_account"] == "公户"
     assert external["invoice_value"] == "Yes"
+
+
+def test_external_expense_decodes_json_invoice_and_project_values():
+    mapped = map_external_expense({
+        "source_type": "operation", "source_id": "json-values", "effective_date": "2026-08-01",
+        "approval_no": "JSON-VALUES", "approval_status": "RUNNING", "approval_result": "agree",
+        "execution_region": "中国China", "beneficiary": "收款人", "base_currency_amount": 10,
+        "raw_data": {"formComponentValues": [
+            {"name": "是否有发票", "value": '["Sí"]'},
+            {"name": "项目归属", "value": '["墨西哥新工厂"]'},
+        ]},
+    })
+    external = mapped["request_data"]["raw_extra"]["external_source"]
+    assert mapped["payment_account"] == "公户"
+    assert mapped["project"] == "墨西哥新工厂"
+    assert mapped["request_data"]["project"] == "墨西哥新工厂"
+    assert external["project"] == "墨西哥新工厂"
+    assert external["invoice_value"] == "Sí"
+
+
+def test_external_expense_recognizes_label_only_invoice_and_project_components():
+    mapped = map_external_expense({
+        "source_type": "operation", "source_id": "label-values", "effective_date": "2026-08-01",
+        "approval_no": "LABEL-VALUES", "approval_status": "RUNNING", "approval_result": "agree",
+        "execution_region": "中国China", "beneficiary": "收款人", "base_currency_amount": 10,
+        "raw_data": {"formComponentValues": [
+            {"label": "EXISTE FACTURA", "value": "Yes"},
+            {"label": "Pertenencia del Proyecto", "value": "标签项目"},
+        ]},
+    })
+    assert mapped["payment_account"] == "公户"
+    assert mapped["project"] == "标签项目"
 
 
 def test_external_expense_project_falls_back_to_source_row_for_purchase_and_monthly():
@@ -3619,6 +3651,13 @@ def test_external_expense_zero_amount_is_not_importable():
 def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch):
     duplicate_row = external_expense_test_row("EXT-DUPLICATE", "701")
     new_row = external_expense_test_row("EXT-NEW", "702", status="COMPLETED", warnings=["缺少收款信息"], beneficiary="")
+    new_row["payment_account"] = "公户"
+    new_row["project"] = "导入项目"
+    new_row["request_data"]["payment_account"] = "公户"
+    new_row["request_data"]["project"] = "导入项目"
+    new_row["request_data"]["raw_extra"]["external_source"].update({
+        "payment_account": "公户", "project": "导入项目",
+    })
     invalid_row = external_expense_test_row("EXT-INVALID", "703")
     invalid_row["errors"] = ["金额缺失"]
 
@@ -3728,6 +3767,8 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
         assert request["pending_amount"] == new_row["amount"]
         assert request["finance_review"] == "未付款"
         assert request["raw_extra"]["external_source"]["approval_status"] == "COMPLETED"
+        assert request["payment_account"] == "公户"
+        assert request["project"] == "导入项目"
         with connect() as conn:
             job = conn.execute("SELECT * FROM import_jobs WHERE id = ?", (imported.json()["job_id"],)).fetchone()
             assert job["kind"] == "external-expenses"
