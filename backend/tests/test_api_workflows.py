@@ -3974,6 +3974,12 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         assert by_id[request_ids[2]]["project"] is None
         assert by_id[request_ids[3]]["payment_account"] is None
         assert by_id[request_ids[3]]["project"] is None
+        with connect() as conn:
+            for request_id in (request_ids[2], request_ids[3]):
+                assert conn.execute(
+                    "SELECT 1 FROM audit_logs WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'",
+                    (request_id,),
+                ).fetchone() is None
         assert by_id[request_ids[4]]["raw_extra"]["external_source"]["approval_status"] == "TERMINATED"
         assert by_id[request_ids[4]]["general_manager_approval"] == "无需审批"
         visible_batch = client.get(f"/api/batches/{batch_id}").json()["batch"]
@@ -4169,7 +4175,7 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
         with connect() as conn:
             history = conn.execute(
                 """
-                SELECT needed_payment_date, payment_account, project
+                SELECT needed_payment_date, event_type
                 FROM payable_history_versions
                 WHERE source_request_id = ? AND event_type = 'dingtalk.sync'
                 ORDER BY id DESC
@@ -4178,8 +4184,23 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
                 (blank["id"],),
             ).fetchone()
         assert history["needed_payment_date"] == "2026-07-24"
-        assert history["payment_account"] == "公户"
-        assert history["project"] == "钉钉项目 A"
+        assert history["event_type"] == "dingtalk.sync"
+        field_audit = conn.execute(
+            """
+            SELECT old_value_json, new_value_json
+            FROM audit_logs
+            WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (blank["id"],),
+        ).fetchone()
+        assert json.loads(field_audit["old_value_json"]) == {"payment_account": None, "project": None}
+        assert json.loads(field_audit["new_value_json"]) == {"payment_account": "公户", "project": "钉钉项目 A"}
+        for request in (manual, invalid_source):
+            assert conn.execute(
+                "SELECT 1 FROM audit_logs WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'",
+                (request["id"],),
+            ).fetchone() is None
 
         details = client.get(
             "/api/daily-payables/details",
@@ -4207,6 +4228,11 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
         assert second_by_id[manual["id"]]["project"] == "人工项目"
         assert second_by_id[invalid_source["id"]]["payment_account"] is None
         assert second_by_id[invalid_source["id"]]["project"] is None
+        with connect() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) AS count FROM audit_logs WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'",
+                (blank["id"],),
+            ).fetchone()["count"] == 1
 
     blank_row = by_id[blank["id"]]
     assert blank_row["payee_name"] == "钉钉收款人"

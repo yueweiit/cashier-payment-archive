@@ -655,8 +655,6 @@ def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
             fx_rate_date TEXT,
             fx_rate_actual_date TEXT,
             source_sheet TEXT,
-            payment_account TEXT,
-            project TEXT,
             summary TEXT,
             applicant TEXT,
             approval_status TEXT,
@@ -678,8 +676,6 @@ def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_column(conn, "payable_history_versions", "source_batch_id", "INTEGER")
     ensure_column(conn, "payable_history_versions", "dingding_id", "TEXT")
-    ensure_column(conn, "payable_history_versions", "payment_account", "TEXT")
-    ensure_column(conn, "payable_history_versions", "project", "TEXT")
 
     roots = _logical_request_roots(conn)
     for request_id, logical_request_id in roots.items():

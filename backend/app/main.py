@@ -5944,6 +5944,24 @@ def _sync_external_expense_metadata_blocking(
                     payment_account = external_payment_account(metadata.get("payment_account")) or payment_account
                 if not str(project or "").strip():
                     project = external_project(metadata.get("project")) or project
+            if payment_account != row["payment_account"] or project != row["project"]:
+                write_audit(
+                    conn,
+                    user["id"],
+                    "external_expenses.metadata_sync.request_fields",
+                    "payment_request",
+                    request_id,
+                    batch_id,
+                    old_value={
+                        "payment_account": row["payment_account"],
+                        "project": row["project"],
+                    },
+                    new_value={
+                        "payment_account": payment_account,
+                        "project": project,
+                    },
+                    operation_id=operation_id,
+                )
             conn.execute(
                 """
                 UPDATE payment_requests
