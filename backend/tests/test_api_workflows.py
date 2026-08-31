@@ -81,8 +81,8 @@ def test_external_expense_metadata_exposes_mapped_needed_payment_date():
 
 
 @pytest.mark.parametrize(("invoice_value", "expected_account"), [
-    ("是", "公户"), ("有发票", "公户"), ("Sí", "公户"), ("Si", "公户"), ("Yes", "公户"),
-    ("否", "私户"), ("无发票", "私户"), ("No", "私户"), ("待定", None), ("", None),
+    ("是", "公户"), ("有", "公户"), ("有发票", "公户"), ("Sí", "公户"), ("Si", "公户"), ("Yes", "公户"),
+    ("否", "私户"), ("无", "私户"), ("无发票", "私户"), ("No", "私户"), ("待定", None), ("", None),
 ])
 def test_external_expense_maps_invoice_choice_and_project(invoice_value, expected_account):
     mapped = map_external_expense({
