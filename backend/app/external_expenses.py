@@ -1015,7 +1015,7 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
         "related_approval_nos": related,
         "fx_rate_actual_date": fx_actual_date,
     })
-    invoice_account = _invoice_payment_account(_form_component_value_prefixes(form_values, INVOICE_COMPONENT_PREFIXES))
+    invoice_account = _invoice_payment_account(_form_component_value_prefixes(form_values, INVOICE_COMPONENT_PREFIXES, preserve_raw=True))
     legacy_account = _monthly_component(form_values, "付款账户类型", "付款账户")
     payment_account = invoice_account if invoice_account is not None else legacy_account
     mapped["payment_account"] = payment_account
@@ -1894,7 +1894,7 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
     source_type = str(row.get("source_type") or "")
     raw_data = _json_object(row.get("raw_data"))
     form_values = _form_values(raw_data)
-    invoice_value = _form_component_value_prefixes(form_values, INVOICE_COMPONENT_PREFIXES)
+    invoice_value = _form_component_value_prefixes(form_values, INVOICE_COMPONENT_PREFIXES, preserve_raw=True)
     invoice_account = _invoice_payment_account(invoice_value)
     project = _form_component_value_prefixes(form_values, PROJECT_COMPONENT_PREFIXES) or _text(row.get("project"))
     beneficiary_values: list[str]
@@ -2241,13 +2241,18 @@ def _component_values(form_values: Iterable[Dict[str, Any]], name_prefix: str) -
     return result
 
 
-def _form_component_value_prefixes(form_values: Iterable[Dict[str, Any]], prefixes: Iterable[str]) -> Optional[str]:
+def _form_component_value_prefixes(
+    form_values: Iterable[Dict[str, Any]],
+    prefixes: Iterable[str],
+    *,
+    preserve_raw: bool = False,
+) -> Optional[str]:
     normalized_prefixes = tuple(prefix.casefold() for prefix in prefixes)
     for item in form_values:
         name = _text(item.get("name")) or ""
         if not any(name.casefold().startswith(prefix) for prefix in normalized_prefixes):
             continue
-        value = _text(item.get("value"))
+        value = str(item.get("value")) if preserve_raw and item.get("value") is not None else _text(item.get("value"))
         if value is not None:
             return value
     return None

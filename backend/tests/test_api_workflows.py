@@ -63,11 +63,15 @@ def test_external_expense_metadata_exposes_mapped_needed_payment_date():
         "source_label": "采购支出",
         "source_id": "9778",
         "needed_payment_date": "2026-07-24",
+        "payment_account": "公户",
+        "project": "规范项目",
         "request_data": {
             "raw_extra": {
                 "external_source": {
                     "approval_status": "RUNNING",
                     "needed_payment_date": "stale-value",
+                    "payment_account": "私户",
+                    "project": "过期项目",
                 }
             }
         },
@@ -78,11 +82,14 @@ def test_external_expense_metadata_exposes_mapped_needed_payment_date():
     assert metadata["approval_no"] == "META-DATE-1"
     assert metadata["source_id"] == "9778"
     assert metadata["needed_payment_date"] == "2026-07-24"
+    assert metadata["payment_account"] == "公户"
+    assert metadata["project"] == "规范项目"
 
 
 @pytest.mark.parametrize(("invoice_value", "expected_account"), [
     ("是", "公户"), ("有", "公户"), ("有发票", "公户"), ("Sí", "公户"), ("Si", "公户"), ("Yes", "公户"),
-    ("否", "私户"), ("无", "私户"), ("无发票", "私户"), ("No", "私户"), ("待定", None), ("", None),
+    ("  SÍ!  ", "公户"), ("yEs", "公户"),
+    ("否", "私户"), ("无", "私户"), ("无发票", "私户"), ("No", "私户"), ("No.", "私户"), ("待定", None), ("", None),
 ])
 def test_external_expense_maps_invoice_choice_and_project(invoice_value, expected_account):
     mapped = map_external_expense({
@@ -91,7 +98,7 @@ def test_external_expense_maps_invoice_choice_and_project(invoice_value, expecte
         "approval_status": "RUNNING", "approval_result": "agree", "execution_region": "中国China",
         "beneficiary": "收款人", "expense_type": "办公", "base_currency_amount": 10,
         "project": "表格项目", "raw_data": {"formComponentValues": [
-            {"name": "是否有发票是否有发票 Existe Factura", "value": invoice_value},
+            {"name": "是否有发票 Existe Factura", "value": invoice_value},
             {"name": "项目归属 Pertenencia del Proyecto", "value": "表单项目"},
         ]},
     })
@@ -104,6 +111,19 @@ def test_external_expense_maps_invoice_choice_and_project(invoice_value, expecte
     assert external["invoice_value"] == invoice_value or (invoice_value == "" and external["invoice_value"] == "")
 
 
+def test_external_expense_maps_case_insensitive_spanish_invoice_prefix():
+    mapped = map_external_expense({
+        "source_type": "operation", "source_id": "invoice-spanish", "effective_date": "2026-08-01",
+        "approval_no": "INVOICE-SPANISH", "approval_status": "RUNNING", "approval_result": "agree",
+        "execution_region": "中国China", "beneficiary": "收款人", "base_currency_amount": 10,
+        "raw_data": {"formComponentValues": [
+            {"name": "EXISTE FACTURA 是否有发票", "value": "No."},
+        ]},
+    })
+    assert mapped["payment_account"] == "私户"
+    assert mapped["request_data"]["raw_extra"]["external_source"]["invoice_value"] == "No."
+
+
 def test_external_expense_project_falls_back_to_source_row_for_purchase_and_monthly():
     for source_type in ("purchase", "monthly"):
         mapped = map_external_expense({
@@ -113,6 +133,8 @@ def test_external_expense_project_falls_back_to_source_row_for_purchase_and_mont
             "project": "表格项目", "raw_data": {"formComponentValues": []},
         })
         assert mapped["project"] == "表格项目"
+        assert mapped["request_data"]["project"] == "表格项目"
+        assert mapped["request_data"]["raw_extra"]["external_source"]["project"] == "表格项目"
 
 
 def test_monthly_invoice_account_wins_and_legacy_account_falls_back():
@@ -133,6 +155,7 @@ def test_monthly_invoice_account_wins_and_legacy_account_falls_back():
     assert mapped["request_data"]["raw_extra"]["external_source"]["payment_account"] == "公户"
     fallback = map_monthly_payment(base)
     assert fallback["payment_account"] == fallback["request_data"]["payment_account"] == "私户"
+    assert fallback["request_data"]["raw_extra"]["external_source"]["payment_account"] == "私户"
 
 
 def login(client: TestClient, username: str = "admin", password: str = "admin123") -> None:
