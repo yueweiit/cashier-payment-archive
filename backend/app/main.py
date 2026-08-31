@@ -6074,7 +6074,7 @@ def _sync_external_expense_metadata_blocking(
                                 amount=pending_amount,
                                 payment_date=payment_date,
                                 payer=str(event.get("operator_name") or "").strip() or None,
-                                payment_account=row["payment_account"],
+                                payment_account=payment_account,
                                 bank_reference=evidence_reference,
                                 remark=(
                                     f"钉钉流程自动识别｜{event.get('stage_name') or '流程评论'}｜"

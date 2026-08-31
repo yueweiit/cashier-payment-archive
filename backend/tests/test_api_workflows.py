@@ -4579,6 +4579,8 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
             "applicant_id": "finance-user",
             "applicant": "测试财务",
             "applicant_department": "财务中心",
+            "payment_account": " 公户 ",
+            "project": " 钉钉项目自动付款 ",
         }],
     )
     events = [
@@ -4662,7 +4664,7 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
         batch = client.post("/api/batches", json={"name": "workflow-auto-payment"}).json()["batch"]
         request = client.post(
             f"/api/batches/{batch['id']}/requests",
-            json={"dingding_id": approval_no, "amount": 100, "payment_account": "公户"},
+            json={"dingding_id": approval_no, "amount": 100},
         ).json()["request"]
         manual_payment = client.post(
             f"/api/batches/{batch['id']}/requests/{request['id']}/payments",
@@ -4687,6 +4689,7 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
         assert automatic["amount"] == 60
         assert automatic["payment_date"] == "2026-07-27"
         assert automatic["payer"] == "测试财务"
+        assert automatic["payment_account"] == "公户"
 
         workflow = client.get(
             f"/api/batches/{batch['id']}/requests/{request['id']}/dingtalk-workflow"
