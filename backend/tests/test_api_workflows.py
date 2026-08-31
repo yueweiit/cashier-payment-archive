@@ -4183,24 +4183,24 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
                 """,
                 (blank["id"],),
             ).fetchone()
-        assert history["needed_payment_date"] == "2026-07-24"
-        assert history["event_type"] == "dingtalk.sync"
-        field_audit = conn.execute(
-            """
-            SELECT old_value_json, new_value_json
-            FROM audit_logs
-            WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'
-            ORDER BY id DESC LIMIT 1
-            """,
-            (blank["id"],),
-        ).fetchone()
-        assert json.loads(field_audit["old_value_json"]) == {"payment_account": None, "project": None}
-        assert json.loads(field_audit["new_value_json"]) == {"payment_account": "公户", "project": "钉钉项目 A"}
-        for request in (manual, invalid_source):
-            assert conn.execute(
-                "SELECT 1 FROM audit_logs WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'",
-                (request["id"],),
-            ).fetchone() is None
+            assert history["needed_payment_date"] == "2026-07-24"
+            assert history["event_type"] == "dingtalk.sync"
+            field_audit = conn.execute(
+                """
+                SELECT old_value_json, new_value_json
+                FROM audit_logs
+                WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (blank["id"],),
+            ).fetchone()
+            assert json.loads(field_audit["old_value_json"]) == {"payment_account": None, "project": None}
+            assert json.loads(field_audit["new_value_json"]) == {"payment_account": "公户", "project": "钉钉项目 A"}
+            for request in (manual, invalid_source):
+                assert conn.execute(
+                    "SELECT 1 FROM audit_logs WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'",
+                    (request["id"],),
+                ).fetchone() is None
 
         details = client.get(
             "/api/daily-payables/details",
@@ -4690,6 +4690,11 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
         assert automatic["payment_date"] == "2026-07-27"
         assert automatic["payer"] == "测试财务"
         assert automatic["payment_account"] == "公户"
+        synced_request = next(
+            item for item in client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+            if item["id"] == request["id"]
+        )
+        assert synced_request["project"] == "钉钉项目自动付款"
 
         workflow = client.get(
             f"/api/batches/{batch['id']}/requests/{request['id']}/dingtalk-workflow"
