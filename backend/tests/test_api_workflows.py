@@ -80,6 +80,61 @@ def test_external_expense_metadata_exposes_mapped_needed_payment_date():
     assert metadata["needed_payment_date"] == "2026-07-24"
 
 
+@pytest.mark.parametrize(("invoice_value", "expected_account"), [
+    ("是", "公户"), ("有发票", "公户"), ("Sí", "公户"), ("Si", "公户"), ("Yes", "公户"),
+    ("否", "私户"), ("无发票", "私户"), ("No", "私户"), ("待定", None), ("", None),
+])
+def test_external_expense_maps_invoice_choice_and_project(invoice_value, expected_account):
+    mapped = map_external_expense({
+        "source_type": "operation", "source_id": "invoice-1", "effective_date": "2026-08-01",
+        "approval_no": "INVOICE-1", "creator_name": "u1", "applicant_department": "财务部",
+        "approval_status": "RUNNING", "approval_result": "agree", "execution_region": "中国China",
+        "beneficiary": "收款人", "expense_type": "办公", "base_currency_amount": 10,
+        "project": "表格项目", "raw_data": {"formComponentValues": [
+            {"name": "是否有发票是否有发票 Existe Factura", "value": invoice_value},
+            {"name": "项目归属 Pertenencia del Proyecto", "value": "表单项目"},
+        ]},
+    })
+    assert mapped["request_data"]["payment_account"] == expected_account
+    assert mapped["payment_account"] == expected_account
+    assert mapped["project"] == "表单项目"
+    external = mapped["request_data"]["raw_extra"]["external_source"]
+    assert external["payment_account"] == expected_account
+    assert external["project"] == "表单项目"
+    assert external["invoice_value"] == invoice_value or (invoice_value == "" and external["invoice_value"] == "")
+
+
+def test_external_expense_project_falls_back_to_source_row_for_purchase_and_monthly():
+    for source_type in ("purchase", "monthly"):
+        mapped = map_external_expense({
+            "source_type": source_type, "source_id": "project-fallback", "effective_date": "2026-08-01",
+            "approval_no": "PROJECT-FALLBACK", "approval_status": "RUNNING", "approval_result": "agree",
+            "execution_region": "中国China", "beneficiary": "收款人", "base_currency_amount": 10,
+            "project": "表格项目", "raw_data": {"formComponentValues": []},
+        })
+        assert mapped["project"] == "表格项目"
+
+
+def test_monthly_invoice_account_wins_and_legacy_account_falls_back():
+    base = {
+        "source_id": "monthly-account", "process_instance_id": "proc-account", "create_time": "2026-08-01",
+        "status": "RUNNING", "result": "agree", "title": "张三提交的月结付款",
+        "raw_payload": {"businessId": "MONTHLY-ACCOUNT", "originatorUserId": "u1",
+            "originatorDeptName": "财务部", "formComponentValues": [
+                {"name": "合计总额", "value": "10"}, {"name": "收款账户信息", "value": "收款人"},
+                {"name": "币种", "value": "人民币"}, {"name": "付款账户类型", "value": "私户"},
+            ]},
+    }
+    recognized = dict(base, raw_payload=dict(base["raw_payload"], formComponentValues=[
+        *base["raw_payload"]["formComponentValues"], {"name": "是否有发票 Existe Factura", "value": "Yes"},
+    ]))
+    mapped = map_monthly_payment(recognized)
+    assert mapped["payment_account"] == mapped["request_data"]["payment_account"] == "公户"
+    assert mapped["request_data"]["raw_extra"]["external_source"]["payment_account"] == "公户"
+    fallback = map_monthly_payment(base)
+    assert fallback["payment_account"] == fallback["request_data"]["payment_account"] == "私户"
+
+
 def login(client: TestClient, username: str = "admin", password: str = "admin123") -> None:
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200

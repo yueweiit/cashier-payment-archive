@@ -58,6 +58,8 @@ EXECUTION_REGION_COMPONENT_PREFIXES = (
     "país",
     "pais",
 )
+INVOICE_COMPONENT_PREFIXES = ("是否有发票", "existe factura")
+PROJECT_COMPONENT_PREFIXES = ("项目归属", "pertenencia del proyecto")
 DISALLOWED_APPROVAL_RESULT_PATTERN = r"(refus|reject|cancel|terminat|revok|void|abort|作废|拒绝|撤销|撤回|取消|终止)"
 DISALLOWED_APPROVAL_RESULT_RE = re.compile(DISALLOWED_APPROVAL_RESULT_PATTERN, re.IGNORECASE)
 SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出", "monthly": "月结付款"}
@@ -1013,7 +1015,12 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
         "related_approval_nos": related,
         "fx_rate_actual_date": fx_actual_date,
     })
-    mapped["request_data"]["payment_account"] = _monthly_component(form_values, "付款账户类型", "付款账户")
+    invoice_account = _invoice_payment_account(_form_component_value_prefixes(form_values, INVOICE_COMPONENT_PREFIXES))
+    legacy_account = _monthly_component(form_values, "付款账户类型", "付款账户")
+    payment_account = invoice_account if invoice_account is not None else legacy_account
+    mapped["payment_account"] = payment_account
+    mapped["request_data"]["payment_account"] = payment_account
+    external_source["payment_account"] = payment_account
     mapped["request_data"]["fx_rate_cny_per_unit"] = fx_rate
     mapped["request_data"]["fx_rate_actual_date"] = fx_actual_date
     mapped["related_approval_nos"] = related
@@ -1173,6 +1180,8 @@ def _external_expense_metadata(mapped: Dict[str, Any]) -> Dict[str, Any]:
         "source_id": mapped["source_id"],
         **external_source,
         "needed_payment_date": mapped.get("needed_payment_date"),
+        "payment_account": mapped.get("payment_account"),
+        "project": mapped.get("project"),
     }
 
 
@@ -1885,6 +1894,9 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
     source_type = str(row.get("source_type") or "")
     raw_data = _json_object(row.get("raw_data"))
     form_values = _form_values(raw_data)
+    invoice_value = _form_component_value_prefixes(form_values, INVOICE_COMPONENT_PREFIXES)
+    invoice_account = _invoice_payment_account(invoice_value)
+    project = _form_component_value_prefixes(form_values, PROJECT_COMPONENT_PREFIXES) or _text(row.get("project"))
     beneficiary_values: list[str]
     if source_type == "purchase":
         beneficiary_values = _component_values(form_values, "收款人")
@@ -2001,7 +2013,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "fx_rate_cny_per_unit": fx_rate,
         "fx_rate_date": application_date,
         "fx_rate_actual_date": application_date,
-        "project": _text(row.get("project")),
+        "project": project,
+        "payment_account": invoice_account,
         "payee_name": beneficiary or None,
         "payee_account": beneficiary or None,
         "needed_payment_date": needed_payment_date,
@@ -2029,6 +2042,9 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 "execution_region": execution_region or None,
                 "source_amount": source_amount,
                 "base_currency_amount": base_amount,
+                "payment_account": invoice_account,
+                "project": project,
+                "invoice_value": invoice_value or "",
             }
         },
     }
@@ -2049,6 +2065,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "currency": source_currency or "CNY",
         "beneficiary": beneficiary,
         "needed_payment_date": needed_payment_date,
+        "payment_account": invoice_account,
+        "project": project,
         "warnings": warnings,
         "errors": errors,
         "source_conflict": False,
@@ -2221,6 +2239,33 @@ def _component_values(form_values: Iterable[Dict[str, Any]], name_prefix: str) -
         if value and value not in result:
             result.append(value)
     return result
+
+
+def _form_component_value_prefixes(form_values: Iterable[Dict[str, Any]], prefixes: Iterable[str]) -> Optional[str]:
+    normalized_prefixes = tuple(prefix.casefold() for prefix in prefixes)
+    for item in form_values:
+        name = _text(item.get("name")) or ""
+        if not any(name.casefold().startswith(prefix) for prefix in normalized_prefixes):
+            continue
+        value = _text(item.get("value"))
+        if value is not None:
+            return value
+    return None
+
+
+def _invoice_payment_account(value: Any) -> Optional[str]:
+    text = _text(value)
+    if text is None:
+        return None
+    normalized = "".join(
+        char for char in unicodedata.normalize("NFKD", text).casefold()
+        if not unicodedata.combining(char) and char.isalnum()
+    )
+    if normalized in {"是", "有", "有发票", "si", "yes"}:
+        return "公户"
+    if normalized in {"否", "无", "无发票", "no"}:
+        return "私户"
+    return None
 
 
 def _text(value: Any) -> Optional[str]:
