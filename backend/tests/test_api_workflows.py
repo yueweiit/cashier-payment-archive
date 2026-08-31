@@ -3862,6 +3862,8 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             "applicant": "同步申请人",
             "applicant_name_source": "ding_user_snapshot",
             "applicant_department": "产品与采购部",
+            "payment_account": "公户",
+            "project": "钉钉项目 A",
         },
         {
             "approval_no": "SYNC-CONFLICT",
@@ -3869,6 +3871,8 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             "source_label": "运营支出",
             "source_id": "902",
             "approval_status": "COMPLETED",
+            "payment_account": "私户",
+            "project": "冲突项目",
         },
         {
             "approval_no": "SYNC-CONFLICT",
@@ -3876,6 +3880,8 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
             "source_label": "采购支出",
             "source_id": "903",
             "approval_status": "TERMINATED",
+            "payment_account": "公户",
+            "project": "冲突项目 2",
         },
         {
             "approval_no": "SYNC-TERMINATED",
@@ -3964,6 +3970,10 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         assert by_id[request_ids[0]]["source_sheet"] == "用户手动 Sheet"
         assert by_id[request_ids[2]]["raw_extra"]["external_source"]["lookup_status"] == "conflict"
         assert by_id[request_ids[3]]["raw_extra"]["external_source"]["lookup_status"] == "unmatched"
+        assert by_id[request_ids[2]]["payment_account"] is None
+        assert by_id[request_ids[2]]["project"] is None
+        assert by_id[request_ids[3]]["payment_account"] is None
+        assert by_id[request_ids[3]]["project"] is None
         assert by_id[request_ids[4]]["raw_extra"]["external_source"]["approval_status"] == "TERMINATED"
         assert by_id[request_ids[4]]["general_manager_approval"] == "无需审批"
         visible_batch = client.get(f"/api/batches/{batch_id}").json()["batch"]
@@ -4069,6 +4079,8 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
             "beneficiary": "钉钉收款人",
             "execution_region": "中国China",
             "needed_payment_date": source_dates[index - 1],
+            "payment_account": ("公户" if index == 1 else "私户" if index == 2 else "未知账户"),
+            "project": ("钉钉项目 A" if index == 1 else "  外部项目  " if index == 2 else ""),
         }
         for index, approval_no in enumerate(approval_nos, start=1)
     ]
@@ -4121,6 +4133,8 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
                 "payee_name": "人工收款人",
                 "payee_account": "人工账号",
                 "needed_payment_date": "2026-08-20",
+                "payment_account": "人工账户",
+                "project": "人工项目",
                 "general_manager_approval": "存在争议",
                 "general_manager_approval_date": "2026-08-20",
             },
@@ -4145,11 +4159,17 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
         assert by_id[blank["id"]]["needed_payment_date"] == "2026-07-24"
         assert by_id[manual["id"]]["needed_payment_date"] == "2026-08-20"
         assert by_id[invalid_source["id"]]["needed_payment_date"] is None
+        assert by_id[blank["id"]]["payment_account"] == "公户"
+        assert by_id[blank["id"]]["project"] == "钉钉项目 A"
+        assert by_id[manual["id"]]["payment_account"] == "人工账户"
+        assert by_id[manual["id"]]["project"] == "人工项目"
+        assert by_id[invalid_source["id"]]["payment_account"] is None
+        assert by_id[invalid_source["id"]]["project"] is None
 
         with connect() as conn:
             history = conn.execute(
                 """
-                SELECT needed_payment_date
+                SELECT needed_payment_date, payment_account, project
                 FROM payable_history_versions
                 WHERE source_request_id = ? AND event_type = 'dingtalk.sync'
                 ORDER BY id DESC
@@ -4158,6 +4178,8 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
                 (blank["id"],),
             ).fetchone()
         assert history["needed_payment_date"] == "2026-07-24"
+        assert history["payment_account"] == "公户"
+        assert history["project"] == "钉钉项目 A"
 
         details = client.get(
             "/api/daily-payables/details",
@@ -4179,6 +4201,12 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
         assert second_by_id[blank["id"]]["needed_payment_date"] == "2026-07-24"
         assert second_by_id[manual["id"]]["needed_payment_date"] == "2026-08-20"
         assert second_by_id[invalid_source["id"]]["needed_payment_date"] is None
+        assert second_by_id[blank["id"]]["payment_account"] == "公户"
+        assert second_by_id[blank["id"]]["project"] == "钉钉项目 A"
+        assert second_by_id[manual["id"]]["payment_account"] == "人工账户"
+        assert second_by_id[manual["id"]]["project"] == "人工项目"
+        assert second_by_id[invalid_source["id"]]["payment_account"] is None
+        assert second_by_id[invalid_source["id"]]["project"] is None
 
     blank_row = by_id[blank["id"]]
     assert blank_row["payee_name"] == "钉钉收款人"

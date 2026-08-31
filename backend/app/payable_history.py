@@ -148,9 +148,14 @@ def record_request_state(
             amount, paid_amount, pending_amount, currency,
             base_amount_cny, base_paid_amount_cny, base_pending_amount_cny,
             fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date,
-            source_sheet, summary, applicant, approval_status, approval_result,
+            source_sheet, payment_account, project, summary, applicant, approval_status, approval_result,
             resolved_region, region_review_status, included, deleted, created_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?
+        )
         """,
         (
             logical_request_id,
@@ -173,6 +178,8 @@ def record_request_state(
             row["fx_rate_date"],
             row["fx_rate_actual_date"],
             canonical_sheet_name(row["source_sheet"]),
+            row["payment_account"],
+            row["project"],
             row["summary"],
             row["applicant"],
             state["approval_status"],

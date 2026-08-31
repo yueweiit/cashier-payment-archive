@@ -5564,6 +5564,16 @@ def external_needed_payment_date(value: Any) -> Optional[str]:
         return None
 
 
+def external_payment_account(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text if text in {"公户", "私户"} else None
+
+
+def external_project(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
 def _sync_external_expense_metadata_blocking(
     batch_id: int,
     only_if_stale_seconds: int,
@@ -5926,11 +5936,19 @@ def _sync_external_expense_metadata_blocking(
                     )
                     or needed_payment_date
                 )
+            payment_account = row["payment_account"]
+            project = row["project"]
+            if approval_no in matched:
+                metadata = metadata_by_approval[approval_no][0]
+                if not str(payment_account or "").strip():
+                    payment_account = external_payment_account(metadata.get("payment_account")) or payment_account
+                if not str(project or "").strip():
+                    project = external_project(metadata.get("project")) or project
             conn.execute(
                 """
                 UPDATE payment_requests
                 SET raw_extra_json = ?, payee_name = ?, payee_account = ?,
-                    needed_payment_date = ?,
+                    needed_payment_date = ?, payment_account = ?, project = ?,
                     general_manager_approval = ?, general_manager_approval_date = ?,
                     updated_by = ?, updated_at = ?, version = version + 1
                 WHERE id = ? AND batch_id = ?
@@ -5940,6 +5958,8 @@ def _sync_external_expense_metadata_blocking(
                     payee_name,
                     payee_account,
                     needed_payment_date,
+                    payment_account,
+                    project,
                     manager_approval,
                     manager_approval_date,
                     user["id"],
