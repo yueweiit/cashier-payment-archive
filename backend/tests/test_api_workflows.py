@@ -56,6 +56,19 @@ from backend.app.rebuild_weekly_data import rebuild_weekly_data
 SAMPLE = Path("/Users/smk/Downloads/20260626~20260707请款明细.xlsx")
 
 
+def test_expected_payment_account_schema_is_added_compatibly():
+    with TestClient(app) as client:
+        login(client)
+        with connect() as conn:
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(payment_requests)").fetchall()
+            }
+
+    assert "expected_payment_account" in columns
+    assert "expected_payment_account_source" in columns
+
+
 def test_external_expense_metadata_exposes_mapped_needed_payment_date():
     mapped = {
         "approval_no": "META-DATE-1",

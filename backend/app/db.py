@@ -172,6 +172,8 @@ def init_db() -> None:
                 dingding_id TEXT,
                 applicant TEXT,
                 payment_account TEXT,
+                expected_payment_account TEXT,
+                expected_payment_account_source TEXT,
                 expense_type TEXT,
                 summary TEXT,
                 style_name TEXT,
@@ -426,6 +428,8 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "payment_requests", "copied_from_request_id", "INTEGER REFERENCES payment_requests(id) ON DELETE SET NULL")
     ensure_column(conn, "payment_requests", "version", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "payment_requests", "applicant", "TEXT")
+    ensure_column(conn, "payment_requests", "expected_payment_account", "TEXT")
+    ensure_column(conn, "payment_requests", "expected_payment_account_source", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_approval_date", "TEXT")
     ensure_column(conn, "payment_requests", "general_manager_opinion", "TEXT")
     ensure_column(conn, "payment_requests", "base_amount_cny", "REAL")
