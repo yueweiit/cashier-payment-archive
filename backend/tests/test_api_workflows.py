@@ -218,6 +218,115 @@ def test_monthly_invoice_account_wins_and_legacy_account_falls_back():
     assert fallback["request_data"]["raw_extra"]["external_source"]["payment_account"] == "私户"
 
 
+def test_external_expense_maps_explicit_expected_payment_account_across_layers():
+    mapped = map_external_expense({
+        "source_type": "operation",
+        "source_id": "expected-explicit",
+        "effective_date": "2026-09-02",
+        "approval_no": "EXPECTED-EXPLICIT",
+        "approval_status": "RUNNING",
+        "approval_result": "agree",
+        "execution_region": "中国China",
+        "beneficiary": "收款人",
+        "base_currency_amount": 100,
+        "raw_data": {"formComponentValues": [
+            {
+                "name": "预计支付账户Cuenta de pago prevista",
+                "value": '[{"name":"悦为智能 6221 主账户"}]',
+            },
+            {"name": "服务主体Sujeto de servicio", "value": "悦为智能 YW Tech_Ai"},
+        ]},
+    })
+
+    assert mapped["expected_payment_account"] == "悦为智能 6221 主账户"
+    assert mapped["expected_payment_account_source"] == "dingtalk_explicit"
+    assert mapped["request_data"]["expected_payment_account"] == "悦为智能 6221 主账户"
+    assert mapped["request_data"]["expected_payment_account_source"] == "dingtalk_explicit"
+    external = mapped["request_data"]["raw_extra"]["external_source"]
+    assert external["expected_payment_account"] == "悦为智能 6221 主账户"
+    assert external["expected_payment_account_source"] == "dingtalk_explicit"
+    assert external["service_subject"] == "悦为智能 YW Tech_Ai"
+    metadata = _external_expense_metadata(mapped)
+    assert metadata["expected_payment_account"] == "悦为智能 6221 主账户"
+    assert metadata["expected_payment_account_source"] == "dingtalk_explicit"
+
+
+@pytest.mark.parametrize("source_type", ["operation", "purchase"])
+def test_external_expense_defaults_expected_payment_account_from_service_subject(source_type):
+    form_values = [
+        {"label": "服务主体", "value": '[{"label":"凌翔产品&开发"}]'},
+    ]
+    if source_type == "purchase":
+        form_values.append({"name": "收款人", "value": "采购收款人"})
+    mapped = map_external_expense({
+        "source_type": source_type,
+        "source_id": f"expected-default-{source_type}",
+        "effective_date": "2026-09-02",
+        "approval_no": f"EXPECTED-DEFAULT-{source_type}",
+        "approval_status": "RUNNING",
+        "approval_result": "agree",
+        "execution_region": "中国China",
+        "beneficiary": "运营收款人",
+        "base_currency_amount": 100,
+        "raw_data": {"formComponentValues": form_values},
+    })
+
+    assert mapped["expected_payment_account"] == "凌翔公司账户"
+    assert mapped["expected_payment_account_source"] == "service_subject_default"
+    assert mapped["request_data"]["expected_payment_account"] == "凌翔公司账户"
+    assert mapped["request_data"]["expected_payment_account_source"] == "service_subject_default"
+    assert "服务主体无法匹配预计支付账户，请人工填写" not in mapped["warnings"]
+
+
+def test_external_expense_unknown_service_subject_warns_without_blocking():
+    mapped = map_external_expense({
+        "source_type": "operation",
+        "source_id": "expected-unknown",
+        "effective_date": "2026-09-02",
+        "approval_no": "EXPECTED-UNKNOWN",
+        "approval_status": "RUNNING",
+        "approval_result": "agree",
+        "execution_region": "中国China",
+        "beneficiary": "收款人",
+        "base_currency_amount": 100,
+        "raw_data": {"formComponentValues": [
+            {"name": "服务主体", "value": "新公司"},
+        ]},
+    })
+
+    assert mapped["expected_payment_account"] is None
+    assert mapped["expected_payment_account_source"] is None
+    assert "服务主体无法匹配预计支付账户，请人工填写" in mapped["warnings"]
+    assert mapped["errors"] == []
+
+
+def test_monthly_payment_uses_shared_expected_payment_account_mapping():
+    mapped = map_monthly_payment({
+        "source_id": "monthly-expected",
+        "process_instance_id": "proc-monthly-expected",
+        "create_time": "2026-09-02",
+        "status": "RUNNING",
+        "result": "agree",
+        "title": "张三提交的月结付款",
+        "raw_payload": {
+            "businessId": "MONTHLY-EXPECTED",
+            "originatorUserId": "u1",
+            "originatorDeptName": "财务部",
+            "formComponentValues": [
+                {"name": "合计总额", "value": "10"},
+                {"name": "收款账户信息", "value": "收款人"},
+                {"name": "币种", "value": "人民币"},
+                {"name": "服务主体", "value": "YW MOLDES MX模具"},
+            ],
+        },
+    })
+
+    assert mapped["expected_payment_account"] == "YW MOLDES公司账户"
+    assert mapped["expected_payment_account_source"] == "service_subject_default"
+    assert mapped["request_data"]["expected_payment_account"] == "YW MOLDES公司账户"
+    assert mapped["request_data"]["expected_payment_account_source"] == "service_subject_default"
+
+
 def login(client: TestClient, username: str = "admin", password: str = "admin123") -> None:
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200

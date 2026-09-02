@@ -21,6 +21,7 @@ from dotenv import dotenv_values
 from psycopg.rows import dict_row
 
 from .db import ROOT_DIR
+from .expected_payment_account import resolve_expected_payment_account
 from .fx_rates import FxRateError, fetch_rates, multiply_money, normalize_currency
 from .mexico_tracking import resolve_region
 
@@ -60,6 +61,14 @@ EXECUTION_REGION_COMPONENT_PREFIXES = (
 )
 INVOICE_COMPONENT_PREFIXES = ("是否有发票", "existe factura")
 PROJECT_COMPONENT_PREFIXES = ("项目归属", "pertenencia del proyecto")
+EXPECTED_PAYMENT_ACCOUNT_COMPONENT_PREFIXES = (
+    "预计支付账户",
+    "cuenta de pago prevista",
+)
+SERVICE_SUBJECT_COMPONENT_PREFIXES = (
+    "服务主体",
+    "sujeto de servicio",
+)
 DISALLOWED_APPROVAL_RESULT_PATTERN = r"(refus|reject|cancel|terminat|revok|void|abort|作废|拒绝|撤销|撤回|取消|终止)"
 DISALLOWED_APPROVAL_RESULT_RE = re.compile(DISALLOWED_APPROVAL_RESULT_PATTERN, re.IGNORECASE)
 SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出", "monthly": "月结付款"}
@@ -1181,6 +1190,8 @@ def _external_expense_metadata(mapped: Dict[str, Any]) -> Dict[str, Any]:
         **external_source,
         "needed_payment_date": mapped.get("needed_payment_date"),
         "payment_account": mapped.get("payment_account"),
+        "expected_payment_account": mapped.get("expected_payment_account"),
+        "expected_payment_account_source": mapped.get("expected_payment_account_source"),
         "project": mapped.get("project"),
     }
 
@@ -1897,6 +1908,18 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
     invoice_value = _form_component_value(form_values, *INVOICE_COMPONENT_PREFIXES)
     invoice_account = _invoice_payment_account(invoice_value)
     project = _form_component_value(form_values, *PROJECT_COMPONENT_PREFIXES) or _text(row.get("project"))
+    explicit_expected_account = _form_component_value(
+        form_values,
+        *EXPECTED_PAYMENT_ACCOUNT_COMPONENT_PREFIXES,
+    )
+    service_subject = _form_component_value(
+        form_values,
+        *SERVICE_SUBJECT_COMPONENT_PREFIXES,
+    )
+    expected_account = resolve_expected_payment_account(
+        explicit_expected_account,
+        service_subject,
+    )
     beneficiary_values: list[str]
     if source_type == "purchase":
         beneficiary_values = _component_values(form_values, "收款人")
@@ -1950,6 +1973,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         source_currency_raw = _text(table_currency_text)
     warnings: list[str] = []
     errors: list[str] = []
+    if expected_account.warning:
+        warnings.append(expected_account.warning)
     if source_currency in {"USD", "MXN"}:
         amount = source_amount
         fx_rate = None
@@ -2015,6 +2040,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "fx_rate_actual_date": application_date,
         "project": project,
         "payment_account": invoice_account,
+        "expected_payment_account": expected_account.value,
+        "expected_payment_account_source": expected_account.source,
         "payee_name": beneficiary or None,
         "payee_account": beneficiary or None,
         "needed_payment_date": needed_payment_date,
@@ -2043,6 +2070,10 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 "source_amount": source_amount,
                 "base_currency_amount": base_amount,
                 "payment_account": invoice_account,
+                "expected_payment_account": expected_account.value,
+                "expected_payment_account_source": expected_account.source,
+                "expected_payment_account_explicit": explicit_expected_account,
+                "service_subject": service_subject,
                 "project": project,
                 "invoice_value": invoice_value or "",
             }
@@ -2066,6 +2097,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "beneficiary": beneficiary,
         "needed_payment_date": needed_payment_date,
         "payment_account": invoice_account,
+        "expected_payment_account": expected_account.value,
+        "expected_payment_account_source": expected_account.source,
         "project": project,
         "warnings": warnings,
         "errors": errors,
