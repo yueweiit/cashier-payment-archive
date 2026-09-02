@@ -1,4 +1,5 @@
 .venv/
+.worktrees/
 node_modules/
 data/
 frontend/dist/
