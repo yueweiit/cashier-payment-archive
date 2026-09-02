@@ -89,6 +89,10 @@ from .external_expenses import (
     mark_china_workbench_external_expense,
     preview_external_expenses,
 )
+from .expected_payment_account import (
+    SOURCE_MANUAL,
+    VALID_EXPECTED_PAYMENT_ACCOUNT_SOURCES,
+)
 from .fx_rates import (
     FxRateError,
     SUPPORTED_CURRENCIES,
@@ -238,6 +242,7 @@ class RequestIn(BaseModel):
     dingding_id: Optional[str] = None
     applicant: Optional[str] = None
     payment_account: Optional[str] = None
+    expected_payment_account: Optional[str] = None
     expense_type: Optional[str] = None
     summary: Optional[str] = None
     style_name: Optional[str] = None
@@ -504,6 +509,7 @@ GENERAL_MANAGER_CONTROLLED_FIELDS = {
 }
 REQUEST_FIELD_LABELS = {
     "applicant": "申请人",
+    "expected_payment_account": "预计支付账户",
     "paid_amount": "已支付金额",
     "pending_amount": "待付款金额",
     "finance_review": "财务审批",
@@ -521,6 +527,8 @@ REQUEST_WRITE_FIELDS = {
     "dingding_id",
     "applicant",
     "payment_account",
+    "expected_payment_account",
+    "expected_payment_account_source",
     "expense_type",
     "summary",
     "style_name",
@@ -1480,6 +1488,7 @@ def rollover_batch(
                 user["id"],
                 ROLE_GENERAL_MANAGER,
                 create_summary_payment=False,
+                preserve_expected_payment_account_source=True,
             )
             copy_attachment_links(conn, copied_from_request_id, new_request_id, user["id"])
             copy_payment_records(conn, copied_from_request_id, new_request_id, user["id"])
@@ -5314,6 +5323,7 @@ def import_external_expense_rows(
                 user["id"],
                 user["role"],
                 create_summary_payment=False,
+                preserve_expected_payment_account_source=True,
             )
             imported_ids.append(request_id)
             imported_rows.append({
@@ -8395,8 +8405,13 @@ def insert_request(
     user_role: str = ROLE_GENERAL_MANAGER,
     *,
     create_summary_payment: bool = True,
+    preserve_expected_payment_account_source: bool = False,
 ) -> int:
     data = enforce_request_field_permissions(data, user_role, creating=True)
+    data = apply_expected_payment_account_write_source(
+        data,
+        preserve_trusted_source=preserve_expected_payment_account_source,
+    )
     if user_role != ROLE_BUSINESS:
         data, _, _ = apply_employee_department_mapping(conn, data)
     summary_paid_amount = data.get("paid_amount")
@@ -8451,6 +8466,30 @@ def insert_request(
     return request_id
 
 
+def apply_expected_payment_account_write_source(
+    data: Dict[str, Any],
+    *,
+    preserve_trusted_source: bool,
+) -> Dict[str, Any]:
+    result = dict(data)
+    if "expected_payment_account" not in result:
+        result.pop("expected_payment_account_source", None)
+        return result
+    value = str(result.get("expected_payment_account") or "").strip()
+    result["expected_payment_account"] = value or None
+    if not value:
+        result["expected_payment_account_source"] = None
+    elif (
+        preserve_trusted_source
+        and result.get("expected_payment_account_source")
+        in VALID_EXPECTED_PAYMENT_ACCOUNT_SOURCES
+    ):
+        pass
+    else:
+        result["expected_payment_account_source"] = SOURCE_MANUAL
+    return result
+
+
 def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     payload = {key: value for key, value in data.items() if key in REQUEST_WRITE_FIELDS}
     if "source_sheet" in payload:
@@ -8501,6 +8540,10 @@ def update_request_row(
 ) -> bool:
     allowed = REQUEST_WRITE_FIELDS - {"content_hash"}
     payload = {key: value for key, value in data.items() if key in allowed}
+    payload = apply_expected_payment_account_write_source(
+        payload,
+        preserve_trusted_source=False,
+    )
     if "source_sheet" in payload:
         payload["source_sheet"] = canonical_sheet_name(payload["source_sheet"])
     if "raw_extra" in data:

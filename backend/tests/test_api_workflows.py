@@ -1870,6 +1870,8 @@ def external_expense_test_row(
     warnings=None,
     execution_region: str = "",
     source_sheet: str = "测试部门",
+    expected_payment_account: str = "",
+    expected_payment_account_source: str = "",
 ) -> dict:
     source_label = {
         "operation": "运营支出",
@@ -1882,6 +1884,8 @@ def external_expense_test_row(
         "summary": "中间表测试",
         "amount": amount,
         "currency": "CNY",
+        "expected_payment_account": expected_payment_account or None,
+        "expected_payment_account_source": expected_payment_account_source or None,
         "payee_account": beneficiary or None,
         "source_sheet": source_sheet,
         "raw_extra": {
@@ -1914,11 +1918,120 @@ def external_expense_test_row(
         "amount": amount,
         "beneficiary": beneficiary,
         "needed_payment_date": "2026-07-20",
+        "expected_payment_account": expected_payment_account or None,
+        "expected_payment_account_source": expected_payment_account_source or None,
         "warnings": warnings or [],
         "errors": [],
         "source_conflict": False,
         "request_data": request_data,
     }
+
+
+def test_expected_payment_account_manual_create_patch_clear_and_bulk_source_spoof():
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "expected-account-manual"}).json()["batch"]
+
+        created = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={
+                "source_sheet": "悦为智能",
+                "amount": 100,
+                "expected_payment_account": "  人工账户 A  ",
+            },
+        )
+        assert created.status_code == 200
+        created_row = created.json()["request"]
+        assert created_row["expected_payment_account"] == "人工账户 A"
+        assert created_row["expected_payment_account_source"] == "manual"
+
+        patched = client.patch(
+            f"/api/batches/{batch['id']}/requests/{created_row['id']}",
+            json={
+                "expected_payment_account": "人工账户 B",
+                "expected_version": created_row["version"],
+            },
+        )
+        assert patched.status_code == 200
+        patched_row = patched.json()["request"]
+        assert patched_row["expected_payment_account"] == "人工账户 B"
+        assert patched_row["expected_payment_account_source"] == "manual"
+
+        cleared = client.patch(
+            f"/api/batches/{batch['id']}/requests/{created_row['id']}",
+            json={
+                "expected_payment_account": "",
+                "expected_version": patched_row["version"],
+            },
+        )
+        assert cleared.status_code == 200
+        cleared_row = cleared.json()["request"]
+        assert cleared_row["expected_payment_account"] is None
+        assert cleared_row["expected_payment_account_source"] is None
+
+        bulk = client.patch(
+            f"/api/batches/{batch['id']}/requests/bulk",
+            json={
+                "creates": [{
+                    "source_sheet": "悦为智能",
+                    "amount": 50,
+                    "expected_payment_account": "批量人工账户",
+                    "expected_payment_account_source": "dingtalk_explicit",
+                }],
+            },
+        )
+        assert bulk.status_code == 200
+        bulk_row = next(
+            row
+            for row in client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+            if row["id"] in bulk.json()["created"]
+        )
+        assert bulk_row["expected_payment_account"] == "批量人工账户"
+        assert bulk_row["expected_payment_account_source"] == "manual"
+
+
+def test_expected_payment_account_external_import_preserves_trusted_source(monkeypatch):
+    explicit = external_expense_test_row(
+        "EXPECTED-IMPORT-EXPLICIT",
+        "9301",
+        execution_region="中国China",
+        expected_payment_account="悦为智能 6221 主账户",
+        expected_payment_account_source="dingtalk_explicit",
+    )
+    defaulted = external_expense_test_row(
+        "EXPECTED-IMPORT-DEFAULT",
+        "9302",
+        execution_region="中国China",
+        expected_payment_account="凌翔公司账户",
+        expected_payment_account_source="service_subject_default",
+    )
+    monkeypatch.setattr(
+        main_module,
+        "fetch_external_expenses",
+        lambda items: [explicit, defaulted],
+    )
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "expected-account-import"}).json()["batch"]
+        imported = client.post(
+            f"/api/batches/{batch['id']}/imports/external-expenses",
+            json={"items": [
+                {"source_type": "operation", "source_id": "9301"},
+                {"source_type": "operation", "source_id": "9302"},
+            ]},
+        )
+
+        assert imported.status_code == 200
+        assert imported.json()["imported_rows"] == 2
+        rows = {
+            row["dingding_id"]: row
+            for row in client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+        }
+        assert rows["EXPECTED-IMPORT-EXPLICIT"]["expected_payment_account"] == "悦为智能 6221 主账户"
+        assert rows["EXPECTED-IMPORT-EXPLICIT"]["expected_payment_account_source"] == "dingtalk_explicit"
+        assert rows["EXPECTED-IMPORT-DEFAULT"]["expected_payment_account"] == "凌翔公司账户"
+        assert rows["EXPECTED-IMPORT-DEFAULT"]["expected_payment_account_source"] == "service_subject_default"
 
 
 def test_rollover_copies_only_unfinished_rows():
