@@ -4123,6 +4123,283 @@ def test_external_expense_concurrent_dedupe_and_source_failure_are_atomic(monkey
             assert conn.execute("SELECT COUNT(*) AS count FROM import_jobs WHERE batch_id = ?", (failed_batch["id"],)).fetchone()["count"] == 0
 
 
+def test_expected_payment_account_sync_transition_matrix(monkeypatch):
+    def metadata_item(
+        approval_no,
+        source_id,
+        expected_value=None,
+        expected_source=None,
+    ):
+        return {
+            "approval_no": approval_no,
+            "source_type": "operation",
+            "source_label": "运营支出",
+            "source_id": source_id,
+            "table": "approval_expense_operation",
+            "record_id": source_id,
+            "approval_status": "RUNNING",
+            "approval_result": "agree",
+            "execution_region": "中国China",
+            "expected_payment_account": expected_value,
+            "expected_payment_account_source": expected_source,
+        }
+
+    first_metadata = [
+        metadata_item(
+            "EXPECTED-SYNC-BLANK",
+            "9501",
+            "悦为智能公司账户",
+            "service_subject_default",
+        ),
+        metadata_item(
+            "EXPECTED-SYNC-MANUAL",
+            "9502",
+            "钉钉明确账户",
+            "dingtalk_explicit",
+        ),
+        metadata_item(
+            "EXPECTED-SYNC-DEFAULT",
+            "9503",
+            "星铭公司账户",
+            "service_subject_default",
+        ),
+        metadata_item(
+            "EXPECTED-SYNC-EXPLICIT",
+            "9504",
+            "钉钉明确账户 B",
+            "dingtalk_explicit",
+        ),
+        metadata_item(
+            "EXPECTED-SYNC-LEGACY",
+            "9505",
+            "新钉钉账户",
+            "dingtalk_explicit",
+        ),
+        metadata_item("EXPECTED-SYNC-UNKNOWN", "9506"),
+        metadata_item(
+            "EXPECTED-SYNC-CONFLICT",
+            "9507",
+            "悦为智能公司账户",
+            "service_subject_default",
+        ),
+        metadata_item(
+            "EXPECTED-SYNC-CONFLICT",
+            "9508",
+            "凌翔公司账户",
+            "service_subject_default",
+        ),
+    ]
+    metadata_state = {"rows": first_metadata}
+    monkeypatch.setattr(
+        main_module,
+        "fetch_external_expense_metadata",
+        lambda approval_nos: metadata_state["rows"],
+    )
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda approval_nos: [])
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda approval_nos: [])
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "expected-account-sync"}).json()["batch"]
+        requests = {}
+        for approval_no in (
+            "EXPECTED-SYNC-BLANK",
+            "EXPECTED-SYNC-MANUAL",
+            "EXPECTED-SYNC-DEFAULT",
+            "EXPECTED-SYNC-EXPLICIT",
+            "EXPECTED-SYNC-LEGACY",
+            "EXPECTED-SYNC-UNKNOWN",
+            "EXPECTED-SYNC-CONFLICT",
+            "EXPECTED-SYNC-UNMATCHED",
+        ):
+            payload = {
+                "dingding_id": approval_no,
+                "source_sheet": "悦为智能",
+                "amount": 100,
+            }
+            if approval_no == "EXPECTED-SYNC-MANUAL":
+                payload["expected_payment_account"] = "人工账户"
+            created = client.post(
+                f"/api/batches/{batch['id']}/requests",
+                json=payload,
+            ).json()["request"]
+            requests[approval_no] = created
+
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE payment_requests
+                SET expected_payment_account = '凌翔公司账户',
+                    expected_payment_account_source = 'service_subject_default'
+                WHERE id = ?
+                """,
+                (requests["EXPECTED-SYNC-DEFAULT"]["id"],),
+            )
+            conn.execute(
+                """
+                UPDATE payment_requests
+                SET expected_payment_account = '钉钉明确账户 A',
+                    expected_payment_account_source = 'dingtalk_explicit'
+                WHERE id = ?
+                """,
+                (requests["EXPECTED-SYNC-EXPLICIT"]["id"],),
+            )
+            conn.execute(
+                """
+                UPDATE payment_requests
+                SET expected_payment_account = '历史人工账户',
+                    expected_payment_account_source = NULL
+                WHERE id = ?
+                """,
+                (requests["EXPECTED-SYNC-LEGACY"]["id"],),
+            )
+
+        first_sync = client.post(
+            f"/api/batches/{batch['id']}/external-expenses/sync-metadata"
+        )
+        assert first_sync.status_code == 200
+        rows = {
+            row["dingding_id"]: row
+            for row in client.get(
+                f"/api/batches/{batch['id']}/requests",
+                params={"dingtalk_lifecycle": "all"},
+            ).json()["requests"]
+        }
+        assert rows["EXPECTED-SYNC-BLANK"]["expected_payment_account"] == "悦为智能公司账户"
+        assert rows["EXPECTED-SYNC-BLANK"]["expected_payment_account_source"] == "service_subject_default"
+        assert rows["EXPECTED-SYNC-MANUAL"]["expected_payment_account"] == "人工账户"
+        assert rows["EXPECTED-SYNC-MANUAL"]["expected_payment_account_source"] == "manual"
+        assert rows["EXPECTED-SYNC-DEFAULT"]["expected_payment_account"] == "星铭公司账户"
+        assert rows["EXPECTED-SYNC-DEFAULT"]["expected_payment_account_source"] == "service_subject_default"
+        assert rows["EXPECTED-SYNC-EXPLICIT"]["expected_payment_account"] == "钉钉明确账户 B"
+        assert rows["EXPECTED-SYNC-EXPLICIT"]["expected_payment_account_source"] == "dingtalk_explicit"
+        assert rows["EXPECTED-SYNC-LEGACY"]["expected_payment_account"] == "历史人工账户"
+        assert rows["EXPECTED-SYNC-LEGACY"]["expected_payment_account_source"] is None
+        for approval_no in (
+            "EXPECTED-SYNC-UNKNOWN",
+            "EXPECTED-SYNC-CONFLICT",
+            "EXPECTED-SYNC-UNMATCHED",
+        ):
+            assert rows[approval_no]["expected_payment_account"] is None
+            assert rows[approval_no]["expected_payment_account_source"] is None
+
+        with connect() as conn:
+            audit = conn.execute(
+                """
+                SELECT old_value_json, new_value_json
+                FROM audit_logs
+                WHERE entity_id = ?
+                  AND action = 'external_expenses.metadata_sync.request_fields'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (requests["EXPECTED-SYNC-BLANK"]["id"],),
+            ).fetchone()
+            assert json.loads(audit["old_value_json"]) == {
+                "expected_payment_account": None,
+                "expected_payment_account_source": None,
+            }
+            assert json.loads(audit["new_value_json"]) == {
+                "expected_payment_account": "悦为智能公司账户",
+                "expected_payment_account_source": "service_subject_default",
+            }
+            for approval_no in (
+                "EXPECTED-SYNC-MANUAL",
+                "EXPECTED-SYNC-LEGACY",
+                "EXPECTED-SYNC-UNKNOWN",
+                "EXPECTED-SYNC-CONFLICT",
+                "EXPECTED-SYNC-UNMATCHED",
+            ):
+                assert conn.execute(
+                    """
+                    SELECT 1 FROM audit_logs
+                    WHERE entity_id = ?
+                      AND action = 'external_expenses.metadata_sync.request_fields'
+                    """,
+                    (requests[approval_no]["id"],),
+                ).fetchone() is None
+
+        metadata_state["rows"] = [
+            *[
+                item
+                for item in first_metadata
+                if item["approval_no"] not in {
+                    "EXPECTED-SYNC-DEFAULT",
+                    "EXPECTED-SYNC-EXPLICIT",
+                    "EXPECTED-SYNC-CONFLICT",
+                }
+            ],
+            metadata_item(
+                "EXPECTED-SYNC-DEFAULT",
+                "9503",
+                "凌翔 8899 主账户",
+                "dingtalk_explicit",
+            ),
+            metadata_item("EXPECTED-SYNC-EXPLICIT", "9504"),
+        ]
+        second_sync = client.post(
+            f"/api/batches/{batch['id']}/external-expenses/sync-metadata"
+        )
+        assert second_sync.status_code == 200
+        second_rows = {
+            row["dingding_id"]: row
+            for row in client.get(
+                f"/api/batches/{batch['id']}/requests",
+                params={"dingtalk_lifecycle": "all"},
+            ).json()["requests"]
+        }
+        assert second_rows["EXPECTED-SYNC-DEFAULT"]["expected_payment_account"] == "凌翔 8899 主账户"
+        assert second_rows["EXPECTED-SYNC-DEFAULT"]["expected_payment_account_source"] == "dingtalk_explicit"
+        assert second_rows["EXPECTED-SYNC-EXPLICIT"]["expected_payment_account"] == "钉钉明确账户 B"
+        assert second_rows["EXPECTED-SYNC-EXPLICIT"]["expected_payment_account_source"] == "dingtalk_explicit"
+
+        manual_row = second_rows["EXPECTED-SYNC-MANUAL"]
+        cleared = client.patch(
+            f"/api/batches/{batch['id']}/requests/{manual_row['id']}",
+            json={
+                "expected_payment_account": "",
+                "expected_version": manual_row["version"],
+            },
+        )
+        assert cleared.status_code == 200
+        metadata_state["rows"] = [
+            *[
+                item
+                for item in metadata_state["rows"]
+                if item["approval_no"] != "EXPECTED-SYNC-MANUAL"
+            ],
+            metadata_item(
+                "EXPECTED-SYNC-MANUAL",
+                "9502",
+                "清空后钉钉账户",
+                "dingtalk_explicit",
+            ),
+        ]
+        third_sync = client.post(
+            f"/api/batches/{batch['id']}/external-expenses/sync-metadata"
+        )
+        assert third_sync.status_code == 200
+        third_rows = {
+            row["dingding_id"]: row
+            for row in client.get(
+                f"/api/batches/{batch['id']}/requests",
+                params={"dingtalk_lifecycle": "all"},
+            ).json()["requests"]
+        }
+        assert third_rows["EXPECTED-SYNC-MANUAL"]["expected_payment_account"] == "清空后钉钉账户"
+        assert third_rows["EXPECTED-SYNC-MANUAL"]["expected_payment_account_source"] == "dingtalk_explicit"
+
+        with connect() as conn:
+            assert conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM audit_logs
+                WHERE entity_id = ?
+                  AND action = 'external_expenses.metadata_sync.request_fields'
+                """,
+                (requests["EXPECTED-SYNC-BLANK"]["id"],),
+            ).fetchone()["count"] == 1
+
+
 def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(monkeypatch):
     metadata = [
         {

@@ -90,8 +90,13 @@ from .external_expenses import (
     preview_external_expenses,
 )
 from .expected_payment_account import (
+    AUTO_EXPECTED_PAYMENT_ACCOUNT_SOURCES,
+    SERVICE_SUBJECT_DEFAULT_ACCOUNTS,
     SOURCE_MANUAL,
+    SOURCE_SERVICE_SUBJECT_DEFAULT,
     VALID_EXPECTED_PAYMENT_ACCOUNT_SOURCES,
+    ExpectedPaymentAccountCandidate,
+    transition_synced_expected_payment_account,
 )
 from .fx_rates import (
     FxRateError,
@@ -5584,6 +5589,21 @@ def external_project(value: Any) -> Optional[str]:
     return text or None
 
 
+def external_expected_payment_account_candidate(
+    metadata: Dict[str, Any],
+) -> ExpectedPaymentAccountCandidate:
+    value = str(metadata.get("expected_payment_account") or "").strip()
+    source = str(metadata.get("expected_payment_account_source") or "").strip()
+    if not value or source not in AUTO_EXPECTED_PAYMENT_ACCOUNT_SOURCES:
+        return ExpectedPaymentAccountCandidate(value=None, source=None)
+    if (
+        source == SOURCE_SERVICE_SUBJECT_DEFAULT
+        and value not in SERVICE_SUBJECT_DEFAULT_ACCOUNTS
+    ):
+        return ExpectedPaymentAccountCandidate(value=None, source=None)
+    return ExpectedPaymentAccountCandidate(value=value, source=source)
+
+
 def _sync_external_expense_metadata_blocking(
     batch_id: int,
     only_if_stale_seconds: int,
@@ -5948,13 +5968,47 @@ def _sync_external_expense_metadata_blocking(
                 )
             payment_account = row["payment_account"]
             project = row["project"]
+            expected_payment_account = row["expected_payment_account"]
+            expected_payment_account_source = row["expected_payment_account_source"]
             if approval_no in matched:
                 metadata = metadata_by_approval[approval_no][0]
                 if not str(payment_account or "").strip():
                     payment_account = external_payment_account(metadata.get("payment_account")) or payment_account
                 if not str(project or "").strip():
                     project = external_project(metadata.get("project")) or project
+                (
+                    expected_payment_account,
+                    expected_payment_account_source,
+                ) = transition_synced_expected_payment_account(
+                    expected_payment_account,
+                    expected_payment_account_source,
+                    external_expected_payment_account_candidate(metadata),
+                )
+            field_old_values: Dict[str, Any] = {}
+            field_new_values: Dict[str, Any] = {}
             if payment_account != row["payment_account"] or project != row["project"]:
+                field_old_values.update({
+                    "payment_account": row["payment_account"],
+                    "project": row["project"],
+                })
+                field_new_values.update({
+                    "payment_account": payment_account,
+                    "project": project,
+                })
+            if (
+                expected_payment_account != row["expected_payment_account"]
+                or expected_payment_account_source
+                != row["expected_payment_account_source"]
+            ):
+                field_old_values.update({
+                    "expected_payment_account": row["expected_payment_account"],
+                    "expected_payment_account_source": row["expected_payment_account_source"],
+                })
+                field_new_values.update({
+                    "expected_payment_account": expected_payment_account,
+                    "expected_payment_account_source": expected_payment_account_source,
+                })
+            if field_old_values:
                 write_audit(
                     conn,
                     user["id"],
@@ -5962,14 +6016,8 @@ def _sync_external_expense_metadata_blocking(
                     "payment_request",
                     request_id,
                     batch_id,
-                    old_value={
-                        "payment_account": row["payment_account"],
-                        "project": row["project"],
-                    },
-                    new_value={
-                        "payment_account": payment_account,
-                        "project": project,
-                    },
+                    old_value=field_old_values,
+                    new_value=field_new_values,
                     operation_id=operation_id,
                 )
             conn.execute(
@@ -5977,6 +6025,8 @@ def _sync_external_expense_metadata_blocking(
                 UPDATE payment_requests
                 SET raw_extra_json = ?, payee_name = ?, payee_account = ?,
                     needed_payment_date = ?, payment_account = ?, project = ?,
+                    expected_payment_account = ?,
+                    expected_payment_account_source = ?,
                     general_manager_approval = ?, general_manager_approval_date = ?,
                     updated_by = ?, updated_at = ?, version = version + 1
                 WHERE id = ? AND batch_id = ?
@@ -5988,6 +6038,8 @@ def _sync_external_expense_metadata_blocking(
                     needed_payment_date,
                     payment_account,
                     project,
+                    expected_payment_account,
+                    expected_payment_account_source,
                     manager_approval,
                     manager_approval_date,
                     user["id"],
