@@ -276,6 +276,7 @@ export type PaymentRequest = {
   dingding_id?: string;
   applicant?: string | null;
   payment_account?: string;
+  expected_payment_account?: string;
   expense_type?: string;
   summary?: string;
   style_name?: string;

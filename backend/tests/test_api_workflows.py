@@ -1163,6 +1163,8 @@ def test_request_grid_preferences_are_saved_per_user():
         default_preference = admin_client.get("/api/me/preferences/request-grid")
         assert default_preference.status_code == 200
         assert "summary" in default_preference.json()["preference"]["order"]
+        assert "expected_payment_account" in default_preference.json()["preference"]["order"]
+        assert "expected_payment_account" not in default_preference.json()["preference"]["hidden"]
 
         saved = admin_client.put(
             "/api/me/preferences/request-grid",
@@ -1170,8 +1172,17 @@ def test_request_grid_preferences_are_saved_per_user():
         )
         assert saved.status_code == 200
         assert saved.json()["preference"]["order"][:3] == ["summary", "amount", "currency"]
+        assert "expected_payment_account" in saved.json()["preference"]["order"]
         assert "amount" in saved.json()["preference"]["hidden"]
+        assert "expected_payment_account" not in saved.json()["preference"]["hidden"]
         assert admin_client.get("/api/me/preferences/request-grid").json()["preference"] == saved.json()["preference"]
+
+        hidden_expected_account = admin_client.put(
+            "/api/me/preferences/request-grid",
+            json={"order": ["summary", "expected_payment_account"], "hidden": ["expected_payment_account"]},
+        )
+        assert hidden_expected_account.status_code == 200
+        assert "expected_payment_account" in hidden_expected_account.json()["preference"]["hidden"]
 
         created_user = admin_client.post(
             "/api/admin/users",

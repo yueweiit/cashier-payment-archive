@@ -145,6 +145,7 @@ const fieldLabels: Record<string, string> = {
   dingding_id: "钉钉申请单号",
   applicant: "申请人",
   payment_account: "付款账户",
+  expected_payment_account: "预计支付账户",
   expense_type: "费用性质",
   summary: "摘要",
   style_name: "款式",
@@ -199,6 +200,7 @@ const gridColumns: GridColumn[] = [
   { key: "source_sheet", labelZh: "应付款公司", labelEs: "Empresa a pagar", width: 220 },
   { key: "applicant", labelZh: "申请人", labelEs: "Solicitante", width: 210 },
   { key: "payment_account", labelZh: "账户性质", labelEs: "Tipo de cuenta", width: 150 },
+  { key: "expected_payment_account", labelZh: "预计支付账户", labelEs: "Cuenta de pago prevista", width: 220 },
   { key: "expense_type", labelZh: "支出性质", labelEs: "Naturaleza del gasto", width: 190 },
   { key: "style_name", labelZh: "支出类别", labelEs: "Categoría del gasto", width: 190 },
   { key: "summary", labelZh: "摘要", labelEs: "Resumen / Concepto", width: 360 },
@@ -229,6 +231,7 @@ const defaultVisibleGridColumnKeys = new Set<keyof PaymentRequest>([
   "dingding_id",
   "source_sheet",
   "payment_account",
+  "expected_payment_account",
   "summary",
   "amount",
   "paid_amount",
@@ -259,6 +262,7 @@ type SheetTab = {
 };
 const wrappableColumnKeys = new Set<keyof PaymentRequest>([
   "payment_account",
+  "expected_payment_account",
   "expense_type",
   "style_name",
   "summary",
@@ -4163,6 +4167,8 @@ function MobileRequestCardList({
     empty: "No hay solicitudes que coincidan con los filtros.",
     company: "Empresa a pagar",
     applicant: "Solicitante",
+    accountNature: "Tipo de cuenta",
+    expectedPaymentAccount: "Cuenta de pago prevista",
     payable: "Monto a pagar",
     paid: "Monto pagado",
     pending: "Monto pendiente",
@@ -4178,6 +4184,8 @@ function MobileRequestCardList({
     empty: "没有符合当前筛选条件的请款。",
     company: "应付款公司",
     applicant: "申请人",
+    accountNature: "账户性质",
+    expectedPaymentAccount: "预计支付账户",
     payable: "应付金额",
     paid: "已支付",
     pending: "待付款",
@@ -4213,6 +4221,8 @@ function MobileRequestCardList({
             <dl className="mobile-request-context">
               <div><dt>{labels.company}</dt><dd>{row.source_sheet || "—"}</dd></div>
               <div><dt>{labels.applicant}</dt><dd>{applicant}</dd></div>
+              <div><dt>{labels.accountNature}</dt><dd>{row.payment_account || "—"}</dd></div>
+              <div><dt>{labels.expectedPaymentAccount}</dt><dd>{row.expected_payment_account || "—"}</dd></div>
             </dl>
             <div className="mobile-request-amounts">
               <div><span>{labels.payable}</span><strong>{formatMoney(Number(row.amount || 0), row.currency)}</strong></div>
@@ -4642,6 +4652,7 @@ function RequestEditor({
     "dingding_id",
     "applicant",
     "payment_account",
+    "expected_payment_account",
     "expense_type",
     "summary",
     "amount",
@@ -4962,6 +4973,7 @@ function RequestEditor({
                   </div>
                 </div>
                 {renderField("payment_account")}
+                {renderField("expected_payment_account")}
                 {renderField("expense_type")}
                 {renderField("project")}
                 {renderField("source_sheet")}

@@ -97,6 +97,7 @@ const zhToEs: Record<string, string> = {
   "撤回最近导入": "Deshacer última importación",
   "搜索单号、申请人、摘要、收款方、项目": "Buscar número, solicitante, concepto, beneficiario o proyecto",
   "付款账户": "Cuenta de pago",
+  "预计支付账户": "Cuenta de pago prevista",
   "开票情况": "Estado de factura",
   "待付金额": "Importe pendiente",
   "待付金额（折合人民币）": "Importe pendiente (equivalente en CNY)",
