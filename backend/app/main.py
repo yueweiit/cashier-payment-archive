@@ -6122,7 +6122,7 @@ def _sync_external_expense_metadata_blocking(
                     evidence_reference = f"dingtalk_workflow:{event_key}"
                     existing_event = conn.execute(
                         """
-                        SELECT payment_record_id
+                        SELECT payment_record_id, classification, classification_reason
                         FROM dingtalk_workflow_events
                         WHERE request_id = ? AND event_key = ?
                         """,
@@ -6165,8 +6165,17 @@ def _sync_external_expense_metadata_blocking(
                         classification = "review_required"
                         classification_reason = "同一钉钉单号关联多条请款，无法自动分配付款"
                     if linked_payment_id:
-                        classification = "already_applied"
-                        classification_reason = "该流程证据已生成付款"
+                        if (
+                            existing_event
+                            and existing_event["payment_record_id"]
+                            and int(existing_event["payment_record_id"]) == linked_payment_id
+                            and existing_event["classification"] == "applied"
+                        ):
+                            classification = "applied"
+                            classification_reason = existing_event["classification_reason"]
+                        else:
+                            classification = "already_applied"
+                            classification_reason = "该流程证据已生成付款"
                         already_applied += 1
                     elif classification == "eligible":
                         if pending_amount <= 0 or request_amount <= 0:

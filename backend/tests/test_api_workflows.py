@@ -5417,6 +5417,12 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
             if item["id"] == request["id"]
         )
         assert synced_request["project"] == "钉钉项目自动付款"
+        batch_after_first_sync = client.get(f"/api/batches/{batch['id']}").json()["batch"]
+        with connect() as conn:
+            history_after_first_sync = conn.execute(
+                "SELECT COUNT(*) AS count FROM payable_history_versions WHERE source_request_id = ?",
+                (request["id"],),
+            ).fetchone()["count"]
 
         workflow = client.get(
             f"/api/batches/{batch['id']}/requests/{request['id']}/dingtalk-workflow"
@@ -5437,10 +5443,24 @@ def test_dingtalk_workflow_sync_creates_idempotent_remaining_payment(monkeypatch
         assert repeated.status_code == 200
         assert repeated.json()["auto_payments"] == 0
         assert repeated.json()["already_applied"] == 2
+        assert repeated.json()["updated_requests"] == 0
         repeated_payments = client.get(
             f"/api/batches/{batch['id']}/requests/{request['id']}/payments"
         ).json()["payments"]
         assert len(repeated_payments) == 2
+        request_after_repeated_sync = next(
+            item for item in client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
+            if item["id"] == request["id"]
+        )
+        batch_after_repeated_sync = client.get(f"/api/batches/{batch['id']}").json()["batch"]
+        with connect() as conn:
+            history_after_repeated_sync = conn.execute(
+                "SELECT COUNT(*) AS count FROM payable_history_versions WHERE source_request_id = ?",
+                (request["id"],),
+            ).fetchone()["count"]
+        assert request_after_repeated_sync["version"] == synced_request["version"]
+        assert batch_after_repeated_sync["version"] == batch_after_first_sync["version"]
+        assert history_after_repeated_sync == history_after_first_sync
 
         fresh = client.post(
             f"/api/batches/{batch['id']}/external-expenses/sync-metadata",
