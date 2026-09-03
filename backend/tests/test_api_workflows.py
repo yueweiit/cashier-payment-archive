@@ -4483,6 +4483,92 @@ def test_expected_payment_account_sync_transition_matrix(monkeypatch):
             ).fetchone()["count"] == 1
 
 
+def test_identical_expected_account_sync_does_not_bump_business_versions(monkeypatch):
+    metadata = [{
+        "approval_no": "EXPECTED-SYNC-IDEMPOTENT",
+        "source_type": "operation",
+        "source_label": "运营支出",
+        "source_id": "9599",
+        "table": "approval_expense_operation",
+        "record_id": "9599",
+        "approval_status": "RUNNING",
+        "approval_result": "agree",
+        "execution_region": "中国China",
+        "expected_payment_account": "悦为智能公司账户",
+        "expected_payment_account_source": "service_subject_default",
+    }]
+    workflows = [{
+        "approval_no": "EXPECTED-SYNC-IDEMPOTENT",
+        "process_instance_id": "expected-sync-process",
+        "status": "RUNNING",
+        "result": "agree",
+        "title": "幂等同步测试",
+        "events": [{
+            "event_key": "stable-comment",
+            "process_instance_id": "expected-sync-process",
+            "activity_id": "finance-node",
+            "event_type": "ADD_REMARK",
+            "stage_name": "评论",
+            "result": None,
+            "operator_id": "finance-user",
+            "operator_name": "测试财务",
+            "event_time": "2026-09-03T08:00:00+08:00",
+            "sequence_index": 0,
+            "comment": "待后续处理",
+            "images": [],
+            "attachments": [],
+            "trusted_finance": False,
+            "current": False,
+        }],
+    }]
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda approval_nos: metadata)
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda approval_nos: workflows)
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda approval_nos: [])
+
+    with TestClient(app) as client:
+        login(client)
+        batch = client.post("/api/batches", json={"name": "expected-account-idempotent"}).json()["batch"]
+        request = client.post(
+            f"/api/batches/{batch['id']}/requests",
+            json={
+                "dingding_id": "EXPECTED-SYNC-IDEMPOTENT",
+                "source_sheet": "悦为智能",
+                "amount": 100,
+            },
+        ).json()["request"]
+
+        first = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+        assert first.status_code == 200
+        after_first = client.get(
+            f"/api/batches/{batch['id']}/requests",
+            params={"dingtalk_lifecycle": "all"},
+        ).json()["requests"][0]
+        batch_after_first = client.get(f"/api/batches/{batch['id']}").json()["batch"]
+        with connect() as conn:
+            history_after_first = conn.execute(
+                "SELECT COUNT(*) AS count FROM payable_history_versions WHERE source_request_id = ?",
+                (request["id"],),
+            ).fetchone()["count"]
+
+        second = client.post(f"/api/batches/{batch['id']}/external-expenses/sync-metadata")
+        assert second.status_code == 200
+        assert second.json()["updated_requests"] == 0
+        after_second = client.get(
+            f"/api/batches/{batch['id']}/requests",
+            params={"dingtalk_lifecycle": "all"},
+        ).json()["requests"][0]
+        batch_after_second = client.get(f"/api/batches/{batch['id']}").json()["batch"]
+        with connect() as conn:
+            history_after_second = conn.execute(
+                "SELECT COUNT(*) AS count FROM payable_history_versions WHERE source_request_id = ?",
+                (request["id"],),
+            ).fetchone()["count"]
+
+        assert after_second["version"] == after_first["version"]
+        assert batch_after_second["version"] == batch_after_first["version"]
+        assert history_after_second == history_after_first
+
+
 def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(monkeypatch):
     metadata = [
         {

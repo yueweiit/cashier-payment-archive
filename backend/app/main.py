@@ -5607,6 +5607,57 @@ def external_expected_payment_account_candidate(
     return ExpectedPaymentAccountCandidate(value=value, source=source)
 
 
+def dingtalk_sync_business_state(
+    conn: sqlite3.Connection,
+    request_id: int,
+) -> Dict[str, Any]:
+    """Return DingTalk-managed business state without synchronization timestamps."""
+
+    request_row = conn.execute(
+        "SELECT * FROM payment_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()
+    if request_row is None:
+        raise ValueError(f"payment request {request_id} does not exist")
+
+    request_state = dict(request_row)
+    raw_extra_value = request_state.pop("raw_extra_json", None)
+    for field in (
+        "id",
+        "batch_id",
+        "logical_request_id",
+        "created_by",
+        "updated_by",
+        "created_at",
+        "updated_at",
+        "version",
+    ):
+        request_state.pop(field, None)
+    try:
+        raw_extra = json.loads(raw_extra_value or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_extra = raw_extra_value
+    if isinstance(raw_extra, dict):
+        raw_extra = dict(raw_extra)
+        external_source = raw_extra.get("external_source")
+        if isinstance(external_source, dict):
+            external_source = dict(external_source)
+            external_source.pop("metadata_synced_at", None)
+            raw_extra["external_source"] = external_source
+    request_state["raw_extra"] = raw_extra
+
+    workflow_states: list[Dict[str, Any]] = []
+    for workflow_row in conn.execute(
+        "SELECT * FROM dingtalk_workflow_events WHERE request_id = ? ORDER BY event_key, id",
+        (request_id,),
+    ).fetchall():
+        workflow_state = dict(workflow_row)
+        for field in ("id", "request_id", "synced_at", "created_at", "updated_at"):
+            workflow_state.pop(field, None)
+        workflow_states.append(workflow_state)
+    return {"request": request_state, "workflow_events": workflow_states}
+
+
 def _sync_external_expense_metadata_blocking(
     batch_id: int,
     only_if_stale_seconds: int,
@@ -5898,6 +5949,7 @@ def _sync_external_expense_metadata_blocking(
             approval_no = str(row["dingding_id"] or "").strip()
             if not approval_no or initial_approval_by_request.get(request_id) != approval_no:
                 continue
+            previous_business_state = dingtalk_sync_business_state(conn, request_id)
             request_data = row_to_dict(row)
             raw_extra = dict(request_data.get("raw_extra") or {})
             existing_source = dict(raw_extra.get("external_source") or {})
@@ -6030,8 +6082,7 @@ def _sync_external_expense_metadata_blocking(
                     needed_payment_date = ?, payment_account = ?, project = ?,
                     expected_payment_account = ?,
                     expected_payment_account_source = ?,
-                    general_manager_approval = ?, general_manager_approval_date = ?,
-                    updated_by = ?, updated_at = ?, version = version + 1
+                    general_manager_approval = ?, general_manager_approval_date = ?
                 WHERE id = ? AND batch_id = ?
                 """,
                 (
@@ -6045,14 +6096,12 @@ def _sync_external_expense_metadata_blocking(
                     expected_payment_account_source,
                     manager_approval,
                     manager_approval_date,
-                    user["id"],
-                    timestamp,
                     request_id,
                     batch_id,
                 ),
             )
             persist_request_region(conn, request_id, actor_id=int(user["id"]))
-            refresh_payment_summaries(conn, request_id)
+            refresh_payment_summaries(conn, request_id, bump_version=False)
 
             conn.execute(
                 "UPDATE dingtalk_workflow_events SET active = 0, synced_at = ?, updated_at = ? WHERE request_id = ?",
@@ -6248,11 +6297,24 @@ def _sync_external_expense_metadata_blocking(
                 """,
                 (timestamp, request_id),
             )
-            refresh_payment_summaries(conn, request_id)
+            refresh_payment_summaries(conn, request_id, bump_version=False)
+            current_business_state = dingtalk_sync_business_state(conn, request_id)
+            if current_business_state == previous_business_state:
+                continue
             current_request_version = conn.execute(
                 "SELECT version FROM payment_requests WHERE id = ?",
                 (request_id,),
             ).fetchone()["version"]
+            if int(current_request_version or 1) == int(row["version"] or 1):
+                conn.execute(
+                    """
+                    UPDATE payment_requests
+                    SET updated_by = ?, updated_at = ?, version = version + 1
+                    WHERE id = ? AND batch_id = ?
+                    """,
+                    (user["id"], timestamp, request_id, batch_id),
+                )
+                current_request_version = int(current_request_version or 1) + 1
             record_request_state(
                 conn,
                 request_id,
