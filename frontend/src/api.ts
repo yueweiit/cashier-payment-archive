@@ -365,6 +365,7 @@ export type ExternalExpensePreviewRow = {
   currency?: string;
   base_amount_cny?: number;
   beneficiary: string;
+  expected_payment_account?: string;
   needed_payment_date?: string;
   related_approval_nos?: string[];
   warnings: string[];

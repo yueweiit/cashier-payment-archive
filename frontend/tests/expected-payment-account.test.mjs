@@ -8,6 +8,10 @@ const i18nSource = readFileSync(new URL("../src/i18n.tsx", import.meta.url), "ut
 
 test("expected payment account is a first-class editable request field", () => {
   assert.match(apiSource, /expected_payment_account\?:\s*string/);
+  assert.match(
+    apiSource,
+    /export type ExternalExpensePreviewRow = \{[\s\S]*?expected_payment_account\?:\s*string;[\s\S]*?\n\};/,
+  );
   assert.match(appSource, /expected_payment_account:\s*"预计支付账户"/);
   assert.match(
     appSource,
