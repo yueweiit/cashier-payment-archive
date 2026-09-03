@@ -3633,6 +3633,7 @@ MERGE_REQUEST_FIELDS = {
     "dingding_id",
     "applicant",
     "payment_account",
+    "expected_payment_account",
     "expense_type",
     "summary",
     "style_name",

@@ -2034,6 +2034,59 @@ def test_expected_payment_account_external_import_preserves_trusted_source(monke
         assert rows["EXPECTED-IMPORT-DEFAULT"]["expected_payment_account_source"] == "service_subject_default"
 
 
+def test_expected_payment_account_rollover_preserves_value_and_source():
+    with TestClient(app) as client:
+        login(client)
+        source = client.post(
+            "/api/batches",
+            json={"name": "expected-account-rollover-source"},
+        ).json()["batch"]
+        manual = client.post(
+            f"/api/batches/{source['id']}/requests",
+            json={
+                "dingding_id": "EXPECTED-ROLLOVER-MANUAL",
+                "source_sheet": "悦为智能",
+                "amount": 100,
+                "expected_payment_account": "人工账户",
+            },
+        ).json()["request"]
+        automatic = client.post(
+            f"/api/batches/{source['id']}/requests",
+            json={
+                "dingding_id": "EXPECTED-ROLLOVER-AUTO",
+                "source_sheet": "悦为智能",
+                "amount": 100,
+            },
+        ).json()["request"]
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE payment_requests
+                SET expected_payment_account = '悦为智能公司账户',
+                    expected_payment_account_source = 'service_subject_default'
+                WHERE id = ?
+                """,
+                (automatic["id"],),
+            )
+
+        rollover = client.post(
+            f"/api/batches/{source['id']}/rollover",
+            json={"name": "expected-account-rollover-target", "copy_mode": "all"},
+        )
+        assert rollover.status_code == 200
+        rows = {
+            row["dingding_id"]: row
+            for row in client.get(
+                f"/api/batches/{rollover.json()['batch']['id']}/requests"
+            ).json()["requests"]
+        }
+        assert rows["EXPECTED-ROLLOVER-MANUAL"]["expected_payment_account"] == "人工账户"
+        assert rows["EXPECTED-ROLLOVER-MANUAL"]["expected_payment_account_source"] == "manual"
+        assert rows["EXPECTED-ROLLOVER-AUTO"]["expected_payment_account"] == "悦为智能公司账户"
+        assert rows["EXPECTED-ROLLOVER-AUTO"]["expected_payment_account_source"] == "service_subject_default"
+        assert rows["EXPECTED-ROLLOVER-MANUAL"]["copied_from_request_id"] == manual["id"]
+
+
 def test_rollover_copies_only_unfinished_rows():
     if not SAMPLE.exists():
         return
@@ -2881,6 +2934,7 @@ def test_restore_draft_baseline_restores_saved_rows_and_attachments():
                 "summary": "基线记录",
                 "amount": 100,
                 "source_sheet": "凌翔产品&开发",
+                "expected_payment_account": "基线人工账户",
             },
         )
         assert created.status_code == 200
@@ -2900,7 +2954,11 @@ def test_restore_draft_baseline_restores_saved_rows_and_attachments():
 
         updated = client.patch(
             f"/api/batches/{batch_id}/requests/{request_id}",
-            json={"summary": "已经保存的错误修改", "amount": 999},
+            json={
+                "summary": "已经保存的错误修改",
+                "amount": 999,
+                "expected_payment_account": "错误人工账户",
+            },
         )
         assert updated.status_code == 200
         extra = client.post(
@@ -2931,6 +2989,8 @@ def test_restore_draft_baseline_restores_saved_rows_and_attachments():
         assert rows[0]["dingding_id"] == "RESTORE-1"
         assert rows[0]["summary"] == "基线记录"
         assert rows[0]["amount"] == 100
+        assert rows[0]["expected_payment_account"] == "基线人工账户"
+        assert rows[0]["expected_payment_account_source"] == "manual"
         attachments = client.get(f"/api/batches/{batch_id}/attachments").json()["attachments"]
         assert len(attachments) == 1
         assert attachments[0]["id"] == baseline_attachment["id"]
@@ -5317,6 +5377,7 @@ def test_weekly_merge_roundtrip_update_add_payment_and_rollback():
                 "dingding_id": "MERGE-001",
                 "applicant": "原申请人",
                 "payment_account": "私户",
+                "expected_payment_account": "原人工账户",
                 "summary": "原摘要",
                 "amount": 100,
                 "source_sheet": "原部门",
@@ -5330,6 +5391,7 @@ def test_weekly_merge_roundtrip_update_add_payment_and_rollback():
         header_row, headers = header_lookup(sheet)
         assert sheet.column_dimensions[sheet.cell(header_row, headers["请款标识"]).column_letter].hidden
         assert sheet.cell(header_row + 1, headers["请款标识"]).value == created["id"]
+        assert sheet.cell(header_row + 1, headers["预计支付账户"]).value == "原人工账户"
         payment_sheet = workbook["付款明细"]
         assert payment_sheet.column_dimensions["A"].hidden
         assert payment_sheet.cell(1, 1).value == "付款标识"
@@ -5349,12 +5411,14 @@ def test_weekly_merge_roundtrip_update_add_payment_and_rollback():
         sheet.title = "新部门"
         header_row, headers = header_lookup(sheet)
         sheet.cell(header_row + 1, headers["摘要"], "更新后的摘要")
+        sheet.cell(header_row + 1, headers["预计支付账户"], "合并人工账户")
         sheet.cell(header_row + 1, headers["已支付金额"], 20)
         new_row = header_row + 2
         sheet.cell(new_row, headers["请款标识"], None)
         sheet.cell(new_row, headers["钉钉申请单号"], "MERGE-002")
         sheet.cell(new_row, headers["申请人"], "新增申请人")
         sheet.cell(new_row, headers["付款账户"], "公户")
+        sheet.cell(new_row, headers["预计支付账户"], "新增人工账户")
         sheet.cell(new_row, headers["摘要"], "新增摘要")
         sheet.cell(new_row, headers["应付金额"], 50)
         sheet.cell(new_row, headers["已支付金额"], 0)
@@ -5391,9 +5455,13 @@ def test_weekly_merge_roundtrip_update_add_payment_and_rollback():
         assert len(rows) == 2
         by_ding = {row["dingding_id"]: row for row in rows}
         assert by_ding["MERGE-001"]["summary"] == "更新后的摘要"
+        assert by_ding["MERGE-001"]["expected_payment_account"] == "合并人工账户"
+        assert by_ding["MERGE-001"]["expected_payment_account_source"] == "manual"
         assert by_ding["MERGE-001"]["source_sheet"] == "新部门"
         assert by_ding["MERGE-001"]["paid_amount"] == 20
         assert by_ding["MERGE-002"]["summary"] == "新增摘要"
+        assert by_ding["MERGE-002"]["expected_payment_account"] == "新增人工账户"
+        assert by_ding["MERGE-002"]["expected_payment_account_source"] == "manual"
         assert client.get(f"/api/batches/{batch['id']}").json()["batch"]["sheet_order"][0] == "新部门"
 
         rolled_back = client.post(f"/api/batches/{batch['id']}/imports/latest/rollback")
@@ -5402,6 +5470,8 @@ def test_weekly_merge_roundtrip_update_add_payment_and_rollback():
         restored_rows = client.get(f"/api/batches/{batch['id']}/requests").json()["requests"]
         assert len(restored_rows) == 1
         assert restored_rows[0]["summary"] == "原摘要"
+        assert restored_rows[0]["expected_payment_account"] == "原人工账户"
+        assert restored_rows[0]["expected_payment_account_source"] == "manual"
         assert restored_rows[0]["source_sheet"] == "原部门"
         assert restored_rows[0]["paid_amount"] == 0
 

@@ -21,6 +21,7 @@ CORE_FIELDS = {
     "dingding_id": "钉钉申请单号",
     "applicant": "申请人",
     "payment_account": "付款账户",
+    "expected_payment_account": "预计支付账户",
     "expense_type": "费用性质",
     "summary": "摘要",
     "style_name": "款式",
@@ -77,6 +78,7 @@ KNOWN_HEADER_ALIASES = {
     "dingding_id": ["钉钉申请单号", "审批编号", "审批单号", "申请单号", "流程编号"],
     "applicant": ["申请人", "请款人", "提交人", "申请人姓名"],
     "payment_account": ["付款账户", "付款账号类型"],
+    "expected_payment_account": ["预计支付账户", "计划支付账户", "Cuenta de pago prevista"],
     "expense_type": ["费用性质", "费用类型", "款项类型"],
     "summary": ["摘要", "支付节点明细", "事由", "付款事由", "申请内容", "明细"],
     "style_name": ["款式", "产品款式"],
@@ -150,6 +152,8 @@ SHEET_HEADERS = {
 for _headers in SHEET_HEADERS.values():
     if "申请人" not in _headers:
         _headers.insert(_headers.index("钉钉申请单号") + 1, "申请人")
+    if "预计支付账户" not in _headers:
+        _headers.insert(_headers.index("付款账户") + 1, "预计支付账户")
     if "请款标识" not in _headers:
         _headers.append("请款标识")
     _currency_headers = ["货币类型", "折合人民币金额", "人民币兑本币汇率", "汇率日期", "实际汇率日期"]
@@ -538,6 +542,7 @@ def row_from_sheet(
         "dingding_id": stringify(first_value(values_by_header, ["钉钉申请单号"])),
         "applicant": stringify(first_value(values_by_header, ["申请人", "请款人", "提交人"])),
         "payment_account": stringify(first_value(values_by_header, ["付款账户"])),
+        "expected_payment_account": stringify(first_value(values_by_header, ["预计支付账户", "计划支付账户", "Cuenta de pago prevista"])),
         "expense_type": stringify(first_value(values_by_header, ["费用性质"])),
         "summary": stringify(first_value(values_by_header, ["摘要", "支付节点明细"])),
         "style_name": stringify(first_value(values_by_header, ["款式"])),
@@ -1200,7 +1205,7 @@ def write_sheet(ws, kind: str, sheet_name: str, records: List[Dict[str, Any]], a
         width = 14
         if header in {"摘要", "支付节点明细", "备注", "总经理意见"}:
             width = 36
-        elif header in {"钉钉申请单号", "收款账户", "收款信息", "账户名", "开户行"}:
+        elif header in {"钉钉申请单号", "预计支付账户", "收款账户", "收款信息", "账户名", "开户行"}:
             width = 22
         elif header in {"应付金额", "已支付金额", "待付款金额", "折合人民币金额"}:
             width = 14
@@ -1229,6 +1234,8 @@ def values_for_headers(headers: List[str], record: Dict[str, Any]) -> List[Any]:
             values.append(manual_applicant if manual_applicant is not None else external_source.get("applicant"))
         elif header == "付款账户":
             values.append(record.get("payment_account"))
+        elif header == "预计支付账户":
+            values.append(record.get("expected_payment_account"))
         elif header == "费用性质":
             values.append(record.get("expense_type"))
         elif header in {"摘要", "支付节点明细"}:

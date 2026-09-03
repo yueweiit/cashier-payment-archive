@@ -145,6 +145,38 @@ def test_export_workbook_roundtrip_bytes():
     assert "待付款金额" in headers
 
 
+def test_expected_payment_account_excel_roundtrip(tmp_path):
+    content = export_workbook(
+        {"id": 9, "name": "预计支付账户导出", "end_date": "2026-09-02"},
+        [{
+            "id": 1,
+            "dingding_id": "EXPECTED-EXCEL-1",
+            "source_sheet": "悦为智能",
+            "payment_account": "公户",
+            "expected_payment_account": "悦为智能 6221 主账户",
+            "amount": 100,
+            "summary": "预计支付账户 Excel 往返",
+        }],
+        {},
+    )
+    exported = tmp_path / "expected-payment-account.xlsx"
+    exported.write_bytes(content)
+
+    workbook = load_workbook(exported, data_only=False)
+    for sheet_name, header_row in (("全部", 2), ("悦为智能", 1)):
+        worksheet = workbook[sheet_name]
+        headers = [cell.value for cell in worksheet[header_row]]
+        payment_account_index = headers.index("付款账户")
+        assert headers[payment_account_index + 1] == "预计支付账户"
+        expected_column = headers.index("预计支付账户") + 1
+        assert worksheet.cell(header_row + 1, expected_column).value == "悦为智能 6221 主账户"
+
+    rows, _meta = parse_weekly_excel(exported)
+    assert len(rows) == 1
+    assert rows[0]["expected_payment_account"] == "悦为智能 6221 主账户"
+    assert "expected_payment_account" in rows[0]["_present_fields"]
+
+
 def test_department_sheet_titles_are_safe_and_unique():
     used: set[str] = set()
     first = safe_sheet_title("产品/采购:中国区*2026?very-long-department-name", used)
