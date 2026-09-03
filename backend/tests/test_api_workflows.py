@@ -4389,6 +4389,18 @@ def test_expected_payment_account_sync_transition_matrix(monkeypatch):
                     (requests[approval_no]["id"],),
                 ).fetchone() is None
 
+        default_row = rows["EXPECTED-SYNC-DEFAULT"]
+        full_form_update = client.patch(
+            f"/api/batches/{batch['id']}/requests/{default_row['id']}",
+            json={
+                "expected_payment_account": default_row["expected_payment_account"],
+                "remark": "只修改备注",
+                "expected_version": default_row["version"],
+            },
+        )
+        assert full_form_update.status_code == 200
+        assert full_form_update.json()["request"]["expected_payment_account_source"] == "service_subject_default"
+
         metadata_state["rows"] = [
             *[
                 item

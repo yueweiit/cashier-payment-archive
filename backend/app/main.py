@@ -8595,10 +8595,6 @@ def update_request_row(
 ) -> bool:
     allowed = REQUEST_WRITE_FIELDS - {"content_hash"}
     payload = {key: value for key, value in data.items() if key in allowed}
-    payload = apply_expected_payment_account_write_source(
-        payload,
-        preserve_trusted_source=False,
-    )
     if "source_sheet" in payload:
         payload["source_sheet"] = canonical_sheet_name(payload["source_sheet"])
     if "raw_extra" in data:
@@ -8609,6 +8605,20 @@ def update_request_row(
     if not existing_row:
         raise HTTPException(status_code=404, detail="请款记录不存在")
     existing = row_to_dict(existing_row)
+    if (
+        "expected_payment_account" in payload
+        and request_values_equal(
+            str(payload.get("expected_payment_account") or "").strip() or None,
+            existing.get("expected_payment_account"),
+        )
+    ):
+        payload.pop("expected_payment_account", None)
+        payload.pop("expected_payment_account_source", None)
+    else:
+        payload = apply_expected_payment_account_write_source(
+            payload,
+            preserve_trusted_source=False,
+        )
     current_version = checked_expected_version(
         existing_row,
         expected_version,
