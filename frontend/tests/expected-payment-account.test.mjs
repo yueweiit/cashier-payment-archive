@@ -23,4 +23,3 @@ test("expected payment account is visible on mobile and translated", () => {
   assert.match(appSource, /expectedPaymentAccount:\s*"预计支付账户"/);
   assert.match(appSource, /labels\.expectedPaymentAccount[\s\S]*?row\.expected_payment_account/);
 });
-
