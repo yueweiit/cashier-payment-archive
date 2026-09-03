@@ -1617,6 +1617,7 @@ def test_mexico_approver_stats_deduplicate_tasks_and_respect_participant_scope(
 def test_mexico_legacy_approver_and_node_fallbacks_match_stat_filters(
     isolated_db,
 ) -> None:
+    now = datetime.fromisoformat("2026-08-24T12:00:00+08:00")
     with isolated_db.connect() as conn:
         _insert_tracking_case(
             conn,
@@ -1636,16 +1637,18 @@ def test_mexico_legacy_approver_and_node_fallbacks_match_stat_filters(
         )
         conn.commit()
 
-        stats = summarize_mexico_approvers(conn)
+        stats = summarize_mexico_approvers(conn, now=now)
         by_approver = list_mexico_tracking(
             conn,
             view="pending",
             approver="Fallback Ana",
+            now=now,
         )
         by_node = list_mexico_tracking(
             conn,
             view="pending",
             node="Director approval",
+            now=now,
         )
         options = mexico_tracking_filter_options(conn)
 
