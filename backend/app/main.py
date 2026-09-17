@@ -4,6 +4,7 @@ import json
 import hashlib
 import io
 import mimetypes
+import math
 import os
 import shutil
 import sqlite3
@@ -761,13 +762,11 @@ def china_region_isolation_enabled(conn) -> bool:
     return True
 
 
-def china_workbench_scope(conn, column_prefix: str = "") -> str:
-    del conn
-    prefix = f"{column_prefix}." if column_prefix else ""
-    return (
-        f"LOWER(TRIM(COALESCE({prefix}resolved_region, ''))) = 'china' "
-        f"AND LOWER(TRIM(COALESCE({prefix}region_review_status, ''))) = 'resolved'"
-    )
+def workbench_scope(conn, column_prefix: str = "") -> str:
+    # Region exclusion belongs to the intermediate-source import boundary.
+    # A finance user may manually enter any company's payable in the workbench.
+    del conn, column_prefix
+    return "1 = 1"
 
 
 def mexico_tracking_participant_name(user: Dict[str, Any]) -> Optional[str]:
@@ -884,7 +883,7 @@ def batch_public_for_user(
     data["sheet_order"] = batch_sheet_order(data)
     access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
     active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
-    region_sql = china_workbench_scope(conn, "p")
+    region_sql = workbench_scope(conn, "p")
     visible_sheet_rows = conn.execute(
         f"""
         SELECT DISTINCT COALESCE(NULLIF(TRIM(p.source_sheet), ''), '未分 Sheet') AS sheet_name
@@ -895,12 +894,7 @@ def batch_public_for_user(
         [data["id"], *access_params],
     ).fetchall()
     visible_row_sheets = [canonical_sheet_name(item["sheet_name"]) for item in visible_sheet_rows]
-    visible_row_sheet_set = set(visible_row_sheets)
-    filtered_order = [
-        sheet_name
-        for sheet_name in data["sheet_order"]
-        if sheet_region(sheet_name) == "china" or sheet_name in visible_row_sheet_set
-    ]
+    filtered_order = list(data["sheet_order"])
     filtered_order.extend(
         sheet_name for sheet_name in visible_row_sheets if sheet_name not in filtered_order
     )
@@ -1238,7 +1232,7 @@ def get_daily_payables_summary(
                 conn,
                 selected_date,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
-                china_only=True,
+                china_only=False,
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1260,7 +1254,7 @@ def get_daily_payables_details(
                 selected_date,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
                 include_details=True,
-                china_only=True,
+                china_only=False,
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1285,7 +1279,7 @@ def get_daily_payables_trend(
                 start,
                 end,
                 allowed_sheets=daily_payables_allowed_sheets(conn, user),
-                china_only=True,
+                china_only=False,
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1313,7 +1307,7 @@ def export_daily_payables(
                     end,
                     allowed_sheets=daily_payables_allowed_sheets(conn, user),
                     include_details=True,
-                    china_only=True,
+                    china_only=False,
                 )
             )
     except DailyPayablesError as exc:
@@ -1357,7 +1351,7 @@ def list_batches(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]
     with connect() as conn:
         access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
         active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
-        region_sql = china_workbench_scope(conn, "p")
+        region_sql = workbench_scope(conn, "p")
         rows = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
@@ -1532,7 +1526,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
     with connect() as conn:
         access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
         active_join_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
-        region_join_sql = china_workbench_scope(conn, "p")
+        region_join_sql = workbench_scope(conn, "p")
         row = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
@@ -1550,7 +1544,7 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
             raise HTTPException(status_code=404, detail="批次不存在")
         stats_access_sql, stats_access_params = sheet_access_filter(conn, user, "source_sheet")
         active_stats_sql = f"NOT {dingtalk_inactive_sql('raw_extra_json')}"
-        region_stats_sql = china_workbench_scope(conn)
+        region_stats_sql = workbench_scope(conn)
         stats = conn.execute(
             f"""
             SELECT payment_account, invoice_status, project, COUNT(*) AS count,
@@ -2009,7 +2003,7 @@ def list_requests(
         access_sql, access_params = sheet_access_filter(conn, user)
         conditions.append(access_sql)
         params.extend(access_params)
-        conditions.append(china_workbench_scope(conn))
+        conditions.append(workbench_scope(conn))
         rows = conn.execute(
             f"""
             SELECT payment_requests.*,
@@ -2039,15 +2033,21 @@ def create_request(
     payload: RequestIn,
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
+    data = payload.dict(exclude_unset=True)
+    with connect() as conn:
+        ensure_editable(require_batch(conn, batch_id), user)
+        ensure_business_can_create_in_sheet(conn, user, batch_id, data.get("source_sheet"))
+    reject_direct_payment_summary_changes(data, creating=True)
+    data = enforce_request_field_permissions(data, user["role"], creating=True)
+    prepare_new_request_currency([data])
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         ensure_batch_operation_available(conn, batch_id)
         batch = require_batch(conn, batch_id)
         ensure_editable(batch, user)
-        data = payload.dict(exclude_unset=True)
         ensure_business_can_create_in_sheet(conn, user, batch_id, data.get("source_sheet"))
         reject_direct_payment_summary_changes(data, creating=True)
-        request_id = insert_request(conn, batch_id, data, user["id"], user["role"], create_summary_payment=False)
+        request_id = insert_request(conn, batch_id, data, user["id"], user["role"], create_summary_payment=False, manual_entry=True)
         row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         write_audit(conn, user["id"], "request.create", "payment_request", request_id, batch_id, new_value=row_to_dict(row))
     return {"request": row_to_dict(row)}
@@ -2059,6 +2059,14 @@ def bulk_save_requests(
     payload: BulkRequestsIn,
     user: Dict[str, Any] = Depends(require_roles(*ALL_ROLES)),
 ) -> Dict[str, Any]:
+    for item in payload.creates:
+        reject_direct_payment_summary_changes(item, creating=True)
+    creates = [enforce_request_field_permissions(item, user["role"], creating=True) for item in payload.creates]
+    with connect() as conn:
+        ensure_bulk_editable(require_batch(conn, batch_id), user, payload.reason)
+        for item in creates:
+            ensure_business_can_create_in_sheet(conn, user, batch_id, item.get("source_sheet"))
+    prepare_new_request_currency(creates)
     operation_id = uuid.uuid4().hex
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -2086,10 +2094,10 @@ def bulk_save_requests(
             row = require_accessible_request(conn, batch_id, request_id, user)
             checked_expected_version(row, expected_version, "payment_request", request_id)
 
-        for item in payload.creates:
+        for item in creates:
             ensure_business_can_create_in_sheet(conn, user, batch_id, item.get("source_sheet"))
             reject_direct_payment_summary_changes(item, creating=True)
-            request_id = insert_request(conn, batch_id, item, user["id"], user["role"], create_summary_payment=False)
+            request_id = insert_request(conn, batch_id, item, user["id"], user["role"], create_summary_payment=False, manual_entry=True)
             row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
             write_audit(
                 conn,
@@ -3677,6 +3685,9 @@ def merge_request_payload(row: Dict[str, Any], *, creating: bool) -> Dict[str, A
     payload["source_sheet"] = canonical_sheet_name(row.get("source_sheet"))
     payload["source_row"] = row.get("source_row")
     if creating:
+        for field in ("base_amount_cny", "fx_rate_cny_per_unit", "fx_rate_date", "fx_rate_actual_date"):
+            if row.get(field) not in (None, ""):
+                payload[field] = row[field]
         try:
             payload["raw_extra"] = json.loads(row.get("raw_extra_json") or "{}")
         except json.JSONDecodeError:
@@ -3797,10 +3808,10 @@ def build_weekly_merge_plan(
                 }
                 for item in matches
             ]
-            if len(matches) == 1:
-                existing = matches[0]
-                action = "update"
-            elif resolution.get("action") == "create":
+            exact_matches = [item for item in matches if
+                str(item.get("summary") or "").strip() == str(row.get("summary") or "").strip()
+                and str(item.get("needed_payment_date") or "") == str(row.get("needed_payment_date") or "")]
+            if resolution.get("action") == "create":
                 action = "create"
             elif (
                 resolution.get("action") == "update"
@@ -3809,11 +3820,14 @@ def build_weekly_merge_plan(
                 existing = by_id[int(resolution["request_id"])]
                 action = "update"
                 request_id = int(existing["id"])
+            elif len(exact_matches) == 1:
+                existing = exact_matches[0]
+                action = "update"
             elif len(matches) == 0:
                 action = "create"
             else:
                 action = "conflict"
-                errors.append("旧版文件匹配到多条请款，请选择关联记录、作为新增或跳过")
+                errors.append("同单号存在不同请款或多条匹配，请选择关联记录、作为新增或跳过")
 
         if format_version >= EXPORT_FORMAT_VERSION and export_batch_id and int(export_batch_id) != batch_id:
             action = "conflict"
@@ -3893,6 +3907,12 @@ def build_weekly_merge_plan(
             plan_by_request_id[int(existing["id"])] = plan
         if request_id:
             plan_by_request_id[request_id] = plan
+
+    target_counts = Counter(int(item["existing"]["id"]) for item in request_plans if item.get("existing"))
+    for item in request_plans:
+        if item.get("existing") and target_counts[int(item["existing"]["id"])] > 1:
+            item["action"] = "conflict"
+            item["errors"].append("多行匹配到同一请款，请分别选择新增或跳过，避免覆盖")
 
     payment_details = list(meta.get("payment_details") or [])
     payment_actions: list[Dict[str, Any]] = []
@@ -4251,6 +4271,19 @@ def cleanup_expired_weekly_merge_jobs(conn) -> None:
         conn.execute("UPDATE import_jobs SET status = 'expired' WHERE id = ?", (job["id"],))
 
 
+def apply_import_target_sheet(rows: list[Dict[str, Any]], meta: Dict[str, Any], target_sheet: Optional[str]) -> None:
+    if not str(target_sheet or "").strip():
+        return
+    if len({row.get("source_sheet") for row in rows}) > 1:
+        raise HTTPException(status_code=400, detail="指定目标 Sheet 时，请上传仅包含一张请款明细的文件")
+    if any(row.get("_request_id") for row in rows) or meta.get("payment_details"):
+        raise HTTPException(status_code=400, detail="包含请款标识或付款明细的系统导出文件，请保留原 Sheet 合并")
+    sheet = canonical_sheet_name(target_sheet)
+    for row in rows:
+        row["source_sheet"] = sheet
+    meta["workbook_sheet_order"] = [sheet]
+
+
 def canonicalize_import_sheet_names(rows: list[Dict[str, Any]], meta: Dict[str, Any]) -> None:
     for row in rows:
         row["source_sheet"] = canonical_sheet_name(row.get("source_sheet"))
@@ -4265,12 +4298,17 @@ def canonicalize_import_sheet_names(rows: list[Dict[str, Any]], meta: Dict[str, 
 async def preview_weekly_excel_merge(
     file: UploadFile = File(...),
     batch_id: int = Form(...),
+    target_sheet: Optional[str] = Form(None),
     user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     try:
         rows, meta = await run_in_threadpool(parse_weekly_excel, saved_path)
+        apply_import_target_sheet(rows, meta, target_sheet)
         canonicalize_import_sheet_names(rows, meta)
+    except HTTPException:
+        saved_path.unlink(missing_ok=True)
+        raise
     except Exception as exc:
         saved_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Excel 解析失败：{exc}") from exc
@@ -4279,6 +4317,7 @@ async def preview_weekly_excel_merge(
         batch = require_batch(conn, batch_id)
         plan = build_weekly_merge_plan(conn, batch_id, rows, meta)
         job_meta = {
+            "target_sheet": target_sheet,
             "source_copy": str(saved_path.relative_to(DATA_DIR)),
             "file_sha256": merge_file_sha256(saved_path),
             "batch_updated_at": batch["updated_at"],
@@ -4483,6 +4522,7 @@ def apply_weekly_excel_merge(
         if not preview_source_path.exists():
             raise HTTPException(status_code=409, detail="合并源文件已变化或丢失，请重新预览")
         parsed_rows, parsed_meta = parse_weekly_excel(preview_source_path)
+        apply_import_target_sheet(parsed_rows, parsed_meta, preview_meta.get("target_sheet"))
         canonicalize_import_sheet_names(parsed_rows, parsed_meta)
         prepared_plan = build_weekly_merge_plan(
             preview_conn,
@@ -4493,6 +4533,7 @@ def apply_weekly_excel_merge(
             payload.payment_dates,
         )
         prepared_file_sha256 = merge_file_sha256(preview_source_path)
+    prepare_new_request_currency([item["payload"] for item in prepared_plan["request_plans"] if item["action"] == "create"])
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         job = conn.execute(
@@ -4599,6 +4640,7 @@ def apply_weekly_excel_merge(
                         user["id"],
                         user["role"],
                         create_summary_payment=False,
+                        manual_entry=True,
                     )
                     request_ids_by_row[item["row_id"]] = request_id
                     manifest["created_requests"].append({"id": request_id})
@@ -4851,10 +4893,12 @@ def apply_weekly_excel_merge(
 async def import_weekly_excel(
     file: UploadFile = File(...),
     batch_id: Optional[int] = Form(None),
+    target_sheet: Optional[str] = Form(None),
     user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
     rows, meta = await run_in_threadpool(parse_weekly_excel, saved_path)
+    apply_import_target_sheet(rows, meta, target_sheet)
     canonicalize_import_sheet_names(rows, meta)
     payment_details = meta.pop("payment_details", [])
     payment_detail_sheet_present = bool(meta.get("payment_detail_sheet_present"))
@@ -4862,6 +4906,10 @@ async def import_weekly_excel(
         raise HTTPException(status_code=403, detail="包含付款数据的 Excel 只能由财务、总经理或管理员导入")
     meta["source_copy"] = str(saved_path.relative_to(DATA_DIR))
     start_date, end_date, default_name = parse_batch_dates(file.filename or saved_path.name)
+    if batch_id is not None:
+        with connect() as precheck:
+            ensure_editable(require_batch(precheck, batch_id), user)
+    await run_in_threadpool(prepare_new_request_currency, rows)
     with connect() as conn:
         created_new_batch = batch_id is None
         existing_request_count = 0
@@ -4895,6 +4943,7 @@ async def import_weekly_excel(
                 user["id"],
                 user["role"],
                 create_summary_payment=not payment_detail_sheet_present,
+                manual_entry=True,
             )
             imported.append(request_id)
             imported_summaries[request_id] = round(float(row.get("paid_amount") or 0), 2)
@@ -7784,7 +7833,7 @@ def export_batch(
         access_sql, access_params = sheet_access_filter(conn, user)
         conditions.append(access_sql)
         params.extend(access_params)
-        conditions.append(china_workbench_scope(conn))
+        conditions.append(workbench_scope(conn))
         records = rows_to_dicts(
             conn.execute(
                 f"""
@@ -8531,6 +8580,7 @@ def insert_request(
     user_role: str = ROLE_GENERAL_MANAGER,
     *,
     create_summary_payment: bool = True,
+    manual_entry: bool = False,
     preserve_expected_payment_account_source: bool = False,
 ) -> int:
     data = enforce_request_field_permissions(data, user_role, creating=True)
@@ -8538,7 +8588,7 @@ def insert_request(
         data,
         preserve_trusted_source=preserve_expected_payment_account_source,
     )
-    if user_role != ROLE_BUSINESS:
+    if user_role != ROLE_BUSINESS and not (manual_entry and str(data.get("source_sheet") or "").strip()):
         data, _, _ = apply_employee_department_mapping(conn, data)
     summary_paid_amount = data.get("paid_amount")
     summary_payment_date = data.get("actual_payment_date")
@@ -8559,6 +8609,27 @@ def insert_request(
     placeholders = ", ".join(["?"] * len(columns))
     cursor = conn.execute(f"INSERT INTO payment_requests ({', '.join(columns)}) VALUES ({placeholders})", values)
     request_id = int(cursor.lastrowid)
+    if payload.get("copied_from_request_id"):
+        conn.execute(
+            "UPDATE payment_requests SET payable_item_key = (SELECT payable_item_key FROM payment_requests WHERE id = ?) WHERE id = ?",
+            (payload["copied_from_request_id"], request_id),
+        )
+    elif manual_entry and str(payload.get("dingding_id") or "").strip():
+        # Reimports reuse the existing obligation's identity, including legacy
+        # unkeyed records. Different installments receive independent stable keys.
+        previous = conn.execute(
+            """SELECT payable_item_key FROM payment_requests
+               WHERE id != ? AND TRIM(COALESCE(dingding_id, '')) = ?
+                 AND COALESCE(summary, '') = ? AND COALESCE(needed_payment_date, '') = ?
+               ORDER BY id DESC LIMIT 1""",
+            (request_id, str(payload["dingding_id"]).strip(), payload.get("summary") or "", payload.get("needed_payment_date") or ""),
+        ).fetchone()
+        item_key = previous["payable_item_key"] if previous else hashlib.sha256(
+            json.dumps([str(payload["dingding_id"]).strip(), payload.get("summary") or "", payload.get("needed_payment_date") or ""], ensure_ascii=False).encode()
+        ).hexdigest()
+        conn.execute("UPDATE payment_requests SET payable_item_key = ? WHERE id = ?", (item_key, request_id))
+    elif manual_entry:
+        conn.execute("UPDATE payment_requests SET payable_item_key = ? WHERE id = ?", (uuid.uuid4().hex, request_id))
     register_batch_sheet(conn, batch_id, payload.get("source_sheet"))
     if create_summary_payment and summary_paid_amount not in (None, "") and float(summary_paid_amount or 0) > 0:
         insert_payment_record_internal(
@@ -8616,6 +8687,35 @@ def apply_expected_payment_account_write_source(
     return result
 
 
+def prepare_new_request_currency(rows: list[Dict[str, Any]]) -> None:
+    """Keep original-currency amounts; fill missing anchors before taking a write lock."""
+    requested_date = date.today()
+    missing: Dict[str, list[Dict[str, Any]]] = {}
+    for row in rows:
+        raw_currency = row.get("currency")
+        currency = normalize_currency(raw_currency, default="CNY" if not raw_currency else None)
+        if currency not in SUPPORTED_CURRENCIES:
+            raise HTTPException(status_code=400, detail="仅支持 CNY、USD 和 MXN")
+        row["currency"] = currency
+        if currency != "CNY" and row.get("amount") not in (None, "") and row.get("fx_rate_cny_per_unit") in (None, ""):
+            missing.setdefault(currency, []).append(row)
+    if not missing:
+        return
+    try:
+        rates = fetch_rates(requested_date, missing)
+        for currency, items in missing.items():
+            rate = rates[currency]
+            for row in items:
+                row.update(
+                    fx_rate_cny_per_unit=rate["cny_per_unit"],
+                    base_amount_cny=multiply_money(row["amount"], rate["cny_per_unit"]),
+                    fx_rate_date=rate["requested_date"],
+                    fx_rate_actual_date=rate["actual_date"],
+                )
+    except FxRateError as exc:
+        raise HTTPException(status_code=400, detail=f"无法保存外币请款：{exc}。请补齐汇率后重试，原币金额未改动。") from exc
+
+
 def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     payload = {key: value for key, value in data.items() if key in REQUEST_WRITE_FIELDS}
     if "source_sheet" in payload:
@@ -8633,6 +8733,8 @@ def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
             payload["amount"] = money(payload["amount"])
         except FxRateError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not math.isfinite(payload["amount"]) or payload["amount"] < 0:
+            raise HTTPException(status_code=400, detail="应付金额必须为非负有限数值")
         rate = payload.get("fx_rate_cny_per_unit")
         if currency == "CNY":
             payload["fx_rate_cny_per_unit"] = 1.0
@@ -8640,6 +8742,8 @@ def normalize_request_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         elif rate not in (None, ""):
             try:
                 payload["fx_rate_cny_per_unit"] = float(rate)
+                if not math.isfinite(float(rate)) or float(rate) <= 0:
+                    raise ValueError("invalid rate")
                 payload["base_amount_cny"] = money(
                     payload.get("base_amount_cny")
                     if payload.get("base_amount_cny") not in (None, "")
@@ -8705,16 +8809,9 @@ def update_request_row(
     for field in ("base_amount_cny", "fx_rate_cny_per_unit", "fx_rate_date", "fx_rate_actual_date"):
         payload.pop(field, None)
     # Full-form saves include source_sheet even when the user did not touch it.
-    # Treat it as an explicit manual move only when the normalized value really
-    # differs from the persisted Sheet; otherwise an applicant change may still
-    # apply the employee-to-department mapping below.
-    source_sheet_was_explicitly_changed = (
-        "source_sheet" in payload
-        and not request_values_equal(
-            payload.get("source_sheet"),
-            canonical_sheet_name(existing.get("source_sheet")),
-        )
-    )
+    # A submitted Sheet is the user's explicit destination, including when an
+    # applicant changes while keeping the currently selected Sheet.
+    source_sheet_was_explicitly_changed = "source_sheet" in payload
     mapping_input = {**existing, **data}
     if "raw_extra" in data:
         mapping_input["raw_extra"] = data["raw_extra"]

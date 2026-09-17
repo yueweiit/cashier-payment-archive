@@ -708,7 +708,7 @@ def test_daily_payables_export_includes_prior_due_items_paid_in_full_that_day():
         assert paid_rows[0][9:12] == (100, 100, 0)
 
 
-def test_daily_payables_export_respects_sheet_permissions_and_china_region():
+def test_daily_payables_export_respects_sheet_permissions_across_regions():
     with TestClient(app) as client:
         login(client)
         selected = date.today()
@@ -771,10 +771,10 @@ def test_daily_payables_export_respects_sheet_permissions_and_china_region():
         workbook = load_workbook(io.BytesIO(response.content), data_only=True)
         summary = workbook["每日汇总"]
         detail = workbook["逐日明细"]
-        assert summary.cell(2, 7).value == 100
-        assert detail.max_row == 2
-        assert detail.cell(2, 3).value == visible["logical_request_id"]
-        assert detail.cell(2, 7).value == "可导出记录"
+        assert summary.cell(2, 7).value == 400
+        assert detail.max_row == 3
+        assert visible["logical_request_id"] in {detail.cell(i, 3).value for i in (2, 3)}
+        assert {detail.cell(i, 7).value for i in (2, 3)} == {"可导出记录", "墨西哥记录"}
 
 
 def test_daily_payables_export_rejects_excel_detail_overflow(monkeypatch):
@@ -973,9 +973,10 @@ def test_daily_trend_does_not_apply_future_dingtalk_identity_to_past():
         dingding_id = f"daily-future-{uuid.uuid4().hex}"
 
         with connect() as conn:
+            # Simulate linking legacy rows, which have no explicit installment key.
             for sequence, request in enumerate((older, newer), start=10):
                 conn.execute(
-                    "UPDATE payment_requests SET dingding_id = ? WHERE id = ?",
+                    "UPDATE payment_requests SET dingding_id = ?, payable_item_key = NULL WHERE id = ?",
                     (dingding_id, request["id"]),
                 )
                 record_request_state(

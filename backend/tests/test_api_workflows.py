@@ -341,7 +341,7 @@ def legacy_workflow_test_sheets_are_china(request, monkeypatch):
     keeps production classification unchanged so unknown Sheets remain review.
     """
 
-    if request.node.name == "test_china_region_isolation_filters_workbench_totals_sheets_and_export":
+    if request.node.name == "test_workbench_keeps_manually_created_mexico_and_review_rows":
         return
     production_sheet_region = mexico_tracking_module.sheet_region
 
@@ -1379,7 +1379,7 @@ def test_employee_workbook_regroups_requests_by_level_two_department_and_keeps_u
 
         future = admin_client.post(
             f"/api/batches/{batch_id}/requests",
-            json={"applicant": "二级映射张甲", "source_sheet": "人工临时 Sheet", "summary": "后续新增自动归组", "amount": 60},
+            json={"applicant": "二级映射张甲", "summary": "未选择Sheet时自动归组", "amount": 60},
         )
         assert future.status_code == 200
         assert future.json()["request"]["source_sheet"] == "二级制造"
@@ -1454,7 +1454,7 @@ def test_manual_sheet_move_wins_over_unchanged_employee_mapping_data():
                 "amount": 100,
             },
         ).json()["request"]
-        assert created["source_sheet"] == "自动归组部门"
+        assert created["source_sheet"] == "导入临时 Sheet"
 
         moved = admin_client.patch(
             f"/api/batches/{batch_id}/requests/bulk",
@@ -1527,7 +1527,7 @@ def test_unchanged_applicant_does_not_remap_sheet_during_unrelated_edit():
         assert updated.json()["request"]["summary"] == "修改后"
 
 
-def test_changed_applicant_still_remaps_when_full_editor_payload_keeps_old_sheet():
+def test_changed_applicant_keeps_explicit_sheet_from_full_editor_payload():
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "员工数据"
@@ -1559,14 +1559,14 @@ def test_changed_applicant_still_remaps_when_full_editor_payload_keeps_old_sheet
             json={
                 "expected_version": created["version"],
                 "applicant": "抽屉新申请人",
-                # The drawer sends the full request, including the unchanged
-                # old Sheet. Its mere presence must not suppress re-mapping.
+                # The Sheet selected in the drawer is the explicit destination,
+                # even when the applicant has changed.
                 "source_sheet": "原申请人部门",
                 "summary": "修改申请人后",
             },
         )
         assert updated.status_code == 200, updated.text
-        assert updated.json()["request"]["source_sheet"] == "新申请人部门"
+        assert updated.json()["request"]["source_sheet"] == "原申请人部门"
 
 
 def test_sparse_grid_update_can_clear_optional_fields_without_overwriting_others():
@@ -6004,7 +6004,7 @@ def test_historical_currency_restore_can_be_rolled_back():
         assert restored["paid_amount"] == 340
 
 
-def test_execution_region_filter_respects_china_workbench_isolation():
+def test_execution_region_filter_selects_existing_workbench_rows():
     with TestClient(app) as client:
         login(client)
         batch = client.post(
@@ -6063,7 +6063,7 @@ def test_execution_region_filter_respects_china_workbench_isolation():
 
         mexico_rows = client.get(f"/api/batches/{batch['id']}/requests?execution_region=mexico")
         assert mexico_rows.status_code == 200, mexico_rows.text
-        assert mexico_rows.json()["requests"] == []
+        assert {row["dingding_id"] for row in mexico_rows.json()["requests"]} == {"REGION-MX", "REGION-MX-CNY"}
         china_rows = client.get(f"/api/batches/{batch['id']}/requests?execution_region=china")
         assert china_rows.status_code == 200, china_rows.text
         assert [row["dingding_id"] for row in china_rows.json()["requests"]] == ["REGION-CN"]
@@ -6447,7 +6447,7 @@ def test_mexico_tracking_row_attachment_sync_is_idempotent_and_authorized(
             )
 
 
-def test_china_region_isolation_filters_workbench_totals_sheets_and_export():
+def test_workbench_keeps_manually_created_mexico_and_review_rows():
     with TestClient(app) as client:
         login(client)
         settings_payload = {
@@ -6486,22 +6486,22 @@ def test_china_region_isolation_filters_workbench_totals_sheets_and_export():
 
             listed = client.get(f"/api/batches/{batch['id']}/requests")
             assert listed.status_code == 200, listed.text
-            assert [row["dingding_id"] for row in listed.json()["requests"]] == ["CN-ISOLATION"]
-            assert listed.json()["totals"]["count"] == 1
-            assert listed.json()["totals"]["amount"] == 100
+            assert {row["dingding_id"] for row in listed.json()["requests"]} == {"CN-ISOLATION", "MX-ISOLATION", "REVIEW-ISOLATION"}
+            assert listed.json()["totals"]["count"] == 3
+            assert listed.json()["totals"]["amount"] == 600
 
             detail = client.get(f"/api/batches/{batch['id']}")
             assert detail.status_code == 200, detail.text
-            assert detail.json()["batch"]["request_count"] == 1
-            assert detail.json()["batch"]["total_amount"] == 100
+            assert detail.json()["batch"]["request_count"] == 3
+            assert detail.json()["batch"]["total_amount"] == 600
             assert "凌翔产品&开发" in detail.json()["batch"]["sheet_order"]
-            assert "YW MOLDES MX模具" not in detail.json()["batch"]["sheet_order"]
-            assert not any(name.startswith("地区待核对-") for name in detail.json()["batch"]["sheet_order"])
+            assert "YW MOLDES MX模具" in detail.json()["batch"]["sheet_order"]
+            assert any(name.startswith("地区待核对-") for name in detail.json()["batch"]["sheet_order"])
 
             batches = client.get("/api/batches").json()["batches"]
             public_batch = next(item for item in batches if item["id"] == batch["id"])
-            assert public_batch["request_count"] == 1
-            assert public_batch["total_amount"] == 100
+            assert public_batch["request_count"] == 3
+            assert public_batch["total_amount"] == 600
 
             exported = client.get(f"/api/batches/{batch['id']}/export.xlsx")
             assert exported.status_code == 200, exported.text
@@ -6514,8 +6514,8 @@ def test_china_region_isolation_filters_workbench_totals_sheets_and_export():
                 if cell.value is not None
             )
             assert "CN-ISOLATION" in workbook_text
-            assert "MX-ISOLATION" not in workbook_text
-            assert "REVIEW-ISOLATION" not in workbook_text
+            assert "MX-ISOLATION" in workbook_text
+            assert "REVIEW-ISOLATION" in workbook_text
         finally:
             settings_payload["china_region_isolation_enabled"] = False
             client.put("/api/mexico-tracking/settings", json=settings_payload)

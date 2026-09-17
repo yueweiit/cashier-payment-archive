@@ -1025,16 +1025,18 @@ export const api = {
   deleteAttachment: (batchId: number, requestId: number, attachmentId: number, reason = "") =>
     request<{ status: string }>(`/api/batches/${batchId}/requests/${requestId}/attachments/${attachmentId}?reason=${encodeURIComponent(reason)}`, { method: "DELETE" }),
   attachmentFileUrl: (attachmentId: number) => `/api/attachments/${attachmentId}/file`,
-  uploadWeekly: (file: File, batchId?: number) => {
+  uploadWeekly: (file: File, batchId?: number, targetSheet = "") => {
     const body = new FormData();
     body.append("file", file);
     if (batchId) body.append("batch_id", String(batchId));
+    if (targetSheet) body.append("target_sheet", targetSheet);
     return request<Record<string, unknown>>("/api/import/weekly-excel", { method: "POST", body });
   },
-  previewWeeklyMerge: (file: File, batchId: number) => {
+  previewWeeklyMerge: (file: File, batchId: number, targetSheet = "") => {
     const body = new FormData();
     body.append("file", file);
     body.append("batch_id", String(batchId));
+    if (targetSheet) body.append("target_sheet", targetSheet);
     return request<WeeklyMergePreview>("/api/import/weekly-excel/merge-preview", { method: "POST", body });
   },
   applyWeeklyMerge: (

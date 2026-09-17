@@ -152,7 +152,8 @@ def _deduplicated_states(
     grouped: Dict[str, tuple[int, Dict[str, Any]]] = {}
     for logical_id, state in states.items():
         dingding_id = _dingtalk_id(state.get("dingding_id"))
-        identity = f"dingtalk:{dingding_id}" if dingding_id else f"logical:{logical_id}"
+        item_key = state.get("payable_item_key")
+        identity = f"dingtalk:{dingding_id}:item:{item_key}" if item_key and dingding_id else f"dingtalk:{dingding_id}" if dingding_id else f"logical:{logical_id}"
         current = grouped.get(identity)
         if current is None or _state_order(state) > _state_order(current[1]):
             grouped[identity] = (logical_id, state)

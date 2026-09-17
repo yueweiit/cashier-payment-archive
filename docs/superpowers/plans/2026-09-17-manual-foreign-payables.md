@@ -1,0 +1,10 @@
+# Manual foreign payable repair
+
+User-authorized scope: restore manual additions, grid paste and Excel import into YW MOLDES MX模具, deploy and add the three supplied obligations if absent. Mexico exclusion applies only when pulling the DingTalk intermediate source. Default intermediate-source filter is 可导入.
+
+Design: remove region filtering from ordinary workbench reads, totals, export and daily payables; preserve source import boundary and access control. New USD/MXN amounts are original-currency amounts, supplemented by server-fetched CNY anchors outside the SQLite write transaction. Saved currency changes retain the existing conversion workflow. Import can explicitly target a Sheet; common finance headers map through one alias list. Quoted TSV handles embedded newlines/tabs. Same approval with distinct installment summary/due date must remain separate, while exact reimports and rollover remain deduplicated.
+
+1. Frontend: write failing helper regressions for quoted TSV, formatted numbers and new/saved currency edit policy; implement parser and editable new foreign rows, default importable filter and optional target Sheet UI/API FormData. Run frontend suite/build.
+2. Backend: failing API tests for manual Mexico visibility and foreign single/bulk create with mocked authoritative FX; remove only workbench region scope and add shared foreign-anchor preparation before writer transactions. Keep source import exclusion tests.
+3. Excel/history: failing tests for aliases, target Sheet, three foreign rows, distinct installments and repeated merge; implement parser aliases, scoped import and safe matching/dedup. Run focused tests then full backend/frontend/build.
+4. Review requirements and implementation, resolve findings. Inspect online repository, back up DB and code, deploy tested commit, restart and verify health/version. Check or insert the three real rows without duplicating existing obligations; verify live visibility and default 可导入. Preserve audit history and rollback artifacts.

@@ -502,6 +502,26 @@ textarea {
   background: #ffffff;
 }
 
+.weekly-import-group {
+  flex-wrap: wrap;
+}
+
+.weekly-target-sheet {
+  flex: 1 0 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #60717d;
+  font-size: 12px;
+}
+
+.weekly-target-sheet select {
+  flex: 1;
+  min-width: 0;
+  min-height: 32px;
+}
+
 .compact-file-button {
   min-height: 32px;
   display: inline-flex;

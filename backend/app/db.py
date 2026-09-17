@@ -626,6 +626,7 @@ def _insert_payable_baseline(
 
 def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "payment_requests", "logical_request_id", "INTEGER")
+    ensure_column(conn, "payment_requests", "payable_item_key", "TEXT")
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_payment_requests_logical
@@ -680,6 +681,7 @@ def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_column(conn, "payable_history_versions", "source_batch_id", "INTEGER")
     ensure_column(conn, "payable_history_versions", "dingding_id", "TEXT")
+    ensure_column(conn, "payable_history_versions", "payable_item_key", "TEXT")
 
     roots = _logical_request_roots(conn)
     for request_id, logical_request_id in roots.items():

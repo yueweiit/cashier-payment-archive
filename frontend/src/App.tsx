@@ -72,6 +72,7 @@ import {
 } from "./api";
 import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
 import { buildDirtyGridPayload, sameSheetOrder } from "./gridSave";
+import { canDirectlyEditGridField, normalizeCellValue, parseClipboardTable } from "./gridClipboard";
 import { AppNavigation, type AppTab } from "./AppNavigation";
 import { MexicoTrackingPage } from "./MexicoTrackingPage";
 import { defaultDailyPayablesExportRange, shanghaiIsoDate, validateDailyPayablesExportRange } from "./dailyPayablesExport";
@@ -1045,6 +1046,7 @@ function TopbarImportActions({
   setMessage: (message: string) => void;
 }) {
   const [weeklyFile, setWeeklyFile] = useState<File | null>(null);
+  const [weeklyTargetSheet, setWeeklyTargetSheet] = useState("");
   const [dingtalkFile, setDingtalkFile] = useState<File | null>(null);
   const [employeeFile, setEmployeeFile] = useState<File | null>(null);
   const [mapping, setMapping] = useState<Record<string, string> | null>(null);
@@ -1063,6 +1065,11 @@ function TopbarImportActions({
   const syncFinishedRef = useRef<string | null>(null);
   const syncRefreshPendingRef = useRef<string | null>(null);
   const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
+  const importTargetSheet = selectedBatch?.sheet_order?.includes(weeklyTargetSheet) ? weeklyTargetSheet : "";
+
+  useEffect(() => {
+    setWeeklyTargetSheet("");
+  }, [selectedBatch?.id]);
 
   useEffect(() => {
     hasUnsavedChangesRef.current = hasUnsavedChanges;
@@ -1084,7 +1091,7 @@ function TopbarImportActions({
     if (!weeklyFile) return;
     setBusyAction("weekly");
     try {
-      await api.uploadWeekly(weeklyFile, selectedBatch?.id);
+      await api.uploadWeekly(weeklyFile, selectedBatch?.id, importTargetSheet);
       setWeeklyFile(null);
       setWeeklyInputKey((value) => value + 1);
       await refreshAfterImport("周报 Excel 已导入");
@@ -1100,7 +1107,7 @@ function TopbarImportActions({
     setBusyAction("weekly-merge");
     setMessage("");
     try {
-      const preview = await api.previewWeeklyMerge(weeklyFile, selectedBatch.id);
+      const preview = await api.previewWeeklyMerge(weeklyFile, selectedBatch.id, importTargetSheet);
       setMergePreview(preview);
     } catch (err) {
       setMessage((err as Error).message);
@@ -1350,7 +1357,7 @@ function TopbarImportActions({
           </div>
         )}
         {importToolsOpen && <div className="topbar-import">
-          <div className="topbar-import-group">
+          <div className="topbar-import-group weekly-import-group">
             <label className="compact-file-button">
               <FileSpreadsheet size={15} />
               周报 Excel
@@ -1376,6 +1383,13 @@ function TopbarImportActions({
               <RefreshCcw size={15} />
               {busyAction === "weekly-merge" ? "解析中" : "合并更新"}
             </button>
+            {selectedBatch && <label className="weekly-target-sheet">
+              导入目标 Sheet
+              <select value={importTargetSheet} onChange={(event) => setWeeklyTargetSheet(event.target.value)} disabled={busyAction !== null}>
+                <option value="">保留 Excel 原 Sheet</option>
+                {(selectedBatch.sheet_order || []).map((sheet) => <option value={sheet} key={sheet}>{sheet}</option>)}
+              </select>
+            </label>}
           </div>
           <div className="topbar-import-group">
             <label className="compact-file-button">
@@ -1759,7 +1773,7 @@ function ExternalExpenseImportDialog({
   const [applicantIds, setApplicantIds] = useState<string[]>([]);
   const [applicantQuery, setApplicantQuery] = useState("");
   const [preview, setPreview] = useState<ExternalExpensePreview | null>(null);
-  const [resultFilter, setResultFilter] = useState<ExternalExpenseResultFilter>("matched");
+  const [resultFilter, setResultFilter] = useState<ExternalExpenseResultFilter>("importable");
   const [previewPage, setPreviewPage] = useState(1);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -1805,7 +1819,7 @@ function ExternalExpenseImportDialog({
         source_types: sourceTypes,
         approval_no: approvalNo.trim(),
         applicant_ids: applicantIds,
-        result_filter: "matched",
+        result_filter: resetSelection ? "importable" : resultFilter,
         page: 1,
         page_size: 50,
       };
@@ -1813,7 +1827,7 @@ function ExternalExpenseImportDialog({
       setPreview(response);
       setPreviewPage(1);
       if (resetSelection) {
-        setResultFilter("matched");
+        setResultFilter("importable");
         setSelectedKeys(new Set());
       }
     } catch (err) {
@@ -4296,6 +4310,7 @@ function EditablePaymentGrid({
   const tableWrapRef = useRef<HTMLDivElement | null>(null);
   const topScrollbarRef = useRef<HTMLDivElement | null>(null);
   const [tableScrollWidth, setTableScrollWidth] = useState(0);
+  const [pasteError, setPasteError] = useState("");
 
   useEffect(() => {
     const tableWrap = tableWrapRef.current;
@@ -4339,7 +4354,7 @@ function EditablePaymentGrid({
   }
 
   function updateCell(rowIndex: number, column: GridColumn, value: string) {
-    if (readOnly || !canEditField(column.key)) return;
+    if (readOnly || !canEditField(column.key) || !canDirectlyEditGridField(rows[rowIndex], column.key)) return;
     const nextRows = [...rows];
     const row = withPaymentAmountChange(
       { ...nextRows[rowIndex] },
@@ -4409,34 +4424,51 @@ function EditablePaymentGrid({
     }
   }
 
-  function handlePaste(event: ClipboardEvent<HTMLInputElement | HTMLTextAreaElement>) {
+  function handlePaste(event: ClipboardEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) {
     if (readOnly) return;
     const text = event.clipboardData.getData("text/plain");
-    const matrix = parseClipboardTable(text);
-    if (matrix.length <= 1 && (matrix[0]?.length || 0) <= 1) return;
-    event.preventDefault();
-    const nextRows = [...rows];
-    const nextDirty = new Set(dirtyCells);
-    matrix.forEach((sourceRow, rowOffset) => {
-      const targetRowIndex = activeCell.row + rowOffset;
-      while (targetRowIndex >= nextRows.length) {
-        nextRows.push({ ...emptyRequest, __localId: newLocalId(), __isNew: true, source_sheet: defaultSourceSheet });
-      }
+    setPasteError("");
+    try {
+      const matrix = parseClipboardTable(text);
+      const firstColumn = columns[activeCell.col];
+      if (matrix.length <= 1 && (matrix[0]?.length || 0) <= 1
+        && !firstColumn?.type && firstColumn?.key !== "currency" && matrix[0]?.[0] === text) return;
+      event.preventDefault();
+      const nextRows = [...rows];
+      const nextDirty = new Set(dirtyCells);
+      matrix.forEach((sourceRow, rowOffset) => {
+        const targetRowIndex = activeCell.row + rowOffset;
+        while (targetRowIndex >= nextRows.length) {
+          nextRows.push({ ...emptyRequest, __localId: newLocalId(), __isNew: true, source_sheet: defaultSourceSheet });
+        }
         let targetRow = { ...nextRows[targetRowIndex] };
         sourceRow.forEach((cellValue, colOffset) => {
           const column = columns[activeCell.col + colOffset];
-          if (!column || !canEditField(column.key)) return;
-          targetRow = withPaymentAmountChange(targetRow, column.key, normalizeCellValue(column, cellValue));
+          if (!column || !canEditField(column.key) || targetRow.__deleted
+            || (requestDingTalkTerminated(targetRow) && generalManagerControlledFields.has(column.key))) return;
+          const value = normalizeCellValue(column, cellValue);
+          if (!canDirectlyEditGridField(targetRow, column.key)) {
+            if (normalizeFormValue(targetRow[column.key]) !== normalizeFormValue(value)) {
+              throw new Error("已保存记录的币种或外币金额，请在请款详情中通过汇率确认或金额更正修改");
+            }
+            return;
+          }
+          targetRow = withPaymentAmountChange(targetRow, column.key, value);
           nextDirty.add(`${targetRow.__localId}:${column.key}`);
+        });
+        nextRows[targetRowIndex] = targetRow;
       });
-      nextRows[targetRowIndex] = targetRow;
-    });
-    onRowsChange(nextRows);
-    setDirtyCells(nextDirty);
+      onRowsChange(nextRows);
+      setDirtyCells(nextDirty);
+    } catch (error) {
+      event.preventDefault();
+      setPasteError(`本次粘贴未应用：${(error as Error).message}`);
+    }
   }
 
   return (
     <div className="grid-scroller">
+      {pasteError && <p className="form-error" role="alert">{pasteError}</p>}
       <div className="table-scroll-control">
         <button className="grid-scroll-button" type="button" onClick={() => scrollTableBy(-520)} aria-label="向左滚动列" title="向左滚动列">
           <ChevronLeft size={16} />
@@ -4490,8 +4522,7 @@ function EditablePaymentGrid({
 	                  const shouldWrap = wrapText && wrappableColumnKeys.has(column.key) && column.type !== "number" && column.type !== "date";
 	                  const terminatedManagerField = requestDingTalkTerminated(row) && generalManagerControlledFields.has(column.key);
 	                  const cellReadOnly = readOnly || row.__deleted || !canEditField(column.key) || terminatedManagerField
-	                    || (column.key === "currency" && Boolean(row.__isNew))
-	                    || (column.key === "amount" && currencyCode(row.currency) !== "CNY");
+	                    || (column.key !== "currency" && !canDirectlyEditGridField(row, column.key));
 	                  const fieldClass = [
 	                    column.key === "dingding_id" ? "mono" : "",
 	                    moneyFields.has(column.key) ? "amount-input" : "",
@@ -4525,6 +4556,7 @@ function EditablePaymentGrid({
 	                            disabled={cellReadOnly}
                             onFocus={() => setActiveCell({ row: rowIndex, col: colIndex })}
                             onKeyDown={(event) => handleSelectKeyDown(event, rowIndex, colIndex)}
+                            onPaste={handlePaste}
                             onChange={(event) => {
                               if (column.key === "currency" && row.id) {
                                 onCurrencyChange(row, event.target.value);
@@ -4808,8 +4840,6 @@ function RequestEditor({
         {selectOptionsForField(field, String(value || "")) ? (
           <select
             value={String(value || "")}
-            disabled={field === "currency" && !form.id}
-            title={field === "currency" && !form.id ? "请先保存请款，再通过汇率确认切换币种" : undefined}
             onChange={(event) => {
               if (field === "currency" && form.id) {
                 onCurrencyChange(form, event.target.value);
@@ -4982,7 +5012,7 @@ function RequestEditor({
             </section>
             <section className="editor-form-section">
               <div className="editor-section-head">
-                <div><h3>金额与收款</h3><p>应付金额、收款资料和开票信息</p></div>
+                <div><h3>金额与收款</h3><p>{form.id ? "应付金额、收款资料和开票信息" : "按所选币种填写原币金额；保存时自动采用当天汇率折算人民币，原币金额保持不变。"}</p></div>
               </div>
               <div className="editor-form-grid">
                 {renderField("amount")}
@@ -6600,11 +6630,6 @@ function rowHasContent(row: GridRow) {
   });
 }
 
-function normalizeCellValue(column: GridColumn, value: string) {
-  if (column.type === "number") return value.trim() === "" ? undefined : Number(value);
-  return value;
-}
-
 function withPaymentAmountChange<T extends Partial<PaymentRequest>>(
   request: T,
   field: keyof PaymentRequest,
@@ -6661,12 +6686,6 @@ function wrappedTextRows(value: string, column: GridColumn) {
     .map((line) => Math.max(1, Math.ceil(line.length / charsPerLine)))
     .reduce((sum, count) => sum + count, 0);
   return Math.max(minimumRows, visualLines);
-}
-
-function parseClipboardTable(text: string) {
-  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = normalized.endsWith("\n") ? normalized.slice(0, -1).split("\n") : normalized.split("\n");
-  return lines.map((line) => line.split("\t"));
 }
 
 function externalImportDefaultDates(batch: Batch) {

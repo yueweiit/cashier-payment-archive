@@ -142,7 +142,7 @@ def record_request_state(
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO payable_history_versions (
-            logical_request_id, source_request_id, source_batch_id, dingding_id,
+            logical_request_id, source_request_id, source_batch_id, dingding_id, payable_item_key,
             effective_at, recorded_at,
             event_type, event_key, needed_payment_date,
             amount, paid_amount, pending_amount, currency,
@@ -150,13 +150,14 @@ def record_request_state(
             fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date,
             source_sheet, summary, applicant, approval_status, approval_result,
             resolved_region, region_review_status, included, deleted, created_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             logical_request_id,
             request_id,
             row["batch_id"],
             row["dingding_id"],
+            row["payable_item_key"],
             effective_at or timestamp,
             timestamp,
             event_type,
