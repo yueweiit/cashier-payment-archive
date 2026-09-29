@@ -6,6 +6,7 @@ import io
 import mimetypes
 import math
 import os
+import secrets
 import shutil
 import sqlite3
 import uuid
@@ -22,7 +23,7 @@ from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -146,6 +147,21 @@ from .employee_departments import (
     replace_employee_department_mappings,
     request_applicant_identity,
     resolve_employee_department,
+)
+from .eims_sso import (
+    FLOW_COOKIE_PATH,
+    FLOW_TTL_SECONDS,
+    LOGIN_COOKIE,
+    LOGOUT_COOKIE,
+    SsoError,
+    auth_mode,
+    authorize_url,
+    consume_flow,
+    create_flow,
+    discover,
+    logout_url,
+    settings as eims_settings,
+    userinfo_for_code,
 )
 from .security import new_session_token, verify_password, hash_password
 from .sheet_names import canonical_sheet_name, canonical_sheet_order
@@ -377,7 +393,7 @@ class WeeklyMergeApplyIn(BaseModel):
 
 class UserIn(BaseModel):
     username: str
-    password: str
+    password: Optional[str] = None
     role: str
     display_name: str
     active: bool = True
@@ -716,13 +732,15 @@ def current_user(request: Request) -> Dict[str, Any]:
     with connect() as conn:
         row = conn.execute(
             """
-            SELECT users.* FROM sessions
+            SELECT users.*, sessions.auth_source AS session_auth_source FROM sessions
             JOIN users ON users.id = sessions.user_id
-            WHERE sessions.token = ? AND users.active = 1 AND users.deleted_at IS NULL
+            WHERE sessions.token = ? AND sessions.expires_at > ?
+              AND users.active = 1 AND users.deleted_at IS NULL
             """,
-            (token,),
+            (token, now_iso()),
         ).fetchone()
-    if not row:
+    mode = auth_mode()
+    if not row or (mode == "eims" and row["session_auth_source"] != "eims") or (mode == "local" and row["session_auth_source"] != "local"):
         raise HTTPException(status_code=401, detail="登录已失效")
     return row_to_dict(row)
 
@@ -1054,6 +1072,8 @@ def ensure_can_change_user(conn, target, actor: Dict[str, Any], updates: Dict[st
 
 @app.on_event("startup")
 def startup() -> None:
+    if auth_mode() != "local":
+        eims_settings()
     init_db()
     (DATA_DIR / "uploads").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "snapshots").mkdir(parents=True, exist_ok=True)
@@ -1061,31 +1081,170 @@ def startup() -> None:
         ensure_draft_baselines(conn)
 
 
+def session_cookie_secure(request: Request) -> bool:
+    public_base_url = os.environ.get("PAYMENT_PUBLIC_BASE_URL", "").strip()
+    return public_base_url.lower().startswith("https://") if public_base_url else request.url.scheme == "https"
+
+
+def session_expires_at() -> str:
+    return (datetime.now() + timedelta(hours=12)).isoformat(timespec="microseconds")
+
+
+def sso_error_redirect(code: str) -> RedirectResponse:
+    response = RedirectResponse(url=f"/?sso_error={quote(code)}", status_code=303)
+    response.delete_cookie(LOGIN_COOKIE, path=FLOW_COOKIE_PATH)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@app.get("/api/auth/config")
+def auth_config(response: Response) -> Dict[str, str]:
+    response.headers["Cache-Control"] = "no-store"
+    return {"mode": auth_mode()}
+
+
+@app.get("/api/auth/eims/start")
+def eims_login_start(request: Request) -> RedirectResponse:
+    if auth_mode() == "local":
+        raise HTTPException(status_code=404, detail="SSO 未启用")
+    old_token = request.cookies.get("session")
+    if old_token:
+        with connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (old_token,))
+    try:
+        config = eims_settings()
+        endpoints = discover(config)
+    except SsoError as exc:
+        response = sso_error_redirect(exc.code)
+        response.delete_cookie("session")
+        return response
+    with connect() as conn:
+        flow = create_flow(conn, "login")
+    response = RedirectResponse(url=authorize_url(config, endpoints, flow), status_code=302)
+    response.set_cookie(
+        LOGIN_COOKIE, flow.flow_id, max_age=FLOW_TTL_SECONDS, httponly=True,
+        secure=config.secure_cookies, samesite="lax", path=FLOW_COOKIE_PATH,
+    )
+    response.delete_cookie("session")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@app.get("/api/auth/eims/callback")
+def eims_login_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+) -> RedirectResponse:
+    if auth_mode() == "local":
+        raise HTTPException(status_code=404, detail="SSO 未启用")
+    try:
+        with connect() as conn:
+            flow = consume_flow(conn, "login", request.cookies.get(LOGIN_COOKIE), state)
+        if error:
+            raise SsoError("access_denied" if error == "access_denied" else "authorization_failed")
+        if not code or not flow.code_verifier:
+            raise SsoError("authorization_failed")
+        config = eims_settings()
+        endpoints = discover(config)
+        identity = userinfo_for_code(config, endpoints, code, flow.code_verifier)
+        app_user_id = identity.get("app_user_id")
+        if not isinstance(app_user_id, str) or not app_user_id:
+            raise SsoError("binding_missing")
+        if not app_user_id.isascii() or not app_user_id.isdigit() or str(int(app_user_id)) != app_user_id:
+            raise SsoError("invalid_binding")
+        local_id = int(app_user_id)
+        if local_id > 2**63 - 1:
+            raise SsoError("invalid_binding")
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (local_id,)).fetchone()
+            if not row:
+                raise SsoError("account_missing")
+            if not row["active"] or row["deleted_at"]:
+                raise SsoError("account_disabled")
+            old_token = request.cookies.get("session")
+            if old_token:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (old_token,))
+            token = new_session_token()
+            conn.execute(
+                "INSERT INTO sessions (token, user_id, created_at, expires_at, auth_source, eims_sub) VALUES (?, ?, ?, ?, 'eims', ?)",
+                (token, local_id, now_iso(), session_expires_at(), identity["sub"]),
+            )
+            write_audit(conn, local_id, "auth.eims_login", "user", local_id, new_value={"eims_sub": identity["sub"]})
+    except SsoError as exc:
+        return sso_error_redirect(exc.code)
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie("session", token, httponly=True, secure=config.secure_cookies, samesite="lax", max_age=60 * 60 * 12)
+    response.delete_cookie(LOGIN_COOKIE, path=FLOW_COOKIE_PATH)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@app.get("/api/auth/eims/logout/callback")
+def eims_logout_callback(request: Request, state: Optional[str] = None) -> RedirectResponse:
+    if auth_mode() == "local":
+        raise HTTPException(status_code=404, detail="SSO 未启用")
+    try:
+        with connect() as conn:
+            consume_flow(conn, "logout", request.cookies.get(LOGOUT_COOKIE), state)
+    except SsoError:
+        response = RedirectResponse(url="/?sso_error=invalid_logout_state", status_code=303)
+    else:
+        response = RedirectResponse(url="/?logged_out=1", status_code=303)
+    response.delete_cookie(LOGOUT_COOKIE, path=FLOW_COOKIE_PATH)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 @app.post("/api/auth/login")
-def login(payload: LoginIn, response: Response) -> Dict[str, Any]:
+def login(payload: LoginIn, request: Request, response: Response) -> Dict[str, Any]:
+    if auth_mode() == "eims":
+        raise HTTPException(status_code=403, detail="请使用 EIMS 登录")
     with connect() as conn:
         row = conn.execute("SELECT * FROM users WHERE username = ? AND active = 1 AND deleted_at IS NULL", (payload.username,)).fetchone()
         if not row or not verify_password(payload.password, row["password_hash"]):
             raise HTTPException(status_code=401, detail="用户名或密码错误")
         token = new_session_token()
         conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
-            (token, row["id"], now_iso()),
+            "INSERT INTO sessions (token, user_id, created_at, expires_at, auth_source) VALUES (?, ?, ?, ?, 'local')",
+            (token, row["id"], now_iso(), session_expires_at()),
         )
         write_audit(conn, row["id"], "auth.login", "user", row["id"], new_value={"username": row["username"]})
         public_user = user_public_with_permissions(conn, row)
-    response.set_cookie("session", token, httponly=True, samesite="lax", max_age=60 * 60 * 12)
+    response.set_cookie("session", token, httponly=True, secure=session_cookie_secure(request), samesite="lax", max_age=60 * 60 * 12)
     return {"user": public_user}
 
 
 @app.post("/api/auth/logout")
-def logout(request: Request, response: Response) -> Dict[str, str]:
+def logout(request: Request, response: Response) -> Dict[str, Any]:
     token = request.cookies.get("session")
+    auth_source = None
     if token:
         with connect() as conn:
+            row = conn.execute("SELECT user_id, auth_source FROM sessions WHERE token = ?", (token,)).fetchone()
+            auth_source = row["auth_source"] if row else None
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
     response.delete_cookie("session")
-    return {"status": "ok"}
+    result: Dict[str, Any] = {"status": "ok"}
+    if auth_source == "eims" and auth_mode() != "local":
+        try:
+            config = eims_settings()
+            endpoints = discover(config)
+            with connect() as conn:
+                flow = create_flow(conn, "logout")
+            result["redirect_url"] = logout_url(config, endpoints, flow.state)
+            response.set_cookie(
+                LOGOUT_COOKIE, flow.flow_id, max_age=FLOW_TTL_SECONDS, httponly=True,
+                secure=config.secure_cookies, samesite="lax", path=FLOW_COOKIE_PATH,
+            )
+        except SsoError:
+            result["eims_logout_unavailable"] = True
+    return result
 
 
 @app.get("/api/me")
@@ -1168,6 +1327,8 @@ def change_password(
     request: Request,
     user: Dict[str, Any] = Depends(current_user),
 ) -> Dict[str, Any]:
+    if auth_mode() == "eims":
+        raise HTTPException(status_code=403, detail="SSO 模式下不能修改本地密码")
     if not payload.current_password or not payload.new_password or not payload.confirm_password:
         raise HTTPException(status_code=400, detail="当前密码、新密码和确认密码不能为空")
     if len(payload.new_password) < 6:
@@ -7944,12 +8105,16 @@ def list_users(user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROL
 @app.post("/api/admin/users")
 def create_user(payload: UserIn, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
     validate_user_role(payload.role)
+    mode = auth_mode()
     mexico_access_scope, mexico_identity_name = validate_mexico_user_access(
         payload.mexico_access_scope,
         payload.mexico_identity_name,
     )
-    if not payload.username.strip() or not payload.password or not payload.display_name.strip():
-        raise HTTPException(status_code=400, detail="账号、姓名和初始密码不能为空")
+    if not payload.username.strip() or not payload.display_name.strip():
+        raise HTTPException(status_code=400, detail="账号和姓名不能为空")
+    if mode != "eims" and not payload.password:
+        raise HTTPException(status_code=400, detail="初始密码不能为空")
+    initial_password = secrets.token_urlsafe(32) if mode == "eims" else str(payload.password)
     with connect() as conn:
         try:
             cursor = conn.execute(
@@ -7962,7 +8127,7 @@ def create_user(payload: UserIn, user: Dict[str, Any] = Depends(require_roles(*G
                 """,
                 (
                     payload.username.strip(),
-                    hash_password(payload.password),
+                    hash_password(initial_password),
                     payload.role,
                     payload.display_name.strip(),
                     int(payload.active),
@@ -7994,6 +8159,8 @@ def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends
     if "password" in updates:
         password = updates.pop("password")
         if password:
+            if auth_mode() == "eims":
+                raise HTTPException(status_code=403, detail="SSO 模式下不能修改本地密码")
             updates["password_hash"] = hash_password(password)
     if "active" in updates:
         updates["active"] = int(updates["active"])
@@ -8049,6 +8216,8 @@ def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends
 
 @app.post("/api/admin/users/{user_id}/reset-password")
 def reset_user_password(user_id: int, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
+    if auth_mode() == "eims":
+        raise HTTPException(status_code=403, detail="SSO 模式下不能重置本地密码")
     with connect() as conn:
         old = conn.execute("SELECT * FROM users WHERE id = ? AND deleted_at IS NULL", (user_id,)).fetchone()
         if not old:

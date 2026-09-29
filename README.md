@@ -13,7 +13,15 @@
 - 账号：`admin`
 - 密码：`admin123`
 
-生产使用前请设置环境变量 `PAYMENT_APP_ADMIN_PASSWORD` 后重新初始化数据库，或登录后在“管理”里新建管理员并停用默认账号。
+`local` 和 `hybrid` 模式可使用上述密码登录。生产使用前请设置环境变量 `PAYMENT_APP_ADMIN_PASSWORD` 后重新初始化数据库，或登录后在“管理”里新建管理员并停用默认账号。
+
+## EIMS 单点登录
+
+本系统可作为 EIMS OIDC Client 接入统一登录。认证模式由进程环境变量 `PAYMENT_AUTH_MODE` 控制：`local`（默认，原密码登录）、`hybrid`（密码与 EIMS 并行）、`eims`（仅 EIMS）。切到 `eims` 后，原本地登录会话和密码登录接口都不能继续访问系统；本地角色、Sheet 权限和墨西哥审批权限仍由本系统控制。
+
+EIMS 的 `app_user_id` 必须填写本系统管理页展示的“绑定 ID”，即 `users.id` 的十进制字符串。系统不会按姓名或邮箱查找账号，也不会在首次 SSO 登录时自动创建账号。EIMS 绑定缺失、本地账号不存在或停用时都会拒绝登录。
+
+服务端需要配置 `PAYMENT_PUBLIC_BASE_URL`、`EIMS_ISSUER`、`EIMS_CLIENT_ID` 和 `EIMS_CLIENT_SECRET`；只申请 `openid profile`。授权使用服务端保存的 `state`、PKCE S256 和一次性授权码，Token 仅用于读取 UserInfo，不保存 Access Token 或 Refresh Token。完整接入资料、发布和回滚步骤见 [`deploy/eims-sso-release.md`](deploy/eims-sso-release.md)。
 
 ## 本机启动
 

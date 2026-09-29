@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Union
 
@@ -108,8 +108,22 @@ def init_db() -> None:
                 token TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
-                expires_at TEXT
+                expires_at TEXT,
+                auth_source TEXT NOT NULL DEFAULT 'local',
+                eims_sub TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS sso_transactions (
+                flow_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN ('login', 'logout')),
+                state TEXT NOT NULL,
+                code_verifier TEXT,
+                created_at TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sso_transactions_expires_at
+            ON sso_transactions(expires_at);
 
             CREATE TABLE IF NOT EXISTS user_sheet_permissions (
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -410,6 +424,29 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "users", "deleted_by", "INTEGER REFERENCES users(id)")
     ensure_column(conn, "users", "mexico_access_scope", "TEXT NOT NULL DEFAULT 'none'")
     ensure_column(conn, "users", "mexico_identity_name", "TEXT")
+    ensure_column(conn, "sessions", "expires_at", "TEXT")
+    ensure_column(conn, "sessions", "auth_source", "TEXT NOT NULL DEFAULT 'local'")
+    ensure_column(conn, "sessions", "eims_sub", "TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sso_transactions (
+            flow_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(kind IN ('login', 'logout')),
+            state TEXT NOT NULL,
+            code_verifier TEXT,
+            created_at TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sso_transactions_expires_at ON sso_transactions(expires_at)")
+    for session in conn.execute("SELECT token, created_at FROM sessions WHERE expires_at IS NULL").fetchall():
+        try:
+            created_at = datetime.fromisoformat(session["created_at"])
+        except (TypeError, ValueError):
+            created_at = datetime.now()
+        expires_at = (created_at + timedelta(hours=12)).isoformat(timespec="microseconds")
+        conn.execute("UPDATE sessions SET expires_at = ? WHERE token = ?", (expires_at, session["token"]))
     ensure_column(conn, "employee_department_mappings", "third_level_department", "TEXT")
     conn.execute(
         """

@@ -1,6 +1,7 @@
 import { translateKnownError } from "./i18n";
 
 export type MexicoAccessScope = "all" | "participant" | "none";
+export type AuthMode = "local" | "hybrid" | "eims";
 
 export type User = {
   id: number;
@@ -790,7 +791,7 @@ export type BatchSnapshot = {
 };
 export type UserPayload = {
   username: string;
-  password: string;
+  password?: string;
   role: UserRole;
   display_name: string;
   active: boolean;
@@ -894,9 +895,10 @@ async function downloadBlob(url: string, fallbackFilename: string): Promise<{ bl
 }
 
 export const api = {
+  authConfig: () => request<{ mode: AuthMode }>("/api/auth/config"),
   login: (username: string, password: string) =>
     request<{ user: User }>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
-  logout: () => request<{ status: string }>("/api/auth/logout", { method: "POST" }),
+  logout: () => request<{ status: string; redirect_url?: string; eims_logout_unavailable?: boolean }>("/api/auth/logout", { method: "POST" }),
   me: () => request<{ user: User }>("/api/me"),
   changePassword: (payload: ChangePasswordPayload) =>
     request<{ status: string; signed_out_sessions: number }>("/api/auth/change-password", { method: "POST", body: JSON.stringify(payload) }),

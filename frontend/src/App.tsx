@@ -33,6 +33,7 @@ import {
 } from "lucide-react";
 import {
   api,
+  AuthMode,
   isApiError,
   AttachmentLink,
   AuditLog,
@@ -297,25 +298,88 @@ export function App() {
 
 function AppContent() {
   const [user, setUser] = useState<User | null>(null);
+  const [authMode, setAuthMode] = useState<AuthMode>("local");
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    api
-      .me()
-      .then((res) => setUser(res.user))
-      .catch(() => setUser(null))
-      .finally(() => setLoading(false));
+    async function initialize() {
+      try {
+        const config = await api.authConfig();
+        setAuthMode(config.mode);
+        try {
+          const result = await api.me();
+          setUser(result.user);
+        } catch (error) {
+          if (isApiError(error) && error.status === 401) {
+            setUser(null);
+          } else {
+            setMessage((error as Error).message);
+          }
+        }
+      } catch (error) {
+        setMessage((error as Error).message);
+      } finally {
+        setLoading(false);
+      }
+    }
+    initialize();
   }, []);
+
+  const loginParams = new URLSearchParams(window.location.search);
+  const ssoError = loginParams.get("sso_error");
+  const loggedOut = loginParams.get("logged_out") === "1";
+
+  function completeLocalLogin(nextUser: User) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("sso_error");
+    url.searchParams.delete("logged_out");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+    setUser(nextUser);
+  }
+
+  useEffect(() => {
+    if (!loading && !user && authMode === "eims" && !ssoError && !loggedOut && !message) {
+      window.location.replace("/api/auth/eims/start");
+    }
+  }, [loading, user, authMode, ssoError, loggedOut, message]);
 
   const { t } = useLanguage();
   if (loading) return <div className="center-screen">{t("加载中", "Cargando")}</div>;
-  if (!user) return <Login onLogin={setUser} />;
+  if (!user && authMode === "eims" && !ssoError && !loggedOut && !message) {
+    return <div className="center-screen">{t("正在前往 EIMS 登录", "Redirigiendo a EIMS")}</div>;
+  }
+  if (!user || ssoError) return <Login onLogin={completeLocalLogin} authMode={authMode} ssoError={ssoError} loggedOut={loggedOut} configError={message} />;
 
-  return <Shell user={user} message={message} setMessage={setMessage} onLogout={() => setUser(null)} />;
+  return <Shell user={user} authMode={authMode} message={message} setMessage={setMessage} onLogout={() => setUser(null)} />;
 }
 
-function Login({ onLogin }: { onLogin: (user: User) => void }) {
+const ssoErrorLabels: Record<string, [string, string]> = {
+  not_configured: ["SSO 尚未配置，请联系管理员", "SSO aún no está configurado; contacte al administrador"],
+  invalid_configuration: ["SSO 配置无效，请联系管理员", "La configuración de SSO no es válida; contacte al administrador"],
+  provider_unavailable: ["暂时无法连接 EIMS，请稍后重试", "No se puede conectar con EIMS; inténtelo más tarde"],
+  invalid_discovery: ["EIMS 服务配置校验失败，请联系管理员", "La configuración de EIMS no se pudo verificar; contacte al administrador"],
+  invalid_state: ["登录请求已过期或校验失败，请重新登录", "La solicitud de acceso caducó o no se pudo verificar; inténtelo de nuevo"],
+  access_denied: ["EIMS 未授权此次登录", "EIMS no autorizó este acceso"],
+  authorization_failed: ["EIMS 授权失败，请重新登录", "La autorización de EIMS falló; inténtelo de nuevo"],
+  token_exchange_failed: ["EIMS 登录凭据交换失败，请重新登录", "No se pudo completar el acceso con EIMS; inténtelo de nuevo"],
+  invalid_token_response: ["EIMS 返回了无效的登录凭据", "EIMS devolvió credenciales no válidas"],
+  userinfo_failed: ["无法从 EIMS 获取用户信息", "No se pudo obtener la información del usuario de EIMS"],
+  invalid_userinfo: ["EIMS 返回的用户信息无效", "La información de usuario de EIMS no es válida"],
+  binding_missing: ["EIMS 尚未绑定本系统账号，请联系管理员", "Su cuenta no está vinculada a este sistema; contacte al administrador"],
+  invalid_binding: ["EIMS 账号绑定值无效，请联系管理员", "La vinculación de la cuenta no es válida; contacte al administrador"],
+  account_missing: ["本系统中找不到绑定的账号，请联系管理员", "No se encontró la cuenta vinculada; contacte al administrador"],
+  account_disabled: ["本系统账号已停用，请联系管理员", "La cuenta de este sistema está desactivada; contacte al administrador"],
+  invalid_logout_state: ["退出回调校验失败；本地会话已退出", "No se pudo verificar la salida; la sesión local ya se cerró"],
+};
+
+function Login({ onLogin, authMode, ssoError, loggedOut, configError }: {
+  onLogin: (user: User) => void;
+  authMode: AuthMode;
+  ssoError: string | null;
+  loggedOut: boolean;
+  configError: string;
+}) {
   const { language, t, toggleLanguage } = useLanguage();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -349,7 +413,15 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
             <span>{t("内网归档工作台", "Centro interno de pagos y archivo")}</span>
           </div>
         </div>
-        <label>
+        {loggedOut && <p role="status">{t("已退出登录", "Sesión cerrada")}</p>}
+        {ssoError && <p className="error-text" role="alert">{t(...(ssoErrorLabels[ssoError] || ["SSO 登录失败，请重新登录", "El acceso con SSO falló; inténtelo de nuevo"]))}</p>}
+        {configError && <p className="error-text" role="alert">{configError}</p>}
+        {authMode !== "local" && (
+          <button className="primary-button" type="button" onClick={() => window.location.assign("/api/auth/eims/start")}>
+            <Shield size={16} />{t("使用 EIMS 登录", "Iniciar sesión con EIMS")}
+          </button>
+        )}
+        {authMode !== "eims" && <><label>
           {t("账号", "Usuario")}
           <input
             value={username}
@@ -374,6 +446,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
           <Shield size={16} />
           {t("登录", "Iniciar sesión")}
         </button>
+        </>}
       </form>
     </main>
   );
@@ -439,11 +512,13 @@ function GlobalFeedback({
 
 function Shell({
   user,
+  authMode,
   message,
   setMessage,
   onLogout,
 }: {
   user: User;
+  authMode: AuthMode;
   message: string;
   setMessage: (message: string) => void;
   onLogout: () => void;
@@ -478,8 +553,19 @@ function Shell({
   }, [canMexico, tab]);
 
   async function logout() {
-    await api.logout();
-    onLogout();
+    try {
+      const result = await api.logout();
+      if (result.redirect_url) {
+        window.location.assign(result.redirect_url);
+        return;
+      }
+      onLogout();
+      if (result.eims_logout_unavailable) {
+        window.location.assign("/?sso_error=provider_unavailable");
+      }
+    } catch (error) {
+      setMessage((error as Error).message);
+    }
   }
 
   return (
@@ -499,10 +585,17 @@ function Shell({
           <button className="icon-text language-button" type="button" onClick={toggleLanguage} title={language === "zh" ? "Cambiar a español" : "切换为中文"}>
             <Languages size={15} />{language === "zh" ? "Español" : "中文"}
           </button>
-          <button className="app-user account-button" type="button" title="修改密码" aria-label={`${user.display_name}，${roleLabels[user.role]}，修改密码`} onClick={() => setPasswordDialogOpen(true)}>
-            <span>{user.display_name}</span>
-            <small>{roleLabels[user.role]}</small>
-          </button>
+          {authMode === "eims" ? (
+            <div className="app-user" aria-label={`${user.display_name}，${roleLabels[user.role]}`}>
+              <span>{user.display_name}</span>
+              <small>{roleLabels[user.role]}</small>
+            </div>
+          ) : (
+            <button className="app-user account-button" type="button" title="修改密码" aria-label={`${user.display_name}，${roleLabels[user.role]}，修改密码`} onClick={() => setPasswordDialogOpen(true)}>
+              <span>{user.display_name}</span>
+              <small>{roleLabels[user.role]}</small>
+            </button>
+          )}
           <button className="icon-text" onClick={logout}>
             <LogOut size={15} />
             退出
@@ -549,9 +642,9 @@ function Shell({
             setMessage={setMessage}
           />
         )}
-        {tab === "admin" && <AdminView setMessage={setMessage} />}
+        {tab === "admin" && <AdminView authMode={authMode} setMessage={setMessage} />}
       </main>
-      {passwordDialogOpen && (
+      {passwordDialogOpen && authMode !== "eims" && (
         <ChangePasswordDialog
           onClose={() => setPasswordDialogOpen(false)}
           onSuccess={(signedOutSessions) => {
@@ -6000,7 +6093,7 @@ function SheetPermissionPicker({
   );
 }
 
-function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
+function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (message: string) => void }) {
   type UserForm = {
     username: string;
     password: string;
@@ -6024,7 +6117,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
   const [availableSheets, setAvailableSheets] = useState<string[]>([]);
   const emptyUserForm = (): UserForm => ({
     username: "",
-    password: "Yuewei123",
+    password: authMode === "eims" ? "" : "Yuewei123",
     role: "business",
     display_name: "",
     active: true,
@@ -6044,6 +6137,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
     return users.filter((item) => {
       const roleLabel = roleLabels[item.role] || item.role;
       return [
+        String(item.id),
         item.username,
         item.display_name,
         item.role,
@@ -6099,7 +6193,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
       setCreateUserError("请输入姓名");
       return;
     }
-    if (userForm.password.length < 6) {
+    if (authMode !== "eims" && userForm.password.length < 6) {
       setCreateUserError("初始密码至少需要 6 位");
       return;
     }
@@ -6113,6 +6207,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
     try {
       await api.createUser({
         ...userForm,
+        ...(authMode === "eims" ? { password: undefined } : {}),
         username,
         display_name: displayName,
         sheet_permissions: userForm.role === "business" ? userForm.sheet_permissions : [],
@@ -6198,7 +6293,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
         </div>
         <div className="table-wrap">
           <table className="data-table">
-            <thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>Sheet 权限</th><th>墨西哥审批权限</th><th>钉钉审批姓名</th><th>状态</th><th>修改密码</th><th>操作</th></tr></thead>
+            <thead><tr><th>绑定 ID</th><th>账号</th><th>姓名</th><th>角色</th><th>Sheet 权限</th><th>墨西哥审批权限</th><th>钉钉审批姓名</th><th>状态</th>{authMode !== "eims" && <th>修改密码</th>}<th>操作</th></tr></thead>
             <tbody>
               {visibleUsers.map((item) => {
                 const draft = userDrafts[item.id] || {
@@ -6212,6 +6307,15 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
                 };
                 return (
                   <tr key={item.id}>
+                    <td><button className="ghost-button" type="button" title="复制 EIMS 绑定 ID" onClick={() => {
+                      if (!navigator.clipboard?.writeText) {
+                        setMessage(`绑定 ID：${item.id}`);
+                        return;
+                      }
+                      navigator.clipboard.writeText(String(item.id))
+                        .then(() => setMessage(`已复制绑定 ID：${item.id}`))
+                        .catch(() => setMessage(`绑定 ID：${item.id}`));
+                    }}>{item.id}</button></td>
                     <td>{item.username}</td>
                     <td><input value={draft.display_name} onChange={(event) => updateUserDraft(item.id, { display_name: event.target.value })} /></td>
                     <td>
@@ -6257,10 +6361,10 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
                         {draft.active ? "启用" : "停用"}
                       </label>
                     </td>
-                    <td><input type="password" placeholder="输入新密码，留空不改" value={draft.password} onChange={(event) => updateUserDraft(item.id, { password: event.target.value })} /></td>
+                    {authMode !== "eims" && <td><input type="password" placeholder="输入新密码，留空不改" value={draft.password} onChange={(event) => updateUserDraft(item.id, { password: event.target.value })} /></td>}
                     <td className="table-actions">
                       <button className="ghost-button" type="button" onClick={() => saveUser(item)}>保存</button>
-                      <button className="ghost-button" type="button" onClick={() => resetPassword(item)}>重置密码</button>
+                      {authMode !== "eims" && <button className="ghost-button" type="button" onClick={() => resetPassword(item)}>重置密码</button>}
                       <button className="ghost-button" type="button" onClick={() => toggleUserActive(item)}>{item.active ? "停用" : "启用"}</button>
                       <button className="ghost-button danger-button" type="button" onClick={() => deleteUser(item)}>删除</button>
                     </td>
@@ -6274,7 +6378,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
       {createDialogOpen && (
         <Modal title="新增用户" onClose={closeCreateUserDialog} className="create-user-modal">
           <form className="create-user-form" onSubmit={createUser}>
-            <p className="form-hint span-2">创建登录账号并设置角色。业务人员只能查看已授权的 Sheet。</p>
+            <p className="form-hint span-2">{authMode === "eims" ? "创建本地账号并设置权限，然后将生成的绑定 ID 配置到 EIMS。" : "创建登录账号并设置角色。业务人员只能查看已授权的 Sheet。"}</p>
             <label>
               账号
               <input
@@ -6296,7 +6400,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
                 disabled={creatingUser}
               />
             </label>
-            <label>
+            {authMode !== "eims" && <label>
               初始密码
               <input
                 type="password"
@@ -6307,7 +6411,7 @@ function AdminView({ setMessage }: { setMessage: (message: string) => void }) {
                 disabled={creatingUser}
               />
               <small>默认密码为 Yuewei123，用户登录后可以自行修改。</small>
-            </label>
+            </label>}
             <label>
               角色
               <select
