@@ -2,6 +2,12 @@
 
 这是一个局域网多人使用的请款明细归档工具。后端使用 FastAPI + SQLite，前端使用 React + TypeScript + Vite，支持周报 Excel 导入、钉钉导出表字段映射导入、内置 Excel 式直接录入、多笔分次付款与凭证、从上周批次生成本周草稿、批次归档、审计日志、附件留档和按多 Sheet 模板导出 Excel。
 
+## 线上访问
+
+- 生产地址：<https://payment.yueweiportal.com/>
+- HTTP 会自动跳转到 HTTPS，应用由 Nginx 反向代理到本机 `8011` 端口。
+- Nginx 站点配置模板见 [`deploy/payment.yueweiportal.com.nginx.conf`](deploy/payment.yueweiportal.com.nginx.conf)。证书使用 Certbot 自动续期，续期完成后需重新加载 Nginx。
+
 ## 默认账号
 
 - 账号：`admin`
