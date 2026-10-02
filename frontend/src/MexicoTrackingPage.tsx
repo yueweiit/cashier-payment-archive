@@ -575,7 +575,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
                   </td>
                   <td className="mexico-summary-cell"><span className="mexico-summary-clamp" title={item.summary || "—"}>{item.summary || "—"}</span><small>{formatOriginalMoney(item.amount, item.currency, language)}</small></td>
                   <td className="mexico-current-task-cell"><CurrentNodes item={item} /><CurrentApprovers item={item} /><small>{workflowStatusLabel(item.workflow_status, language)}</small></td>
-                  <td className="mexico-duration-actions"><div><strong>{item.age_days} {t("天", "días")}</strong><small>{compactDateTime(item.current_node_entered_at, language)}</small></div><div className="mexico-row-actions"><button onClick={() => openDetail(item.id)}>{t("查看", "Ver")}</button>{item.reminder && <button title={t("复制双语提醒", "Copiar recordatorio bilingüe")} onClick={() => copyReminder(item)}><ClipboardCopy size={15} /></button>}</div></td>
+                  <td className="mexico-duration-actions"><div><strong>{item.age_days} {t("天", "días")}</strong><small>{compactDateTime(item.current_node_entered_at, language)}</small></div><div className="mexico-row-actions"><button onClick={() => openDetail(item.id)}>{t("查看", "Ver")}</button><MexicoOriginalLink workflowUrl={item.workflow_url} label={t("原单", "Original")} />{item.reminder && <button title={t("复制双语提醒", "Copiar recordatorio bilingüe")} onClick={() => copyReminder(item)}><ClipboardCopy size={15} /></button>}</div></td>
                 </tr>
               ))}</tbody>
             </table>
@@ -585,7 +585,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
                 <h3>{item.summary || item.approval_no}</h3>
                 <p>{item.company_name || item.source_sheet || "—"}</p>
                 <dl><div><dt>{t("申请人", "Solicitante")}</dt><dd>{item.applicant_name || "—"}</dd></div><div><dt>{t("当前节点", "Etapa")}</dt><dd><CurrentNodes item={item} /></dd></div><div><dt>{t("当前审批人", "Aprobador")}</dt><dd><CurrentApprovers item={item} /></dd></div><div><dt>{t("金额", "Importe")}</dt><dd>{formatOriginalMoney(item.amount, item.currency, language)}</dd></div></dl>
-                <footer><span>{item.approval_no}</span><div>{item.reminder && <button onClick={(event) => { event.stopPropagation(); copyReminder(item); }}><ClipboardCopy size={15} />{t("提醒", "Recordar")}</button>}<button>{t("查看", "Ver")}</button></div></footer>
+                <footer><span>{item.approval_no}</span><div>{item.reminder && <button onClick={(event) => { event.stopPropagation(); copyReminder(item); }}><ClipboardCopy size={15} />{t("提醒", "Recordar")}</button>}<MexicoOriginalLink workflowUrl={item.workflow_url} label={t("原单", "Original")} /><button>{t("查看", "Ver")}</button></div></footer>
               </article>
             ))}</div>
           </>
@@ -617,6 +617,11 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
       )}
     </section>
   );
+}
+
+function MexicoOriginalLink({ workflowUrl, label }: { workflowUrl?: string | null; label: string }) {
+  if (!workflowUrl) return null;
+  return <a className="mexico-original-link" href={workflowUrl} target="_blank" rel="noopener noreferrer" onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}><ExternalLink size={15} />{label}</a>;
 }
 
 function MexicoDetailDrawer({

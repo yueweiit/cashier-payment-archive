@@ -13,6 +13,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Optional
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -1643,6 +1644,37 @@ def _current_workflow_tasks(
     )
 
 
+def _workflow_original_url(tasks: list[Dict[str, Any]]) -> Optional[str]:
+    """Use DingTalk-provided task links, preferring the current desktop task."""
+    current = [
+        task for task in tasks
+        if (_text(task.get("status")) or "").upper()
+        in {"RUNNING", "PROCESSING", "PENDING"}
+    ]
+    for group in (current, tasks):
+        for key in ("pcUrl", "mobileUrl"):
+            for task in group:
+                url = _text(task.get(key)) or ""
+                if not url or re.search(r"[\x00-\x20\x7f\\]", url):
+                    continue
+                if re.match(r"^aflow\.dingtalk\.com(?=[/?#]|$)", url, re.I):
+                    url = "https://" + url
+                try:
+                    parsed = urlsplit(url)
+                    trusted = (
+                        parsed.scheme == "https"
+                        and parsed.hostname in {"aflow.dingtalk.com", "oa.dingtalk.com"}
+                        and parsed.port in {None, 443}
+                        and parsed.username is None
+                        and parsed.password is None
+                    )
+                except ValueError:
+                    continue
+                if trusted:
+                    return url
+    return None
+
+
 def parse_dingtalk_workflow_instance(
     instance: Dict[str, Any],
     user_names: Dict[str, str],
@@ -1716,6 +1748,7 @@ def parse_dingtalk_workflow_instance(
         "current_approver_id": "、".join(current_approver_ids) or None,
         "current_approver_name": "、".join(current_approvers) or None,
         "current_node_entered_at": min(entered_times) if entered_times else None,
+        "workflow_url": _workflow_original_url(tasks),
     }
 
 

@@ -5608,6 +5608,24 @@ textarea {
   padding: 6px 8px;
 }
 
+.mexico-original-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid #c9dfdb;
+  border-radius: 6px;
+  color: #1e8074;
+  background: #edf7f5;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.mexico-original-link:hover { background: #dcefeb; }
+.mexico-original-link:focus-visible { outline: 2px solid #1e8074; outline-offset: 2px; }
+
 .mexico-loading,
 .mexico-empty,
 .mexico-detail-loading {
@@ -5982,8 +6000,8 @@ textarea {
   .mexico-tracking-card dl > div { display: grid; gap: 2px; min-width: 0; }
   .mexico-tracking-card dt { color: #829198; font-size: 11px; }
   .mexico-tracking-card dd { margin: 0; overflow-wrap: anywhere; font-weight: 600; }
-  .mexico-tracking-card footer { padding-top: 8px; border-top: 1px solid #e5ebee; color: #819198; font-size: 11px; }
-  .mexico-tracking-card footer > div { gap: 6px; }
+  .mexico-tracking-card footer { flex-wrap: wrap; padding-top: 8px; border-top: 1px solid #e5ebee; color: #819198; font-size: 11px; }
+  .mexico-tracking-card footer > div { flex-wrap: wrap; gap: 6px; }
   .mexico-tracking-card footer button { display: inline-flex; align-items: center; gap: 4px; padding: 6px 8px; }
   .mexico-detail-drawer { width: 100%; max-width: none; }
   .mexico-detail-content { padding: 12px 12px 28px; }

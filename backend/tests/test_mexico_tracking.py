@@ -937,6 +937,65 @@ def test_workflow_snapshot_keeps_all_current_tasks_and_assignees() -> None:
     assert snapshot["current_node_entered_at"] == "2026-08-24T08:30:00+08:00"
 
 
+@pytest.mark.parametrize(
+    ("tasks", "expected"),
+    [
+        (
+            [
+                {"status": "COMPLETED", "pcUrl": "https://aflow.dingtalk.com/history"},
+                {"status": "RUNNING", "mobileUrl": "https://aflow.dingtalk.com/mobile"},
+                {"status": "PENDING", "pcUrl": "https://aflow.dingtalk.com/current"},
+            ],
+            "https://aflow.dingtalk.com/current",
+        ),
+        (
+            [
+                {"status": "COMPLETED", "pcUrl": "https://aflow.dingtalk.com/history"},
+                {"status": "PROCESSING", "mobileUrl": "https://aflow.dingtalk.com/mobile"},
+            ],
+            "https://aflow.dingtalk.com/mobile",
+        ),
+        (
+            [
+                {"status": "COMPLETED", "mobileUrl": "https://aflow.dingtalk.com/mobile"},
+                {"status": "COMPLETED", "pcUrl": "https://aflow.dingtalk.com/history"},
+            ],
+            "https://aflow.dingtalk.com/history",
+        ),
+        ([{"status": "COMPLETED", "mobileUrl": "https://aflow.dingtalk.com/mobile"}], "https://aflow.dingtalk.com/mobile"),
+        ([{"status": "RUNNING", "pcUrl": " aflow.dingtalk.com?procInstId=process-1#approval "}], "https://aflow.dingtalk.com?procInstId=process-1#approval"),
+        ([], None),
+    ],
+    ids=["current-pc-first", "current-mobile-before-history", "history-pc-first", "history-mobile", "missing-scheme", "missing-url"],
+)
+def test_workflow_snapshot_selects_original_form_link(tasks, expected) -> None:
+    snapshot = parse_dingtalk_workflow_instance({"process_instance_id": "process-1", "tasks": tasks}, {})
+    assert snapshot.get("workflow_url") == expected
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "https://example.com/approval",
+        "https://aflow.dingtalk.com.evil.example/approval",
+        "https://evildingtalk.com/approval",
+        "http://aflow.dingtalk.com/approval",
+        "javascript:alert(1)",
+        "dingtalk://dingtalkclient/page/link?url=untrusted",
+        "https://user:secret@aflow.dingtalk.com/approval",
+        "https://aflow.dingtalk.com:8080/approval",
+        "https://aflow.dingtalk.com/approval\nother",
+        "https://aflow.dingtalk.com/\\other",
+        "aflow.dingtalk.com.evil.example/approval",
+    ],
+)
+def test_workflow_snapshot_rejects_untrusted_links_and_uses_safe_fallback(invalid_url) -> None:
+    tasks = [{"status": "RUNNING", "pcUrl": invalid_url}]
+    assert parse_dingtalk_workflow_instance({"tasks": tasks}, {}).get("workflow_url") is None
+    tasks.append({"status": "COMPLETED", "pcUrl": "https://aflow.dingtalk.com/safe"})
+    assert parse_dingtalk_workflow_instance({"tasks": tasks}, {}).get("workflow_url") == "https://aflow.dingtalk.com/safe"
+
+
 def test_workflow_snapshot_keeps_unknown_current_approver_id() -> None:
     snapshot = parse_dingtalk_workflow_instance(
         {
@@ -963,8 +1022,9 @@ def test_workflow_snapshot_keeps_unknown_current_approver_id() -> None:
     assert snapshot["current_tasks"][0]["approver_name"] == "未识别人员（unknown-user-id）"
 
 
+@pytest.mark.parametrize("workflow_url", [None, "https://aflow.dingtalk.com/approval?procInstId=process-102"])
 def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
-    isolated_db,
+    isolated_db, workflow_url,
 ) -> None:
     approval_no = "202608240102"
     workflow = parse_dingtalk_workflow_instance(
@@ -985,7 +1045,7 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
                     remark="同意",
                 )
             ],
-            "tasks": [],
+            "tasks": [{"status": "COMPLETED", "pcUrl": workflow_url}],
             "updated_at": "2026-08-24T03:01:00Z",
         },
         {"ceo-user": "Eduardo Gómez"},
@@ -1054,7 +1114,7 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
             synced_at=timestamp,
         )
         stored_after_first = conn.execute(
-            "SELECT workflow_status, workflow_result, version FROM mexico_approval_tracking "
+            "SELECT workflow_status, workflow_result, version, workflow_url FROM mexico_approval_tracking "
             "WHERE approval_no = ?",
             (approval_no,),
         ).fetchone()
@@ -1064,7 +1124,7 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
             synced_at="2026-08-24T12:05:00.000000+08:00",
         )
         stored_after_second = conn.execute(
-            "SELECT workflow_status, workflow_result, version FROM mexico_approval_tracking "
+            "SELECT workflow_status, workflow_result, version, workflow_url FROM mexico_approval_tracking "
             "WHERE approval_no = ?",
             (approval_no,),
         ).fetchone()
@@ -1075,6 +1135,8 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
             "events_updated": 0,
             "links_added": 2,
             "links_removed": 0,
+            "workflow_urls_available": int(bool(workflow_url)),
+            "workflow_urls_missing": int(not workflow_url),
         }
         assert second_result == {
             "workflows_changed": 0,
@@ -1082,9 +1144,11 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
             "events_updated": 0,
             "links_added": 0,
             "links_removed": 0,
+            "workflow_urls_available": int(bool(workflow_url)),
+            "workflow_urls_missing": int(not workflow_url),
         }
-        assert tuple(stored_after_first) == ("COMPLETED", "agree", 2)
-        assert tuple(stored_after_second) == ("COMPLETED", "agree", 2)
+        assert tuple(stored_after_first) == ("COMPLETED", "agree", 2, workflow_url)
+        assert tuple(stored_after_second) == ("COMPLETED", "agree", 2, workflow_url)
         assert conn.execute(
             "SELECT COUNT(*) AS count FROM mexico_approval_events WHERE approval_no = ?",
             (approval_no,),
@@ -1105,6 +1169,7 @@ def test_workflow_cache_is_idempotent_tracks_history_and_rebuilds_request_links(
         assert [item["approval_no"] for item in bruno_items] == [approval_no]
         assert len(bruno_items[0]["current_tasks"]) == 3
         assert bruno_items[0]["current_approvers"] == ["Carla", "Ana", "Bruno"]
+        assert bruno_items[0]["workflow_url"] == workflow_url
         reduced = {
             **workflow,
             "current_tasks": [workflow["current_tasks"][0], workflow["current_tasks"][2]],

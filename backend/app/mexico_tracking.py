@@ -968,6 +968,8 @@ def cache_mexico_workflow_snapshots(
         "events_updated": 0,
         "links_added": 0,
         "links_removed": 0,
+        "workflow_urls_available": 0,
+        "workflow_urls_missing": 0,
     }
     try:
         if manage_transaction:
@@ -982,6 +984,9 @@ def cache_mexico_workflow_snapshots(
             ).fetchone()
             if tracking is None:
                 continue
+
+            url_count_key = "workflow_urls_available" if workflow.get("workflow_url") else "workflow_urls_missing"
+            summary[url_count_key] += 1
 
             request_ids = [
                 int(row["id"])

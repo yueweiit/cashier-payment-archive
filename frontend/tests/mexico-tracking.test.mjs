@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import test from "node:test";
+import ts from "typescript";
+import { renderToStaticMarkup } from "react-dom/server";
 
 const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 const navigationSource = readFileSync(new URL("../src/AppNavigation.tsx", import.meta.url), "utf8");
@@ -9,6 +12,32 @@ const i18nSource = readFileSync(new URL("../src/i18n.tsx", import.meta.url), "ut
 const helperSource = readFileSync(new URL("../src/mexicoTracking.ts", import.meta.url), "utf8");
 const pageSource = readFileSync(new URL("../src/MexicoTrackingPage.tsx", import.meta.url), "utf8");
 const styleSource = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+
+test("original form links open a new window without opening the local detail", () => {
+  const ast = ts.createSourceFile("MexicoTrackingPage.tsx", pageSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const component = ast.statements.find((statement) => ts.isFunctionDeclaration(statement) && statement.name?.text === "MexicoOriginalLink");
+  assert.ok(component, "missing shared original form link");
+  const compiled = ts.transpileModule(`import { ExternalLink } from "lucide-react";\n${component.getText(ast)}\nexport { MexicoOriginalLink };`, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2020 },
+  });
+  const exports = {};
+  new Function("require", "exports", compiled.outputText)(createRequire(import.meta.url), exports);
+  const { MexicoOriginalLink } = exports;
+  assert.equal(MexicoOriginalLink({ workflowUrl: null, label: "原单" }), null);
+  for (const label of ["原单", "Original"]) {
+    const link = MexicoOriginalLink({ workflowUrl: "https://aflow.dingtalk.com/approval", label });
+    assert.equal(link.type, "a");
+    assert.equal(link.props.href, "https://aflow.dingtalk.com/approval");
+    assert.equal(link.props.target, "_blank");
+    assert.match(link.props.rel, /noopener/);
+    assert.match(renderToStaticMarkup(link), new RegExp(label));
+    let stopped = false;
+    link.props.onClick({ stopPropagation: () => { stopped = true; } });
+    assert.equal(stopped, true);
+  }
+  assert.equal((pageSource.match(/<MexicoOriginalLink\b/g) || []).length, 2, "desktop and mobile both expose the link");
+  assert.equal((pageSource.match(/label=\{t\("原单", "Original"\)\}/g) || []).length, 2);
+});
 
 test("Mexico approval tracking has a stable navigation destination", () => {
   assert.match(navigationSource, /type AppTab =[\s\S]*"mexico-tracking"/);
