@@ -2101,12 +2101,23 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 "currency_source": currency_source,
                 "execution_region": execution_region or None,
                 "source_amount": source_amount,
+                "original_source_amount_raw": str(row["source_amount"]) if row.get("source_amount") is not None else None,
                 "base_currency_amount": base_amount,
                 "payment_account": invoice_account,
                 "expected_payment_account": expected_account.value,
                 "expected_payment_account_source": expected_account.source,
                 "expected_payment_account_explicit": explicit_expected_account,
                 "service_subject": service_subject,
+                # Preserve exact original labels for ERP classification. Account
+                # type and departmental sheet names are not legal/type evidence.
+                "application_type_raw": next((
+                    component.get("value") for component in form_values
+                    if component.get("name") in {"申请类型", "Tipo de trámite"}
+                ), None),
+                "source_company_raw": next((
+                    component.get("value") for component in form_values
+                    if component.get("name") in {"付款公司", "法人主体", "公司主体", "Empresa pagadora", "Entidad legal"}
+                ), None),
                 "project": project,
                 "invoice_value": invoice_value or "",
             }

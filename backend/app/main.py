@@ -174,6 +174,8 @@ from .snapshots import (
 
 
 app = FastAPI(title="出纳请款明细系统")
+from .erp_export import router as erp_export_router
+app.include_router(erp_export_router)
 
 _DINGTALK_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dingtalk-sync")
 _DINGTALK_SYNC_FUTURES: Dict[str, Any] = {}
