@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse
 
 from . import db
 from .file_storage import resolve_attachment_path
-from .external_expenses import _workflow_original_url
+from .external_expenses import _workflow_original_url, is_application_type_component
 
 router = APIRouter(prefix='/api/integrations/erp', tags=['ERP export'])
 SOURCE_SYSTEM = 'cashier-payment-archive'
@@ -111,12 +111,16 @@ def operation_source(row):
 
 
 def application_type(external, raw):
-    value = external.get('application_type_raw') or external.get('申请类型') or external.get('Tipo de trámite') or raw.get('申请类型') or raw.get('Tipo de trámite')
+    value = external.get('application_type_raw')
+    if value is None:
+        value = next((container[key] for container in (external,raw) for key in container if is_application_type_component(key)),None)
     for component in external.get('formComponentValues', []) or []:
-        if isinstance(component, dict) and component.get('name') in {'申请类型','Tipo de trámite'}:
+        if isinstance(component, dict) and is_application_type_component(component.get('name')):
             value = component.get('value')
-    normalized = str(value or '').strip().lower()
+    normalized = ' '.join(str(value or '').split()).casefold()
     return {'付款':'payment','请款':'payment','payment':'payment','pago':'payment',
+            '付款申请':'payment','solicitud de pago':'payment','付款申请solicitud de pago':'payment','付款申请 solicitud de pago':'payment',
+            '费用报销':'reimbursement','reembolso de gastos':'reimbursement','费用报销reembolso de gastos':'reimbursement','费用报销 reembolso de gastos':'reimbursement',
             '报销':'reimbursement','reimbursement':'reimbursement','reembolso':'reimbursement'}.get(normalized, 'unclassified'), value
 
 

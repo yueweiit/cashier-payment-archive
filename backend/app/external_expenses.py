@@ -2112,7 +2112,7 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 # type and departmental sheet names are not legal/type evidence.
                 "application_type_raw": next((
                     component.get("value") for component in form_values
-                    if component.get("name") in {"申请类型", "Tipo de trámite"}
+                    if is_application_type_component(component.get("name"))
                 ), None),
                 "source_company_raw": next((
                     component.get("value") for component in form_values
@@ -2304,6 +2304,12 @@ def _json_object(value: Any) -> Dict[str, Any]:
 def _form_values(raw_data: Dict[str, Any]) -> list[Dict[str, Any]]:
     values = raw_data.get("formComponentValues")
     return [item for item in values if isinstance(item, dict)] if isinstance(values, list) else []
+
+
+def is_application_type_component(name: Any) -> bool:
+    """Recognize only the actual single-language and bilingual form labels."""
+    normalized = " ".join(str(name or "").split()).casefold()
+    return normalized in {"申请类型", "tipo de trámite", "申请类型tipo de trámite", "申请类型 tipo de trámite"}
 
 
 def _component_values(form_values: Iterable[Dict[str, Any]], name_prefix: str) -> list[str]:

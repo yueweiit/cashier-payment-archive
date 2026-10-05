@@ -50,6 +50,23 @@ def get(client, **params):
                       headers={'Authorization':'Bearer test-export-token'})
 
 
+@pytest.fixture
+def native_type_client(tmp_path,monkeypatch):
+    monkeypatch.setattr(db,'DATA_DIR',tmp_path)
+    monkeypatch.setattr(db,'DB_PATH',tmp_path/'native-type.db')
+    monkeypatch.setenv('PAYMENT_ERP_EXPORT_TOKEN','test-export-token')
+    monkeypatch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS','["运营"]')
+    db.init_db()
+    with db.connect() as conn:
+        conn.execute("INSERT INTO request_batches(id,name,created_at,updated_at) VALUES(101,'native-type','2026-01-01','2026-01-01')")
+        conn.execute("INSERT INTO payment_requests(id,logical_request_id,batch_id,source_sheet,amount,currency,created_at,updated_at) VALUES(2,1,101,'运营',100,'CNY','2026-01-01','2026-01-01')")
+    conn.close()
+    from backend.app.erp_export import router
+    app=FastAPI()
+    app.include_router(router)
+    return TestClient(app),db.DB_PATH
+
+
 def test_authentication_and_explicit_scope(export_client, monkeypatch):
     client, _ = export_client
     assert client.get('/api/integrations/erp/operating-expenses').status_code == 401
@@ -358,6 +375,38 @@ def test_mapper_raw_form_whitespace_is_preserved():
     mapped = map_external_expense({'source_type':'operation','source_id':'8','raw_data':{
         'formComponentValues':[{'name':'申请类型','value':' 报销 '} ]}})
     assert mapped['request_data']['raw_extra']['external_source']['application_type_raw']==' 报销 '
+
+
+@pytest.mark.parametrize('value,expected',[
+    ('付款申请','payment'),('费用报销','reimbursement'),
+    ('Solicitud de pago','payment'),('Reembolso de gastos','reimbursement'),
+    ('付款申请Solicitud de pago','payment'),('付款申请 Solicitud de pago','payment'),
+    ('费用报销Reembolso de gastos','reimbursement'),('费用报销 Reembolso de gastos','reimbursement'),
+    (' 费用报销  Reembolso   de gastos ','reimbursement'),
+    ('付款申请等待确认','unclassified'),('业务Solicitud de pago说明','unclassified')])
+def test_actual_user_type_labels_http(native_type_client,value,expected):
+    from backend.app.external_expenses import map_external_expense
+    client,path=native_type_client
+    mapped=map_external_expense({'source_type':'operation','source_id':'abc','raw_data':{
+        'formComponentValues':[{'name':'申请类型Tipo de trámite','value':value}]}})
+    source=mapped['request_data']['raw_extra']['external_source']
+    assert source['application_type_raw']==value
+    source.update(source_type='operation',approval_status='COMPLETED',approval_result='agree')
+    with sqlite3.connect(path) as conn:
+        conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=2',(json.dumps({'external_source':source}),))
+    item=get(client,source_id='1').json()['items'][0]
+    assert item['application_type']==expected and item['application_type_raw']==value
+
+
+@pytest.mark.parametrize('name',['申请类型Tipo de trámite','申请类型 Tipo de trámite',' 申请类型  Tipo de trámite '])
+def test_bilingual_form_label_in_original_metadata(export_client,name):
+    client,path=export_client
+    with sqlite3.connect(path) as conn:
+        raw=json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=2').fetchone()[0])
+        raw['external_source'].pop('申请类型')
+        raw['external_source']['formComponentValues']=[{'name':name,'value':'费用报销Reembolso de gastos'}]
+        conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=2',(json.dumps(raw),))
+    assert get(client,source_id='1').json()['items'][0]['application_type']=='reimbursement'
 
 
 def test_mapper_keeps_original_amount_precision():
