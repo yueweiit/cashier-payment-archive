@@ -16,13 +16,15 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, StrictStr
 
 from . import db
+from .employee_departments import request_applicant_identity, resolve_employee_department
 from .file_storage import resolve_attachment_path
 from .external_expenses import _workflow_original_url, is_application_type_component
 
@@ -30,6 +32,15 @@ router = APIRouter(prefix='/api/integrations/erp', tags=['ERP export'])
 SOURCE_SYSTEM = 'cashier-payment-archive'
 UNCERTAIN_PAYMENTS = {'legacy_migration', 'snapshot_legacy', 'excel_summary', 'rollover'}
 RECORDED_PAYMENTS = {'manual','excel_detail','dingtalk_workflow'}
+
+
+class ApplicantIdentity(BaseModel):
+    user_id: StrictStr = Field(default='', max_length=200)
+    employee_name: StrictStr = Field(default='', max_length=200)
+
+
+class ApplicantCompanyLookup(BaseModel):
+    applicants: List[ApplicantIdentity] = Field(max_length=500)
 
 
 def export_scope(authorization: str = Header(default='')):
@@ -190,6 +201,61 @@ def safe_original_url(value):
     return 'https://aflow.dingtalk.com/dingtalk/mobile/homepage.htm?' + urlencode({'procInstId':process_ids[0]})
 
 
+def applicant_company_resolution(conn, sheets, user_id, employee_name, mappings_available):
+    """Resolve only a supplied person and disclose only configured organizations."""
+    mapping, match_source = resolve_employee_department(
+        conn, applicant_id=user_id, applicant_name=employee_name,
+    ) if mappings_available else (None, 'unavailable')
+    status = 'matched' if mapping else match_source
+    if mapping and mapping['assigned_department'] not in sheets:
+        mapping, status = None, 'out_of_scope'
+    return {'user_id': user_id, 'employee_name': employee_name,
+            'status': status, 'match_source': match_source,
+            **{field: mapping[field] if mapping and mapping.get(field) in sheets else None
+               for field in ('assigned_department', 'second_level_department', 'third_level_department')}}
+
+
+def employee_mappings_available(conn):
+    columns = {row['name'] for row in conn.execute('PRAGMA table_info(employee_department_mappings)')}
+    return {'id', 'user_id', 'employee_name', 'second_level_department', 'third_level_department'} <= columns
+
+
+@router.post('/resolve-applicant-companies')
+def resolve_applicant_companies(body: ApplicantCompanyLookup, sheets=Depends(export_scope)):
+    with read_database() as conn:
+        available = employee_mappings_available(conn)
+        items = [applicant_company_resolution(conn, sheets, person.user_id, person.employee_name, available)
+                 for person in body.applicants]
+    return {'schema_version': 1, 'source_system': SOURCE_SYSTEM, 'items': items}
+
+
+def dingtalk_identity(selected, external):
+    original_url = safe_original_url(external.get('workflow_url') or external.get('original_url'))
+    instance_evidence = []
+    for key in ('process_instance_id', 'workflow_process_instance_id'):
+        if isinstance(external.get(key), str) and external[key].strip():
+            instance_evidence.append({'value': external[key].strip(), 'source': 'external_source.' + key})
+    if original_url:
+        instance_evidence.append({'value': parse_qs(urlsplit(original_url).query)['procInstId'][0],
+                                  'source': 'vetted_original_url.procInstId'})
+    conflict = len({item['value'] for item in instance_evidence}) > 1
+    instance_id = instance_evidence[0]['value'] if instance_evidence and not conflict else None
+    instance_source = instance_evidence[0]['source'] if instance_id else None
+    explicit_approval = external.get('approval_no')
+    return {'external_source_id': str(external.get('record_id') or external.get('source_id')),
+            'originator_user_id': external.get('applicant_id') or None,
+            'originator_name': external.get('applicant') or None,
+            'corp_id': external.get('corp_id') or None,
+            'process_instance_id': instance_id,
+            'approval_identity_status': 'conflict' if conflict else ('explicit' if explicit_approval or instance_id else 'unverified'),
+            'approval_identity_provenance': {
+                'approval_no': 'external_source.approval_no' if explicit_approval else (
+                    'payment_request.dingding_id' if selected.get('dingding_id') else None),
+                'process_instance_id': instance_source},
+            'approval_identity_evidence': {'process_instance_id': instance_evidence},
+            **({'original_url': original_url} if original_url else {})}
+
+
 def collect(conn, sheets, source_id=None):
     if source_id is not None:
         requests=[dict(r) for r in conn.execute('SELECT * FROM payment_requests WHERE logical_request_id=?',(source_id,))]
@@ -255,6 +321,8 @@ def collect(conn, sheets, source_id=None):
         if external is None or selected.get('source_sheet') not in sheets:
             continue
         identities = set()
+        explicit_identities = defaultdict(set)
+        selected_identity = dingtalk_identity(selected, external)
         for copy in copies:
             # Identity and legal ownership are immutable across weekly copies.
             # A later timestamp cannot authorize merging different source roots.
@@ -263,7 +331,15 @@ def collect(conn, sheets, source_id=None):
                 meta = {}
             identities.add(digest([meta.get('system'),meta.get('record_id') or meta.get('source_id'),meta.get('source_type') or meta.get('table'),
                 meta.get('legal_company_id') or meta.get('legal_company_name') or meta.get('source_company') or meta.get('source_company_raw')]))
-        source_conflict = len(identities) > 1
+            for field in ('approval_no', 'applicant_id', 'corp_id'):
+                if meta.get(field):
+                    explicit_identities[field].add(str(meta[field]).strip())
+            identity = selected_identity if copy is selected else dingtalk_identity(copy, meta)
+            explicit_identities['process_instance_id'].update(
+                evidence['value'] for evidence in identity['approval_identity_evidence']['process_instance_id'])
+        # An older copy lacking metadata is compatible with later enrichment;
+        # two explicit source identities are never merged by timestamp.
+        source_conflict = len(identities) > 1 or any(len(values) > 1 for values in explicit_identities.values())
         all_copies=copies
         copies = [r for r in copies if r.get('source_sheet') in sheets and operation_source(r)]
         ids = {r['id'] for r in copies}
@@ -315,6 +391,9 @@ def collect(conn, sheets, source_id=None):
             voucher['payment_source_id'] = str(payment.get('root_payment_id') or payment['id'])
             attached[('payment-voucher',voucher['id'])] = {'_row':voucher,'_kind':'payment-voucher'}
         paid = sum((Decimal(p['amount']) for p in exported_payments if p['evidence_status']=='recorded' and p['amount'] is not None), Decimal(0))
+        payment_evidence_status = 'conflict' if conflicts or currency_conflict or source_conflict else (
+            'recorded' if exported_payments and all(p['evidence_status'] == 'recorded' and p['amount'] is not None
+                                                   for p in exported_payments) else 'unknown')
         amount = money(selected['amount'])
         kind, type_raw = application_type(external, object_json(selected.get('raw_extra_json')))
         approval_raw = {'status':external.get('approval_status'),'result':external.get('approval_result'),
@@ -341,8 +420,9 @@ def collect(conn, sheets, source_id=None):
                 'source_sheet':selected.get('source_sheet'),'applicant':selected.get('applicant'), 'payee_name':selected.get('payee_name'),
                 'summary':selected.get('summary'),'request_date':external.get('application_date'),
                 'request_date_raw':external.get('application_date'),'needed_payment_date':selected.get('needed_payment_date'),
-                'currency':selected.get('currency'),'amount':amount,'paid_amount':None if conflicts or currency_conflict else money(paid),
-                'pending_amount':money(Decimal(amount)-paid) if amount is not None and not conflicts and not currency_conflict else None,
+                'currency':selected.get('currency'),'amount':amount,'paid_amount':money(paid) if payment_evidence_status == 'recorded' else None,
+                'pending_amount':money(Decimal(amount)-paid) if amount is not None and payment_evidence_status == 'recorded' else None,
+                'payment_evidence_status':payment_evidence_status,
                 'approvals':{'raw':approval_raw,'eligibility':'eligible' if eligible else 'blocked'},
                 'source_status':selected.get('payment_status'),'payments':exported_payments,'attachments':list(attached.values()),
                 'updated_at':max(times)}
@@ -358,9 +438,12 @@ def collect(conn, sheets, source_id=None):
                 item['storage_precision_warning'] = True
         item['source_conflict'] = source_conflict
         item['currency_conflict'] = currency_conflict
-        original_url = safe_original_url(external.get('workflow_url') or external.get('original_url'))
-        if original_url:
-            item['original_url'] = original_url
+        item.update(selected_identity)
+        if source_conflict:
+            item['approval_identity_status'] = 'conflict'
+        item['_applicant_identity'] = request_applicant_identity({**selected, 'raw_extra': selected['_export_raw']})
+        original_applicant = str(external.get('applicant') or '').strip()
+        item['_manual_applicant_override'] = bool(original_applicant and item['_applicant_identity'][1] != original_applicant)
         items.append(item)
     return items
 
@@ -418,7 +501,12 @@ def operating_expenses(changed_since: Optional[str] = None, until: Optional[str]
     with read_database() as conn:
         items = sorted(filter(included, collect(conn, sheets,source_id)),key=lambda i:(i['updated_at'],i['source_id']))
         page, end = items[:limit], len(items) <= limit
+        mappings_available = employee_mappings_available(conn)
         for item in page:
+            user_id, employee_name = item.pop('_applicant_identity')
+            item['applicant_company_resolution'] = applicant_company_resolution(
+                conn, sheets, user_id, employee_name, mappings_available)
+            item['applicant_company_resolution']['manual_applicant_override'] = item.pop('_manual_applicant_override')
             item['attachments'] = [attachment_item(a['_row'],conn,a['_kind']) for a in item['attachments']]
             dedup = {}
             for attachment in item['attachments']:
