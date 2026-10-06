@@ -4,6 +4,9 @@ Full exports materialize candidate metadata before choosing a page, with linear
 relation indexing and one audit pass. This initial opt-in implementation does
 not claim bounded metadata memory; only file hydration is limited to the page.
 Exact-source reads restrict request and relation queries to that logical root.
+Employee company resolution is current-only and provided by the separate POST.
+Replacement imports retain no historical employee rows, so current directory
+values never participate in watermarked GET facts, versions or pagination.
 """
 import base64
 import hashlib
@@ -201,16 +204,11 @@ def safe_original_url(value):
     return 'https://aflow.dingtalk.com/dingtalk/mobile/homepage.htm?' + urlencode({'procInstId':process_ids[0]})
 
 
-def applicant_company_resolution(conn, sheets, user_id, employee_name, mappings_available, identity_ambiguous=False):
+def applicant_company_resolution(conn, sheets, user_id, employee_name, mappings_available):
     """Resolve only a supplied person and disclose only configured organizations."""
-    if identity_ambiguous:
-        mapping, match_source = None, 'ambiguous'
-    elif mappings_available:
-        mapping, match_source = resolve_employee_department(
-            conn, applicant_id=user_id, applicant_name=employee_name,
-        )
-    else:
-        mapping, match_source = None, 'unavailable'
+    mapping, match_source = resolve_employee_department(
+        conn, applicant_id=user_id, applicant_name=employee_name,
+    ) if mappings_available else (None, 'unavailable')
     status = 'matched' if mapping else match_source
     if mapping and mapping['assigned_department'] not in sheets:
         mapping, status = None, 'out_of_scope'
@@ -231,7 +229,7 @@ def resolve_applicant_companies(body: ApplicantCompanyLookup, sheets=Depends(exp
         available = employee_mappings_available(conn)
         items = [applicant_company_resolution(conn, sheets, person.user_id, person.employee_name, available)
                  for person in body.applicants]
-    return {'schema_version': 1, 'source_system': SOURCE_SYSTEM, 'items': items}
+    return {'schema_version': 1, 'source_system': SOURCE_SYSTEM, 'resolution_mode': 'current', 'items': items}
 
 
 def dingtalk_identity(selected, external):
@@ -450,13 +448,16 @@ def collect(conn, sheets, source_id=None):
         item.update(selected_identity)
         if source_conflict:
             item['approval_identity_status'] = 'conflict'
-        item['_applicant_identity'] = request_applicant_identity({**selected, 'raw_extra': selected['_export_raw']})
+        user_id, employee_name = request_applicant_identity({**selected, 'raw_extra': selected['_export_raw']})
         original_applicant = str(external.get('applicant') or '').strip()
-        item['_manual_applicant_override'] = bool(original_applicant and item['_applicant_identity'][1] != original_applicant)
         # Without the original name a populated cashier name could be a manual
-        # edit. Preserve the application's resolver rule, but do not export a
-        # company assignment for that uncertain identity.
-        item['_applicant_identity_ambiguous'] = bool(not original_applicant and all(item['_applicant_identity']))
+        # edit. This evidence is derived only from the selected source record.
+        identity_ambiguous = bool(not original_applicant and user_id and employee_name)
+        item['applicant_identity'] = {'user_id': user_id, 'employee_name': employee_name,
+            'status': 'ambiguous' if identity_ambiguous else ('selected' if user_id or employee_name else 'missing_applicant'),
+            'manual_applicant_override': None if identity_ambiguous else bool(original_applicant and employee_name != original_applicant)}
+        if identity_ambiguous:
+            item['applicant_identity']['ambiguity_reason'] = 'original_applicant_name_missing'
         items.append(item)
     return items
 
@@ -514,16 +515,7 @@ def operating_expenses(changed_since: Optional[str] = None, until: Optional[str]
     with read_database() as conn:
         items = sorted(filter(included, collect(conn, sheets,source_id)),key=lambda i:(i['updated_at'],i['source_id']))
         page, end = items[:limit], len(items) <= limit
-        mappings_available = employee_mappings_available(conn)
         for item in page:
-            user_id, employee_name = item.pop('_applicant_identity')
-            identity_ambiguous = item.pop('_applicant_identity_ambiguous')
-            item['applicant_company_resolution'] = applicant_company_resolution(
-                conn, sheets, user_id, employee_name, mappings_available, identity_ambiguous)
-            item['applicant_company_resolution']['manual_applicant_override'] = item.pop('_manual_applicant_override')
-            if identity_ambiguous:
-                item['applicant_company_resolution'].update(manual_applicant_override=None,
-                    ambiguity_reason='original_applicant_name_missing')
             item['attachments'] = [attachment_item(a['_row'],conn,a['_kind']) for a in item['attachments']]
             dedup = {}
             for attachment in item['attachments']:

@@ -235,6 +235,7 @@ def test_raw_applicant_company_lookup_does_not_require_imported_application(expo
     assert result.status_code == 200, result.text
     payload = result.json()
     assert payload['schema_version'] == 1 and payload['source_system'] == 'cashier-payment-archive'
+    assert payload['resolution_mode'] == 'current'
     assert [{k: item[k] for k in ('user_id', 'employee_name')} for item in payload['items']] == applicants
     assert [item['assigned_department'] for item in payload['items']] == ['运营'] * 3
     assert [item['match_source'] for item in payload['items']] == ['user_id', 'employee_name', 'user_id']
@@ -336,10 +337,13 @@ def test_export_preserves_dingtalk_originator_and_manual_applicant_mapping(expor
     assert item['approval_identity_provenance'] == {
         'approval_no': 'external_source.approval_no',
         'process_instance_id': 'external_source.workflow_process_instance_id'}
-    mapping = item['applicant_company_resolution']
-    assert mapping['user_id'] == '' and mapping['employee_name'] == '人工申请人'
+    identity = item['applicant_identity']
+    assert identity['user_id'] == '' and identity['employee_name'] == '人工申请人'
+    assert identity['status'] == 'selected' and identity['manual_applicant_override'] is True
+    assert 'applicant_company_resolution' not in item
+    mapping = resolve_applicants(client, [{'user_id': identity['user_id'], 'employee_name': identity['employee_name']}]).json()['items'][0]
     assert mapping['assigned_department'] == '运营' and mapping['match_source'] == 'employee_name'
-    assert mapping['status'] == 'matched' and mapping['manual_applicant_override'] is True
+    assert mapping['status'] == 'matched'
 
 
 @pytest.mark.parametrize('external_identity, expected_instance, expected_status, expected_provenance', [
@@ -414,7 +418,7 @@ def test_weekly_copies_cannot_merge_different_explicit_dingtalk_identities(expor
     assert item['approvals']['eligibility'] == 'blocked' and item['paid_amount'] is None
 
 
-def test_export_resolved_employee_organization_is_scoped_without_manual_override(export_client, monkeypatch):
+def test_record_identity_can_be_resolved_by_scoped_current_lookup(export_client, monkeypatch):
     client, path = export_client
     seed_applicant_mappings(path)
     monkeypatch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS', '["运营", "凌翔/星铭供应链及职能中心", "凌翔产品&开发"]')
@@ -423,13 +427,17 @@ def test_export_resolved_employee_organization_is_scoped_without_manual_override
         raw['external_source'].update(applicant_id='original-user', applicant='张三')
         conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=2', (json.dumps(raw),))
     item = get(client, source_id='1').json()['items'][0]
-    resolution = item['applicant_company_resolution']
+    identity = item['applicant_identity']
+    assert identity['status'] == 'selected' and identity['manual_applicant_override'] is False
+    applicants = [{'user_id': identity['user_id'], 'employee_name': identity['employee_name']}]
+    resolution = resolve_applicants(client, applicants).json()['items'][0]
     assert resolution['assigned_department'] == '凌翔产品&开发'
     assert resolution['second_level_department'] == '凌翔/星铭供应链及职能中心'
     assert resolution['third_level_department'] == '凌翔产品&开发'
-    assert resolution['match_source'] == 'user_id' and resolution['manual_applicant_override'] is False
+    assert resolution['match_source'] == 'user_id'
     monkeypatch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS', '["运营"]')
-    resolution = get(client, source_id='1').json()['items'][0]['applicant_company_resolution']
+    assert get(client, source_id='1').json()['items'][0] == item
+    resolution = resolve_applicants(client, applicants).json()['items'][0]
     assert resolution['status'] == 'out_of_scope'
     assert all(resolution[field] is None for field in ('assigned_department', 'second_level_department', 'third_level_department'))
 
@@ -442,7 +450,7 @@ def test_whitespace_or_empty_applicant_edit_is_not_a_person_override(export_clie
         raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=2').fetchone()[0])
         raw['external_source'].update(applicant_id='original-user', applicant='张三')
         conn.execute('UPDATE payment_requests SET applicant=?,raw_extra_json=? WHERE id=2', (current_name, json.dumps(raw)))
-    resolution = get(client, source_id='1').json()['items'][0]['applicant_company_resolution']
+    resolution = get(client, source_id='1').json()['items'][0]['applicant_identity']
     assert resolution['user_id'] == 'original-user' and resolution['employee_name'] == '张三'
     assert resolution['manual_applicant_override'] is False
 
@@ -507,12 +515,12 @@ def test_missing_original_name_cannot_prove_cashier_applicant_was_not_overridden
         conn.execute('UPDATE payment_requests SET applicant=?,raw_extra_json=? WHERE id=2', (current_name, json.dumps(raw)))
     assert request_applicant_identity({'applicant': current_name, 'raw_extra': raw}) == ('original-user', current_name)
     item = get(client, source_id='1').json()['items'][0]
-    resolution = item['applicant_company_resolution']
+    resolution = item['applicant_identity']
     assert item['originator_user_id'] == 'original-user' and item['originator_name'] is None
-    assert resolution['status'] == 'ambiguous' and resolution['match_source'] == 'ambiguous'
+    assert resolution['status'] == 'ambiguous'
     assert resolution['manual_applicant_override'] is None
     assert resolution['ambiguity_reason'] == 'original_applicant_name_missing'
-    assert all(resolution[field] is None for field in ('assigned_department', 'second_level_department', 'third_level_department'))
+    assert all(field not in resolution for field in ('assigned_department', 'second_level_department', 'third_level_department'))
 
 
 def test_original_user_id_without_any_cashier_name_keeps_existing_id_resolution(export_client, monkeypatch):
@@ -524,9 +532,69 @@ def test_original_user_id_without_any_cashier_name_keeps_existing_id_resolution(
         raw['external_source'].update(applicant_id='original-user')
         raw['external_source'].pop('applicant', None)
         conn.execute('UPDATE payment_requests SET applicant=NULL,raw_extra_json=? WHERE id=2', (json.dumps(raw),))
-    resolution = get(client, source_id='1').json()['items'][0]['applicant_company_resolution']
+    identity = get(client, source_id='1').json()['items'][0]['applicant_identity']
+    assert identity['status'] == 'selected' and identity['user_id'] == 'original-user'
+    assert identity['employee_name'] == '' and identity['manual_applicant_override'] is False
+    resolution = resolve_applicants(client, [{'user_id': identity['user_id'], 'employee_name': identity['employee_name']}]).json()['items'][0]
     assert resolution['status'] == 'matched' and resolution['match_source'] == 'user_id'
-    assert resolution['assigned_department'] == '凌翔产品&开发' and resolution['manual_applicant_override'] is False
+    assert resolution['assigned_department'] == '凌翔产品&开发'
+
+
+@pytest.mark.parametrize('mapping_change', ['update', 'delete'])
+def test_current_mapping_changes_are_observed_by_post_without_changing_watermarked_get(
+        export_client, monkeypatch, mapping_change):
+    client, path = export_client
+    seed_applicant_mappings(path)
+    monkeypatch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS', '["运营", "凌翔产品&开发"]')
+    with sqlite3.connect(path) as conn:
+        conn.execute('ALTER TABLE employee_department_mappings ADD COLUMN imported_at TEXT')
+        conn.execute("UPDATE employee_department_mappings SET imported_at='2026-01-01T00:00:00Z'")
+        raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=2').fetchone()[0])
+        raw['external_source'].update(applicant_id='raw-user', applicant='未导入人员')
+        conn.execute('UPDATE payment_requests SET applicant=?,raw_extra_json=? WHERE id=2', ('未导入人员', json.dumps(raw)))
+    filters = {'source_id': '1', 'changed_since': '2026-01-10T00:00:00Z', 'until': '2026-01-12T00:00:00Z'}
+    before = get(client, **filters).json()
+    applicants = [{'user_id': 'raw-user', 'employee_name': '未导入人员'}]
+    assert resolve_applicants(client, applicants).json()['items'][0]['assigned_department'] == '运营'
+    # Actual mapping replacement has no row-level history or deletion audit.
+    # Its current rows may be newer than an outstanding export watermark.
+    with sqlite3.connect(path) as conn:
+        if mapping_change == 'update':
+            conn.execute("UPDATE employee_department_mappings SET second_level_department='凌翔产品&开发',imported_at='2026-02-01T00:00:00Z' WHERE user_id='raw-user'")
+        else:
+            conn.execute("DELETE FROM employee_department_mappings WHERE user_id='raw-user'")
+    after = get(client, **filters).json()
+    assert after == before  # Contents, source version, ordering and watermark are source-record facts.
+    identity = after['items'][0]['applicant_identity']
+    assert identity == {'user_id': 'raw-user', 'employee_name': '未导入人员',
+                        'status': 'selected', 'manual_applicant_override': False}
+    assert 'applicant_company_resolution' not in after['items'][0]
+    assert get(client, source_id='1', changed_since='2026-01-12T00:00:00Z', until='2026-02-02T00:00:00Z').json()['items'] == []
+    current = resolve_applicants(client, applicants).json()
+    assert current['resolution_mode'] == 'current'
+    resolution = current['items'][0]
+    assert resolution['status'] == ('matched' if mapping_change == 'update' else 'unmatched')
+    assert resolution['assigned_department'] == ('凌翔产品&开发' if mapping_change == 'update' else None)
+
+
+def test_watermarked_get_does_not_read_current_employee_directory(export_client, monkeypatch):
+    from contextlib import contextmanager
+    from backend.app import erp_export
+    client, path = export_client
+    seed_applicant_mappings(path)
+    original_read = erp_export.read_database
+    queries = []
+    @contextmanager
+    def traced_read():
+        with original_read() as conn:
+            conn.set_trace_callback(queries.append)
+            yield conn
+    monkeypatch.setattr(erp_export, 'read_database', traced_read)
+    assert get(client, source_id='1').status_code == 200
+    assert not any('employee_department_mappings' in query for query in queries)
+    queries.clear()
+    assert resolve_applicants(client, [{'user_id': 'raw-user', 'employee_name': '未导入人员'}]).status_code == 200
+    assert any('employee_department_mappings' in query for query in queries)
 
 
 def test_attachment_delete_change_is_incremental(export_client):
