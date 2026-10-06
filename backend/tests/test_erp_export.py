@@ -447,6 +447,88 @@ def test_whitespace_or_empty_applicant_edit_is_not_a_person_override(export_clie
     assert resolution['manual_applicant_override'] is False
 
 
+@pytest.mark.parametrize('workflow_url, original_url, expected_instance, expected_status', [
+    ('https://aflow.dingtalk.com/a?procInstId=one', 'https://aflow.dingtalk.com/b?procInstId=two', None, 'conflict'),
+    ('https://untrusted.test/a?procInstId=one', 'https://aflow.dingtalk.com/b?procInstId=two', 'two', 'explicit'),
+    ('https://aflow.dingtalk.com/a?procInstId=one', 'https://aflow.dingtalk.com/b?procInstId=one', 'one', 'explicit'),
+])
+def test_all_trusted_approval_urls_participate_in_instance_identity(
+        export_client, workflow_url, original_url, expected_instance, expected_status):
+    client, path = export_client
+    with sqlite3.connect(path) as conn:
+        raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=2').fetchone()[0])
+        raw['external_source'].update(workflow_url=workflow_url, original_url=original_url)
+        conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=2', (json.dumps(raw),))
+    item = get(client, source_id='1').json()['items'][0]
+    assert item['process_instance_id'] == expected_instance and item['approval_identity_status'] == expected_status
+    if expected_status == 'conflict':
+        assert item['source_conflict'] and item['approvals']['eligibility'] == 'blocked'
+        assert item['payment_evidence_status'] == 'conflict' and item['paid_amount'] is None
+        assert {proof['value'] for proof in item['approval_identity_evidence']['process_instance_id']} == {'one', 'two'}
+    else:
+        assert not item['source_conflict'] and item['paid_amount'] == '20'
+
+
+@pytest.mark.parametrize('manual_number', [None, 'edited-application-number'])
+def test_whitespace_external_approval_number_is_not_explicit_identity(export_client, manual_number):
+    client, path = export_client
+    with sqlite3.connect(path) as conn:
+        conn.execute('ALTER TABLE payment_requests ADD COLUMN dingding_id TEXT')
+        raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=2').fetchone()[0])
+        raw['external_source']['approval_no'] = '  \t '
+        conn.execute('UPDATE payment_requests SET dingding_id=?,raw_extra_json=? WHERE id=2', (manual_number, json.dumps(raw)))
+    item = get(client, source_id='1').json()['items'][0]
+    assert item['approval_identity_status'] == 'unverified' and item['approval_no'] == manual_number
+    assert item['approval_identity_provenance']['approval_no'] == ('payment_request.dingding_id' if manual_number else None)
+
+
+def test_missing_explicit_identity_in_older_copy_does_not_conflict_with_later_enrichment(export_client):
+    client, path = export_client
+    with sqlite3.connect(path) as conn:
+        for rid, approval_no in ((1, '  '), (2, 'DT-explicit')):
+            raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=?', (rid,)).fetchone()[0])
+            raw['external_source']['approval_no'] = approval_no
+            conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=?', (json.dumps(raw), rid))
+    item = get(client, source_id='1').json()['items'][0]
+    assert not item['source_conflict'] and item['approval_identity_status'] == 'explicit'
+    assert item['approval_no'] == 'DT-explicit' and item['paid_amount'] == '20'
+
+
+@pytest.mark.parametrize('current_name', ['人工申请人', '张三'])
+def test_missing_original_name_cannot_prove_cashier_applicant_was_not_overridden(export_client, monkeypatch, current_name):
+    from backend.app.employee_departments import request_applicant_identity
+    client, path = export_client
+    seed_applicant_mappings(path)
+    monkeypatch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS', '["运营", "凌翔/星铭供应链及职能中心", "凌翔产品&开发"]')
+    with sqlite3.connect(path) as conn:
+        raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=2').fetchone()[0])
+        raw['external_source'].update(applicant_id='original-user')
+        raw['external_source'].pop('applicant', None)
+        conn.execute('UPDATE payment_requests SET applicant=?,raw_extra_json=? WHERE id=2', (current_name, json.dumps(raw)))
+    assert request_applicant_identity({'applicant': current_name, 'raw_extra': raw}) == ('original-user', current_name)
+    item = get(client, source_id='1').json()['items'][0]
+    resolution = item['applicant_company_resolution']
+    assert item['originator_user_id'] == 'original-user' and item['originator_name'] is None
+    assert resolution['status'] == 'ambiguous' and resolution['match_source'] == 'ambiguous'
+    assert resolution['manual_applicant_override'] is None
+    assert resolution['ambiguity_reason'] == 'original_applicant_name_missing'
+    assert all(resolution[field] is None for field in ('assigned_department', 'second_level_department', 'third_level_department'))
+
+
+def test_original_user_id_without_any_cashier_name_keeps_existing_id_resolution(export_client, monkeypatch):
+    client, path = export_client
+    seed_applicant_mappings(path)
+    monkeypatch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS', '["运营", "凌翔/星铭供应链及职能中心", "凌翔产品&开发"]')
+    with sqlite3.connect(path) as conn:
+        raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=2').fetchone()[0])
+        raw['external_source'].update(applicant_id='original-user')
+        raw['external_source'].pop('applicant', None)
+        conn.execute('UPDATE payment_requests SET applicant=NULL,raw_extra_json=? WHERE id=2', (json.dumps(raw),))
+    resolution = get(client, source_id='1').json()['items'][0]['applicant_company_resolution']
+    assert resolution['status'] == 'matched' and resolution['match_source'] == 'user_id'
+    assert resolution['assigned_department'] == '凌翔产品&开发' and resolution['manual_applicant_override'] is False
+
+
 def test_attachment_delete_change_is_incremental(export_client):
     client,path = export_client
     with sqlite3.connect(path) as conn:

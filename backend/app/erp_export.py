@@ -201,11 +201,16 @@ def safe_original_url(value):
     return 'https://aflow.dingtalk.com/dingtalk/mobile/homepage.htm?' + urlencode({'procInstId':process_ids[0]})
 
 
-def applicant_company_resolution(conn, sheets, user_id, employee_name, mappings_available):
+def applicant_company_resolution(conn, sheets, user_id, employee_name, mappings_available, identity_ambiguous=False):
     """Resolve only a supplied person and disclose only configured organizations."""
-    mapping, match_source = resolve_employee_department(
-        conn, applicant_id=user_id, applicant_name=employee_name,
-    ) if mappings_available else (None, 'unavailable')
+    if identity_ambiguous:
+        mapping, match_source = None, 'ambiguous'
+    elif mappings_available:
+        mapping, match_source = resolve_employee_department(
+            conn, applicant_id=user_id, applicant_name=employee_name,
+        )
+    else:
+        mapping, match_source = None, 'unavailable'
     status = 'matched' if mapping else match_source
     if mapping and mapping['assigned_department'] not in sheets:
         mapping, status = None, 'out_of_scope'
@@ -230,19 +235,24 @@ def resolve_applicant_companies(body: ApplicantCompanyLookup, sheets=Depends(exp
 
 
 def dingtalk_identity(selected, external):
-    original_url = safe_original_url(external.get('workflow_url') or external.get('original_url'))
+    original_url = None
     instance_evidence = []
     for key in ('process_instance_id', 'workflow_process_instance_id'):
         if isinstance(external.get(key), str) and external[key].strip():
             instance_evidence.append({'value': external[key].strip(), 'source': 'external_source.' + key})
-    if original_url:
-        instance_evidence.append({'value': parse_qs(urlsplit(original_url).query)['procInstId'][0],
-                                  'source': 'vetted_original_url.procInstId'})
+    for key in ('workflow_url', 'original_url'):
+        vetted_url = safe_original_url(external.get(key))
+        if vetted_url:
+            original_url = original_url or vetted_url
+            instance_evidence.append({'value': parse_qs(urlsplit(vetted_url).query)['procInstId'][0],
+                                      'source': 'vetted_original_url.procInstId', 'field': 'external_source.' + key})
     conflict = len({item['value'] for item in instance_evidence}) > 1
     instance_id = instance_evidence[0]['value'] if instance_evidence and not conflict else None
     instance_source = instance_evidence[0]['source'] if instance_id else None
-    explicit_approval = external.get('approval_no')
+    explicit_approval = str(external.get('approval_no') or '').strip() or None
     return {'external_source_id': str(external.get('record_id') or external.get('source_id')),
+            'approval_no': explicit_approval or selected.get('dingding_id'),
+            'dingding_id': selected.get('dingding_id') or explicit_approval,
             'originator_user_id': external.get('applicant_id') or None,
             'originator_name': external.get('applicant') or None,
             'corp_id': external.get('corp_id') or None,
@@ -332,8 +342,9 @@ def collect(conn, sheets, source_id=None):
             identities.add(digest([meta.get('system'),meta.get('record_id') or meta.get('source_id'),meta.get('source_type') or meta.get('table'),
                 meta.get('legal_company_id') or meta.get('legal_company_name') or meta.get('source_company') or meta.get('source_company_raw')]))
             for field in ('approval_no', 'applicant_id', 'corp_id'):
-                if meta.get(field):
-                    explicit_identities[field].add(str(meta[field]).strip())
+                normalized_identity = str(meta.get(field) or '').strip()
+                if normalized_identity:
+                    explicit_identities[field].add(normalized_identity)
             identity = selected_identity if copy is selected else dingtalk_identity(copy, meta)
             explicit_identities['process_instance_id'].update(
                 evidence['value'] for evidence in identity['approval_identity_evidence']['process_instance_id'])
@@ -413,8 +424,6 @@ def collect(conn, sheets, source_id=None):
                     if meta.get(field):
                         times.append(timestamp(meta[field]))
         item = {'source_system':SOURCE_SYSTEM,'source_id':logical,'source_request_id':str(selected['id']),
-                'approval_no':external.get('approval_no') or selected.get('dingding_id'),
-                'dingding_id':selected.get('dingding_id') or external.get('approval_no'),
                 'application_type':kind,'application_type_raw':type_raw,
                 'source_company':external.get('legal_company_id') or external.get('legal_company_name') or external.get('source_company') or external.get('source_company_raw'),
                 'source_sheet':selected.get('source_sheet'),'applicant':selected.get('applicant'), 'payee_name':selected.get('payee_name'),
@@ -444,6 +453,10 @@ def collect(conn, sheets, source_id=None):
         item['_applicant_identity'] = request_applicant_identity({**selected, 'raw_extra': selected['_export_raw']})
         original_applicant = str(external.get('applicant') or '').strip()
         item['_manual_applicant_override'] = bool(original_applicant and item['_applicant_identity'][1] != original_applicant)
+        # Without the original name a populated cashier name could be a manual
+        # edit. Preserve the application's resolver rule, but do not export a
+        # company assignment for that uncertain identity.
+        item['_applicant_identity_ambiguous'] = bool(not original_applicant and all(item['_applicant_identity']))
         items.append(item)
     return items
 
@@ -504,9 +517,13 @@ def operating_expenses(changed_since: Optional[str] = None, until: Optional[str]
         mappings_available = employee_mappings_available(conn)
         for item in page:
             user_id, employee_name = item.pop('_applicant_identity')
+            identity_ambiguous = item.pop('_applicant_identity_ambiguous')
             item['applicant_company_resolution'] = applicant_company_resolution(
-                conn, sheets, user_id, employee_name, mappings_available)
+                conn, sheets, user_id, employee_name, mappings_available, identity_ambiguous)
             item['applicant_company_resolution']['manual_applicant_override'] = item.pop('_manual_applicant_override')
+            if identity_ambiguous:
+                item['applicant_company_resolution'].update(manual_applicant_override=None,
+                    ambiguity_reason='original_applicant_name_missing')
             item['attachments'] = [attachment_item(a['_row'],conn,a['_kind']) for a in item['attachments']]
             dedup = {}
             for attachment in item['attachments']:
