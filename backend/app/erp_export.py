@@ -17,7 +17,7 @@ import re
 import sqlite3
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import List, Optional
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -30,6 +30,7 @@ from . import db
 from .employee_departments import request_applicant_identity, resolve_employee_department
 from .file_storage import resolve_attachment_path
 from .external_expenses import _workflow_original_url, is_application_type_component
+from .mexico_tracking import _normalized_token
 
 router = APIRouter(prefix='/api/integrations/erp', tags=['ERP export'])
 SOURCE_SYSTEM = 'cashier-payment-archive'
@@ -110,16 +111,40 @@ def timestamp(value):
         raise HTTPException(400, 'Invalid timestamp')
 
 
-def operation_source(row):
+def dingtalk_expense_source(row, source_type):
     raw = row['_export_raw'] if '_export_raw' in row else object_json(row.get('raw_extra_json'))
     external = raw.get('external_source') or {}
     if not isinstance(external, dict):
         return None
     if external.get('system') != 'dingtalk_expense_database' or not (external.get('record_id') or external.get('source_id')):
         return None
-    if external.get('source_type') != 'operation' and not (not external.get('source_type') and external.get('table') == 'approval_expense_operation'):
+    if external.get('source_type') != source_type and not (not external.get('source_type') and external.get('table') == 'approval_expense_' + source_type):
         return None
     if external.get('lookup_status') in {'unmatched', 'conflict'}:
+        return None
+    return external
+
+
+def operation_source(row):
+    return dingtalk_expense_source(row, 'operation')
+
+
+def purchase_source(row):
+    external = dingtalk_expense_source(row, 'purchase')
+    if external is None:
+        return None
+    # Only the original execution-region field can establish China scope.
+    # Department mappings and currency never fill missing source evidence.
+    # The general region resolver accepts substrings for historical tracking;
+    # this export requires a complete, verified China label.
+    region = ' '.join(_normalized_token(external.get('execution_region')).split())
+    if region not in {'中国', 'china', '中国china', '中国 china'}:
+        return None
+    try:
+        request_date = date.fromisoformat(external.get('application_date'))
+    except (ValueError, TypeError):
+        return None
+    if request_date.year != 2026:
         return None
     return external
 
@@ -138,7 +163,7 @@ def application_type(external, raw):
             '报销':'reimbursement','reimbursement':'reimbursement','reembolso':'reimbursement'}.get(normalized, 'unclassified'), value
 
 
-def attachment_item(row, conn, kind='attachment', include_version=True):
+def attachment_item(row, conn, kind='attachment', include_version=True, source_type='operation'):
     try:
         path, _ = resolve_attachment_path(row, conn)
     except (ValueError, sqlite3.Error):
@@ -148,8 +173,9 @@ def attachment_item(row, conn, kind='attachment', include_version=True):
     source_id = f"{kind}:{row['id']}"
     if row.get('source_attachment_id'):
         source_id = kind + ':' + digest([row.get('source_system'),row.get('source_instance_id'),row['source_attachment_id']])
+    file_scope = 'purchase-expenses/' if source_type == 'purchase' else ''
     value = {'source_id':source_id, 'filename':row.get('original_filename') or path.name,
-             'url':f"/api/integrations/erp/{'payment-vouchers' if kind == 'payment-voucher' else 'attachments'}/{row['id']}"}
+             'url':f"/api/integrations/erp/{file_scope}{'payment-vouchers' if kind == 'payment-voucher' else 'attachments'}/{row['id']}"}
     if kind == 'payment-voucher':
         value['payment_source_id'] = row['payment_source_id']
     if not include_version:
@@ -264,7 +290,8 @@ def dingtalk_identity(selected, external):
             **({'original_url': original_url} if original_url else {})}
 
 
-def collect(conn, sheets, source_id=None):
+def collect(conn, sheets, source_id=None, source_type='operation'):
+    source_reader = {'operation': operation_source, 'purchase': purchase_source}[source_type]
     if source_id is not None:
         requests=[dict(r) for r in conn.execute('SELECT * FROM payment_requests WHERE logical_request_id=?',(source_id,))]
     else:
@@ -281,9 +308,9 @@ def collect(conn, sheets, source_id=None):
             groups.setdefault(str(row['logical_request_id']), []).append(row)
     request_currency={r['id']:r.get('currency') for r in requests}
     groups={logical:copies for logical,copies in groups.items() if
-        max(copies,key=lambda r:r['id']).get('source_sheet') in sheets and operation_source(max(copies,key=lambda r:r['id']))}
+        max(copies,key=lambda r:r['id']).get('source_sheet') in sheets and source_reader(max(copies,key=lambda r:r['id']))}
     all_request_ids={r['id'] for copies in groups.values() for r in copies}
-    scoped_ids={r['id'] for copies in groups.values() for r in copies if r.get('source_sheet') in sheets and operation_source(r)}
+    scoped_ids={r['id'] for copies in groups.values() for r in copies if r.get('source_sheet') in sheets and source_reader(r)}
     payments = selected_rows(conn,'payment_records','request_id',scoped_ids)
     links = selected_rows(conn,'attachment_links','request_id',scoped_ids)
     payments_by_request=indexed(payments,'request_id')
@@ -325,7 +352,7 @@ def collect(conn, sheets, source_id=None):
         # A later weekly copy is authoritative even when an earlier archived
         # copy was subsequently edited. Apply scope only after this selection.
         selected = max(copies, key=lambda r:r['id'])
-        external = operation_source(selected)
+        external = source_reader(selected)
         if external is None or selected.get('source_sheet') not in sheets:
             continue
         identities = set()
@@ -337,7 +364,12 @@ def collect(conn, sheets, source_id=None):
             meta = copy['_export_raw'].get('external_source') or {}
             if not isinstance(meta,dict):
                 meta = {}
-            identities.add(digest([meta.get('system'),meta.get('record_id') or meta.get('source_id'),meta.get('source_type') or meta.get('table'),
+            identity_kind = meta.get('source_type') or meta.get('table')
+            if source_type == 'purchase' and dingtalk_expense_source(copy, 'purchase') is not None:
+                # A verified legacy table marker and its later typed form name
+                # the same purchase source. Unknown tables retain their identity.
+                identity_kind = 'purchase'
+            identities.add(digest([meta.get('system'),meta.get('record_id') or meta.get('source_id'),identity_kind,
                 meta.get('legal_company_id') or meta.get('legal_company_name') or meta.get('source_company') or meta.get('source_company_raw')]))
             for field in ('approval_no', 'applicant_id', 'corp_id'):
                 normalized_identity = str(meta.get(field) or '').strip()
@@ -350,7 +382,7 @@ def collect(conn, sheets, source_id=None):
         # two explicit source identities are never merged by timestamp.
         source_conflict = len(identities) > 1 or any(len(values) > 1 for values in explicit_identities.values())
         all_copies=copies
-        copies = [r for r in copies if r.get('source_sheet') in sheets and operation_source(r)]
+        copies = [r for r in copies if r.get('source_sheet') in sheets and source_reader(r)]
         ids = {r['id'] for r in copies}
         roots = {}
         related_payments = [p for request_id in ids for p in payments_by_request[request_id]]
@@ -433,6 +465,9 @@ def collect(conn, sheets, source_id=None):
                 'approvals':{'raw':approval_raw,'eligibility':'eligible' if eligible else 'blocked'},
                 'source_status':selected.get('payment_status'),'payments':exported_payments,'attachments':list(attached.values()),
                 'updated_at':max(times)}
+        if source_type == 'purchase':
+            item.update(source_type='purchase', application_type='purchase',
+                        execution_region='china', execution_region_raw=external.get('execution_region'))
         original_amount = external.get('original_source_amount_raw',external.get('source_amount'))
         item['original_source_amount'] = str(original_amount) if original_amount is not None else None
         item['original_source_currency'] = external.get('source_currency_raw')
@@ -480,21 +515,20 @@ def decode_cursor(value):
         raise HTTPException(400,'Invalid export cursor')
 
 
-@router.get('/operating-expenses')
-def operating_expenses(changed_since: Optional[str] = None, until: Optional[str] = None,
-                       cursor: Optional[str] = None, limit: int = Query(default=100, ge=1, le=500),
-                       date_from: Optional[str] = None, date_to: Optional[str] = None,
-                       source_id: Optional[str] = None,
-                       sheets=Depends(export_scope)):
+def export_expenses(changed_since, until, cursor, limit, date_from, date_to, source_id,
+                    sheets, source_type='operation'):
     since = timestamp(changed_since) if changed_since else None
     for date_value in (date_from,date_to):
         if date_value:
             try:
-                from datetime import date
                 date.fromisoformat(date_value)
             except ValueError:
                 raise HTTPException(400,'Invalid request date')
     bounds = {'since':since,'date_from':date_from,'date_to':date_to,'sheets':sheets,'source_id':source_id}
+    if source_type == 'purchase':
+        # Keep existing operation cursors compatible while giving procurement
+        # an explicit scope that neither endpoint can interchange.
+        bounds['scope'] = {'source_type': 'purchase', 'execution_region': 'china', 'request_year': 2026}
     after = None
     if cursor:
         state = decode_cursor(cursor)
@@ -510,13 +544,15 @@ def operating_expenses(changed_since: Optional[str] = None, until: Optional[str]
             return False
         requested = item['request_date']
         in_dates = requested and (not date_from or requested >= date_from) and (not date_to or requested <= date_to)
+        if source_type == 'purchase':
+            return bool(in_dates)
         older_unpaid = date_from and requested and requested < date_from and (item['pending_amount'] is None or Decimal(item['pending_amount']) > 0)
         return not (date_from or date_to) or bool(in_dates or older_unpaid)
     with read_database() as conn:
-        items = sorted(filter(included, collect(conn, sheets,source_id)),key=lambda i:(i['updated_at'],i['source_id']))
+        items = sorted(filter(included, collect(conn, sheets,source_id,source_type)),key=lambda i:(i['updated_at'],i['source_id']))
         page, end = items[:limit], len(items) <= limit
         for item in page:
-            item['attachments'] = [attachment_item(a['_row'],conn,a['_kind']) for a in item['attachments']]
+            item['attachments'] = [attachment_item(a['_row'],conn,a['_kind'],source_type=source_type) for a in item['attachments']]
             dedup = {}
             for attachment in item['attachments']:
                 if attachment is None:
@@ -533,39 +569,67 @@ def operating_expenses(changed_since: Optional[str] = None, until: Optional[str]
     return {'schema_version':1,'source_system':SOURCE_SYSTEM,'items':page,'until':watermark,'next_cursor':next_cursor,'end':end}
 
 
-def logical_request_allowed(conn,request_id,sheets):
+@router.get('/operating-expenses')
+def operating_expenses(changed_since: Optional[str] = None, until: Optional[str] = None,
+                       cursor: Optional[str] = None, limit: int = Query(default=100, ge=1, le=500),
+                       date_from: Optional[str] = None, date_to: Optional[str] = None,
+                       source_id: Optional[str] = None,
+                       sheets=Depends(export_scope)):
+    return export_expenses(changed_since, until, cursor, limit, date_from, date_to, source_id, sheets)
+
+
+@router.get('/purchase-expenses')
+def purchase_expenses(changed_since: Optional[str] = None, until: Optional[str] = None,
+                      cursor: Optional[str] = None, limit: int = Query(default=100, ge=1, le=500),
+                      date_from: Optional[str] = None, date_to: Optional[str] = None,
+                      source_id: Optional[str] = None,
+                      sheets=Depends(export_scope)):
+    return export_expenses(changed_since, until, cursor, limit, date_from, date_to, source_id, sheets, 'purchase')
+
+
+def logical_request_allowed(conn,request_id,sheets,source_type='operation'):
     request = conn.execute('SELECT logical_request_id FROM payment_requests WHERE id=?',(request_id,)).fetchone()
     if request is None or not request['logical_request_id']:
         return False
     latest = conn.execute('SELECT * FROM payment_requests WHERE logical_request_id=? ORDER BY id DESC LIMIT 1',(request['logical_request_id'],)).fetchone()
-    return bool(latest and latest['source_sheet'] in sheets and operation_source(dict(latest)))
+    source_reader = {'operation': operation_source, 'purchase': purchase_source}[source_type]
+    return bool(latest and latest['source_sheet'] in sheets and source_reader(dict(latest)))
+
+
+def expense_file(file_id, sheets, source_type='operation', kind='attachment'):
+    source_reader = {'operation': operation_source, 'purchase': purchase_source}[source_type]
+    query = ('SELECT a.*, r.source_sheet, r.raw_extra_json FROM attachment_links a JOIN payment_requests r ON r.id=a.request_id WHERE a.id=?'
+             if kind == 'attachment' else
+             'SELECT v.*, r.id AS request_id, r.source_sheet, r.raw_extra_json FROM payment_vouchers v JOIN payment_records p ON p.id=v.payment_id JOIN payment_requests r ON r.id=p.request_id WHERE v.id=?')
+    missing = 'Attachment not found' if kind == 'attachment' else 'Payment proof not found'
+    with read_database() as conn:
+        row = conn.execute(query,(file_id,)).fetchone()
+        if row is None or row['source_sheet'] not in sheets or not source_reader(dict(row)) or not logical_request_allowed(conn,row['request_id'],sheets,source_type):
+            raise HTTPException(404,missing)
+        try:
+            path, _ = resolve_attachment_path(row,conn)
+        except (ValueError,sqlite3.Error):
+            path = None
+        if path is None:
+            raise HTTPException(404,missing)
+    return FileResponse(path,filename=row['original_filename'] or path.name)
 
 
 @router.get('/attachments/{attachment_id}')
 def attachment_file(attachment_id: int, sheets=Depends(export_scope)):
-    with read_database() as conn:
-        row = conn.execute('SELECT a.*, r.source_sheet, r.raw_extra_json FROM attachment_links a JOIN payment_requests r ON r.id=a.request_id WHERE a.id=?',(attachment_id,)).fetchone()
-        if row is None or row['source_sheet'] not in sheets or not operation_source(dict(row)) or not logical_request_allowed(conn,row['request_id'],sheets):
-            raise HTTPException(404,'Attachment not found')
-        try:
-            path, _ = resolve_attachment_path(row,conn)
-        except (ValueError,sqlite3.Error):
-            path = None
-        if path is None:
-            raise HTTPException(404,'Attachment not found')
-    return FileResponse(path,filename=row['original_filename'] or path.name)
+    return expense_file(attachment_id, sheets)
 
 
 @router.get('/payment-vouchers/{voucher_id}')
 def payment_voucher_file(voucher_id: int, sheets=Depends(export_scope)):
-    with read_database() as conn:
-        row = conn.execute('SELECT v.*, r.id AS request_id, r.source_sheet, r.raw_extra_json FROM payment_vouchers v JOIN payment_records p ON p.id=v.payment_id JOIN payment_requests r ON r.id=p.request_id WHERE v.id=?',(voucher_id,)).fetchone()
-        if row is None or row['source_sheet'] not in sheets or not operation_source(dict(row)) or not logical_request_allowed(conn,row['request_id'],sheets):
-            raise HTTPException(404,'Payment proof not found')
-        try:
-            path, _ = resolve_attachment_path(row,conn)
-        except (ValueError,sqlite3.Error):
-            path = None
-        if path is None:
-            raise HTTPException(404,'Payment proof not found')
-    return FileResponse(path,filename=row['original_filename'] or path.name)
+    return expense_file(voucher_id, sheets, kind='payment-voucher')
+
+
+@router.get('/purchase-expenses/attachments/{attachment_id}')
+def purchase_attachment_file(attachment_id: int, sheets=Depends(export_scope)):
+    return expense_file(attachment_id, sheets, 'purchase')
+
+
+@router.get('/purchase-expenses/payment-vouchers/{voucher_id}')
+def purchase_payment_voucher_file(voucher_id: int, sheets=Depends(export_scope)):
+    return expense_file(voucher_id, sheets, 'purchase', 'payment-voucher')

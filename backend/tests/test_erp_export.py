@@ -973,3 +973,321 @@ def test_native_audit_heavy_export_uses_one_scan(tmp_path,monkeypatch,record_pro
         exact_audits=[q for q in queries if 'FROM audit_logs' in q]
         assert len(exact_audits)==1 and 'json_each' in exact_audits[0]
         previous=count
+
+
+def purchase_get(client, **params):
+    return client.get('/api/integrations/erp/purchase-expenses', params=params,
+                      headers={'Authorization': 'Bearer test-export-token'})
+
+
+def update_export_source(path, request_id, **values):
+    with sqlite3.connect(path) as conn:
+        raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=?', (request_id,)).fetchone()[0])
+        raw['external_source'].update(values)
+        conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=?', (json.dumps(raw), request_id))
+
+
+@pytest.fixture
+def purchase_client(export_client, tmp_path, monkeypatch):
+    from backend.app import file_storage
+    client, path = export_client
+    monkeypatch.setattr(file_storage, 'DATA_DIR', tmp_path)
+    (tmp_path / 'purchase.pdf').write_bytes(b'purchase-proof')
+    (tmp_path / 'operation.pdf').write_bytes(b'operation-proof')
+    meta = {'system': 'dingtalk_expense_database', 'source_type': 'purchase',
+            'table': 'approval_expense_purchase', 'record_id': 'purchase-db-3',
+            'execution_region': '中国 China', 'application_date': '2026-01-01',
+            'application_type_raw': '报销', 'source_company_raw': '中国法人',
+            'approval_status': 'COMPLETED', 'approval_result': 'agree',
+            'approval_no': 'DT-P3', 'corp_id': 'corp-china',
+            'process_instance_id': 'instance-p3', 'applicant_id': 'purchaser',
+            'applicant': '张三', 'source_amount': '100', 'source_currency_raw': 'CNY'}
+    with sqlite3.connect(path) as conn:
+        conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=3',
+                     (json.dumps({'external_source': meta}),))
+        for rid, logical, source_date, record_id in ((6, 3, '2026-01-01', 'purchase-db-3'),
+                                                    (7, 7, '2026-07-01', 'purchase-db-7')):
+            source = dict(meta, application_date=source_date, record_id=record_id)
+            if logical == 7:
+                source.update(approval_no='DT-P7', process_instance_id='instance-p7')
+            conn.execute('INSERT INTO payment_requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                         (rid, logical, '运营', json.dumps({'external_source': source}),
+                          '张三', '采购供应商', '采购零件', 100, 'CNY', None, '待支付', 90,
+                          '2026-01-01T00:00:00Z', f'2026-01-{rid+5:02d}T00:00:00Z'))
+        for pid, rid in ((30, 3), (31, 6)):
+            conn.execute('INSERT INTO payment_records VALUES(?,?,?,?,?,?,?,?,?,?)',
+                         (pid, rid, 30, 40, '2026-01-10', '采购银行', 'PURCHASE-REF', 'manual',
+                          '2026-01-10T00:00:00Z', '2026-01-10T00:00:00Z'))
+        conn.execute("UPDATE attachment_links SET file_path='operation.pdf' WHERE id=1")
+        for aid, rid in ((30, 3), (31, 6)):
+            conn.execute('INSERT INTO attachment_links VALUES(?,?,?,?,?,?,?,?,?)',
+                         (aid, rid, 'purchase-attachment', 'dingtalk', 'instance-p3',
+                          '采购附件.pdf', 'purchase.pdf', '', '2026-01-11T00:00:00Z'))
+        conn.execute('CREATE TABLE payment_vouchers(id INTEGER,payment_id INTEGER,file_path TEXT,original_filename TEXT,created_at TEXT)')
+        conn.execute("INSERT INTO payment_vouchers VALUES(1,10,'operation.pdf','付款凭证.pdf','2026-01-11T00:00:00Z')")
+        for vid, pid in ((30, 30), (31, 31)):
+            conn.execute('INSERT INTO payment_vouchers VALUES(?,?,?,?,?)',
+                         (vid, pid, 'purchase.pdf', '采购付款凭证.pdf', '2026-01-11T00:00:00Z'))
+    return client, path
+
+
+def test_purchase_reuses_export_contract_without_changing_operation_or_database(purchase_client):
+    client, path = purchase_client
+    filters = {'until': '2026-08-01T00:00:00Z'}
+    operation = get(client, **filters).json()
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    response = purchase_get(client, **filters)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload) == set(operation)
+    assert payload['schema_version'] == 1 and payload['source_system'] == 'cashier-payment-archive'
+    assert [item['source_id'] for item in payload['items']] == ['3', '7']
+    item = payload['items'][0]
+    assert item['source_type'] == 'purchase' and item['application_type'] == 'purchase'
+    assert item['application_type_raw'] == '报销'  # Preserve form evidence; purchase source decides classification.
+    assert item['source_request_id'] == '6' and item['external_source_id'] == 'purchase-db-3'
+    assert item['execution_region'] == 'china' and item['execution_region_raw'] == '中国 China'
+    assert item['corp_id'] == 'corp-china' and item['process_instance_id'] == 'instance-p3'
+    assert item['approval_no'] == 'DT-P3' and item['approval_identity_status'] == 'explicit'
+    assert item['approval_identity_provenance']['approval_no'] == 'external_source.approval_no'
+    assert item['amount'] == '100' and item['paid_amount'] == '40' and item['pending_amount'] == '60'
+    assert item['payment_evidence_status'] == 'recorded' and item['approvals']['eligibility'] == 'eligible'
+    assert [payment['source_id'] for payment in item['payments']] == ['30']
+    assert len(item['payments'][0]['provenance']) == 2
+    assert len(item['attachments']) == 2 and len(item['version']) == 64
+    assert get(client, **filters).json() == operation
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize('source_type,table,system,lookup,expected', [
+    ('purchase', 'approval_expense_purchase', 'dingtalk_expense_database', 'matched', True),
+    (None, 'approval_expense_purchase', 'dingtalk_expense_database', None, True),
+    ('', 'approval_expense_purchase', 'dingtalk_expense_database', None, True),
+    ('operation', 'approval_expense_purchase', 'dingtalk_expense_database', None, False),
+    (None, 'approval_expense_operation', 'dingtalk_expense_database', None, False),
+    (None, 'approval_expense_purchase_copy', 'dingtalk_expense_database', None, False),
+    ('purchase', 'approval_expense_purchase', 'other', None, False),
+    ('purchase', 'approval_expense_purchase', 'dingtalk_expense_database', 'unmatched', False),
+    ('purchase', 'approval_expense_purchase', 'dingtalk_expense_database', 'conflict', False),
+])
+def test_purchase_source_requires_exact_dingtalk_discriminator(purchase_client, source_type, table, system, lookup, expected):
+    client, path = purchase_client
+    for rid in (3, 6):
+        update_export_source(path, rid, source_type=source_type, table=table, system=system, lookup_status=lookup)
+    response = purchase_get(client, source_id='3')
+    assert response.status_code == 200, response.text
+    assert bool(response.json()['items']) is expected
+
+
+@pytest.mark.parametrize('region,expected', [
+    ('中国', True), ('China', True), ('中国China', True), (' 中国 China ', True), ('ＣＨＩＮＡ', True),
+    ('墨西哥 México', False), ('中国/墨西哥', False), ('Canada', False),
+    ('not China', False), ('非中国', False), ('China/Canada', False),
+    (None, False), ('', False), ('  ', False),
+])
+def test_purchase_requires_explicit_china_execution_region(purchase_client, region, expected):
+    client, path = purchase_client
+    for rid in (3, 6):
+        update_export_source(path, rid, execution_region=region)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE payment_requests SET source_sheet='凌翔产品&开发' WHERE logical_request_id=3")
+    # Even a configured China department and CNY cannot supply missing region evidence.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS', '["凌翔产品&开发"]')
+        response = purchase_get(client, source_id='3')
+    assert response.status_code == 200, response.text
+    assert bool(response.json()['items']) is expected
+
+
+@pytest.mark.parametrize('region', ['not China', '非中国', 'China/Canada'])
+def test_purchase_downloads_reject_unverified_china_region_labels(purchase_client, region):
+    client, path = purchase_client
+    for rid in (3, 6):
+        update_export_source(path, rid, execution_region=region)
+    for kind in ('attachments', 'payment-vouchers'):
+        response = client.get(f'/api/integrations/erp/purchase-expenses/{kind}/30',
+                              headers={'Authorization': 'Bearer test-export-token'})
+        assert response.status_code == 404
+
+
+@pytest.mark.parametrize('request_date,expected', [
+    ('2026-01-01', True), ('2026-12-31', True), ('2025-12-31', False),
+    ('2027-01-01', False), ('2026-02-30', False), ('invalid', False), (None, False),
+])
+def test_purchase_hard_bounds_source_request_year(purchase_client, request_date, expected):
+    client, path = purchase_client
+    for rid in (3, 6):
+        update_export_source(path, rid, application_date=request_date)
+    response = purchase_get(client, source_id='3', date_from='2025-01-01', date_to='2027-12-31')
+    assert response.status_code == 200, response.text
+    assert bool(response.json()['items']) is expected
+
+
+def test_purchase_request_dates_do_not_carry_older_unpaid_items(purchase_client):
+    client, path = purchase_client
+    with sqlite3.connect(path) as conn:
+        conn.execute('DELETE FROM payment_records WHERE request_id IN (3,6)')
+    response = purchase_get(client, date_from='2026-07-01', date_to='2026-12-31')
+    assert response.status_code == 200, response.text
+    assert [item['source_id'] for item in response.json()['items']] == ['7']
+    assert purchase_get(client, date_to='2025-12-31').json()['items'] == []
+
+
+@pytest.mark.parametrize('scenario,expected', [
+    ('missing', 'unknown'), ('summary', 'unknown'), ('mixed_summary', 'unknown'),
+    ('invalid_amount', 'unknown'), ('unknown_source', 'conflict'), ('conflict', 'conflict'),
+])
+def test_purchase_paid_amount_uses_only_actual_recorded_payment_proof(purchase_client, scenario, expected):
+    client, path = purchase_client
+    with sqlite3.connect(path) as conn:
+        if scenario == 'missing':
+            conn.execute('DELETE FROM payment_records WHERE request_id IN (3,6)')
+        elif scenario == 'summary':
+            conn.execute("UPDATE payment_records SET source_type='excel_summary' WHERE request_id IN (3,6)")
+        elif scenario == 'mixed_summary':
+            conn.execute("INSERT INTO payment_records VALUES(32,6,32,50,'2026-01-10','银行','SUMMARY','excel_summary','2026-01-10','2026-01-10')")
+        elif scenario == 'invalid_amount':
+            conn.execute('UPDATE payment_records SET amount=NULL WHERE request_id IN (3,6)')
+        elif scenario == 'unknown_source':
+            conn.execute("UPDATE payment_records SET source_type='oa_planned_payment' WHERE request_id IN (3,6)")
+        else:
+            conn.execute('UPDATE payment_records SET amount=90 WHERE id=31')
+    response = purchase_get(client, source_id='3')
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    assert item['payment_evidence_status'] == expected
+    assert item['paid_amount'] is None and item['pending_amount'] is None
+
+
+@pytest.mark.parametrize('field,value', [
+    ('record_id', 'other-root'), ('source_company_raw', '另一法人'),
+    ('approval_no', 'other-approval'), ('corp_id', 'other-corp'),
+    ('applicant_id', 'other-person'), ('process_instance_id', 'other-instance'),
+])
+def test_purchase_logical_copies_cannot_merge_source_or_approval_identity(purchase_client, field, value):
+    client, path = purchase_client
+    update_export_source(path, 3, **{field: value})
+    response = purchase_get(client, source_id='3')
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    assert item['source_conflict'] and item['approval_identity_status'] == 'conflict'
+    assert item['approvals']['eligibility'] == 'blocked'
+    assert item['paid_amount'] is None and item['pending_amount'] is None
+
+
+@pytest.mark.parametrize('older_type,older_table,newer_type,expected_conflict', [
+    (None, 'approval_expense_purchase', 'purchase', False),
+    ('', 'approval_expense_purchase', 'purchase', False),
+    ('purchase', 'approval_expense_purchase', None, False),
+    (None, 'approval_expense_purchase_copy', 'purchase', True),
+    (None, 'approval_expense_operation', 'purchase', True),
+])
+def test_purchase_identity_normalizes_only_verified_kind_equivalence(
+        purchase_client, older_type, older_table, newer_type, expected_conflict):
+    client, path = purchase_client
+    update_export_source(path, 3, source_type=older_type, table=older_table)
+    update_export_source(path, 6, source_type=newer_type)
+    response = purchase_get(client, source_id='3')
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    assert item['source_id'] == '3' and item['source_request_id'] == '6'
+    assert item['external_source_id'] == 'purchase-db-3' and item['source_type'] == 'purchase'
+    assert item['source_conflict'] is expected_conflict
+    if expected_conflict:
+        assert item['approvals']['eligibility'] == 'blocked' and item['paid_amount'] is None
+    else:
+        assert item['approvals']['eligibility'] == 'eligible' and item['paid_amount'] == '40'
+        assert item['payment_evidence_status'] == 'recorded' and len(item['payments']) == 1
+        assert len(item['payments'][0]['provenance']) == 2
+
+
+@pytest.mark.parametrize('status,result', [
+    ('COMPLETED', 'agree'), ('RUNNING', 'agree'), ('COMPLETED', 'refuse'),
+    ('TERMINATED', 'agree'), ('COMPLETED', None),
+])
+def test_purchase_preserves_approval_eligibility_evidence(purchase_client, status, result):
+    client, path = purchase_client
+    update_export_source(path, 6, approval_status=status, approval_result=result)
+    response = purchase_get(client, source_id='3')
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    assert item['approvals']['raw']['status'] == status and item['approvals']['raw']['result'] == result
+    assert item['approvals']['eligibility'] == ('eligible' if status == 'COMPLETED' and result == 'agree' else 'blocked')
+
+
+def test_purchase_cursor_cannot_cross_operating_endpoint(purchase_client):
+    client, _ = purchase_client
+    response = purchase_get(client, limit=1)
+    assert response.status_code == 200, response.text
+    first = response.json()
+    assert first['items'][0]['source_id'] == '3' and not first['end']
+    second = purchase_get(client, limit=1, cursor=first['next_cursor']).json()
+    assert second['items'][0]['source_id'] == '7' and second['until'] == first['until'] and second['end']
+    assert get(client, limit=1, cursor=first['next_cursor']).status_code == 400
+    operating_cursor = get(client, limit=1).json()['next_cursor']
+    assert purchase_get(client, limit=1, cursor=operating_cursor).status_code == 400
+    assert purchase_get(client, cursor=first['next_cursor'], date_from='2026-07-01').status_code == 400
+    assert purchase_get(client, cursor=first['next_cursor'] + 'x').status_code == 400
+
+
+@pytest.mark.parametrize('kind,identifier', [('attachments', 30), ('payment-vouchers', 30)])
+def test_purchase_files_use_explicit_procurement_paths_and_same_token(purchase_client, kind, identifier):
+    client, _ = purchase_client
+    response = purchase_get(client, source_id='3')
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    proof = next(a for a in item['attachments'] if ('payment_source_id' in a) == (kind == 'payment-vouchers'))
+    assert proof['url'].startswith('/api/integrations/erp/purchase-expenses/' + kind + '/')
+    if kind == 'payment-vouchers':
+        assert proof['payment_source_id'] == '30'
+    assert client.get(proof['url'], headers={'Authorization': 'Bearer test-export-token'}).content == b'purchase-proof'
+    assert client.get(proof['url']).status_code == 401
+    assert client.get(f'/api/integrations/erp/{kind}/{identifier}', headers={'Authorization': 'Bearer test-export-token'}).status_code == 404
+    assert client.get(f'/api/integrations/erp/purchase-expenses/{kind}/1', headers={'Authorization': 'Bearer test-export-token'}).status_code == 404
+    assert client.get(f'/api/integrations/erp/{kind}/1', headers={'Authorization': 'Bearer test-export-token'}).content == b'operation-proof'
+
+
+@pytest.mark.parametrize('field,value', [
+    ('source_type', 'operation'), ('system', 'other'), ('execution_region', '墨西哥'),
+    ('execution_region', None), ('application_date', '2025-12-31'), ('lookup_status', 'conflict'),
+    ('source_sheet', '秘密'),
+])
+def test_purchase_latest_copy_controls_export_and_older_copy_download(purchase_client, field, value):
+    client, path = purchase_client
+    response = purchase_get(client, source_id='3')
+    assert response.status_code == 200 and len(response.json()['items']) == 1
+    if field == 'source_sheet':
+        with sqlite3.connect(path) as conn:
+            conn.execute('UPDATE payment_requests SET source_sheet=? WHERE id=6', (value,))
+    else:
+        update_export_source(path, 6, **{field: value})
+    assert purchase_get(client, source_id='3').json()['items'] == []
+    for kind in ('attachments', 'payment-vouchers'):
+        assert client.get(f'/api/integrations/erp/purchase-expenses/{kind}/30', headers={'Authorization': 'Bearer test-export-token'}).status_code == 404
+
+
+@pytest.mark.parametrize('misconfiguration,expected', [
+    ('token_missing', 503), ('sheets_missing', 503), ('sheets_empty', 503), ('sheets_wildcard', 503),
+])
+def test_purchase_uses_existing_opt_in_sheet_configuration(purchase_client, monkeypatch, misconfiguration, expected):
+    client, _ = purchase_client
+    if misconfiguration == 'token_missing':
+        monkeypatch.delenv('PAYMENT_ERP_EXPORT_TOKEN')
+    elif misconfiguration == 'sheets_missing':
+        monkeypatch.delenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS')
+    else:
+        monkeypatch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS', '["*"]' if misconfiguration == 'sheets_wildcard' else '[]')
+    assert purchase_get(client).status_code == expected
+
+
+def test_purchase_validates_authentication_filters_and_read_only_missing_database(purchase_client, tmp_path, monkeypatch):
+    client, _ = purchase_client
+    assert client.get('/api/integrations/erp/purchase-expenses').status_code == 401
+    assert purchase_get(client, limit=501).status_code == 422
+    assert purchase_get(client, date_from='not-a-date').status_code == 400
+    assert purchase_get(client, changed_since='bad').status_code == 400
+    assert purchase_get(client, until='2999-01-01').status_code == 400
+    missing = tmp_path / 'purchase-missing.db'
+    monkeypatch.setattr(db, 'DB_PATH', missing)
+    assert purchase_get(client).status_code == 503
+    assert not missing.exists()
