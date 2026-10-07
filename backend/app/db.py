@@ -498,6 +498,11 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     ensure_payment_detail_tables(conn)
     ensure_column(conn, "payment_records", "version", "INTEGER NOT NULL DEFAULT 1")
     ensure_batch_operations_table(conn)
+    # Ownership predicates require the current ledger schema, and its guards
+    # require logical-root/history tables. Prepare schema only here: financial
+    # history baselines must still follow the monetary backfills below.
+    ensure_daily_payable_history_tables(conn)
+    ensure_erp_operating_ownership(conn)
     migrate_currency_amount_anchors(conn)
     ensure_dingtalk_workflow_events_table(conn)
     migrate_payment_summaries_to_details(conn)
@@ -543,7 +548,6 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             "INSERT INTO schema_migrations (key, applied_at) VALUES (?, ?)",
             (isolation_key, now_iso()),
         )
-    ensure_erp_operating_ownership(conn)
 
 
 ERP_OWNERSHIP_ERROR = "ERP_PAYMENT_OWNERSHIP_LOCKED"
@@ -835,7 +839,7 @@ def _insert_payable_baseline(
     )
 
 
-def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
+def ensure_daily_payable_history_tables(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "payment_requests", "logical_request_id", "INTEGER")
     ensure_column(conn, "payment_requests", "payable_item_key", "TEXT")
     conn.executescript(
@@ -894,6 +898,9 @@ def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "payable_history_versions", "dingding_id", "TEXT")
     ensure_column(conn, "payable_history_versions", "payable_item_key", "TEXT")
 
+
+def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
+    ensure_daily_payable_history_tables(conn)
     roots = _logical_request_roots(conn)
     for request_id, logical_request_id in roots.items():
         conn.execute(

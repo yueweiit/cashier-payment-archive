@@ -244,12 +244,22 @@ def test_operating_source_reader_filters_corp_directory_and_uses_normalized_task
     assert 'corp_id=%s' in directory[0] and directory[1][0] == 'fake-corp'
 
 
-def test_ownership_schema_upgrade_preserves_frozen_legacy_claims_and_guards(v2_client):
+@pytest.mark.parametrize('has_claim', [False, True])
+def test_init_db_upgrades_legacy_ownership_before_financial_migrations_and_preserves_guards(v2_client, has_claim):
     _, _, path = v2_client
     columns = 'logical_request_id,external_source_id,source_sheet,owner,actor_fingerprint,takeover_request_id,claim_token,claimed_at,history_fingerprint,snapshot_json'
     snapshot = json.dumps({'source_id': '7', 'corp_id': 'old-corp', 'process_instance_id': 'old-instance', 'approval_no': 'old-approval'})
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("INSERT INTO request_batches(id,name,created_at,updated_at) VALUES(7,'legacy','2026-01-01','2026-01-01')")
+        conn.execute('''INSERT INTO payment_requests(id,logical_request_id,batch_id,source_sheet,amount,paid_amount,pending_amount,
+            currency,base_amount_cny,fx_rate_cny_per_unit,fx_rate_date,fx_rate_actual_date,finance_review,payment_status,
+            general_manager_approval,actual_payment_date,payer,created_at,updated_at)
+            VALUES(7,7,7,'运营',100,20,80,'CNY',100,1,'2026-01-01','2026-01-01','部分付款','部分付款',
+            '同意付款','2026-01-10','测试付款人','2026-01-01','2026-01-01')''')
+        conn.execute('''INSERT INTO payment_records(id,request_id,root_payment_id,amount,payment_date,payer,source_type,
+            base_amount_cny,fx_rate_cny_per_unit,fx_rate_date,fx_rate_actual_date,created_at,updated_at)
+            VALUES(7,7,7,20,'2026-01-10','测试付款人','manual',20,1,'2026-01-01','2026-01-01','2026-01-01','2026-01-01')''')
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB 'erp_guard_*'").fetchall():
             conn.execute(f'DROP TRIGGER "{row["name"]}"')
         conn.execute('DROP TABLE erp_operating_expense_ownership')
@@ -257,15 +267,33 @@ def test_ownership_schema_upgrade_preserves_frozen_legacy_claims_and_guards(v2_c
             external_source_id TEXT NOT NULL UNIQUE,source_sheet TEXT NOT NULL,owner TEXT NOT NULL,
             actor_fingerprint TEXT NOT NULL,takeover_request_id TEXT NOT NULL,claim_token TEXT NOT NULL UNIQUE,
             claimed_at TEXT NOT NULL,history_fingerprint TEXT NOT NULL,snapshot_json TEXT NOT NULL)''')
-        conn.execute(f'INSERT INTO erp_operating_expense_ownership({columns}) VALUES(7,?,?,?,?,?,?,?,?,?)',
-                     ('old-source', '运营', 'deeplinkerp', 'old-actor', 'old-request', 'old-token', '2026-01-01', 'old-history', snapshot))
-        before = tuple(conn.execute(f'SELECT {columns} FROM erp_operating_expense_ownership').fetchone())
-        db.ensure_erp_operating_ownership(conn)
-        after = tuple(conn.execute(f'SELECT {columns} FROM erp_operating_expense_ownership').fetchone())
-        assert before == after
-        assert tuple(conn.execute('SELECT corp_id,process_instance_id,approval_no FROM erp_operating_expense_ownership').fetchone()) == ('old-corp', 'old-instance', 'old-approval')
-        with pytest.raises(sqlite3.IntegrityError, match='ERP'):
-            conn.execute("UPDATE erp_operating_expense_ownership SET owner='other'")
+        if has_claim:
+            conn.execute(f'INSERT INTO erp_operating_expense_ownership({columns}) VALUES(7,?,?,?,?,?,?,?,?,?)',
+                ('old-source', '运营', 'deeplinkerp', 'old-actor', 'old-request', 'old-token', '2026-01-01', 'old-history', snapshot))
+        # Real old-schema trigger, not a synthetic call to the upgrade helper.
+        conn.execute('''CREATE TRIGGER erp_guard_payment_requests_update BEFORE UPDATE ON payment_requests
+            WHEN OLD.amount IS NOT NEW.amount AND EXISTS(SELECT 1 FROM erp_operating_expense_ownership
+                WHERE logical_request_id=OLD.logical_request_id)
+            BEGIN SELECT RAISE(ABORT,'OLD_ERP_PAYMENT_OWNERSHIP_LOCKED'); END''')
+        before = [tuple(row) for row in conn.execute(f'SELECT {columns} FROM erp_operating_expense_ownership')]
+        financial = {table: [dict(row) for row in conn.execute(f'SELECT * FROM {table} ORDER BY id')]
+            for table in ('payment_requests', 'payment_records')}
+    for _ in range(2):
+        db.init_db()
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            assert [tuple(row) for row in conn.execute(f'SELECT {columns} FROM erp_operating_expense_ownership')] == before
+            assert {'ownership_id', 'corp_id', 'process_instance_id', 'approval_no'} <= {
+                row['name'] for row in conn.execute('PRAGMA table_info(erp_operating_expense_ownership)')}
+            assert {table: [dict(row) for row in conn.execute(f'SELECT * FROM {table} ORDER BY id')]
+                for table in financial} == financial
+            if has_claim:
+                assert tuple(conn.execute('SELECT corp_id,process_instance_id,approval_no FROM erp_operating_expense_ownership').fetchone()) == ('old-corp', 'old-instance', 'old-approval')
+                for sql in ("UPDATE erp_operating_expense_ownership SET owner='other'",
+                    'UPDATE payment_requests SET amount=101 WHERE id=7', 'UPDATE payment_records SET amount=21 WHERE id=7',
+                    'INSERT INTO payment_records(request_id,amount,created_at,updated_at) VALUES(7,1,\'2026-01-01\',\'2026-01-01\')'):
+                    with pytest.raises(sqlite3.IntegrityError, match='ERP_PAYMENT_OWNERSHIP_LOCKED'):
+                        conn.execute(sql)
 
 
 def test_oa_takeover_uses_one_source_snapshot_and_rejects_wrong_stored_alias(v2_client, monkeypatch):
