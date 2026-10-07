@@ -7,6 +7,7 @@ import re
 import time
 import unicodedata
 from collections import Counter, defaultdict
+from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -720,16 +721,22 @@ def _monthly_component(form_values: Iterable[Dict[str, Any]], *prefixes: str) ->
     return None
 
 
-def _form_component_value(form_values: Iterable[Dict[str, Any]], *prefixes: str) -> Optional[str]:
+def _form_component_value(form_values: Iterable[Dict[str, Any]], *prefixes: str, require_unique=False) -> Optional[str]:
     normalized_prefixes = tuple(prefix.casefold() for prefix in prefixes)
+    matches = []
     for item in form_values:
+        if not isinstance(item, dict):
+            continue
         name = _first_text(item.get("name"), item.get("label")) or ""
         if not name.casefold().startswith(normalized_prefixes):
             continue
         value = _display_component_value(item.get("value"))
+        if require_unique:
+            matches.append(value)
+            continue
         if value:
             return value
-    return None
+    return matches[0] if len(matches) == 1 else None
 
 
 def _monthly_payment_allowed_in_china_workbench(instance: Dict[str, Any]) -> bool:
@@ -1446,13 +1453,13 @@ def _parse_workflow_events(
 ) -> list[Dict[str, Any]]:
     stage_by_activity: Dict[str, str] = {}
     normalized_operations: list[tuple[int, Dict[str, Any], Optional[str]]] = []
-    finance_agree_times: Dict[str, list[str]] = {}
+    finance_agree_times: Dict[str, str] = {}
     for sequence_index, operation in enumerate(operations):
         activity_id = _text(operation.get("activityId")) or ""
         stage_name = _text(operation.get("showName")) or ""
         event_type = (_text(operation.get("type")) or "").upper()
         result = (_text(operation.get("result")) or "").upper()
-        event_time = _workflow_event_time(operation.get("date"))
+        event_time = _workflow_event_time(operation.get('source_event_time')) if 'source_event_time' in operation else _workflow_event_time(operation.get("date"))
         normalized_operations.append((sequence_index, operation, event_time))
         if activity_id and stage_name and not GENERIC_COMMENT_STAGE_RE.fullmatch(stage_name):
             stage_by_activity.setdefault(activity_id, stage_name)
@@ -1464,18 +1471,17 @@ def _parse_workflow_events(
             and FINANCE_STAGE_RE.search(stage_name)
             and event_time
         ):
-            finance_agree_times.setdefault(operator_id, []).append(event_time)
+            finance_agree_times[operator_id] = min(finance_agree_times.get(operator_id, event_time), event_time)
 
-    stage_contexts = sorted(
-        [
+    normalized_operations.sort(key=lambda item: (item[2] is None, item[2] or '', item[0]))
+    stage_contexts = [
             (event_time, sequence_index, _text(operation.get("showName")) or "")
             for sequence_index, operation, event_time in normalized_operations
             if event_time
             and _text(operation.get("showName"))
             and not GENERIC_COMMENT_STAGE_RE.fullmatch(_text(operation.get("showName")) or "")
-        ],
-        key=lambda item: (item[0], item[1]),
-    )
+        ]
+    stage_positions = [(time, index) for time, index, _ in stage_contexts]
 
     events: list[Dict[str, Any]] = []
     for sequence_index, operation, event_time in normalized_operations:
@@ -1490,14 +1496,10 @@ def _parse_workflow_events(
         ) or stage_by_activity.get(activity_id)
         if is_generic_comment_stage and not mapped_stage_name and event_time:
             position = (event_time, sequence_index)
-            previous_stage = next(
-                (stage for time, index, stage in reversed(stage_contexts) if (time, index) < position),
-                None,
-            )
-            next_stage = next(
-                (stage for time, index, stage in stage_contexts if (time, index) > position),
-                None,
-            )
+            previous_index = bisect_left(stage_positions, position) - 1
+            next_index = bisect_right(stage_positions, position)
+            previous_stage = stage_contexts[previous_index][2] if previous_index >= 0 else None
+            next_stage = stage_contexts[next_index][2] if next_index < len(stage_contexts) else None
             if previous_stage and next_stage:
                 mapped_stage_name = (
                     f"{previous_stage}节点评论"
@@ -1520,10 +1522,8 @@ def _parse_workflow_events(
         trusted_after_finance_agree = bool(
             operator_id
             and event_time
-            and any(
-                approval_time <= event_time
-                for approval_time in finance_agree_times.get(operator_id, [])
-            )
+            and operator_id in finance_agree_times
+            and finance_agree_times[operator_id] <= event_time
         )
         events.append({
             "event_key": _workflow_event_key(
@@ -1546,15 +1546,9 @@ def _parse_workflow_events(
             "attachments": _json_list(operation.get("attachments")),
             "trusted_finance": bool(is_finance_agree or trusted_after_finance_agree),
             "current": bool(activity_id and activity_id in current_activity_ids),
+            "time_provenance": operation.get('source_event_time_provenance', 'raw_operation_record'),
         })
-    return sorted(
-        events,
-        key=lambda event: (
-            event.get("event_time") is None,
-            event.get("event_time") or "",
-            int(event.get("sequence_index") or 0),
-        ),
-    )
+    return events
 
 
 def _task_assignee_ids(task: Dict[str, Any]) -> list[str]:
@@ -1585,6 +1579,7 @@ def _current_workflow_tasks(
     user_names: Dict[str, str],
 ) -> list[Dict[str, Optional[str]]]:
     current: list[Dict[str, Optional[str]]] = []
+    stage_by_activity = {event['activity_id']: event.get('stage_name') for event in events if event.get('activity_id')}
     for index, task in enumerate(tasks):
         status = (_text(task.get("status")) or "").upper()
         if status not in {"RUNNING", "PROCESSING", "PENDING"}:
@@ -1602,17 +1597,10 @@ def _current_workflow_tasks(
         )
         node_name = (
             _text(task.get("activityName"))
+            or _text(task.get("taskGroupName"))
             or _text(task.get("showName"))
             or _text(task.get("name"))
-            or next(
-                (
-                    _text(event.get("stage_name"))
-                    for event in reversed(events)
-                    if activity_id
-                    and _text(event.get("activity_id")) == activity_id
-                ),
-                None,
-            )
+            or stage_by_activity.get(activity_id)
             or "待审批节点"
         )
         assignee_ids = _task_assignee_ids(task) or [""]
@@ -1632,6 +1620,7 @@ def _current_workflow_tasks(
                     "approver_id": approver_id or None,
                     "approver_name": approver_name,
                     "entered_at": entered_at or None,
+                    "status": status,
                 }
             )
     return sorted(
@@ -1738,6 +1727,11 @@ def parse_dingtalk_workflow_instance(
     return {
         "approval_no": _text(instance.get("approval_no")) or "",
         "process_instance_id": process_instance_id,
+        "corp_id": _text(instance.get("corp_id")),
+        "process_code": _text(instance.get("process_code")),
+        "template_version": _text(instance.get("template_version")),
+        "originator_user_id": _text(instance.get("originator_user_id")),
+        "task_evidence_complete": instance.get('task_evidence_complete', True),
         "status": (_text(instance.get("status")) or "").upper(),
         "result": (_text(instance.get("result")) or "").lower(),
         "title": _text(instance.get("title")),
@@ -1832,6 +1826,151 @@ def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]
         seen_approval_nos.add(approval_no)
         workflows.append(parse_dingtalk_workflow_instance(instance, user_names))
     return workflows
+
+
+def fetch_operating_workflow_sources(identities, scopes):
+    """Read at most 500 exact OA identities; names are resolved once per corp.
+
+    The raw originator and normalized task table are authoritative. Approval
+    business numbers and expense-table creator_name are never identity joins.
+    """
+    if len(identities) > 500:
+        raise ExternalExpenseError('工作流查询超过 500 条')
+    by_corp = defaultdict(set)
+    for identity in identities:
+        by_corp[identity['corp_id']].add(identity['process_instance_id'])
+    config = source_database_config()
+    instances, names = [], {}
+    with source_connection(config.user_dbname) as conn:
+        conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        for corp_id, instance_ids in by_corp.items():
+            process_codes = sorted({code for scope in scopes if scope['corp_id'] == corp_id for code in scope['process_codes']})
+            rows = conn.execute('''SELECT id,corp_id,process_instance_id,process_code,title,status,result,
+                    originator_user_id,originator_user_name,create_time,form_component_values,raw_payload,updated_at
+                FROM public.ding_approval_instance
+                WHERE deleted_at IS NULL AND corp_id=%s AND process_instance_id=ANY(%s)
+                  AND process_code=ANY(%s) ORDER BY process_instance_id,id LIMIT 501''',
+                [corp_id, sorted(instance_ids), process_codes]).fetchall()
+            if len(instances) + len(rows) > 500:
+                raise ExternalExpenseError('工作流身份重复或超过查询范围')
+            task_rows = conn.execute('''SELECT process_instance_id,task_id,activity_id,node_name,status,result,
+                    approver_user_id,approver_user_name,start_time,end_time,raw_payload,updated_at
+                FROM public.ding_approval_task WHERE corp_id=%s AND process_instance_id=ANY(%s)
+                ORDER BY process_instance_id,task_order,id LIMIT 10001''', [corp_id, sorted(instance_ids)]).fetchall()
+            if len(task_rows) > 10000:
+                raise ExternalExpenseError('工作流待办超过查询范围')
+            tasks = defaultdict(list)
+            task_evidence = defaultdict(list)
+            for task in task_rows:
+                task_evidence[task['process_instance_id']].append(task)
+                raw = _json_object(task.get('raw_payload'))
+                tasks[task['process_instance_id']].append({**raw, 'taskId': task['task_id'],
+                    'activityId': task['activity_id'], 'taskGroupName': task['node_name'],
+                    'status': task['status'], 'result': task['result'],
+                    'userId': task['approver_user_id'], 'startTime': task['start_time'],
+                    'createTime': None, 'createdAt': None, 'updatedAt': None})
+            corp_instances = []
+            for row in rows:
+                raw = _json_object(row.get('raw_payload'))
+                forms = _json_list(row.get('form_component_values')) or _form_values(raw)
+                raw_tasks = {_text(task.get('taskId') or task.get('id')): task for task in _json_list(raw.get('tasks')) if isinstance(task, dict)}
+                merged_tasks, task_ids = [], set()
+                complete = True
+                for task in tasks.get(row['process_instance_id'], []):
+                    task_id = _text(task.get('taskId'))
+                    task_ids.add(task_id)
+                    original = raw_tasks.get(task_id, {})
+                    if original.get('status') and str(original['status']).upper() != str(task.get('status') or '').upper():
+                        complete = False
+                    merged_tasks.append({**original, **task})
+                for task_id, task in raw_tasks.items():
+                    if task_id not in task_ids:
+                        # A missing canonical task cannot establish a timezone.
+                        merged_tasks.append({**task, 'startTime': None, 'createTime': None, 'createdAt': None, 'updatedAt': None})
+                        if str(task.get('status') or '').upper() in {'RUNNING', 'PROCESSING', 'PENDING'}:
+                            complete = False
+                corp_instances.append({**dict(row),
+                    'raw_corp_id': raw.get('corpId') or raw.get('corp_id'),
+                    'raw_process_instance_id': raw.get('processInstanceId'),
+                    'originator_user_id': _text(raw.get('originatorUserId')) or _text(row.get('originator_user_id')),
+                    'approval_no': _text(raw.get('businessId')) or '',
+                    'operation_records': _oa_operation_times(row, task_evidence[row['process_instance_id']]),
+                    'tasks': merged_tasks, 'task_evidence_complete': complete,
+                    # No stored template version exists today. A future verified
+                    # ingestion may supply it; absent evidence blocks RUNNING.
+                    'template_version': raw.get('processVersion') or raw.get('templateVersion'),
+                    'effective_date': _date_text(_workflow_event_time(row.get('create_time'))),
+                    'execution_region': _form_component_value(forms, *EXECUTION_REGION_COMPONENT_PREFIXES, require_unique=True),
+                    'source_amount': _form_component_value(forms, '申请金额', '付款金额', '报销金额', '金额', require_unique=True),
+                    'source_currency': _form_component_value(forms, *CURRENCY_COMPONENT_PREFIXES, require_unique=True),
+                    'beneficiary': _form_component_value(forms, '收款人', '收款方'),
+                    'summary': _form_component_value(forms, '事项说明', '报销事由', '付款事由', '事由'),
+                    'application_type_raw': next((f.get('value') for f in forms if isinstance(f, dict) and is_application_type_component(f.get('name'))), None),
+                    'source_company_raw': _form_component_value(forms, '付款公司', '法人主体', '公司主体', require_unique=True),
+                    'source_updated_at': row.get('updated_at'), 'last_synced_at': row.get('updated_at')})
+            user_ids = set(_workflow_user_ids(corp_instances))
+            user_ids.update(row['originator_user_id'] for row in corp_instances if row.get('originator_user_id'))
+            user_ids = list(user_ids)
+            for start in range(0, len(user_ids), 500):
+                chunk = user_ids[start:start + 500]
+                directory = conn.execute('''SELECT DISTINCT ON (BTRIM(user_id)) BTRIM(user_id) AS user_id,BTRIM(name) AS name
+                    FROM public.ding_user_snapshot WHERE corp_id=%s AND BTRIM(user_id)=ANY(%s)
+                      AND name IS NOT NULL AND BTRIM(name)<>''
+                    ORDER BY BTRIM(user_id),is_current DESC NULLS LAST,valid_from DESC NULLS LAST,
+                             updated_at DESC NULLS LAST,id DESC''', [corp_id, chunk]).fetchall()
+                names.update({(corp_id, str(row['user_id'])): str(row['name']) for row in directory
+                    if valid_applicant_name(row.get('name')) and str(row['name']) != str(row['user_id'])})
+            instances.extend(corp_instances)
+    return {'instances': instances, 'user_names': names}
+
+
+def _oa_operation_times(instance, tasks):
+    """Resolve mixed false-Z encodings using only this instance's real times.
+
+    A unique executed task supplies the event time directly. Other events need
+    matching instance-create and task-start/end offsets; uncertainty stays null.
+    This is confined to OA v2 and does not reinterpret legacy UTC callers.
+    """
+    def instant(value):
+        normalized = _workflow_event_time(value)
+        try:
+            return datetime.fromisoformat(normalized).astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            return None
+    raw = _json_object(instance.get('raw_payload'))
+    create_raw, create_stored = instant(raw.get('createTime')), instant(instance.get('create_time'))
+    offset = (create_raw - create_stored).total_seconds() if create_raw and create_stored else None
+    checks, executed = [], defaultdict(list)
+    for task in tasks:
+        task_raw = _json_object(task.get('raw_payload'))
+        for raw_key, stored_key in (('createTime', 'start_time'), ('finishTime', 'end_time')):
+            raw_time, stored_time = instant(task_raw.get(raw_key)), instant(task.get(stored_key))
+            if raw_time and stored_time:
+                checks.append((raw_time - stored_time).total_seconds())
+        if task.get('end_time') and task.get('activity_id') and task.get('approver_user_id'):
+            executed[(str(task['activity_id']), str(task['approver_user_id']), str(task.get('result') or '').upper())].append(task['end_time'])
+    verified_offset = offset if offset in {0, 28800} and checks and all(value == offset for value in checks) else None
+    raw_operations = [operation for operation in _json_list(raw.get('operationRecords')) if isinstance(operation, dict)]
+    operation_counts = Counter((str(operation.get('activityId') or ''), str(operation.get('userId') or ''),
+        str(operation.get('result') or '').upper()) for operation in raw_operations
+        if str(operation.get('type') or '').upper() in {'EXECUTE_TASK_NORMAL', 'EXECUTE_TASK_AUTO'})
+    operations = []
+    for operation in raw_operations:
+        value = dict(operation)
+        key = (str(value.get('activityId') or ''), str(value.get('userId') or ''), str(value.get('result') or '').upper())
+        evidence = executed.get(key, []) if str(value.get('type') or '').upper() in {'EXECUTE_TASK_NORMAL', 'EXECUTE_TASK_AUTO'} else []
+        if len(evidence) == 1 and operation_counts[key] == 1:
+            value.update(source_event_time=evidence[0], source_event_time_provenance='normalized_task_end_time')
+        elif isinstance(value.get('date'), (int, float)) and not isinstance(value.get('date'), bool):
+            value.update(source_event_time=value['date'], source_event_time_provenance='provider_epoch')
+        elif verified_offset is not None and instant(value.get('date')):
+            from datetime import timedelta
+            value.update(source_event_time=instant(value['date']) - timedelta(seconds=verified_offset),
+                         source_event_time_provenance='instance_and_task_verified_encoding')
+        else:
+            value.update(source_event_time=None, source_event_time_provenance='unverified_time_encoding')
+        operations.append(value)
+    return operations
 
 
 def classify_dingtalk_payment_event(

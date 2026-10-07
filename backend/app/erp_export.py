@@ -30,7 +30,9 @@ from pydantic import BaseModel, Field, StrictBool, StrictStr
 from . import db
 from .employee_departments import request_applicant_identity, resolve_employee_department
 from .file_storage import resolve_attachment_path
-from .external_expenses import _workflow_original_url, classify_dingtalk_payment_event, is_application_type_component
+from .external_expenses import (ExternalExpenseError, _workflow_original_url,
+    classify_dingtalk_payment_event, is_application_type_component,
+    fetch_operating_workflow_sources, parse_dingtalk_workflow_instance, approval_result_is_disallowed)
 from .fx_rates import CURRENCY_ALIASES
 from .mexico_tracking import _normalized_token
 
@@ -38,6 +40,14 @@ router = APIRouter(prefix='/api/integrations/erp', tags=['ERP export'])
 SOURCE_SYSTEM = 'cashier-payment-archive'
 UNCERTAIN_PAYMENTS = {'legacy_migration', 'snapshot_legacy', 'excel_summary', 'rollover'}
 RECORDED_PAYMENTS = {'manual','excel_detail','dingtalk_workflow'}
+OPERATING_COMPANY_BRIDGES = {
+    '悦为智能 YW Tech_Ai': '悦为智能技术（东莞）有限公司',
+    '拉丁购': '拉丁购国际电子商务（东莞）有限公司',
+    '凌翔产品&开发': '广州凌翔电子产品有限公司',
+    '凌翔供应链及采购执行单元': '广州凌翔电子产品有限公司',
+    '星铭HR人力资源中心': '东莞市星铭贸易有限公司',
+    '星铭FC财务中心': '东莞市星铭贸易有限公司',
+}
 
 
 class ApplicantIdentity(BaseModel):
@@ -54,6 +64,19 @@ class OperatingTakeoverPreview(BaseModel):
     expected_version: Optional[StrictStr] = Field(default=None, min_length=64, max_length=64)
     zero_history_confirmed: StrictBool = False
     confirmed_by: Optional[StrictStr] = Field(default=None, min_length=1, max_length=140)
+    corp_id: Optional[StrictStr] = Field(default=None, min_length=1, max_length=200)
+    process_instance_id: Optional[StrictStr] = Field(default=None, min_length=1, max_length=200)
+    expected_eligibility_fingerprint: Optional[StrictStr] = Field(default=None, min_length=64, max_length=64)
+
+
+class OperatingWorkflowIdentity(BaseModel):
+    corp_id: StrictStr = Field(min_length=1, max_length=200)
+    process_instance_id: StrictStr = Field(min_length=1, max_length=200)
+    source_id: Optional[StrictStr] = Field(default=None, min_length=1, max_length=140)
+
+
+class OperatingWorkflowBatch(BaseModel):
+    identities: List[OperatingWorkflowIdentity] = Field(min_length=1, max_length=500)
 
 
 class OperatingTakeoverClaim(OperatingTakeoverPreview):
@@ -632,11 +655,12 @@ def bounded_operating_relations(conn, source_id, tables=None):
     return relations
 
 
-def operating_takeover_item(conn, sheets, source_id, *, zero_history_confirmed=False, confirmed_by=None):
+def operating_takeover_item(conn, sheets, source_id, *, zero_history_confirmed=False, confirmed_by=None, workflow=None):
     rows = exact_operating_rows(conn, sheets, source_id)
     relations = bounded_operating_relations(conn, source_id)
     item = collect(conn, sheets, source_id)[0]
-    if item['approvals']['eligibility'] != 'eligible' or item['source_conflict'] or item['currency_conflict']:
+    approval_allowed = workflow['payment_eligibility']['can_register_payment'] if workflow else item['approvals']['eligibility'] == 'eligible'
+    if not approval_allowed or item['source_conflict'] or item['currency_conflict']:
         raise HTTPException(409, 'Operating expense approval, identity or currency is conflicting')
     if (item['approval_identity_status'] != 'explicit' or not item['source_company']
             or item['application_type'] not in {'payment', 'reimbursement'}):
@@ -714,20 +738,119 @@ def operating_takeover_item(conn, sheets, source_id, *, zero_history_confirmed=F
     elif item['payment_evidence_status'] != 'recorded' or item['paid_amount'] != money(rows[-1]['paid_amount']):
         raise HTTPException(409, 'Operating expense payment evidence is incomplete')
     hydrate_export_item(conn, item, require_files=True)
+    if workflow:
+        item['payment_eligibility'] = workflow['payment_eligibility']
     history_fingerprint = digest({'requests': rows, **relations, 'export_version': item['version']})
     item['version'] = digest({'export_version': item['version'], 'history_fingerprint': history_fingerprint})
     return item, history_fingerprint
 
 
 def operating_envelope(item):
-    return {'schema_version': 1, 'source_system': SOURCE_SYSTEM, 'items': [item]}
+    return {'schema_version': 2 if item.get('oa_identity') else 1, 'source_system': SOURCE_SYSTEM, 'items': [item]}
 
 
-def stored_operating_takeover(conn, source_id, sheets):
-    row = conn.execute('SELECT * FROM erp_operating_expense_ownership WHERE logical_request_id=?', (source_id,)).fetchone()
-    if row and (str(row['logical_request_id']) != source_id or row['source_sheet'] not in sheets):
+def stored_operating_takeover(conn, source_id, sheets, corp_id=None, process_instance_id=None):
+    if bool(corp_id) != bool(process_instance_id):
+        raise HTTPException(422, 'Exact corp and process instance are required')
+    scopes = operating_oa_scopes(sheets) if corp_id else []
+    row = conn.execute('''SELECT * FROM erp_operating_expense_ownership WHERE logical_request_id=?
+        OR external_source_id=? OR (corp_id=? AND process_instance_id=?)''',
+        (source_id, source_id, corp_id, process_instance_id)).fetchone()
+    if row and (row['source_sheet'] not in sheets
+                or (corp_id and (row['corp_id'] != corp_id or row['process_instance_id'] != process_instance_id))
+                or (corp_id and source_id not in {str(row['logical_request_id']), 'oa:' + digest([corp_id, process_instance_id])})
+                or (not corp_id and str(row['logical_request_id']) != source_id)):
         raise HTTPException(404, 'Operating expense source not found')
+    if row and corp_id:
+        snapshot = json.loads(row['snapshot_json'])
+        if not any(scope['corp_id'] == corp_id and snapshot.get('process_code') in scope['process_codes'] for scope in scopes):
+            raise HTTPException(404, 'Operating expense source not found')
     return row
+
+
+def operating_takeover_snapshot(conn, sheets, body):
+    if bool(body.corp_id) != bool(body.process_instance_id):
+        raise HTTPException(422, 'Exact corp and process instance are required')
+    if not body.corp_id:
+        if body.source_id.startswith('oa:'):
+            raise HTTPException(422, 'Exact corp and process instance are required')
+        return operating_takeover_item(conn, sheets, body.source_id,
+            zero_history_confirmed=body.zero_history_confirmed, confirmed_by=body.confirmed_by)
+    scopes = operating_oa_scopes(sheets)
+    identity = {'corp_id': body.corp_id, 'process_instance_id': body.process_instance_id, 'source_id': body.source_id}
+    try:
+        source = fetch_operating_workflow_sources([identity], scopes)
+    except ExternalExpenseError:
+        raise HTTPException(503, 'ERP operating workflow source is unavailable')
+    parsed_workflows = {}
+    workflow = operating_workflows_v2([identity], sheets, source_data=source, parsed_workflows=parsed_workflows)['items'][0]
+    if workflow['lookup_status'] != 'found' or not workflow['payment_eligibility']['can_register_payment']:
+        raise HTTPException(409, 'Operating expense approval or source identity is unverified')
+    if re.fullmatch(r'[1-9][0-9]*', body.source_id):
+        item, history = operating_takeover_item(conn, sheets, body.source_id, workflow=workflow,
+            zero_history_confirmed=body.zero_history_confirmed, confirmed_by=body.confirmed_by)
+        item.update(source_id=workflow['source_id'], source_request_id=body.source_id,
+                    oa_identity=workflow['oa_identity'], process_code=workflow.get('process_code'))
+        item['version'] = digest({'item': item, 'history_fingerprint': history})
+        return item, history
+    matches = [row for row in source['instances'] if row.get('corp_id') == body.corp_id and row.get('process_instance_id') == body.process_instance_id]
+    if len(matches) != 1:
+        raise HTTPException(409, 'Operating expense source identity is conflicting')
+    row = matches[0]
+    scope = next(scope for scope in scopes if scope['corp_id'] == body.corp_id and row.get('process_code') in scope['process_codes'])
+    # A legacy/cashier source must use its established root and actual history.
+    # Approval-only rows and missing identities cannot establish zero history.
+    raw_sql = "CASE WHEN json_valid(raw_extra_json) THEN raw_extra_json ELSE '{}' END"
+    existing = conn.execute(f'''SELECT id FROM payment_requests WHERE
+        TRIM(dingding_id)=? OR (json_extract({raw_sql}, '$.external_source.corp_id')=? AND
+            COALESCE(json_extract({raw_sql}, '$.external_source.process_instance_id'),
+                     json_extract({raw_sql}, '$.external_source.workflow_process_instance_id'))=?) LIMIT 1''',
+        (row.get('approval_no'), body.corp_id, body.process_instance_id)).fetchone()
+    if existing:
+        raise HTTPException(409, 'Operating expense cashier history must be verified through its established source root')
+    if (not body.zero_history_confirmed or not body.confirmed_by or body.confirmed_by != body.confirmed_by.strip()
+            or not body.confirmed_by.strip()):
+        raise HTTPException(409, 'Operating expense zero history requires explicit finance confirmation and operator attribution')
+    amount = money(row.get('source_amount'))
+    raw_currency = str(row.get('source_currency') or '').strip().upper()
+    direct_currency = CURRENCY_ALIASES.get(raw_currency.replace(' ', ''))
+    currencies = {value for alias, value in CURRENCY_ALIASES.items() if alias != '$' and alias in raw_currency}
+    currency = direct_currency or (next(iter(currencies)) if len(currencies) == 1 else None)
+    if (amount is None or Decimal(amount) <= 0 or currency not in {'CNY', 'USD', 'MXN'}
+            or Decimal(amount).as_tuple().exponent < -2):
+        raise HTTPException(409, 'Operating expense original amount or currency is unverified')
+    for event in parsed_workflows[(body.corp_id, body.process_instance_id)]['events']:
+        classification, _ = classify_dingtalk_payment_event(event, approval_no=row.get('approval_no') or '',
+            pending_amount=float(amount), paid_amount=0, workflow_status=workflow['approval_status'],
+            workflow_result=workflow['approval_result'])
+        if classification in {'eligible', 'preview_candidate', 'review_required', 'source_missing'}:
+            raise HTTPException(409, 'Operating expense workflow payment evidence requires review')
+    typ, raw_type = application_type({'application_type_raw': row.get('application_type_raw')}, {})
+    company = row.get('source_company_raw')
+    source_sheet = scope.get('source_sheet')
+    resolution = applicant_company_resolution(conn, sheets, workflow['originator']['id'] or '',
+        workflow['originator']['name'] or '', employee_mappings_available(conn))
+    if resolution['status'] == 'matched':
+        source_sheet = resolution['assigned_department']
+        resolved_company = OPERATING_COMPANY_BRIDGES.get(source_sheet)
+        if company and resolved_company and company != resolved_company:
+            raise HTTPException(409, 'Operating expense legal company is conflicting')
+        company = company or resolved_company
+    if typ not in {'payment', 'reimbursement'} or not company or source_sheet not in sheets:
+        raise HTTPException(409, 'Operating expense application type or legal company is unverified')
+    # No synthesized request/payment rows: this is only an immutable ownership
+    # snapshot with a human attestation for absence of historical payments.
+    item = {**workflow, 'external_source_id': workflow['source_id'], 'source_sheet': source_sheet,
+        'source_company': company, 'company_resolution': resolution, 'approval_no': row.get('approval_no'),
+        'application_type': typ, 'application_type_raw': raw_type, 'amount': amount, 'currency': currency,
+        'original_source_amount': amount, 'original_source_currency': row.get('source_currency'),
+        'paid_amount': '0', 'pending_amount': amount, 'payments': [], 'attachments': [],
+        'payment_evidence_status': 'recorded', 'summary': row.get('summary'), 'payee_name': row.get('beneficiary'),
+        'application_date': row.get('effective_date'), 'source_request_id': None,
+        'zero_history_attestation': {'method': 'explicit_erp_finance_confirmation', 'confirmed_by': body.confirmed_by, 'verified_zero': True}}
+    history_fingerprint = digest({'item': item, 'source_updated_at': str(row.get('source_updated_at') or '')})
+    item['version'] = digest({'item': item, 'history_fingerprint': history_fingerprint})
+    return item, history_fingerprint
 
 
 def stored_operating_item(stored):
@@ -746,12 +869,12 @@ def stored_operating_item(stored):
 @router.post('/operating-expenses/takeover-preview')
 def operating_takeover_preview(body: OperatingTakeoverPreview, sheets=Depends(export_scope)):
     with read_database() as conn:
-        stored = stored_operating_takeover(conn, body.source_id, sheets)
-        item = stored_operating_item(stored) if stored else operating_takeover_item(
-            conn, sheets, body.source_id, zero_history_confirmed=body.zero_history_confirmed,
-            confirmed_by=body.confirmed_by)[0]
+        stored = stored_operating_takeover(conn, body.source_id, sheets, body.corp_id, body.process_instance_id)
+        item = stored_operating_item(stored) if stored else operating_takeover_snapshot(conn, sheets, body)[0]
         if body.expected_version and body.expected_version != item['version']:
             raise HTTPException(409, 'Operating expense source version changed')
+        if body.expected_eligibility_fingerprint and body.expected_eligibility_fingerprint != item.get('payment_eligibility', {}).get('evidence_fingerprint'):
+            raise HTTPException(409, 'Operating expense approval evidence changed')
     return operating_envelope(item)
 
 
@@ -760,39 +883,48 @@ def operating_takeover_claim(body: OperatingTakeoverClaim, sheets=Depends(export
     if os.environ.get('PAYMENT_ERP_TAKEOVER_ENABLED', '').strip().lower() not in {'true', '1', 'yes'}:
         raise HTTPException(503, 'ERP operating expense takeover is disabled')
     actor = hashlib.sha256(os.environ['PAYMENT_ERP_EXPORT_TOKEN'].encode()).hexdigest()
+    if body.corp_id and not body.expected_eligibility_fingerprint:
+        raise HTTPException(409, 'Operating expense approval evidence fingerprint is required')
     with db.connect() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        stored = stored_operating_takeover(conn, body.source_id, sheets)
+        stored = stored_operating_takeover(conn, body.source_id, sheets, body.corp_id, body.process_instance_id)
         if stored:
             if stored['actor_fingerprint'] != actor or stored['takeover_request_id'] != body.request_id:
                 raise HTTPException(409, 'Operating expense payment is already managed by ERP')
             frozen = stored_operating_item(stored)
+            if body.expected_eligibility_fingerprint and body.expected_eligibility_fingerprint != frozen.get('payment_eligibility', {}).get('evidence_fingerprint'):
+                raise HTTPException(409, 'Operating expense approval evidence changed')
             attestation = frozen.get('zero_history_attestation')
             if (bool(attestation) != body.zero_history_confirmed
                     or (attestation and attestation['confirmed_by'] != body.confirmed_by)):
                 raise HTTPException(409, 'Operating expense zero history confirmation changed')
             return operating_envelope(frozen)
-        item, history_fingerprint = operating_takeover_item(
-            conn, sheets, body.source_id, zero_history_confirmed=body.zero_history_confirmed,
-            confirmed_by=body.confirmed_by)
+        item, history_fingerprint = operating_takeover_snapshot(conn, sheets, body)
         if body.expected_version != item['version']:
             raise HTTPException(409, 'Operating expense source version changed')
+        if body.expected_eligibility_fingerprint and body.expected_eligibility_fingerprint != item.get('payment_eligibility', {}).get('evidence_fingerprint'):
+            raise HTTPException(409, 'Operating expense approval evidence changed')
         takeover = {'owner': 'deeplinkerp', 'claim_token': secrets.token_urlsafe(32),
                     'claimed_at': timestamp(datetime.now(timezone.utc)), 'history_fingerprint': history_fingerprint}
         item['takeover'] = takeover
         if item.get('zero_history_attestation'):
             item['zero_history_attestation']['confirmed_at'] = takeover['claimed_at']
+        claim_corp = body.corp_id or item.get('corp_id')
+        claim_instance = body.process_instance_id or item.get('process_instance_id')
+        if not claim_corp or not claim_instance:
+            claim_corp, claim_instance = None, None
         try:
             conn.execute('''INSERT INTO erp_operating_expense_ownership(logical_request_id,external_source_id,source_sheet,
-                owner,actor_fingerprint,takeover_request_id,claim_token,claimed_at,history_fingerprint,snapshot_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                (int(body.source_id), item['external_source_id'], item['source_sheet'], takeover['owner'], actor,
+                owner,actor_fingerprint,takeover_request_id,claim_token,claimed_at,history_fingerprint,snapshot_json,
+                corp_id,process_instance_id,approval_no)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (int(body.source_id) if body.source_id.isdecimal() else None, item['external_source_id'], item['source_sheet'], takeover['owner'], actor,
                  body.request_id, takeover['claim_token'], takeover['claimed_at'], history_fingerprint,
-                 json.dumps(item, ensure_ascii=False, separators=(',', ':'))))
+                 json.dumps(item, ensure_ascii=False, separators=(',', ':')), claim_corp, claim_instance, item.get('approval_no')))
         except sqlite3.IntegrityError:
             raise HTTPException(409, 'Operating expense source is already owned or conflicting')
         db.write_audit(conn, None, 'erp.operating_expense.takeover_claim', 'erp_operating_expense_ownership',
-                       int(body.source_id), operation_id=body.request_id,
+                       int(body.source_id) if body.source_id.isdecimal() else None, operation_id=body.request_id,
                        new_value={'source_id': body.source_id, 'owner': takeover['owner'],
                                   'confirmed_by': body.confirmed_by,
                                   'zero_history_attestation': item.get('zero_history_attestation'),
@@ -811,8 +943,174 @@ def workflow_descriptors(raw):
             for descriptor in values if isinstance(descriptor, dict)] if isinstance(values, list) else []
 
 
+def operating_oa_scopes(sheets):
+    try:
+        configured = json.loads(os.environ.get('PAYMENT_ERP_OPERATING_OA_SCOPE', 'null'))
+        configured = configured if isinstance(configured, list) else [configured]
+        scopes = []
+        for value in configured:
+            if not isinstance(value, dict):
+                raise ValueError()
+            codes = value.get('process_codes') or [value.get('process_code')]
+            if (not isinstance(value.get('corp_id'), str) or not value['corp_id'].strip()
+                    or not isinstance(codes, list) or not codes or len(codes) > 50
+                    or any(not isinstance(code, str) or not code.strip() or code == '*' for code in codes)
+                    or value.get('year') != 2026 or value.get('execution_region') != '中国'
+                    or (value.get('source_sheet') is not None and value.get('source_sheet') not in sheets)):
+                raise ValueError()
+            scopes.append({**value, 'process_codes': sorted(set(codes))})
+        if not scopes or len(scopes) > 50:
+            raise ValueError()
+        return scopes
+    except (ValueError, TypeError):
+        raise HTTPException(503, 'ERP operating OA scope is not configured')
+
+
+def operating_payment_eligibility(workflow, lookup_status='found'):
+    """Approval permission only; payment-history/ownership checks remain separate."""
+    try:
+        configured = json.loads(os.environ.get('PAYMENT_ERP_OPERATING_PAYMENT_POLICY', 'null'))
+        policies = configured if isinstance(configured, list) else [configured]
+    except (ValueError, TypeError):
+        policies = []
+    matching_policies = [rule for rule in policies if isinstance(rule, dict)
+                   and rule.get('process_code') == workflow.get('process_code')
+                   and rule.get('corp_id', workflow.get('corp_id')) == workflow.get('corp_id')
+                   and rule.get('template_version') == workflow.get('template_version')
+                   and isinstance(rule.get('template_version'), str) and rule['template_version']]
+    policy = matching_policies[0] if len(matching_policies) == 1 else None
+    evidence = {'identity': [workflow.get('corp_id'), workflow.get('process_instance_id')],
+                'status': workflow.get('status'), 'result': workflow.get('result'),
+                'events': workflow.get('events', []), 'tasks': workflow.get('current_tasks', []),
+                'updated_at': workflow.get('updated_at'), 'task_evidence_complete': workflow.get('task_evidence_complete'),
+                'lookup_status': lookup_status, 'policy': policy}
+    events = workflow.get('events') or []
+    blocked = any(approval_result_is_disallowed(event.get('result'))
+                  or any(token in str(event.get('event_type') or '').upper() for token in ('TERMINAT', 'WITHDRAW', 'REVOK', 'CANCEL'))
+                  for event in events)
+    allowed, reason, notice = False, 'approval_incomplete', '审批尚未完成，暂不能登记付款'
+    if lookup_status != 'found':
+        reason, notice = 'source_' + lookup_status, '审批来源未核实，暂不能登记付款'
+    elif blocked or approval_result_is_disallowed(workflow.get('result')):
+        reason, notice = 'approval_rejected_or_withdrawn', '审批已拒绝或撤回，不能登记付款'
+    elif workflow.get('status') == 'COMPLETED' and workflow.get('result') == 'agree' and not workflow.get('current_tasks'):
+        allowed, reason, notice = True, 'completed_agreed', '审批已通过'
+    elif workflow.get('status') == 'RUNNING':
+        reason, notice = 'approval_policy_unverified', '审批节点规则尚未核实，暂不能登记付款'
+        required = policy.get('required_approval_activity_ids') if policy else None
+        cashier = policy.get('cashier_activity_ids') if policy else None
+        if (policy and isinstance(policy.get('policy_version'), str) and policy['policy_version']
+                and isinstance(required, list) and required and isinstance(cashier, list) and cashier
+                and all(isinstance(node, str) and node for node in required + cashier)
+                and not set(required) & set(cashier)):
+            latest = {}
+            for event in events:
+                if event.get('activity_id') and event.get('event_type') == 'EXECUTE_TASK_NORMAL':
+                    latest[event['activity_id']] = event.get('result')
+            tasks = workflow.get('current_tasks') or []
+            if workflow.get('task_evidence_complete') and all(latest.get(node) == 'AGREE' for node in required) and tasks and all(
+                    task.get('activity_id') in cashier and task.get('approver_id')
+                    and task.get('status') in {'RUNNING', 'PROCESSING', 'PENDING'} for task in tasks):
+                allowed, reason, notice = True, 'required_approvals_passed_cashier_only', '必要审批已通过，仅出纳执行待办未结束，可登记付款'
+            else:
+                reason, notice = 'required_approvals_incomplete', '必要审批或出纳待办尚未核实，暂不能登记付款'
+    return {'can_register_payment': allowed, 'reason': reason, 'notice': notice,
+            'policy_version': policy.get('policy_version') or '' if policy else '',
+            'evidence_fingerprint': digest(evidence)}
+
+
+def operating_workflows_v2(identities, sheets, *, source_data=None, parsed_workflows=None):
+    scopes = operating_oa_scopes(sheets)
+    normalized = [identity.model_dump() if isinstance(identity, BaseModel) else identity for identity in identities]
+    requested = [identity for identity in normalized if any(scope['corp_id'] == identity['corp_id'] for scope in scopes)]
+    try:
+        source = source_data if source_data is not None else fetch_operating_workflow_sources(requested, scopes) if requested else {'instances': [], 'user_names': {}}
+    except ExternalExpenseError:
+        raise HTTPException(503, 'ERP operating workflow source is unavailable')
+    candidates = defaultdict(list)
+    for instance in source['instances']:
+        candidates[(instance.get('corp_id'), instance.get('process_instance_id'))].append(instance)
+    items = []
+    names = source.get('user_names') or {}
+    corp_names, fallback_names = defaultdict(dict), {}
+    for key, name in names.items():
+        if isinstance(key, tuple):
+            corp_names[key[0]][key[1]] = name
+        elif isinstance(key, str):
+            fallback_names[key] = name
+    for identity in normalized:
+        corp_id, instance_id = identity['corp_id'], identity['process_instance_id']
+        source_id = 'oa:' + digest([corp_id, instance_id])
+        matches = candidates[(corp_id, instance_id)]
+        lookup = 'found' if len(matches) == 1 else ('conflict' if matches else 'missing')
+        if identity.get('source_id') and identity['source_id'] != source_id:
+            alias_matches = False
+            if re.fullmatch(r'[1-9][0-9]*', identity['source_id']):
+                with read_database() as conn:
+                    rows = exact_operating_rows(conn, sheets, identity['source_id'], for_workflow=True)
+                    external = dingtalk_expense_source(rows[-1], 'operation', allow_unmatched=True)
+                    old = dingtalk_identity(rows[-1], external)
+                    alias_matches = old['corp_id'] == corp_id and old['process_instance_id'] == instance_id and old['approval_identity_status'] != 'conflict'
+            if not alias_matches:
+                lookup = 'conflict'
+        raw = matches[0] if lookup == 'found' else {}
+        if raw:
+            try:
+                in_scope = any(scope['corp_id'] == corp_id and raw.get('process_code') in scope['process_codes']
+                    and date.fromisoformat(str(raw.get('effective_date'))[:10]).year == 2026
+                    and ' '.join(_normalized_token(raw.get('execution_region')).split()) in {'中国', 'china', '中国china', '中国 china'} for scope in scopes)
+            except (ValueError, TypeError):
+                in_scope = False
+            if (not in_scope or (raw.get('raw_corp_id') and raw['raw_corp_id'] != corp_id)
+                    or (raw.get('raw_process_instance_id') and raw['raw_process_instance_id'] != instance_id)):
+                lookup, raw = ('missing' if not in_scope else 'conflict'), {}
+        # The map is scoped to the source corp even when directory IDs overlap.
+        user_names = corp_names.get(corp_id, fallback_names)
+        workflow = parse_dingtalk_workflow_instance(raw, user_names)
+        if parsed_workflows is not None:
+            parsed_workflows[(corp_id, instance_id)] = workflow
+        grouped = {}
+        for task in workflow['current_tasks']:
+            key = (task['task_id'], task['activity_id'])
+            if key not in grouped:
+                grouped[key] = {'id': task['task_id'], 'stage': task['node_name'], 'assignees': [],
+                    'status': task.get('status'), 'activity_id': task['activity_id'], 'entered_at': task['entered_at']}
+            grouped[key]['assignees'].append({'id': task['approver_id'], 'name': task['approver_name']})
+        originator = workflow.get('originator_user_id')
+        items.append({'source_id': source_id, 'corp_id': corp_id, 'process_instance_id': instance_id,
+            'oa_identity': {'corp_id': corp_id, 'process_instance_id': instance_id}, 'process_code': workflow.get('process_code'),
+            'lookup_status': lookup, 'approval_status': workflow['status'], 'approval_result': workflow['result'],
+            'originator': {'id': originator, 'name': user_names.get(originator) if originator else None},
+            'events': [{'id': event['event_key'], 'stage': event['stage_name'], 'operator': event['operator_name'],
+                'operator_id': event['operator_id'], 'time': event['event_time'], 'result': event['result'],
+                'time_provenance': event.get('time_provenance'),
+                'comment': event['comment'], 'current': event['current'], 'active': True,
+                'images': workflow_descriptors(json.dumps(event['images'])),
+                'attachments': workflow_descriptors(json.dumps(event['attachments']))} for event in workflow['events']],
+            'current_tasks': list(grouped.values()), 'source_updated_at': str(raw.get('source_updated_at')) if raw.get('source_updated_at') else workflow['updated_at'],
+            'last_synced_at': str(raw.get('last_synced_at')) if raw.get('last_synced_at') else workflow['updated_at'],
+            'original_url': safe_original_url(workflow['workflow_url']),
+            'workflow_summary': {key: workflow[key] for key in ('current_node_name', 'current_approver_name', 'current_node_entered_at')},
+            'payment_eligibility': operating_payment_eligibility(workflow, lookup)})
+    return {'schema_version': 2, 'source_system': SOURCE_SYSTEM, 'items': items}
+
+
+@router.post('/operating-expenses/workflow')
+def operating_workflow_batch(body: OperatingWorkflowBatch, sheets=Depends(export_scope)):
+    return operating_workflows_v2(body.identities, sheets)
+
+
 @router.get('/operating-expenses/workflow')
-def operating_workflow(source_id: str = Query(min_length=1, max_length=140), sheets=Depends(export_scope)):
+def operating_workflow(source_id: Optional[str] = Query(default=None, min_length=1, max_length=140),
+                       corp_id: Optional[str] = Query(default=None, min_length=1, max_length=200),
+                       process_instance_id: Optional[str] = Query(default=None, min_length=1, max_length=200),
+                       sheets=Depends(export_scope)):
+    if corp_id is not None or process_instance_id is not None:
+        if not corp_id or not process_instance_id:
+            raise HTTPException(422, 'Exact corp and process instance are required')
+        return operating_workflows_v2([{'source_id': source_id, 'corp_id': corp_id, 'process_instance_id': process_instance_id}], sheets)
+    if source_id is None:
+        raise HTTPException(422, 'Operating expense source identity is required')
     with read_database() as conn:
         rows = exact_operating_rows(conn, sheets, source_id, for_workflow=True)
         selected = rows[-1]

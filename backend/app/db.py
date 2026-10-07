@@ -566,7 +566,14 @@ def erp_ownership_predicate(alias: str) -> str:
                     OR json_extract({raw}, '$.external_source.table') = 'approval_expense_operation')
                AND ownership.external_source_id = CAST(COALESCE(
                    json_extract({raw}, '$.external_source.record_id'),
-                   json_extract({raw}, '$.external_source.source_id')) AS TEXT)))"""
+                   json_extract({raw}, '$.external_source.source_id')) AS TEXT))
+           OR (ownership.corp_id=json_extract({raw}, '$.external_source.corp_id')
+               AND ownership.process_instance_id=COALESCE(
+                   json_extract({raw}, '$.external_source.process_instance_id'),
+                   json_extract({raw}, '$.external_source.workflow_process_instance_id')))
+           OR (ownership.approval_no IS NOT NULL AND ownership.approval_no=TRIM({alias}.dingding_id)
+               AND (json_extract({raw}, '$.external_source.corp_id') IS NULL
+                    OR ownership.corp_id=json_extract({raw}, '$.external_source.corp_id'))))"""
 
 
 def erp_owned_request_ids(conn: sqlite3.Connection, batch_id: Optional[int] = None, *, request_id: Optional[int] = None) -> set[int]:
@@ -585,9 +592,21 @@ def ensure_erp_operating_ownership(conn: sqlite3.Connection) -> None:
     Switching the feature flag off prevents new claims, never releases old ones.
     Ownership contains one frozen export, not a second set of payment records.
     """
+    existing_columns = {row['name'] for row in conn.execute('PRAGMA table_info(erp_operating_expense_ownership)')}
+    migrating = bool(existing_columns and 'ownership_id' not in existing_columns)
+    if migrating:
+        # Preserve every frozen claim while removing the rowid/root coupling.
+        # OA-only claims have no cashier logical root and never fabricate one.
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB 'erp_guard_*'").fetchall():
+            conn.execute(f'DROP TRIGGER "{row["name"]}"')
+        conn.execute('ALTER TABLE erp_operating_expense_ownership RENAME TO erp_operating_expense_ownership_legacy')
     conn.execute("""CREATE TABLE IF NOT EXISTS erp_operating_expense_ownership (
-        logical_request_id INTEGER PRIMARY KEY CHECK(logical_request_id > 0),
+        ownership_id INTEGER PRIMARY KEY,
+        logical_request_id INTEGER UNIQUE CHECK(logical_request_id IS NULL OR logical_request_id > 0),
         external_source_id TEXT NOT NULL UNIQUE,
+        corp_id TEXT,
+        process_instance_id TEXT,
+        approval_no TEXT,
         source_sheet TEXT NOT NULL,
         owner TEXT NOT NULL CHECK(owner = 'deeplinkerp'),
         actor_fingerprint TEXT NOT NULL,
@@ -595,8 +614,24 @@ def ensure_erp_operating_ownership(conn: sqlite3.Connection) -> None:
         claim_token TEXT NOT NULL UNIQUE,
         claimed_at TEXT NOT NULL,
         history_fingerprint TEXT NOT NULL,
-        snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json))
+        snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
+        UNIQUE(corp_id,process_instance_id),
+        CHECK(logical_request_id IS NOT NULL OR (corp_id IS NOT NULL AND process_instance_id IS NOT NULL)),
+        CHECK((corp_id IS NULL AND process_instance_id IS NULL) OR (corp_id IS NOT NULL AND process_instance_id IS NOT NULL))
     )""")
+    if migrating:
+        conn.execute('''INSERT INTO erp_operating_expense_ownership(logical_request_id,external_source_id,
+            source_sheet,owner,actor_fingerprint,takeover_request_id,claim_token,claimed_at,history_fingerprint,snapshot_json,
+            corp_id,process_instance_id,approval_no)
+            SELECT logical_request_id,external_source_id,source_sheet,owner,actor_fingerprint,takeover_request_id,
+                claim_token,claimed_at,history_fingerprint,snapshot_json,
+                CASE WHEN json_extract(snapshot_json,'$.corp_id') IS NOT NULL AND json_extract(snapshot_json,'$.process_instance_id') IS NOT NULL
+                     THEN json_extract(snapshot_json,'$.corp_id') END,
+                CASE WHEN json_extract(snapshot_json,'$.corp_id') IS NOT NULL AND json_extract(snapshot_json,'$.process_instance_id') IS NOT NULL
+                     THEN json_extract(snapshot_json,'$.process_instance_id') END,
+                json_extract(snapshot_json,'$.approval_no') FROM erp_operating_expense_ownership_legacy''')
+        conn.execute('DROP TABLE erp_operating_expense_ownership_legacy')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_erp_operating_approval_no ON erp_operating_expense_ownership(approval_no)')
     conn.execute("CREATE INDEX IF NOT EXISTS idx_payment_records_logical_root ON payment_records(COALESCE(root_payment_id, id))")
     request_changed = " OR ".join(f"OLD.{field} IS NOT NEW.{field}" for field in ERP_REQUEST_LOCKED_FIELDS)
     source_values = []
@@ -629,7 +664,8 @@ def ensure_erp_operating_ownership(conn: sqlite3.Connection) -> None:
         predicates[("erp_operating_expense_ownership", operation)] = "1" if operation != "INSERT" else """EXISTS (
             SELECT 1 FROM erp_operating_expense_ownership existing
             WHERE existing.logical_request_id=NEW.logical_request_id
-               OR existing.external_source_id=NEW.external_source_id OR existing.claim_token=NEW.claim_token)"""
+               OR existing.external_source_id=NEW.external_source_id OR existing.claim_token=NEW.claim_token
+               OR (existing.corp_id=NEW.corp_id AND existing.process_instance_id=NEW.process_instance_id))"""
         predicates[("attachment_links", operation)] = " OR ".join(
             f"EXISTS (SELECT 1 FROM payment_requests request WHERE request.id={alias}.request_id AND {erp_ownership_predicate('request')})"
             for alias in aliases)
@@ -886,7 +922,7 @@ def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
         latest_by_logical.setdefault(int(row["logical_request_id"]), row)
     ownership_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_operating_expense_ownership'").fetchone()
     owned_roots = {int(row["logical_request_id"]) for row in conn.execute(
-        "SELECT logical_request_id FROM erp_operating_expense_ownership")} if ownership_exists else set()
+        "SELECT logical_request_id FROM erp_operating_expense_ownership WHERE logical_request_id IS NOT NULL")} if ownership_exists else set()
     for logical_request_id, row in latest_by_logical.items():
         if logical_request_id in owned_roots:
             continue

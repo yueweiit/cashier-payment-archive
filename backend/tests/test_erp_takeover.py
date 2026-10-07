@@ -209,6 +209,41 @@ def test_zero_confirmation_cannot_override_recorded_positive_payments(takeover_c
     assert preview(client, zero_history_confirmed=True, confirmed_by='fake-finance@example.invalid').status_code == 409
 
 
+def test_legacy_claim_with_corp_but_unknown_instance_preserves_v1_compatibility(takeover_client):
+    client, path = takeover_client
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE payment_requests SET raw_extra_json=json_set(json_remove(raw_extra_json,'$.external_source.process_instance_id'),'$.external_source.corp_id','fake-corp') WHERE logical_request_id=1")
+    item = preview_item(client)
+    assert claim(client, item).status_code == 200
+    with sqlite3.connect(path) as conn:
+        assert conn.execute('SELECT corp_id,process_instance_id FROM erp_operating_expense_ownership').fetchone() == (None, None)
+
+
+def test_numeric_v2_takeover_keeps_real_cashier_history_and_returns_canonical_identity(takeover_client, monkeypatch):
+    from backend.app import erp_export
+    client, path = takeover_client
+    monkeypatch.setenv('PAYMENT_ERP_OPERATING_OA_SCOPE', json.dumps({'corp_id': 'fake-corp', 'process_codes': ['fake-template'],
+        'execution_region': '中国', 'year': 2026, 'source_sheet': '运营'}))
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE payment_requests SET raw_extra_json=json_set(raw_extra_json,'$.external_source.corp_id','fake-corp') WHERE logical_request_id=1")
+    monkeypatch.setattr(erp_export, 'fetch_operating_workflow_sources', lambda identities, scopes: {
+        'instances': [{'corp_id': 'fake-corp', 'process_instance_id': 'fake-process-1', 'process_code': 'fake-template',
+            'effective_date': '2026-01-01', 'execution_region': '中国', 'status': 'COMPLETED', 'result': 'agree',
+            'operation_records': [], 'tasks': [], 'updated_at': '2026-01-12T00:00:00Z'}], 'user_names': {}})
+    identity = {'source_id': '1', 'corp_id': 'fake-corp', 'process_instance_id': 'fake-process-1'}
+    response = client.post(PREFIX + '/takeover-preview', headers=HEADERS, json=identity)
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    assert response.json()['schema_version'] == 2
+    assert item['source_id'] == 'oa:' + erp_export.digest(['fake-corp', 'fake-process-1'])
+    assert item['source_request_id'] == '1' and item['paid_amount'] == '20' and item['pending_amount'] == '80'
+    assert [payment['amount'] for payment in item['payments']] == ['20']
+    response = client.post(PREFIX + '/takeover-claim', headers=HEADERS, json={**identity,
+        'expected_version': item['version'], 'expected_eligibility_fingerprint': item['payment_eligibility']['evidence_fingerprint'],
+        'request_id': 'fake-v2-real-history'})
+    assert response.status_code == 200, response.text
+
+
 def test_legacy_claimed_zero_snapshot_without_attestation_cannot_be_replayed(takeover_client):
     client, path = takeover_client
     legacy = {'source_id': '3', 'source_sheet': '运营', 'payments': [], 'paid_amount': '0',
@@ -264,7 +299,7 @@ def test_database_guards_all_claimed_money_and_identity_paths(takeover_client, s
     "INSERT OR REPLACE INTO attachment_links(id,request_id,url_path,created_at) VALUES(91,3,'replacement','2026-01-20')",
     "INSERT OR REPLACE INTO payment_vouchers(id,payment_id,file_path,created_at) VALUES(92,12,'replacement','2026-01-20')",
     "INSERT OR REPLACE INTO payable_history_versions(logical_request_id,effective_at,recorded_at,event_type,event_key) VALUES(3,'2026-01-20','2026-01-20','replacement','fake-history')",
-    "INSERT OR REPLACE INTO erp_operating_expense_ownership SELECT logical_request_id,external_source_id,source_sheet,owner,actor_fingerprint,takeover_request_id,'replacement-token',claimed_at,history_fingerprint,snapshot_json FROM erp_operating_expense_ownership",
+    "INSERT OR REPLACE INTO erp_operating_expense_ownership(logical_request_id,external_source_id,source_sheet,owner,actor_fingerprint,takeover_request_id,claim_token,claimed_at,history_fingerprint,snapshot_json) SELECT logical_request_id,external_source_id,source_sheet,owner,actor_fingerprint,takeover_request_id,'replacement-token',claimed_at,history_fingerprint,snapshot_json FROM erp_operating_expense_ownership",
     "INSERT OR REPLACE INTO file_objects(id,sha256,size_bytes,storage_path,status,created_at) VALUES(81,'replacement-hash',1,'replacement-path','ready','2026-01-20')",
     "INSERT OR REPLACE INTO file_objects(sha256,size_bytes,storage_path,status,created_at) VALUES('fake-old-hash',1,'replacement-path','ready','2026-01-20')",
 ])
