@@ -308,7 +308,7 @@ def resolve_applicant_companies(body: ApplicantCompanyLookup, sheets=Depends(exp
         'source_system': SOURCE_SYSTEM, 'resolution_mode': 'current', 'items': items}
 
 
-def dingtalk_identity(selected, external):
+def dingtalk_identity(selected, external, *, copies=None):
     original_url = None
     instance_evidence = []
     for key in ('process_instance_id', 'workflow_process_instance_id'):
@@ -324,6 +324,21 @@ def dingtalk_identity(selected, external):
     instance_id = instance_evidence[0]['value'] if instance_evidence and not conflict else None
     instance_source = instance_evidence[0]['source'] if instance_id else None
     explicit_approval = str(external.get('approval_no') or '').strip() or None
+    evidence = {'process_instance_id': instance_evidence}
+    if copies is not None:
+        evidence = {field: [] for field in ('process_instance_id', 'corp_id', 'approval_no')}
+        for copy in copies:
+            meta = object_json(copy.get('raw_extra_json')).get('external_source') or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            identity = dingtalk_identity(copy, meta)
+            for entry in identity['approval_identity_evidence']['process_instance_id']:
+                evidence['process_instance_id'].append({**entry, 'request_id': str(copy['id'])})
+            for field, value, source in [('corp_id', meta.get('corp_id'), 'external_source.corp_id'),
+                    ('approval_no', meta.get('approval_no'), 'external_source.approval_no'),
+                    ('approval_no', copy.get('dingding_id'), 'payment_request.dingding_id')]:
+                if str(value or '').strip():
+                    evidence[field].append({'value': str(value).strip(), 'source': source, 'request_id': str(copy['id'])})
     return {'external_source_id': str(external.get('record_id') or external.get('source_id')),
             'approval_no': explicit_approval or selected.get('dingding_id'),
             'dingding_id': selected.get('dingding_id') or explicit_approval,
@@ -336,7 +351,7 @@ def dingtalk_identity(selected, external):
                 'approval_no': 'external_source.approval_no' if explicit_approval else (
                     'payment_request.dingding_id' if selected.get('dingding_id') else None),
                 'process_instance_id': instance_source},
-            'approval_identity_evidence': {'process_instance_id': instance_evidence},
+            'approval_identity_evidence': evidence,
             **({'original_url': original_url} if original_url else {})}
 
 
@@ -356,9 +371,56 @@ def source_identity_conflict(copies, selected, source_type='operation'):
             value = str(meta.get(field) or '').strip()
             if value:
                 explicit[field].add(value)
+        if source_type == 'operation' and str(copy.get('dingding_id') or '').strip():
+            explicit['approval_no'].add(str(copy['dingding_id']).strip())
         identity = dingtalk_identity(copy, meta)
         explicit['process_instance_id'].update(evidence['value'] for evidence in identity['approval_identity_evidence']['process_instance_id'])
     return len(identities) > 1 or any(len(values) > 1 for values in explicit.values())
+
+
+def operating_alias_identity(rows):
+    external = dingtalk_expense_source(rows[-1], 'operation', allow_unmatched=True)
+    return {**dingtalk_identity(rows[-1], external, copies=rows),
+            'source_conflict': source_identity_conflict(rows, rows[-1])}
+
+
+def enrich_operating_identities(items, sheets, *, source_data=None):
+    """Read-only projection; only original-record/global-OA proof publishes corp.
+
+    Original declarations, manual fields, history and watermarked timestamps
+    remain untouched. Proof freshness participates in the ordinary item version.
+    """
+    if not items:
+        return
+    if source_data is None:
+        # Legacy v1 installations without OA scope retain their old projection;
+        # strict v2 callers always configure scope and supply fresh source proof.
+        if not os.environ.get('PAYMENT_ERP_OPERATING_OA_SCOPE'):
+            return
+        try:
+            source_data = fetch_operating_workflow_sources([], operating_oa_scopes(sheets),
+                legacy_sources=items, identity_only=True)
+        except (ExternalExpenseError, HTTPException) as exc:
+            reason = 'source_unavailable' if isinstance(exc, ExternalExpenseError) else 'scope_unconfigured'
+            source_data = {'identity_proofs': {str(item['external_source_id']):
+                {'status': 'unknown', 'reason': reason} for item in items}}
+    proofs = source_data.get('identity_proofs') or {}
+    for item in items:
+        proof = proofs.get(str(item['external_source_id'])) or {'status': 'unknown', 'reason': 'source_record_missing'}
+        archived = {field: item.get(field) for field in ('corp_id', 'process_instance_id', 'approval_no',
+            'approval_identity_evidence', 'source_conflict')}
+        evidence = {'method': 'original_expense_raw_instance_and_global_oa_unique', **proof}
+        evidence['fingerprint'] = digest({'proof': evidence, 'archived_identity': archived})
+        item['source_identity_proof'] = evidence
+        verified = proof.get('status') == 'verified' and proof.get('corp_id') and proof.get('process_instance_id')
+        # ERP's exact-corp matcher does not interpret a generic unverified tuple.
+        # Never leave the archived corp usable when authoritative proof failed.
+        item['corp_id'] = proof['corp_id'] if verified else None
+        item['process_instance_id'] = proof['process_instance_id'] if verified else None
+        conflict = proof.get('status') == 'conflict' or item.get('source_conflict') or item.get('approval_identity_status') == 'conflict'
+        item['approval_identity_status'] = 'explicit' if verified and not conflict else ('conflict' if conflict else 'unverified')
+        if verified:
+            item['approval_identity_provenance'].update(corp_id=evidence['method'], process_instance_id=evidence['method'])
 
 
 def collect(conn, sheets, source_id=None, source_type='operation'):
@@ -426,7 +488,7 @@ def collect(conn, sheets, source_id=None, source_type='operation'):
         external = source_reader(selected)
         if external is None or selected.get('source_sheet') not in sheets:
             continue
-        selected_identity = dingtalk_identity(selected, external)
+        selected_identity = dingtalk_identity(selected, external, copies=copies) if source_type == 'operation' else dingtalk_identity(selected, external)
         # An older copy lacking metadata is compatible with later enrichment;
         # two explicit source identities are never merged by timestamp.
         source_conflict = source_identity_conflict(copies, selected, source_type)
@@ -600,6 +662,8 @@ def export_expenses(changed_since, until, cursor, limit, date_from, date_to, sou
     with read_database() as conn:
         items = sorted(filter(included, collect(conn, sheets,source_id,source_type)),key=lambda i:(i['updated_at'],i['source_id']))
         page, end = items[:limit], len(items) <= limit
+        if source_type == 'operation':
+            enrich_operating_identities(page, sheets)
         for item in page:
             hydrate_export_item(conn, item, source_type)
     next_cursor = None if end else encode_cursor({'bounds':bounds,'until':watermark,'after':[page[-1]['updated_at'],page[-1]['source_id']]})
@@ -669,10 +733,12 @@ def bounded_operating_relations(conn, source_id, tables=None):
     return relations
 
 
-def operating_takeover_item(conn, sheets, source_id, *, zero_history_confirmed=False, confirmed_by=None, workflow=None):
+def operating_takeover_item(conn, sheets, source_id, *, zero_history_confirmed=False, confirmed_by=None, workflow=None, source_data=None):
     rows = exact_operating_rows(conn, sheets, source_id)
     relations = bounded_operating_relations(conn, source_id)
     item = collect(conn, sheets, source_id)[0]
+    if workflow is not None:
+        enrich_operating_identities([item], sheets, source_data=source_data)
     approval_allowed = workflow['payment_eligibility']['can_register_payment'] if workflow else item['approvals']['eligibility'] == 'eligible'
     if not approval_allowed or item['source_conflict'] or item['currency_conflict']:
         raise HTTPException(409, 'Operating expense approval, identity or currency is conflicting')
@@ -823,12 +889,17 @@ def operating_takeover_snapshot(conn, sheets, body):
             zero_history_confirmed=body.zero_history_confirmed, confirmed_by=body.confirmed_by)
     scopes = operating_oa_scopes(sheets)
     identity = {'corp_id': body.corp_id, 'process_instance_id': body.process_instance_id, 'source_id': body.source_id}
+    alias_rows = None
+    if re.fullmatch(r'[1-9][0-9]*', body.source_id):
+        alias_rows = {body.source_id: exact_operating_rows(conn, sheets, body.source_id, for_workflow=True)}
     try:
-        source = fetch_operating_workflow_sources([identity], scopes)
+        source = fetch_operating_workflow_sources([identity], scopes,
+            legacy_sources=[operating_alias_identity(alias_rows[body.source_id])]) if alias_rows else fetch_operating_workflow_sources([identity], scopes)
     except ExternalExpenseError:
         raise HTTPException(503, 'ERP operating workflow source is unavailable')
     parsed_workflows = {}
-    workflow = operating_workflows_v2([identity], sheets, source_data=source, parsed_workflows=parsed_workflows)['items'][0]
+    workflow = operating_workflows_v2([identity], sheets, source_data=source,
+        parsed_workflows=parsed_workflows, alias_rows=alias_rows)['items'][0]
     if workflow['lookup_status'] != 'found' or not workflow['payment_eligibility']['can_register_payment']:
         raise HTTPException(409, 'Operating expense approval or source identity is unverified')
     matches = [row for row in source['instances'] if row.get('corp_id') == body.corp_id and row.get('process_instance_id') == body.process_instance_id]
@@ -848,7 +919,7 @@ def operating_takeover_snapshot(conn, sheets, body):
             raise HTTPException(409, 'Operating expense workflow payment evidence requires review')
     if re.fullmatch(r'[1-9][0-9]*', body.source_id):
         item, history = operating_takeover_item(conn, sheets, body.source_id, workflow=workflow,
-            zero_history_confirmed=body.zero_history_confirmed, confirmed_by=body.confirmed_by)
+            zero_history_confirmed=body.zero_history_confirmed, confirmed_by=body.confirmed_by, source_data=source)
         if (any(item.get(field) != facts[field] for field in ('amount', 'currency', 'source_company', 'source_sheet', 'application_type'))
                 or not workflow['originator']['id'] or item.get('originator_user_id') != workflow['originator']['id']
                 or (workflow['originator']['name'] and item.get('originator_name') != workflow['originator']['name'])):
@@ -1101,33 +1172,48 @@ def operating_payment_eligibility(workflow, lookup_status='found'):
             'evidence_fingerprint': digest(evidence)}
 
 
-def operating_workflows_v2(identities, sheets, *, source_data=None, parsed_workflows=None):
+def operating_workflows_v2(identities, sheets, *, source_data=None, parsed_workflows=None, alias_rows=None):
     scopes = operating_oa_scopes(sheets)
     normalized = [identity.model_dump() if isinstance(identity, BaseModel) else identity for identity in identities]
     requested = [identity for identity in normalized if any(scope['corp_id'] == identity['corp_id'] for scope in scopes)]
+    aliases = sorted({identity['source_id'] for identity in normalized if identity.get('source_id')
+        and re.fullmatch(r'[1-9][0-9]*', identity['source_id'])})
+    if alias_rows is None:
+        alias_rows = defaultdict(list)
+        if aliases:
+            # One bounded read snapshot for the entire legacy-alias batch. Full
+            # takeover history remains a separate exact-root operation.
+            with read_database() as conn:
+                rows = [dict(row) for row in conn.execute('''SELECT id,logical_request_id,source_sheet,dingding_id,raw_extra_json
+                    FROM payment_requests WHERE logical_request_id IN (SELECT value FROM json_each(?))
+                    ORDER BY logical_request_id,id LIMIT ?''', (json.dumps(aliases), 501))]
+            if len(rows) > 500:
+                raise HTTPException(409, 'Operating expense workflow alias batch exceeds history limits')
+            for row in rows:
+                alias_rows[str(row['logical_request_id'])].append(row)
+    legacy = {}
+    for alias in aliases:
+        try:
+            rows = exact_operating_rows(None, sheets, alias, for_workflow=True, rows=alias_rows.get(alias, []))
+            legacy[alias] = operating_alias_identity(rows)
+        except HTTPException as exc:
+            if exc.status_code not in {404, 409}:
+                raise
     try:
-        source = source_data if source_data is not None else fetch_operating_workflow_sources(requested, scopes) if requested else {'instances': [], 'user_names': {}}
+        if source_data is not None:
+            source = source_data
+        elif requested:
+            source = fetch_operating_workflow_sources(requested, scopes, legacy_sources=list(legacy.values())) if legacy else fetch_operating_workflow_sources(requested, scopes)
+        else:
+            source = {'instances': [], 'user_names': {}}
     except ExternalExpenseError:
         raise HTTPException(503, 'ERP operating workflow source is unavailable')
+    enrich_operating_identities(list(legacy.values()), sheets, source_data=source)
     candidates = defaultdict(list)
     for instance in source['instances']:
         candidates[(instance.get('corp_id'), instance.get('process_instance_id'))].append(instance)
     items = []
     names = source.get('user_names') or {}
-    aliases = sorted({identity['source_id'] for identity in normalized if identity.get('source_id')
-        and re.fullmatch(r'[1-9][0-9]*', identity['source_id'])})
-    alias_rows = defaultdict(list)
-    if aliases:
-        # One bounded read snapshot for the entire legacy-alias batch. Full
-        # takeover history remains a separate exact-root operation.
-        with read_database() as conn:
-            rows = [dict(row) for row in conn.execute('''SELECT id,logical_request_id,source_sheet,dingding_id,raw_extra_json
-                FROM payment_requests WHERE logical_request_id IN (SELECT value FROM json_each(?))
-                ORDER BY logical_request_id,id LIMIT ?''', (json.dumps(aliases), 501))]
-        if len(rows) > 500:
-            raise HTTPException(409, 'Operating expense workflow alias batch exceeds history limits')
-        for row in rows:
-            alias_rows[str(row['logical_request_id'])].append(row)
     corp_names, fallback_names = defaultdict(dict), {}
     for key, name in names.items():
         if isinstance(key, tuple):
@@ -1142,15 +1228,8 @@ def operating_workflows_v2(identities, sheets, *, source_data=None, parsed_workf
         if identity.get('source_id') and identity['source_id'] != source_id:
             alias_matches = False
             if re.fullmatch(r'[1-9][0-9]*', identity['source_id']):
-                try:
-                    rows = exact_operating_rows(None, sheets, identity['source_id'], for_workflow=True,
-                        rows=alias_rows[identity['source_id']])
-                    external = dingtalk_expense_source(rows[-1], 'operation', allow_unmatched=True)
-                    old = dingtalk_identity(rows[-1], external)
-                    alias_matches = old['corp_id'] == corp_id and old['process_instance_id'] == instance_id and old['approval_identity_status'] != 'conflict'
-                except HTTPException as exc:
-                    if exc.status_code not in {404, 409}:
-                        raise
+                old = legacy.get(identity['source_id']) or {}
+                alias_matches = old.get('corp_id') == corp_id and old.get('process_instance_id') == instance_id and old.get('approval_identity_status') == 'explicit'
             if not alias_matches:
                 lookup = 'conflict'
         raw = matches[0] if lookup == 'found' else {}

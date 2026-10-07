@@ -1837,21 +1837,148 @@ def fetch_dingtalk_workflows(approval_nos: Iterable[str]) -> list[Dict[str, Any]
     return workflows
 
 
-def fetch_operating_workflow_sources(identities, scopes):
+def _operating_expense_record_id(value):
+    value = str(value)
+    return int(value) if re.fullmatch(r'[1-9][0-9]{0,18}', value) and int(value) <= 9223372036854775807 else None
+
+
+def _operating_identity_proofs(legacy_sources, expense_rows, oa_rows, scopes):
+    """Prove legacy links by original record -> raw instance -> global OA row."""
+    expenses, candidates, claims = defaultdict(list), defaultdict(list), defaultdict(list)
+    for row in expense_rows:
+        expenses[str(row['source_id'])].append(row)
+    for row in oa_rows:
+        candidates[_text(row.get('process_instance_id'))].append(row)
+    for item in legacy_sources:
+        claims[str(item['external_source_id'])].append(item)
+    def values(sequence):
+        return {_text(value) for value in sequence if _text(value)}
+    proofs = {}
+    for source_id, items in claims.items():
+        declared = {field: values([item.get(field) for item in items] + [entry.get('value')
+            for item in items for entry in (item.get('approval_identity_evidence') or {}).get(field, [])])
+            for field in ('corp_id', 'process_instance_id', 'approval_no')}
+        proof = {'status': 'unknown', 'reason': 'source_record_missing', 'corp_id': None,
+            'process_instance_id': None, 'expense_record_id': source_id,
+            'declared_identity': {key: sorted(value) for key, value in declared.items()}}
+        proofs[source_id] = proof
+        if _operating_expense_record_id(source_id) is None:
+            proof['reason'] = 'source_record_id_invalid'
+            continue
+        if any(item.get('source_conflict') for item in items):
+            proof.update(status='conflict', reason='preserved_source_conflict')
+            continue
+        if any(len(value) > 1 for value in declared.values()):
+            proof.update(status='conflict', reason='explicit_copy_conflict')
+            continue
+        rows = expenses[source_id]
+        if len(rows) != 1:
+            if rows:
+                proof.update(status='conflict', reason='source_record_duplicate')
+            continue
+        expense = rows[0]
+        raw = _json_object(expense.get('raw_identity'))
+        proof['expense_source_updated_at'] = _datetime_text(expense.get('source_updated_at'))
+        instance_ids = values(raw.get(key) for key in ('processInstanceId', 'process_instance_id', 'processInstanceID'))
+        raw_corps = values(raw.get(key) for key in ('corpId', 'corp_id'))
+        proof['expense_raw_identity'] = raw
+        if not instance_ids:
+            proof['reason'] = 'source_raw_instance_missing'
+            continue
+        if len(instance_ids) != 1 or len(raw_corps) > 1:
+            proof.update(status='conflict', reason='source_raw_identity_conflict')
+            continue
+        instance_id = next(iter(instance_ids))
+        if declared['process_instance_id'] and declared['process_instance_id'] != instance_ids:
+            proof.update(status='conflict', reason='explicit_copy_conflict')
+            continue
+        matches = candidates[instance_id]
+        proof['global_candidate_count'] = len(matches)
+        if len(matches) != 1:
+            proof.update(status='conflict' if matches else 'unknown', reason='global_duplicate' if matches else 'oa_instance_missing')
+            continue
+        oa = matches[0]
+        oa_raw = _json_object(oa.get('raw_identity'))
+        corp = _text(oa.get('corp_id'))
+        proof.update(oa_source_row_id=str(oa['id']), oa_source_updated_at=_datetime_text(oa.get('updated_at')),
+            oa_raw_identity=oa_raw, process_code=oa.get('process_code'))
+        if oa.get('deleted_at') is not None:
+            proof.update(status='conflict', reason='deleted')
+            continue
+        if (not corp or (raw_corps and raw_corps != {corp}) or (declared['corp_id'] and declared['corp_id'] != {corp})
+                or any(values(oa_raw.get(key) for key in keys) - {expected} for keys, expected in (
+                    (('corpId', 'corp_id'), corp), (('processInstanceId', 'process_instance_id', 'processInstanceID'), instance_id),
+                    (('processCode', 'process_code'), oa.get('process_code'))))
+                or values(raw.get(key) for key in ('processCode', 'process_code')) - {oa.get('process_code')}):
+            proof.update(status='conflict', reason='source_raw_canonical_conflict')
+            continue
+        if len(declared['approval_no'] | values([expense.get('approval_no'), raw.get('businessId'), oa_raw.get('businessId')])) > 1:
+            proof.update(status='conflict', reason='explicit_number_conflict')
+            continue
+        region = _form_component_value(_json_list(oa.get('form_component_values')), *EXECUTION_REGION_COMPONENT_PREFIXES, require_unique=True)
+        day = (_workflow_event_time(oa.get('create_time')) or '')[:10]
+        if not any(scope['corp_id'] == corp and oa.get('process_code') in scope['process_codes']
+                and day.startswith('2026-') and ' '.join(str(region or '').strip().casefold().split())
+                in {'中国', 'china', '中国china', '中国 china'} for scope in scopes):
+            proof['reason'] = 'out_of_scope'
+            continue
+        proof.update(status='verified', reason='found', corp_id=corp, process_instance_id=instance_id)
+    return proofs
+
+
+def fetch_operating_workflow_sources(identities, scopes, *, legacy_sources=None, identity_only=False):
     """Read at most 500 exact OA identities; names are resolved once per corp.
 
     The raw originator and normalized task table are authoritative. Approval
     business numbers and expense-table creator_name are never identity joins.
     """
-    if len(identities) > 500:
+    legacy_sources = legacy_sources or []
+    if len(identities) > 500 or len(legacy_sources) > 500:
         raise ExternalExpenseError('工作流查询超过 500 条')
     by_corp = defaultdict(set)
     for identity in identities:
         by_corp[identity['corp_id']].add(identity['process_instance_id'])
     config = source_database_config()
+    expense_rows = []
+    record_ids = sorted({record_id for item in legacy_sources
+        if (record_id := _operating_expense_record_id(item['external_source_id'])) is not None})
+    if record_ids:
+        with source_connection() as expense_conn:
+            expense_conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            # Verified source schema: id is bigint. Keep the indexed column
+            # untouched; invalid archived IDs remain unknown, not batch errors.
+            expense_rows = expense_conn.execute('''SELECT id::text AS source_id,approval_no,source_updated_at,
+                    jsonb_build_object('processInstanceId',raw_data->'processInstanceId',
+                        'process_instance_id',raw_data->'process_instance_id','processInstanceID',raw_data->'processInstanceID',
+                        'corpId',raw_data->'corpId','corp_id',raw_data->'corp_id',
+                        'processCode',raw_data->'processCode','process_code',raw_data->'process_code',
+                        'businessId',raw_data->'businessId') AS raw_identity
+                FROM public.approval_expense_operation WHERE id=ANY(%s::bigint[]) ORDER BY id LIMIT 501''',
+                [record_ids]).fetchall()
+            if len(expense_rows) > 500:
+                raise ExternalExpenseError('旧来源身份重复或超过查询范围')
     instances, names = [], {}
     with source_connection(config.user_dbname) as conn:
         conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        identity_proofs = {}
+        if legacy_sources:
+            instance_ids = sorted({_text(value) for row in expense_rows
+                for key, value in _json_object(row.get('raw_identity')).items()
+                if key in {'processInstanceId', 'process_instance_id', 'processInstanceID'} and _text(value)})
+            oa_rows = conn.execute('''SELECT id,corp_id,process_instance_id,process_code,create_time,
+                    deleted_at,updated_at,form_component_values,
+                    jsonb_build_object('corpId',raw_payload->'corpId','corp_id',raw_payload->'corp_id',
+                        'processInstanceId',raw_payload->'processInstanceId','process_instance_id',raw_payload->'process_instance_id',
+                        'processInstanceID',raw_payload->'processInstanceID',
+                        'processCode',raw_payload->'processCode','process_code',raw_payload->'process_code',
+                        'businessId',raw_payload->'businessId') AS raw_identity
+                FROM public.ding_approval_instance WHERE process_instance_id=ANY(%s)
+                ORDER BY process_instance_id,corp_id,id LIMIT 10001''', [instance_ids]).fetchall() if instance_ids else []
+            if len(oa_rows) > 10000:
+                raise ExternalExpenseError('旧来源全局审批身份超过查询范围')
+            identity_proofs = _operating_identity_proofs(legacy_sources, expense_rows, oa_rows, scopes)
+        if identity_only:
+            return {'instances': [], 'user_names': {}, 'identity_proofs': identity_proofs}
         for corp_id, instance_ids in by_corp.items():
             process_codes = sorted({code for scope in scopes if scope['corp_id'] == corp_id for code in scope['process_codes']})
             rows = conn.execute('''SELECT id,corp_id,process_instance_id,process_code,title,status,result,
@@ -1946,7 +2073,7 @@ def fetch_operating_workflow_sources(identities, scopes):
                 names.update({(corp_id, str(row['user_id'])): str(row['name']) for row in directory
                     if valid_applicant_name(row.get('name')) and str(row['name']) != str(row['user_id'])})
             instances.extend(corp_instances)
-    return {'instances': instances, 'user_names': names}
+    return {'instances': instances, 'user_names': names, 'identity_proofs': identity_proofs}
 
 
 def _oa_operation_times(instance, tasks):

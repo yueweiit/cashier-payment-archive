@@ -228,14 +228,16 @@ def test_numeric_v2_takeover_keeps_real_cashier_history_and_returns_canonical_id
     monkeypatch.setenv('PAYMENT_ERP_OPERATING_OA_SCOPE', json.dumps({'corp_id': 'fake-corp', 'process_codes': ['fake-template'],
         'execution_region': '中国', 'year': 2026, 'source_sheet': label}))
     with sqlite3.connect(path) as conn:
-        conn.execute("UPDATE payment_requests SET source_sheet=?,raw_extra_json=json_set(raw_extra_json,'$.external_source.corp_id','fake-corp','$.external_source.legal_company_name',?) WHERE logical_request_id=1", (label, company))
+        conn.execute("UPDATE payment_requests SET source_sheet=?,raw_extra_json=json_set(raw_extra_json,'$.external_source.corp_id','fake-corp','$.external_source.record_id','1001','$.external_source.legal_company_name',?) WHERE logical_request_id=1", (label, company))
         if change == 'manual_applicant':
             conn.execute("UPDATE payment_requests SET applicant='人工确认姓名' WHERE logical_request_id=1")
     source = {'instances': [{'corp_id': 'fake-corp', 'process_instance_id': 'fake-process-1', 'process_code': 'fake-template',
             'effective_date': '2026-01-01', 'execution_region': '中国', 'status': 'COMPLETED', 'result': 'agree',
             'source_amount': '100', 'source_currency': 'CNY', 'source_company_raw': company, 'application_type_raw': '付款',
             'originator_user_id': 'fake-user', 'task_evidence_complete': True,
-            'operation_records': [], 'tasks': [], 'updated_at': '2026-01-12T00:00:00Z'}], 'user_names': {'fake-user': '测试申请人'}}
+            'operation_records': [], 'tasks': [], 'updated_at': '2026-01-12T00:00:00Z'}], 'user_names': {'fake-user': '测试申请人'},
+        'identity_proofs': {'1001': {'status': 'verified', 'reason': 'found',
+            'corp_id': 'fake-corp', 'process_instance_id': 'fake-process-1'}}}
     changes = {'amount': ('source_amount', '101'), 'currency': ('source_currency', 'USD'),
         'company': ('source_company_raw', '广州凌翔电子产品有限公司'), 'applicant_id': ('originator_user_id', 'another-user'),
         'type': ('application_type_raw', '报销')}
@@ -248,7 +250,7 @@ def test_numeric_v2_takeover_keeps_real_cashier_history_and_returns_canonical_id
         source['instances'][0]['operation_records'] = [{'activityId': 'finance', 'showName': '财务审批',
             'type': 'EXECUTE_TASK_NORMAL', 'userId': 'finance-user', 'result': 'AGREE',
             'date': '2026-01-11T00:00:00Z', 'remark': '已支付100元'}]
-    monkeypatch.setattr(erp_export, 'fetch_operating_workflow_sources', lambda identities, scopes: source)
+    monkeypatch.setattr(erp_export, 'fetch_operating_workflow_sources', lambda identities, scopes, **kwargs: source)
     identity = {'source_id': '1', 'corp_id': 'fake-corp', 'process_instance_id': 'fake-process-1'}
     response = client.post(PREFIX + '/takeover-preview', headers=HEADERS, json=identity)
     if change not in {None, 'manual_applicant'}:

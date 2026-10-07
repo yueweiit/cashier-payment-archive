@@ -54,7 +54,7 @@ def v2_client(tmp_path, monkeypatch):
                          'source_company_raw': '悦为智能技术（东莞）有限公司'}],
             'user_names': {'raw-originator': '真实申请人', 'manager-user': '经理', 'finance-user': '财务',
                            'cashier-a': '出纳甲', 'cashier-b': '出纳乙'}}
-    monkeypatch.setattr(erp_export, 'fetch_operating_workflow_sources', lambda identities, scope: data, raising=False)
+    monkeypatch.setattr(erp_export, 'fetch_operating_workflow_sources', lambda identities, scope, **kwargs: data, raising=False)
     app = FastAPI()
     app.include_router(erp_export.router)
     return TestClient(app), data, db.DB_PATH
@@ -854,3 +854,235 @@ def test_numeric_workflow_alias_batch_uses_one_bounded_sqlite_snapshot(monkeypat
     assert len(result['items']) == 500
     assert len(connections) == 1 and len(queries) == 1
     assert 'LIMIT' in queries[0][0] and 501 in queries[0][1]
+
+
+@pytest.mark.parametrize('change,reason', [('none', 'found'), ('archive_missing_instance', 'found'),
+    ('source_missing', 'source_record_missing'), ('raw_missing', 'source_raw_instance_missing'),
+    ('raw_conflict', 'source_raw_identity_conflict'), ('archive_conflict', 'explicit_copy_conflict'),
+    ('archive_corp', 'source_raw_canonical_conflict'), ('oa_raw_conflict', 'source_raw_canonical_conflict'),
+    ('oa_process_conflict', 'source_raw_canonical_conflict'),
+    ('global_duplicate', 'global_duplicate'), ('deleted_duplicate', 'global_duplicate'),
+    ('deleted', 'deleted'), ('number_conflict', 'explicit_number_conflict'),
+    ('scope', 'out_of_scope'), ('preserved_conflict', 'preserved_source_conflict')])
+def test_legacy_identity_reader_requires_original_record_raw_and_global_oa_unique_evidence(monkeypatch, change, reason):
+    from contextlib import contextmanager
+    from datetime import datetime, timezone
+    claim = {'external_source_id': '100', 'corp_id': None, 'process_instance_id': IDENTITY['process_instance_id'],
+        'approval_no': 'fake-approval', 'source_conflict': False, 'approval_identity_evidence': {}}
+    expense = {'source_id': '100', 'approval_no': 'fake-approval', 'source_updated_at': '2026-09-01T03:00:00Z',
+        'raw_identity': {'processInstanceId': IDENTITY['process_instance_id']}}
+    oa = {'id': 1, **IDENTITY, 'process_code': 'fake-process', 'deleted_at': None,
+        'create_time': datetime(2026, 9, 1, 1, tzinfo=timezone.utc), 'updated_at': '2026-09-01T04:00:00Z',
+        'form_component_values': [{'name': '执行地区', 'value': '中国'}], 'raw_identity': {'businessId': 'fake-approval'}}
+    expense_rows, oa_rows = [expense], [oa]
+    if change == 'archive_missing_instance':
+        claim['process_instance_id'] = None
+    elif change == 'source_missing':
+        expense_rows = []
+    elif change == 'raw_missing':
+        expense['raw_identity'] = {}
+    elif change == 'raw_conflict':
+        expense['raw_identity']['process_instance_id'] = 'different-instance'
+    elif change == 'archive_conflict':
+        claim['approval_identity_evidence']['process_instance_id'] = [{'value': 'different-instance'}]
+    elif change == 'archive_corp':
+        claim['corp_id'] = 'different-corp'
+    elif change == 'oa_raw_conflict':
+        oa['raw_identity']['corpId'] = 'different-corp'
+    elif change == 'oa_process_conflict':
+        oa['raw_identity']['processCode'] = 'out-of-scope-process'
+    elif change in {'global_duplicate', 'deleted_duplicate'}:
+        oa_rows.append({**oa, 'id': 2, 'corp_id': 'out-of-scope-corp', 'process_code': 'out-of-scope-process',
+            'deleted_at': '2026-09-02' if change == 'deleted_duplicate' else None})
+    elif change == 'deleted':
+        oa['deleted_at'] = '2026-09-02'
+    elif change == 'number_conflict':
+        oa['raw_identity']['businessId'] = 'different-approval'
+    elif change == 'scope':
+        oa['process_code'] = 'out-of-scope-process'
+    elif change == 'preserved_conflict':
+        claim['source_conflict'] = True
+    calls = []
+    class FakeConnection:
+        def __init__(self, name):
+            self.name = name
+        def execute(self, sql, params=None):
+            calls.append((self.name, sql, params))
+            self.sql = sql
+            return self
+        def fetchall(self):
+            return expense_rows if 'approval_expense_operation' in self.sql else oa_rows
+    @contextmanager
+    def fake_connection(dbname=None):
+        yield FakeConnection(dbname or 'expense-db')
+    monkeypatch.setattr(external_expenses, 'source_connection', fake_connection)
+    monkeypatch.setattr(external_expenses, 'source_database_config', lambda: type('Config', (), {'user_dbname': 'oa-db'})())
+    source = external_expenses.fetch_operating_workflow_sources([], [{**SCOPE, 'process_codes': ['fake-process']}],
+        legacy_sources=[claim], identity_only=True)
+    proof = source['identity_proofs']['100']
+    assert proof['reason'] == reason
+    assert (proof['status'] == 'verified') is (reason == 'found')
+    if reason == 'found':
+        assert proof['corp_id'] == IDENTITY['corp_id'] and proof['process_instance_id'] == IDENTITY['process_instance_id']
+    oa_queries = [(sql, params) for name, sql, params in calls if name == 'oa-db' and 'ding_approval_instance' in sql]
+    if oa_queries:
+        assert 'corp_id=%s' not in oa_queries[0][0] and 'deleted_at IS NULL' not in oa_queries[0][0]
+        assert 'process_code=ANY' not in oa_queries[0][0] and 'LIMIT' in oa_queries[0][0]
+
+
+@pytest.fixture
+def legacy_cashier_client(v2_client):
+    client, data, path = v2_client
+    data['instances'][0].update(status='COMPLETED', result='agree', tasks=[])
+    data['identity_proofs'] = {'100': {'status': 'verified', 'reason': 'found', **IDENTITY,
+        'expense_source_updated_at': '2026-09-01T03:00:00Z', 'oa_source_updated_at': '2026-09-01T04:00:00Z',
+        'oa_source_row_id': 'fake-source'}}
+    external = {'system': 'dingtalk_expense_database', 'source_type': 'operation', 'record_id': '100',
+        'approval_no': 'fake-approval', 'application_date': '2026-09-01', 'application_type_raw': '付款',
+        'approval_status': 'COMPLETED', 'approval_result': 'agree', 'applicant_id': 'raw-originator',
+        'applicant': '真实申请人', 'source_company_raw': '悦为智能技术（东莞）有限公司',
+        'source_currency_raw': 'CNY', 'original_source_amount_raw': '100'}
+    with sqlite3.connect(path) as conn:
+        conn.execute("INSERT INTO request_batches(id,name,created_at,updated_at) VALUES(100,'legacy','2026-09-01','2026-09-01')")
+        conn.execute('''INSERT INTO payment_requests(id,logical_request_id,batch_id,source_sheet,dingding_id,
+            raw_extra_json,applicant,amount,paid_amount,pending_amount,currency,created_at,updated_at)
+            VALUES(100,100,100,?,'fake-approval',?,'手工申请人',100,20,80,'CNY','2026-09-01','2026-09-01')''',
+            (SCOPE['source_sheet'], json.dumps({'external_source': external})))
+        conn.execute("INSERT INTO payment_records(id,request_id,root_payment_id,amount,payment_date,payer,source_type,created_at,updated_at) VALUES(100,100,100,20,'2026-09-01','测试付款人','manual','2026-09-01','2026-09-01')")
+    return client, data, path
+
+
+def test_operating_export_enriches_identity_only_without_changing_history_or_manual_values(legacy_cashier_client):
+    client, data, path = legacy_cashier_client
+    before = path.read_bytes()
+    response = client.get(PREFIX, headers=HEADERS)
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    assert item['source_id'] == '100' and item['corp_id'] == IDENTITY['corp_id']
+    assert item['process_instance_id'] == IDENTITY['process_instance_id']
+    assert item['source_identity_proof']['status'] == 'verified'
+    assert item['paid_amount'] == '20' and item['pending_amount'] == '80'
+    assert item['applicant'] == '手工申请人' and item['source_company'] == '悦为智能技术（东莞）有限公司'
+    data['identity_proofs']['100']['expense_source_updated_at'] = '2026-09-01T05:00:00Z'
+    newer = client.get(PREFIX, headers=HEADERS).json()['items'][0]
+    assert newer['version'] != item['version'] and newer['updated_at'] == item['updated_at']
+    assert path.read_bytes() == before
+
+
+def test_numeric_v2_uses_fresh_identity_proof_and_preserves_established_root_history(legacy_cashier_client, monkeypatch):
+    client, data, path = legacy_cashier_client
+    monkeypatch.setenv('PAYMENT_ERP_TAKEOVER_ENABLED', 'true')
+    identity = {**IDENTITY, 'source_id': '100'}
+    workflow = client.get(PREFIX + '/workflow', headers=HEADERS, params=identity)
+    assert workflow.status_code == 200, workflow.text
+    assert workflow.json()['items'][0]['lookup_status'] == 'found'
+    response = client.post(PREFIX + '/takeover-preview', headers=HEADERS, json=identity)
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    assert item['source_request_id'] == '100' and item['source_id'] == IDENTITY['source_id']
+    assert item['paid_amount'] == '20' and item['pending_amount'] == '80'
+    assert [payment['source_id'] for payment in item['payments']] == ['100']
+    data['identity_proofs']['100']['oa_source_updated_at'] = '2026-09-01T06:00:00Z'
+    body = {**identity, 'expected_version': item['version'], 'request_id': 'legacy-claim',
+        'expected_eligibility_fingerprint': item['payment_eligibility']['evidence_fingerprint']}
+    before = path.read_bytes()
+    assert client.post(PREFIX + '/takeover-claim', headers=HEADERS, json=body).status_code == 409
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('reason', ['source_record_missing', 'global_duplicate', 'source_unavailable'])
+def test_failed_legacy_proof_does_not_publish_even_an_archived_complete_tuple(legacy_cashier_client, monkeypatch, reason):
+    client, data, path = legacy_cashier_client
+    with sqlite3.connect(path) as conn:
+        raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=100').fetchone()[0])
+        raw['external_source'].update(corp_id=IDENTITY['corp_id'], process_instance_id=IDENTITY['process_instance_id'])
+        conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=100', (json.dumps(raw),))
+    if reason == 'source_unavailable':
+        def unavailable(*args, **kwargs):
+            raise external_expenses.ExternalExpenseError('synthetic source unavailable')
+        monkeypatch.setattr(erp_export, 'fetch_operating_workflow_sources', unavailable)
+    else:
+        data['identity_proofs']['100'] = {'status': 'conflict' if reason == 'global_duplicate' else 'unknown', 'reason': reason}
+    before = path.read_bytes()
+    item = client.get(PREFIX, headers=HEADERS).json()['items'][0]
+    assert item['corp_id'] is None
+    assert item['source_identity_proof']['reason'] == reason
+    assert item['approval_identity_evidence']['corp_id'][0]['value'] == IDENTITY['corp_id']
+    assert item['paid_amount'] == '20' and item['pending_amount'] == '80'
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('source_type,conflict', [('operation', True), ('purchase', False)])
+def test_copy_explicit_business_numbers_conflict_only_for_operating_enrichment(source_type, conflict):
+    external = {'system': 'dingtalk_expense_database', 'source_type': source_type, 'record_id': '100'}
+    copies = [{'id': index, 'dingding_id': number, 'raw_extra_json': json.dumps({'external_source': external})}
+        for index, number in [(1, 'first-business'), (2, 'different-business')]]
+    assert erp_export.source_identity_conflict(copies, copies[-1], source_type) is conflict
+    if source_type == 'operation':
+        identity = erp_export.dingtalk_identity(copies[-1], external, copies=copies)
+        assert {entry['value'] for entry in identity['approval_identity_evidence']['approval_no']} == {'first-business', 'different-business'}
+
+
+@pytest.mark.parametrize('invalid_id', ['not-a-record-id', '0', '-1', '9223372036854775808'])
+def test_legacy_reader_invalid_record_ids_do_not_break_valid_batch_or_cast_indexed_column(monkeypatch, invalid_id):
+    from contextlib import contextmanager
+    calls = []
+    class FakeConnection:
+        def execute(self, sql, params=None):
+            if 'approval_expense_operation' in sql:
+                calls.append((sql, params))
+            return self
+        def fetchall(self):
+            return []
+    @contextmanager
+    def fake_connection(dbname=None):
+        yield FakeConnection()
+    monkeypatch.setattr(external_expenses, 'source_connection', fake_connection)
+    monkeypatch.setattr(external_expenses, 'source_database_config', lambda: type('Config', (), {'user_dbname': 'oa-db'})())
+    source = external_expenses.fetch_operating_workflow_sources([], [],
+        legacy_sources=[{'external_source_id': '100'}, {'external_source_id': invalid_id}], identity_only=True)
+    assert source['identity_proofs'][invalid_id]['reason'] == 'source_record_id_invalid'
+    assert source['identity_proofs']['100']['reason'] == 'source_record_missing'
+    assert len(calls) == 1 and calls[0][1] == [[100]]
+    assert 'WHERE id=ANY(%s::bigint[])' in calls[0][0]
+
+
+def test_legacy_proof_and_exact_workflow_share_one_oa_snapshot(monkeypatch):
+    from contextlib import contextmanager
+    from datetime import datetime, timezone
+    created = datetime(2026, 9, 1, 1, tzinfo=timezone.utc)
+    expense = {'source_id': '100', 'approval_no': 'fake-approval', 'source_updated_at': created,
+        'raw_identity': {'processInstanceId': IDENTITY['process_instance_id']}}
+    instance = {'id': 1, **IDENTITY, 'process_code': 'fake-process', 'deleted_at': None,
+        'create_time': created, 'updated_at': created, 'status': 'COMPLETED', 'result': 'agree',
+        'form_component_values': [{'name': '执行地区', 'value': '中国'}],
+        'raw_payload': {'businessId': 'fake-approval', 'originatorUserId': 'raw-originator', 'tasks': []},
+        'raw_identity': {'businessId': 'fake-approval'}}
+    opened, queries = [], []
+    class FakeConnection:
+        def __init__(self, name):
+            self.name = name
+        def execute(self, sql, params=None):
+            queries.append((self.name, id(self), sql))
+            self.sql = sql
+            return self
+        def fetchall(self):
+            if 'approval_expense_operation' in self.sql:
+                return [expense]
+            if 'ding_approval_instance' in self.sql:
+                return [instance]
+            return []
+    @contextmanager
+    def fake_connection(dbname=None):
+        opened.append(dbname or 'expense-db')
+        yield FakeConnection(dbname or 'expense-db')
+    monkeypatch.setattr(external_expenses, 'source_connection', fake_connection)
+    monkeypatch.setattr(external_expenses, 'source_database_config', lambda: type('Config', (), {'user_dbname': 'oa-db'})())
+    source = external_expenses.fetch_operating_workflow_sources([IDENTITY], [{**SCOPE, 'process_codes': ['fake-process']}],
+        legacy_sources=[{'external_source_id': '100', 'approval_no': 'fake-approval'}])
+    assert source['identity_proofs']['100']['status'] == 'verified'
+    assert source['instances'][0]['corp_id'] == IDENTITY['corp_id']
+    assert opened == ['expense-db', 'oa-db']
+    assert len({connection for name, connection, sql in queries if name == 'oa-db'}) == 1
+    assert sum('REPEATABLE READ READ ONLY' in sql for name, _, sql in queries if name == 'oa-db') == 1
+    assert sum('ding_approval_instance' in sql for name, _, sql in queries if name == 'oa-db') == 2
