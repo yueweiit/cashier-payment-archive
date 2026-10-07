@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, StrictStr
+from pydantic import BaseModel, Field, StrictBool, StrictStr
 
 from . import db
 from .employee_departments import request_applicant_identity, resolve_employee_department
@@ -52,6 +52,8 @@ class ApplicantCompanyLookup(BaseModel):
 class OperatingTakeoverPreview(BaseModel):
     source_id: StrictStr = Field(min_length=1, max_length=140)
     expected_version: Optional[StrictStr] = Field(default=None, min_length=64, max_length=64)
+    zero_history_confirmed: StrictBool = False
+    confirmed_by: Optional[StrictStr] = Field(default=None, min_length=1, max_length=140)
 
 
 class OperatingTakeoverClaim(OperatingTakeoverPreview):
@@ -630,7 +632,7 @@ def bounded_operating_relations(conn, source_id, tables=None):
     return relations
 
 
-def operating_takeover_item(conn, sheets, source_id):
+def operating_takeover_item(conn, sheets, source_id, *, zero_history_confirmed=False, confirmed_by=None):
     rows = exact_operating_rows(conn, sheets, source_id)
     relations = bounded_operating_relations(conn, source_id)
     item = collect(conn, sheets, source_id)[0]
@@ -687,11 +689,19 @@ def operating_takeover_item(conn, sheets, source_id):
         if not event.get('payment_record_id') and (event.get('classification') in unresolved or classification in unresolved):
             raise HTTPException(409, 'Operating expense workflow payment evidence requires review')
     if not item['payments']:
-        # Native, explicit zero summaries across every copy prove zero. A missing
-        # payment row or a default imported summary alone never establishes it.
+        # Import/migration defaults erase unknown-vs-zero. Only an explicit
+        # upstream finance human confirmation can attest complete zero history;
+        # a native numeric summary or source JSON flag cannot establish it.
+        if (not zero_history_confirmed or not confirmed_by or not confirmed_by.strip()
+                or confirmed_by != confirmed_by.strip()):
+            raise HTTPException(409, 'Operating expense zero payment history requires explicit finance confirmation and operator attribution')
         if any(row.get('actual_payment_date') or row.get('payer') for row in rows):
             raise HTTPException(409, 'Operating expense zero payment evidence is unverified')
         item.update(paid_amount='0', pending_amount=amount, payment_evidence_status='recorded')
+        item['zero_history_attestation'] = {
+            'method': 'explicit_erp_finance_confirmation', 'confirmed_by': confirmed_by, 'verified_zero': True}
+    elif zero_history_confirmed:
+        raise HTTPException(409, 'Operating expense zero history confirmation conflicts with recorded payments')
     elif item['payment_evidence_status'] != 'recorded' or item['paid_amount'] != money(rows[-1]['paid_amount']):
         raise HTTPException(409, 'Operating expense payment evidence is incomplete')
     hydrate_export_item(conn, item, require_files=True)
@@ -711,11 +721,26 @@ def stored_operating_takeover(conn, source_id, sheets):
     return row
 
 
+def stored_operating_item(stored):
+    item = json.loads(stored['snapshot_json'])
+    if not item.get('payments'):
+        attestation = item.get('zero_history_attestation') or {}
+        operator = attestation.get('confirmed_by') if isinstance(attestation, dict) else None
+        if (not isinstance(attestation, dict) or attestation.get('verified_zero') is not True
+                or attestation.get('method') != 'explicit_erp_finance_confirmation'
+                or not isinstance(operator, str) or not 1 <= len(operator) <= 140 or operator != operator.strip()
+                or not operator.strip() or attestation.get('confirmed_at') != stored['claimed_at']):
+            raise HTTPException(409, 'Operating expense claimed zero history has no verified finance attestation')
+    return item
+
+
 @router.post('/operating-expenses/takeover-preview')
 def operating_takeover_preview(body: OperatingTakeoverPreview, sheets=Depends(export_scope)):
     with read_database() as conn:
         stored = stored_operating_takeover(conn, body.source_id, sheets)
-        item = json.loads(stored['snapshot_json']) if stored else operating_takeover_item(conn, sheets, body.source_id)[0]
+        item = stored_operating_item(stored) if stored else operating_takeover_item(
+            conn, sheets, body.source_id, zero_history_confirmed=body.zero_history_confirmed,
+            confirmed_by=body.confirmed_by)[0]
         if body.expected_version and body.expected_version != item['version']:
             raise HTTPException(409, 'Operating expense source version changed')
     return operating_envelope(item)
@@ -732,13 +757,22 @@ def operating_takeover_claim(body: OperatingTakeoverClaim, sheets=Depends(export
         if stored:
             if stored['actor_fingerprint'] != actor or stored['takeover_request_id'] != body.request_id:
                 raise HTTPException(409, 'Operating expense payment is already managed by ERP')
-            return operating_envelope(json.loads(stored['snapshot_json']))
-        item, history_fingerprint = operating_takeover_item(conn, sheets, body.source_id)
+            frozen = stored_operating_item(stored)
+            attestation = frozen.get('zero_history_attestation')
+            if (bool(attestation) != body.zero_history_confirmed
+                    or (attestation and attestation['confirmed_by'] != body.confirmed_by)):
+                raise HTTPException(409, 'Operating expense zero history confirmation changed')
+            return operating_envelope(frozen)
+        item, history_fingerprint = operating_takeover_item(
+            conn, sheets, body.source_id, zero_history_confirmed=body.zero_history_confirmed,
+            confirmed_by=body.confirmed_by)
         if body.expected_version != item['version']:
             raise HTTPException(409, 'Operating expense source version changed')
         takeover = {'owner': 'deeplinkerp', 'claim_token': secrets.token_urlsafe(32),
                     'claimed_at': timestamp(datetime.now(timezone.utc)), 'history_fingerprint': history_fingerprint}
         item['takeover'] = takeover
+        if item.get('zero_history_attestation'):
+            item['zero_history_attestation']['confirmed_at'] = takeover['claimed_at']
         try:
             conn.execute('''INSERT INTO erp_operating_expense_ownership(logical_request_id,external_source_id,source_sheet,
                 owner,actor_fingerprint,takeover_request_id,claim_token,claimed_at,history_fingerprint,snapshot_json)
@@ -748,6 +782,13 @@ def operating_takeover_claim(body: OperatingTakeoverClaim, sheets=Depends(export
                  json.dumps(item, ensure_ascii=False, separators=(',', ':'))))
         except sqlite3.IntegrityError:
             raise HTTPException(409, 'Operating expense source is already owned or conflicting')
+        db.write_audit(conn, None, 'erp.operating_expense.takeover_claim', 'erp_operating_expense_ownership',
+                       int(body.source_id), operation_id=body.request_id,
+                       new_value={'source_id': body.source_id, 'owner': takeover['owner'],
+                                  'confirmed_by': body.confirmed_by,
+                                  'zero_history_attestation': item.get('zero_history_attestation'),
+                                  'history_fingerprint': history_fingerprint},
+                       reason='ERP finance takeover; zero history requires explicit human confirmation')
     return operating_envelope(item)
 
 

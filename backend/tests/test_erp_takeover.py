@@ -69,8 +69,8 @@ def claim(client, item, request_id='fake-request-1', **body):
                              'request_id': request_id, **body})
 
 
-def preview_item(client, source_id='1'):
-    response = preview(client, source_id)
+def preview_item(client, source_id='1', **body):
+    response = preview(client, source_id, **body)
     assert response.status_code == 200, response.text
     return response.json()['items'][0]
 
@@ -118,20 +118,114 @@ def test_claim_retries_return_frozen_history_and_root_scoped_request_ids(takeove
     assert claim(client, item, request_id='different-request').status_code == 409
     assert preview(client, '01').status_code == 404
     assert claim(client, item, source_id='01').status_code == 404
+    with sqlite3.connect(path) as conn:
+        conn.execute("INSERT INTO payment_records(id,request_id,root_payment_id,amount,payment_date,payer,payment_account,source_type,created_at,updated_at) VALUES(12,3,12,10,'2026-01-10','测试付款人','测试银行','manual','2026-01-10','2026-01-10')")
+        conn.execute("UPDATE payment_requests SET paid_amount=10,pending_amount=90,actual_payment_date='2026-01-10',payer='测试付款人' WHERE id=3")
     other = preview_item(client, '3')
     assert claim(client, other).status_code == 200
     with sqlite3.connect(path) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM payment_records').fetchone()[0] == 3
+
+
+@pytest.mark.parametrize('origin', ['native_zero', 'missing_excel_column', 'explicit_excel_zero', 'legacy_null_migration'])
+def test_zero_summary_without_verified_complete_history_is_not_takeover_evidence(takeover_client, origin):
+    from backend.app.excel_io import normalize_request_business_fields
+    client, path = takeover_client
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        if origin in {'missing_excel_column', 'explicit_excel_zero'}:
+            imported = {'amount': 100}
+            if origin == 'explicit_excel_zero':
+                imported['paid_amount'] = 0
+            normalize_request_business_fields(imported)
+            assert imported['paid_amount'] == 0 and imported['pending_amount'] == 100
+            conn.execute('UPDATE payment_requests SET paid_amount=?,pending_amount=? WHERE id=3',
+                         (imported['paid_amount'], imported['pending_amount']))
+        elif origin == 'legacy_null_migration':
+            conn.execute('UPDATE payment_requests SET paid_amount=NULL WHERE id=3')
+            db.migrate_payment_amounts(conn)
+        assert conn.execute('SELECT paid_amount,pending_amount FROM payment_requests WHERE id=3').fetchone()['paid_amount'] == 0
+    response = preview(client, '3')
+    assert response.status_code == 409, response.text
+    assert 'zero' in response.json()['detail'].lower()
+    response = client.post(PREFIX + '/takeover-claim', headers=HEADERS, json={
+        'source_id': '3', 'expected_version': '0' * 64, 'request_id': 'fake-zero-claim'})
+    assert response.status_code == 409
+    assert 'zero' in response.json()['detail'].lower()
+    with sqlite3.connect(path) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM erp_operating_expense_ownership').fetchone()[0] == 0
+
+
+def test_explicit_finance_zero_attestation_is_versioned_frozen_and_audited(takeover_client):
+    client, path = takeover_client
+    confirmation = {'zero_history_confirmed': True, 'confirmed_by': 'fake-finance@example.invalid'}
+    item = preview_item(client, '3', **confirmation)
+    assert item == preview_item(client, '3', **confirmation)
+    assert item['paid_amount'] == '0' and item['pending_amount'] == '100' and item['payments'] == []
+    assert item['zero_history_attestation'] == {
+        'method': 'explicit_erp_finance_confirmation', 'confirmed_by': confirmation['confirmed_by'], 'verified_zero': True}
+    response = claim(client, item, **confirmation)
+    assert response.status_code == 200, response.text
+    frozen = response.json()
+    attestation = frozen['items'][0]['zero_history_attestation']
+    assert attestation['confirmed_at'] == frozen['items'][0]['takeover']['claimed_at']
+    assert claim(client, item, **confirmation).json() == frozen
+    assert claim(client, item).status_code == 409
+    assert claim(client, item, zero_history_confirmed=True, confirmed_by='other-finance@example.invalid').status_code == 409
+    with sqlite3.connect(path) as conn:
+        audit = conn.execute("SELECT new_value_json FROM audit_logs WHERE action='erp.operating_expense.takeover_claim'").fetchall()
+        assert len(audit) == 1
+        assert json.loads(audit[0][0])['confirmed_by'] == confirmation['confirmed_by']
+        assert json.loads(audit[0][0])['zero_history_attestation'] == attestation
         assert conn.execute('SELECT COUNT(*) FROM payment_records').fetchone()[0] == 2
 
 
-def test_zero_requires_native_explicit_consistent_summary(takeover_client):
+def test_changed_zero_confirmation_operator_cannot_claim_preview_version(takeover_client):
     client, path = takeover_client
-    item = preview_item(client, '3')
-    assert item['paid_amount'] == '0' and item['pending_amount'] == '100'
-    assert item['payment_evidence_status'] == 'recorded' and item['payments'] == []
+    item = preview_item(client, '3', zero_history_confirmed=True, confirmed_by='fake-finance-a@example.invalid')
+    other = preview_item(client, '3', zero_history_confirmed=True, confirmed_by='fake-finance-b@example.invalid')
+    assert item['version'] != other['version']
+    assert claim(client, item, zero_history_confirmed=True, confirmed_by='fake-finance-b@example.invalid').status_code == 409
+    assert claim(client, item, zero_history_confirmed=False, confirmed_by='fake-finance-a@example.invalid').status_code == 409
     with sqlite3.connect(path) as conn:
-        conn.execute('UPDATE payment_requests SET paid_amount=NULL WHERE id=3')
+        assert conn.execute('SELECT COUNT(*) FROM erp_operating_expense_ownership').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('confirmation', [1, 0, 'true', 'false'])
+def test_zero_history_confirmation_must_be_a_strict_boolean(takeover_client, confirmation):
+    client, _ = takeover_client
+    assert preview(client, '3', zero_history_confirmed=confirmation,
+                   confirmed_by='fake-finance@example.invalid').status_code == 422
+
+
+@pytest.mark.parametrize('operator', [None, '   '])
+def test_zero_history_confirmation_requires_attributed_operator(takeover_client, operator):
+    client, _ = takeover_client
+    assert preview(client, '3', zero_history_confirmed=True, confirmed_by=operator).status_code == 409
+
+
+def test_zero_confirmation_cannot_override_recorded_positive_payments(takeover_client):
+    client, _ = takeover_client
+    assert preview(client, zero_history_confirmed=True, confirmed_by='fake-finance@example.invalid').status_code == 409
+
+
+def test_legacy_claimed_zero_snapshot_without_attestation_cannot_be_replayed(takeover_client):
+    client, path = takeover_client
+    legacy = {'source_id': '3', 'source_sheet': '运营', 'payments': [], 'paid_amount': '0',
+              'pending_amount': '100', 'version': '0' * 64}
+    with sqlite3.connect(path) as conn:
+        conn.execute('''INSERT INTO erp_operating_expense_ownership(logical_request_id,external_source_id,source_sheet,
+            owner,actor_fingerprint,takeover_request_id,claim_token,claimed_at,history_fingerprint,snapshot_json)
+            VALUES(3,'fake-source-3','运营','deeplinkerp','old-actor','fake-old-request','fake-old-token',
+            '2026-01-12','fake-old-fingerprint',?)''', (json.dumps(legacy),))
     assert preview(client, '3').status_code == 409
+    assert preview(client, '3', zero_history_confirmed=True, confirmed_by='fake-finance@example.invalid').status_code == 409
+
+
+@pytest.mark.parametrize('operator', [1, 'x' * 141])
+def test_zero_confirmation_operator_is_strict_and_bounded(takeover_client, operator):
+    client, _ = takeover_client
+    assert preview(client, '3', zero_history_confirmed=True, confirmed_by=operator).status_code == 422
 
 
 @pytest.mark.parametrize('sql', [
