@@ -1,8 +1,21 @@
 type ClipboardColumn = { key: string; type?: "number" | "date" };
-type EditableGridRecord = { id?: number; currency?: string; __deleted?: boolean };
+type EditableGridRecord = { id?: number; currency?: string; __deleted?: boolean; erp_payment_owner?: string | null };
+
+const erpLockedFields = new Set([
+  "id", "batch_id", "logical_request_id", "copied_from_request_id", "payable_item_key", "dingding_id", "applicant",
+  "source_sheet", "amount", "paid_amount", "pending_amount", "currency", "base_amount_cny",
+  "fx_rate_cny_per_unit", "fx_rate_date", "fx_rate_actual_date", "payment_account",
+  "expected_payment_account", "expected_payment_account_source", "payee_account", "payee_name",
+  "bank_name", "needed_payment_date", "actual_payment_date", "payer", "payment_status", "finance_review",
+]);
+
+export function isErpLockedRequestField(row: EditableGridRecord, field: string): boolean {
+  return row.erp_payment_owner === "deeplinkerp" && erpLockedFields.has(field);
+}
 
 export function canDirectlyEditGridField(row: EditableGridRecord, field: string): boolean {
   if (row.__deleted) return false;
+  if (isErpLockedRequestField(row, field)) return false;
   if (!row.id) return true;
   if (field === "currency") return false;
   return field !== "amount" || String(row.currency || "CNY").toUpperCase() === "CNY";

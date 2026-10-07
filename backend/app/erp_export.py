@@ -1,4 +1,4 @@
-"""Opt-in, sheet-scoped ERP reads. No application write connection is used here.
+"""Opt-in, sheet-scoped ERP reads and atomic operating-payment ownership.
 
 Full exports materialize candidate metadata before choosing a page, with linear
 relation indexing and one audit pass. This initial opt-in implementation does
@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 from collections import defaultdict
 from contextlib import contextmanager
@@ -29,7 +30,8 @@ from pydantic import BaseModel, Field, StrictStr
 from . import db
 from .employee_departments import request_applicant_identity, resolve_employee_department
 from .file_storage import resolve_attachment_path
-from .external_expenses import _workflow_original_url, is_application_type_component
+from .external_expenses import _workflow_original_url, classify_dingtalk_payment_event, is_application_type_component
+from .fx_rates import CURRENCY_ALIASES
 from .mexico_tracking import _normalized_token
 
 router = APIRouter(prefix='/api/integrations/erp', tags=['ERP export'])
@@ -45,6 +47,16 @@ class ApplicantIdentity(BaseModel):
 
 class ApplicantCompanyLookup(BaseModel):
     applicants: List[ApplicantIdentity] = Field(max_length=500)
+
+
+class OperatingTakeoverPreview(BaseModel):
+    source_id: StrictStr = Field(min_length=1, max_length=140)
+    expected_version: Optional[StrictStr] = Field(default=None, min_length=64, max_length=64)
+
+
+class OperatingTakeoverClaim(OperatingTakeoverPreview):
+    expected_version: StrictStr = Field(min_length=64, max_length=64)
+    request_id: StrictStr = Field(min_length=1, max_length=140)
 
 
 def export_scope(authorization: str = Header(default='')):
@@ -111,7 +123,7 @@ def timestamp(value):
         raise HTTPException(400, 'Invalid timestamp')
 
 
-def dingtalk_expense_source(row, source_type):
+def dingtalk_expense_source(row, source_type, *, allow_unmatched=False):
     raw = row['_export_raw'] if '_export_raw' in row else object_json(row.get('raw_extra_json'))
     external = raw.get('external_source') or {}
     if not isinstance(external, dict):
@@ -120,7 +132,7 @@ def dingtalk_expense_source(row, source_type):
         return None
     if external.get('source_type') != source_type and not (not external.get('source_type') and external.get('table') == 'approval_expense_' + source_type):
         return None
-    if external.get('lookup_status') in {'unmatched', 'conflict'}:
+    if not allow_unmatched and external.get('lookup_status') in {'unmatched', 'conflict'}:
         return None
     return external
 
@@ -290,6 +302,27 @@ def dingtalk_identity(selected, external):
             **({'original_url': original_url} if original_url else {})}
 
 
+def source_identity_conflict(copies, selected, source_type='operation'):
+    identities = set()
+    explicit = defaultdict(set)
+    for copy in copies:
+        meta = object_json(copy.get('raw_extra_json')).get('external_source') or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        kind = meta.get('source_type') or meta.get('table')
+        if source_type == 'purchase' and dingtalk_expense_source(copy, 'purchase') is not None:
+            kind = 'purchase'
+        identities.add(digest([meta.get('system'), meta.get('record_id') or meta.get('source_id'), kind,
+                              meta.get('legal_company_id') or meta.get('legal_company_name') or meta.get('source_company') or meta.get('source_company_raw')]))
+        for field in ('approval_no', 'applicant_id', 'corp_id'):
+            value = str(meta.get(field) or '').strip()
+            if value:
+                explicit[field].add(value)
+        identity = dingtalk_identity(copy, meta)
+        explicit['process_instance_id'].update(evidence['value'] for evidence in identity['approval_identity_evidence']['process_instance_id'])
+    return len(identities) > 1 or any(len(values) > 1 for values in explicit.values())
+
+
 def collect(conn, sheets, source_id=None, source_type='operation'):
     source_reader = {'operation': operation_source, 'purchase': purchase_source}[source_type]
     if source_id is not None:
@@ -355,32 +388,10 @@ def collect(conn, sheets, source_id=None, source_type='operation'):
         external = source_reader(selected)
         if external is None or selected.get('source_sheet') not in sheets:
             continue
-        identities = set()
-        explicit_identities = defaultdict(set)
         selected_identity = dingtalk_identity(selected, external)
-        for copy in copies:
-            # Identity and legal ownership are immutable across weekly copies.
-            # A later timestamp cannot authorize merging different source roots.
-            meta = copy['_export_raw'].get('external_source') or {}
-            if not isinstance(meta,dict):
-                meta = {}
-            identity_kind = meta.get('source_type') or meta.get('table')
-            if source_type == 'purchase' and dingtalk_expense_source(copy, 'purchase') is not None:
-                # A verified legacy table marker and its later typed form name
-                # the same purchase source. Unknown tables retain their identity.
-                identity_kind = 'purchase'
-            identities.add(digest([meta.get('system'),meta.get('record_id') or meta.get('source_id'),identity_kind,
-                meta.get('legal_company_id') or meta.get('legal_company_name') or meta.get('source_company') or meta.get('source_company_raw')]))
-            for field in ('approval_no', 'applicant_id', 'corp_id'):
-                normalized_identity = str(meta.get(field) or '').strip()
-                if normalized_identity:
-                    explicit_identities[field].add(normalized_identity)
-            identity = selected_identity if copy is selected else dingtalk_identity(copy, meta)
-            explicit_identities['process_instance_id'].update(
-                evidence['value'] for evidence in identity['approval_identity_evidence']['process_instance_id'])
         # An older copy lacking metadata is compatible with later enrichment;
         # two explicit source identities are never merged by timestamp.
-        source_conflict = len(identities) > 1 or any(len(values) > 1 for values in explicit_identities.values())
+        source_conflict = source_identity_conflict(copies, selected, source_type)
         all_copies=copies
         copies = [r for r in copies if r.get('source_sheet') in sheets and source_reader(r)]
         ids = {r['id'] for r in copies}
@@ -552,21 +563,232 @@ def export_expenses(changed_since, until, cursor, limit, date_from, date_to, sou
         items = sorted(filter(included, collect(conn, sheets,source_id,source_type)),key=lambda i:(i['updated_at'],i['source_id']))
         page, end = items[:limit], len(items) <= limit
         for item in page:
-            item['attachments'] = [attachment_item(a['_row'],conn,a['_kind'],source_type=source_type) for a in item['attachments']]
-            dedup = {}
-            for attachment in item['attachments']:
-                if attachment is None:
-                    continue
-                provenance = {'url':attachment['url']}
-                if attachment['source_id'] in dedup:
-                    dedup[attachment['source_id']]['provenance'].append(provenance)
-                else:
-                    attachment['provenance'] = [provenance]
-                    dedup[attachment['source_id']] = attachment
-            item['attachments'] = list(dedup.values())
-            item['version'] = digest(item)
+            hydrate_export_item(conn, item, source_type)
     next_cursor = None if end else encode_cursor({'bounds':bounds,'until':watermark,'after':[page[-1]['updated_at'],page[-1]['source_id']]})
     return {'schema_version':1,'source_system':SOURCE_SYSTEM,'items':page,'until':watermark,'next_cursor':next_cursor,'end':end}
+
+
+def hydrate_export_item(conn, item, source_type='operation', require_files=False):
+    dedup = {}
+    for candidate in item['attachments']:
+        attachment = attachment_item(candidate['_row'], conn, candidate['_kind'], source_type=source_type)
+        if attachment is None:
+            if require_files:
+                raise HTTPException(409, 'Operating expense attachment evidence is unavailable')
+            continue
+        provenance = {'url': attachment['url']}
+        if attachment['source_id'] in dedup:
+            dedup[attachment['source_id']]['provenance'].append(provenance)
+        else:
+            attachment['provenance'] = [provenance]
+            dedup[attachment['source_id']] = attachment
+    item['attachments'] = list(dedup.values())
+    item['version'] = digest(item)
+
+
+MAX_TAKEOVER_COPIES = 500
+MAX_TAKEOVER_PAYMENTS = 2000
+MAX_TAKEOVER_FILES = 1000
+MAX_TAKEOVER_EVENTS = 2000
+
+
+def exact_operating_rows(conn, sheets, source_id, *, for_workflow=False):
+    source_reader = lambda row: dingtalk_expense_source(row, 'operation', allow_unmatched=for_workflow)
+    rows = [dict(row) for row in conn.execute(
+        'SELECT * FROM payment_requests WHERE logical_request_id=? ORDER BY id LIMIT ?',
+        (source_id, MAX_TAKEOVER_COPIES + 1))]
+    if not rows or str(rows[0]['logical_request_id']) != source_id:
+        raise HTTPException(404, 'Operating expense source not found')
+    selected = rows[-1]
+    if selected.get('source_sheet') not in sheets or source_reader(selected) is None:
+        raise HTTPException(404, 'Operating expense source not found')
+    if len(rows) > MAX_TAKEOVER_COPIES:
+        raise HTTPException(409, 'Operating expense history exceeds takeover limits')
+    if any(row.get('source_sheet') not in sheets or source_reader(row) is None for row in rows):
+        raise HTTPException(409, 'Operating expense history has conflicting source scope')
+    return rows
+
+
+def bounded_operating_relations(conn, source_id, tables=None):
+    relations = {}
+    limits = {'payment_records': MAX_TAKEOVER_PAYMENTS, 'attachment_links': MAX_TAKEOVER_FILES,
+              'payment_vouchers': MAX_TAKEOVER_FILES, 'dingtalk_workflow_events': MAX_TAKEOVER_EVENTS}
+    for table, maximum in limits.items():
+        if tables is not None and table not in tables:
+            continue
+        if table == 'payment_vouchers':
+            query = '''SELECT relation.* FROM payment_vouchers relation
+                JOIN payment_records payment ON payment.id=relation.payment_id
+                JOIN payment_requests request ON request.id=payment.request_id'''
+        else:
+            query = f'SELECT relation.* FROM {table} relation JOIN payment_requests request ON request.id=relation.request_id'
+        rows = [dict(row) for row in conn.execute(
+            query + ' WHERE request.logical_request_id=? ORDER BY relation.id LIMIT ?', (source_id, maximum + 1))]
+        if len(rows) > maximum:
+            raise HTTPException(409, 'Operating expense history exceeds takeover limits')
+        relations[table] = rows
+    return relations
+
+
+def operating_takeover_item(conn, sheets, source_id):
+    rows = exact_operating_rows(conn, sheets, source_id)
+    relations = bounded_operating_relations(conn, source_id)
+    item = collect(conn, sheets, source_id)[0]
+    if item['approvals']['eligibility'] != 'eligible' or item['source_conflict'] or item['currency_conflict']:
+        raise HTTPException(409, 'Operating expense approval, identity or currency is conflicting')
+    if (item['approval_identity_status'] != 'explicit' or not item['source_company']
+            or item['application_type'] not in {'payment', 'reimbursement'}):
+        raise HTTPException(409, 'Operating expense source identity is unverified')
+    for row in rows:
+        external = operation_source(row)
+        if external.get('approval_no') and str(row.get('dingding_id') or '').strip() != str(external['approval_no']).strip():
+            raise HTTPException(409, 'Operating expense approval identity is conflicting')
+    raw_currency = str(item.get('original_source_currency') or '').upper()
+    currencies = {currency for alias, currency in CURRENCY_ALIASES.items() if alias in raw_currency}
+    if item['storage_precision_warning'] or (raw_currency and currencies != {item['currency']}):
+        raise HTTPException(409, 'Operating expense original money or currency is conflicting')
+    if conn.execute('''SELECT 1 FROM payment_requests request WHERE request.logical_request_id IS NOT CAST(? AS INTEGER)
+            AND json_extract(CASE WHEN json_valid(request.raw_extra_json) THEN request.raw_extra_json ELSE '{}' END, '$.external_source.system')='dingtalk_expense_database'
+            AND (json_extract(CASE WHEN json_valid(request.raw_extra_json) THEN request.raw_extra_json ELSE '{}' END, '$.external_source.source_type')='operation'
+                OR json_extract(CASE WHEN json_valid(request.raw_extra_json) THEN request.raw_extra_json ELSE '{}' END, '$.external_source.table')='approval_expense_operation')
+            AND CAST(COALESCE(json_extract(CASE WHEN json_valid(request.raw_extra_json) THEN request.raw_extra_json ELSE '{}' END, '$.external_source.record_id'),
+                             json_extract(CASE WHEN json_valid(request.raw_extra_json) THEN request.raw_extra_json ELSE '{}' END, '$.external_source.source_id')) AS TEXT)=? LIMIT 1''',
+            (source_id, item['external_source_id'])).fetchone():
+        raise HTTPException(409, 'Operating expense external identity belongs to another logical root')
+    amount = money(item['amount'])
+    if amount is None or Decimal(amount) <= 0 or item['currency'] not in {'CNY', 'USD', 'MXN'}:
+        raise HTTPException(409, 'Operating expense amount or currency is unverified')
+    if len({row.get('currency') for row in rows}) != 1:
+        raise HTTPException(409, 'Operating expense history has conflicting currencies')
+    payments = indexed(relations['payment_records'], 'request_id')
+    for row in rows:
+        amounts = [money(payment['amount']) for payment in payments[row['id']]]
+        if any(value is None or Decimal(value) <= 0 for value in amounts):
+            raise HTTPException(409, 'Operating expense payment evidence is incomplete')
+        total = sum((Decimal(value) for value in amounts), Decimal(0))
+        requested, paid, pending = (money(row.get(field)) for field in ('amount', 'paid_amount', 'pending_amount'))
+        if (requested is None or paid is None or pending is None or Decimal(paid) != total
+                or Decimal(pending) != Decimal(requested) - total or total > Decimal(requested)):
+            raise HTTPException(409, 'Operating expense payment summaries are unverified')
+    payment_roots = {payment.get('root_payment_id') or payment['id'] for payment in relations['payment_records']}
+    if payment_roots and conn.execute('''SELECT 1 FROM payment_records payment JOIN payment_requests request ON request.id=payment.request_id
+            WHERE COALESCE(payment.root_payment_id, payment.id) IN (SELECT value FROM json_each(?))
+              AND request.logical_request_id IS NOT CAST(? AS INTEGER) LIMIT 1''',
+            (json.dumps(sorted(payment_roots)), source_id)).fetchone():
+        raise HTTPException(409, 'Operating expense payment root belongs to another source')
+    unresolved = {'eligible', 'preview_candidate', 'review_required', 'source_missing'}
+    for event in relations['dingtalk_workflow_events']:
+        if event.get('process_instance_id') and item['process_instance_id'] and event['process_instance_id'] != item['process_instance_id']:
+            raise HTTPException(409, 'Operating expense workflow identity is conflicting')
+        classification, _ = classify_dingtalk_payment_event(
+            event, approval_no=item['approval_no'], pending_amount=float(rows[-1]['pending_amount']),
+            paid_amount=float(rows[-1]['paid_amount']), workflow_status=item['approvals']['raw']['status'],
+            workflow_result=item['approvals']['raw']['result'])
+        if not event.get('payment_record_id') and (event.get('classification') in unresolved or classification in unresolved):
+            raise HTTPException(409, 'Operating expense workflow payment evidence requires review')
+    if not item['payments']:
+        # Native, explicit zero summaries across every copy prove zero. A missing
+        # payment row or a default imported summary alone never establishes it.
+        if any(row.get('actual_payment_date') or row.get('payer') for row in rows):
+            raise HTTPException(409, 'Operating expense zero payment evidence is unverified')
+        item.update(paid_amount='0', pending_amount=amount, payment_evidence_status='recorded')
+    elif item['payment_evidence_status'] != 'recorded' or item['paid_amount'] != money(rows[-1]['paid_amount']):
+        raise HTTPException(409, 'Operating expense payment evidence is incomplete')
+    hydrate_export_item(conn, item, require_files=True)
+    history_fingerprint = digest({'requests': rows, **relations, 'export_version': item['version']})
+    item['version'] = digest({'export_version': item['version'], 'history_fingerprint': history_fingerprint})
+    return item, history_fingerprint
+
+
+def operating_envelope(item):
+    return {'schema_version': 1, 'source_system': SOURCE_SYSTEM, 'items': [item]}
+
+
+def stored_operating_takeover(conn, source_id, sheets):
+    row = conn.execute('SELECT * FROM erp_operating_expense_ownership WHERE logical_request_id=?', (source_id,)).fetchone()
+    if row and (str(row['logical_request_id']) != source_id or row['source_sheet'] not in sheets):
+        raise HTTPException(404, 'Operating expense source not found')
+    return row
+
+
+@router.post('/operating-expenses/takeover-preview')
+def operating_takeover_preview(body: OperatingTakeoverPreview, sheets=Depends(export_scope)):
+    with read_database() as conn:
+        stored = stored_operating_takeover(conn, body.source_id, sheets)
+        item = json.loads(stored['snapshot_json']) if stored else operating_takeover_item(conn, sheets, body.source_id)[0]
+        if body.expected_version and body.expected_version != item['version']:
+            raise HTTPException(409, 'Operating expense source version changed')
+    return operating_envelope(item)
+
+
+@router.post('/operating-expenses/takeover-claim')
+def operating_takeover_claim(body: OperatingTakeoverClaim, sheets=Depends(export_scope)):
+    if os.environ.get('PAYMENT_ERP_TAKEOVER_ENABLED', '').strip().lower() not in {'true', '1', 'yes'}:
+        raise HTTPException(503, 'ERP operating expense takeover is disabled')
+    actor = hashlib.sha256(os.environ['PAYMENT_ERP_EXPORT_TOKEN'].encode()).hexdigest()
+    with db.connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        stored = stored_operating_takeover(conn, body.source_id, sheets)
+        if stored:
+            if stored['actor_fingerprint'] != actor or stored['takeover_request_id'] != body.request_id:
+                raise HTTPException(409, 'Operating expense payment is already managed by ERP')
+            return operating_envelope(json.loads(stored['snapshot_json']))
+        item, history_fingerprint = operating_takeover_item(conn, sheets, body.source_id)
+        if body.expected_version != item['version']:
+            raise HTTPException(409, 'Operating expense source version changed')
+        takeover = {'owner': 'deeplinkerp', 'claim_token': secrets.token_urlsafe(32),
+                    'claimed_at': timestamp(datetime.now(timezone.utc)), 'history_fingerprint': history_fingerprint}
+        item['takeover'] = takeover
+        try:
+            conn.execute('''INSERT INTO erp_operating_expense_ownership(logical_request_id,external_source_id,source_sheet,
+                owner,actor_fingerprint,takeover_request_id,claim_token,claimed_at,history_fingerprint,snapshot_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                (int(body.source_id), item['external_source_id'], item['source_sheet'], takeover['owner'], actor,
+                 body.request_id, takeover['claim_token'], takeover['claimed_at'], history_fingerprint,
+                 json.dumps(item, ensure_ascii=False, separators=(',', ':'))))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, 'Operating expense source is already owned or conflicting')
+    return operating_envelope(item)
+
+
+def workflow_descriptors(raw):
+    try:
+        values = json.loads(raw or '[]')
+    except (TypeError, ValueError):
+        return []
+    fields = {'id', 'fileId', 'file_id', 'fileName', 'file_name', 'name', 'size', 'fileSize', 'mime_type', 'type', 'url', 'downloadUrl'}
+    return [{key: value for key, value in descriptor.items() if key in fields and isinstance(value, (str, int, float))}
+            for descriptor in values if isinstance(descriptor, dict)] if isinstance(values, list) else []
+
+
+@router.get('/operating-expenses/workflow')
+def operating_workflow(source_id: str = Query(min_length=1, max_length=140), sheets=Depends(export_scope)):
+    with read_database() as conn:
+        rows = exact_operating_rows(conn, sheets, source_id, for_workflow=True)
+        selected = rows[-1]
+        external = dingtalk_expense_source(selected, 'operation', allow_unmatched=True)
+        identity = dingtalk_identity(selected, external)
+        event_rows = bounded_operating_relations(conn, source_id, {'dingtalk_workflow_events'})['dingtalk_workflow_events']
+        conflict = external.get('lookup_status') == 'conflict' or source_identity_conflict(rows, selected) or identity['approval_identity_status'] == 'conflict' or any(
+            event.get('process_instance_id') and identity['process_instance_id']
+            and event['process_instance_id'] != identity['process_instance_id'] for event in event_rows)
+        events = {}
+        for event in event_rows if not conflict else []:
+            previous = events.get(event['event_key'])
+            if previous and (previous['synced_at'], previous['id']) >= (event['synced_at'], event['id']):
+                continue
+            events[event['event_key']] = event
+        ordered = sorted(events.values(), key=lambda event: (event.get('event_time') or '', event.get('sequence_index') or 0, event['id']))
+        payload = {'source_id': source_id, 'lookup_status': 'conflict' if conflict else external.get('lookup_status') or ('matched' if ordered else 'unmatched'),
+                   'last_synced_at': max((timestamp(event['synced_at']) for event in ordered), default=None),
+                   'original_url': identity.get('original_url'),
+                   'events': [{'id': event['event_key'], 'stage': event.get('stage_name'), 'operator': event.get('operator_name'),
+                               'time': timestamp(event['event_time']) if event.get('event_time') else None,
+                               'result': event.get('result'), 'comment': event.get('comment'),
+                               'current': bool(event.get('is_current')), 'active': bool(event.get('active')),
+                               'images': workflow_descriptors(event.get('images_json')),
+                               'attachments': workflow_descriptors(event.get('attachments_json'))} for event in ordered]}
+    return operating_envelope(payload)
 
 
 @router.get('/operating-expenses')
@@ -596,6 +818,21 @@ def logical_request_allowed(conn,request_id,sheets,source_type='operation'):
     return bool(latest and latest['source_sheet'] in sheets and source_reader(dict(latest)))
 
 
+def claimed_operating_file_allowed(conn, request_id, sheets, file_url):
+    # Ordinary exports remain compatible with older read-only source schemas.
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_operating_expense_ownership'").fetchone():
+        return False
+    ownership = conn.execute('''SELECT ownership.source_sheet,ownership.snapshot_json
+        FROM erp_operating_expense_ownership ownership JOIN payment_requests request
+            ON ownership.logical_request_id=COALESCE(NULLIF(request.logical_request_id,0),request.id)
+        WHERE request.id=?''', (request_id,)).fetchone()
+    if not ownership or ownership['source_sheet'] not in sheets:
+        return False
+    frozen = json.loads(ownership['snapshot_json'])
+    return any(file_url == attachment.get('url') or any(file_url == evidence.get('url')
+               for evidence in attachment.get('provenance', [])) for attachment in frozen['attachments'])
+
+
 def expense_file(file_id, sheets, source_type='operation', kind='attachment'):
     source_reader = {'operation': operation_source, 'purchase': purchase_source}[source_type]
     query = ('SELECT a.*, r.source_sheet, r.raw_extra_json FROM attachment_links a JOIN payment_requests r ON r.id=a.request_id WHERE a.id=?'
@@ -604,7 +841,12 @@ def expense_file(file_id, sheets, source_type='operation', kind='attachment'):
     missing = 'Attachment not found' if kind == 'attachment' else 'Payment proof not found'
     with read_database() as conn:
         row = conn.execute(query,(file_id,)).fetchone()
-        if row is None or row['source_sheet'] not in sheets or not source_reader(dict(row)) or not logical_request_allowed(conn,row['request_id'],sheets,source_type):
+        allowed = bool(row and row['source_sheet'] in sheets and source_reader(dict(row))
+                       and logical_request_allowed(conn,row['request_id'],sheets,source_type))
+        if not allowed and row and source_type == 'operation':
+            file_url = f"/api/integrations/erp/{'attachments' if kind == 'attachment' else 'payment-vouchers'}/{file_id}"
+            allowed = claimed_operating_file_allowed(conn, row['request_id'], sheets, file_url)
+        if not allowed:
             raise HTTPException(404,missing)
         try:
             path, _ = resolve_attachment_path(row,conn)

@@ -5,7 +5,7 @@ import sqlite3
 from datetime import date, datetime
 from typing import Any, Dict, Optional
 
-from .db import now_iso
+from .db import erp_owned_request_ids, now_iso
 from .sheet_names import canonical_sheet_name
 
 
@@ -135,6 +135,11 @@ def record_request_state(
     ).fetchone()
     if not row:
         raise ValueError(f"payment request {request_id} does not exist")
+    # Approval state/events continue on their native tables. Do not append a
+    # monetary history projection (including FX/backdating) after ERP takeover.
+    ownership_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_operating_expense_ownership'").fetchone()
+    if ownership_exists and erp_owned_request_ids(conn, request_id=request_id):
+        return False
     logical_request_id = ensure_logical_request_id(conn, request_id)
     row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
     state = _state_values(row)

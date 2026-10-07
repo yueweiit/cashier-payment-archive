@@ -274,6 +274,7 @@ export type PaymentRequest = {
   version: number;
   batch_id: number;
   copied_from_request_id?: number;
+  erp_payment_owner?: "deeplinkerp" | null;
   dingding_id?: string;
   applicant?: string | null;
   payment_account?: string;

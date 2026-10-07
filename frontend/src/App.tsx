@@ -73,7 +73,7 @@ import {
 } from "./api";
 import { currentLanguage, LanguageProvider, useLanguage } from "./i18n";
 import { buildDirtyGridPayload, sameSheetOrder } from "./gridSave";
-import { canDirectlyEditGridField, normalizeCellValue, parseClipboardTable } from "./gridClipboard";
+import { canDirectlyEditGridField, isErpLockedRequestField, normalizeCellValue, parseClipboardTable } from "./gridClipboard";
 import { AppNavigation, type AppTab } from "./AppNavigation";
 import { MexicoTrackingPage } from "./MexicoTrackingPage";
 import { defaultDailyPayablesExportRange, shanghaiIsoDate, validateDailyPayablesExportRange } from "./dailyPayablesExport";
@@ -4591,7 +4591,7 @@ function EditablePaymentGrid({
             {rows.map((row, rowIndex) => (
               <tr key={row.__localId} className={deletedLocalIds.has(row.__localId) ? "row-deleted" : ""} onDoubleClick={() => row.id && onEdit(row as PaymentRequest)}>
                 <td className="checkbox-col">
-                  {row.id && <input type="checkbox" checked={selectedRows.includes(row.id)} onChange={() => toggle(row.id!)} />}
+                  {row.id && <input type="checkbox" checked={selectedRows.includes(row.id)} disabled={row.erp_payment_owner === "deeplinkerp"} onChange={() => toggle(row.id!)} />}
                 </td>
                 <td className="payment-detail-col fixed-grid-column">
                   <button
@@ -4603,7 +4603,7 @@ function EditablePaymentGrid({
                       if (row.id) onEdit(row as PaymentRequest, "payments");
                     }}
                   >
-                    {Number(row.payment_count || 0) > 0
+                    {row.erp_payment_owner === "deeplinkerp" ? (headerLanguage === "es" ? "Pago en ERP" : "付款由ERP管理") : Number(row.payment_count || 0) > 0
                       ? (headerLanguage === "es" ? `${Number(row.payment_count || 0)} pago(s)` : `付款 ${Number(row.payment_count || 0)} 笔`)
                       : (headerLanguage === "es" ? "No pagado" : "未付款")}
                   </button>
@@ -4615,6 +4615,7 @@ function EditablePaymentGrid({
 	                  const shouldWrap = wrapText && wrappableColumnKeys.has(column.key) && column.type !== "number" && column.type !== "date";
 	                  const terminatedManagerField = requestDingTalkTerminated(row) && generalManagerControlledFields.has(column.key);
 	                  const cellReadOnly = readOnly || row.__deleted || !canEditField(column.key) || terminatedManagerField
+	                    || isErpLockedRequestField(row, column.key)
 	                    || (column.key !== "currency" && !canDirectlyEditGridField(row, column.key));
 	                  const fieldClass = [
 	                    column.key === "dingding_id" ? "mono" : "",
@@ -4799,7 +4800,9 @@ function RequestEditor({
     "source_sheet",
   ];
   const isDirty = requestFormDirty(request, form, fields);
-  const canManagePayments = ["finance", "general_manager", "admin"].includes(user.role)
+  const erpOwned = form.erp_payment_owner === "deeplinkerp";
+  const attachmentsEditable = canEditAttachments && !erpOwned;
+  const canManagePayments = !erpOwned && ["finance", "general_manager", "admin"].includes(user.role)
     && (batch.status === "draft" || isPrivilegedRole(user.role));
   const canCorrectArchived = batch.status === "archived" && isPrivilegedRole(user.role);
   const payableAmount = Number(form.amount || 0);
@@ -4871,7 +4874,7 @@ function RequestEditor({
   }, [confirmationOpen, foreignAmountCorrection, onCancel, previewImages]);
 
   async function addAttachment() {
-    if (!form.id || !canEditAttachments || !attachmentForm.url_path.trim()) return;
+    if (!form.id || !attachmentsEditable || !attachmentForm.url_path.trim()) return;
     const res = await api.createAttachment(batch.id, form.id, attachmentForm);
     setAttachments([...attachments, res.attachment]);
     setAttachmentForm({ label: "", url_path: "" });
@@ -4880,7 +4883,7 @@ function RequestEditor({
   }
 
   async function uploadImageAttachment() {
-    if (!form.id || !canEditAttachments || !imageFile) return;
+    if (!form.id || !attachmentsEditable || !imageFile) return;
     setUploadingImage(true);
     try {
       const res = await api.uploadImageAttachment(batch.id, form.id, imageFile, imageLabel, reason);
@@ -4895,7 +4898,7 @@ function RequestEditor({
   }
 
   async function removeAttachment(id: number) {
-    if (!form.id || !canEditAttachments) return;
+    if (!form.id || !attachmentsEditable) return;
     await api.deleteAttachment(batch.id, form.id, id, reason);
     setAttachments(attachments.filter((item) => item.id !== id));
     setPreviewImages(null);
@@ -4910,6 +4913,7 @@ function RequestEditor({
 
   function renderField(field: keyof PaymentRequest, options: { span?: boolean } = {}) {
     const fieldEditable = canEditField(field)
+      && !isErpLockedRequestField(form, field)
       && !(requestDingTalkTerminated(form) && generalManagerControlledFields.has(field))
       && !(field === "amount" && currencyCode(form.currency) !== "CNY" && !["finance", "general_manager", "admin"].includes(user.role));
     const className = options.span ? "editor-field span-2" : "editor-field";
@@ -5075,6 +5079,7 @@ function RequestEditor({
         </nav>
       </header>
       <div className="request-editor-content">
+        {erpOwned && <div className="editor-info-banner">付款由ERP管理，请在ERP维护付款及凭证。此处可查看历史和审批信息。</div>}
         {activeTab === "request" && (
           <div className="editor-tab-panel">
             {!form.id && <div className="editor-info-banner">首次保存后即可录入付款和上传附件。</div>}
@@ -5088,7 +5093,7 @@ function RequestEditor({
                   {renderField("applicant")}
                   <div className="editor-applicant-meta">
                     <span>{requestApplicantMeta(form)}</span>
-                    {form.raw_extra?.external_source?.applicant && form.applicant != null && (
+                    {!erpOwned && form.raw_extra?.external_source?.applicant && form.applicant != null && (
                       <button type="button" className="text-button" onClick={() => setForm({ ...form, applicant: null })}>
                         恢复为钉钉姓名
                       </button>
@@ -5237,7 +5242,7 @@ function RequestEditor({
             <section className="editor-form-section attachment-manager">
               <div className="editor-section-head attachment-section-head">
                 <div><h3>请款附件</h3><p>合同、发票等资料；付款凭证请在对应付款记录中维护</p></div>
-                {canEditAttachments && (
+                {attachmentsEditable && (
                   <div className="attachment-mode-actions">
                     <button className={attachmentMode === "image" ? "ghost-button active-toggle" : "ghost-button"} type="button" onClick={() => setAttachmentMode(attachmentMode === "image" ? null : "image")}>
                       <ImageIcon size={16} />上传图片
@@ -5292,7 +5297,7 @@ function RequestEditor({
                           <Download size={14} />{isPdfAttachment(item) ? "查看" : "下载"}
                         </a>
                       )}
-                      {canEditAttachments && !isDingtalkAttachment(item) && <button type="button" onClick={() => removeAttachment(item.id)}>删除</button>}
+                      {attachmentsEditable && !isDingtalkAttachment(item) && <button type="button" onClick={() => removeAttachment(item.id)}>删除</button>}
                     </div>
                   </div>
                 ))}

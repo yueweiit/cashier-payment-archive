@@ -41,8 +41,10 @@ from .batch_operations import (
 )
 from .db import (
     DATA_DIR,
+    ERP_OWNERSHIP_ERROR,
     ROOT_DIR,
     connect,
+    erp_owned_request_ids,
     init_db,
     now_iso,
     payment_record_hash,
@@ -174,7 +176,7 @@ from .snapshots import (
 
 
 app = FastAPI(title="出纳请款明细系统")
-from .erp_export import router as erp_export_router
+from .erp_export import dingtalk_identity, router as erp_export_router
 app.include_router(erp_export_router)
 
 _DINGTALK_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dingtalk-sync")
@@ -230,6 +232,15 @@ async def handle_sqlite_operational_error(_: Request, exc: sqlite3.OperationalEr
         status_code=500,
         content={"detail": {"code": "DATABASE_ERROR", "message": "数据库操作失败"}},
     )
+
+
+@app.exception_handler(sqlite3.IntegrityError)
+async def handle_sqlite_integrity_error(_: Request, exc: sqlite3.IntegrityError) -> JSONResponse:
+    if str(exc) == ERP_OWNERSHIP_ERROR:
+        return JSONResponse(status_code=409, content={"detail": {
+            "code": ERP_OWNERSHIP_ERROR, "message": "付款由ERP管理，请在ERP维护付款及凭证"}})
+    return JSONResponse(status_code=500, content={"detail": {
+        "code": "DATABASE_INTEGRITY_ERROR", "message": "数据库约束校验失败"}})
 
 
 class LoginIn(BaseModel):
@@ -1617,8 +1628,13 @@ def rollover_batch(
             ).fetchall()
         copied_count = 0
         skipped_duplicate_rows = 0
+        erp_owned_ids = erp_owned_request_ids(conn, source_batch_id)
+        skipped_erp_owned_rows = 0
         seen_request_keys: set[tuple[str, str, str]] = set()
         for source_row in source_rows:
+            if int(source_row["id"]) in erp_owned_ids:
+                skipped_erp_owned_rows += 1
+                continue
             source_data = row_to_dict(source_row)
             approval_no = str(source_data.get("dingding_id") or "").strip()
             duplicate_key = (
@@ -1670,6 +1686,7 @@ def rollover_batch(
                 "target_batch_id": target_batch_id,
                 "copied_count": copied_count,
                 "skipped_duplicate_rows": skipped_duplicate_rows,
+                "skipped_erp_owned_rows": skipped_erp_owned_rows,
                 "copy_mode": payload.copy_mode,
             },
             operation_id=operation_id,
@@ -1679,6 +1696,7 @@ def rollover_batch(
         "batch": row_to_dict(target),
         "copied_count": copied_count,
         "skipped_duplicate_rows": skipped_duplicate_rows,
+        "skipped_erp_owned_rows": skipped_erp_owned_rows,
         "copy_mode": payload.copy_mode,
         "operation_id": operation_id,
     }
@@ -1930,6 +1948,7 @@ def restore_batch_baseline(
         "pre_restore_snapshot_id": result["pre_restore_snapshot"]["id"],
         "before": result["before"],
         "after": result["after"],
+        "preserved_erp_owned_rows": result["preserved_erp_owned_rows"],
     }
 
 
@@ -1999,7 +2018,7 @@ def correct_archived_request(
             user["role"],
             expected_version=payload.expected_version,
         )
-        new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (payload.request_id,)).fetchone()
+        new_row = require_request(conn, batch_id, payload.request_id)
         if changed:
             touch_batch(conn, batch_id)
             write_audit(
@@ -2170,8 +2189,11 @@ def list_requests(
         rows = conn.execute(
             f"""
             SELECT payment_requests.*,
+                   erp_ownership.owner AS erp_payment_owner,
                    (SELECT COUNT(*) FROM payment_records WHERE payment_records.request_id = payment_requests.id) AS payment_count
             FROM payment_requests
+            LEFT JOIN (SELECT logical_request_id AS erp_logical_root, owner FROM erp_operating_expense_ownership) erp_ownership
+                ON erp_ownership.erp_logical_root=COALESCE(NULLIF(payment_requests.logical_request_id,0), payment_requests.id)
             WHERE {' AND '.join(conditions)}
             ORDER BY payment_requests.id DESC
             """,
@@ -2392,7 +2414,7 @@ def update_request(
             user["role"],
             expected_version=expected_version,
         )
-        new_row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+        new_row = require_request(conn, batch_id, request_id)
         if changed:
             touch_batch(conn, batch_id)
             write_audit(
@@ -6156,6 +6178,7 @@ def _sync_external_expense_metadata_blocking(
                 raise_version_conflict("payment_request", request_id, current_version)
         if int(batch["version"] or 1) != initial_batch_version:
             raise_version_conflict("request_batch", batch_id, int(batch["version"] or 1))
+        erp_owned_ids = erp_owned_request_ids(conn, batch_id)
         for row in current_rows:
             request_id = int(row["id"])
             approval_no = str(row["dingding_id"] or "").strip()
@@ -6200,6 +6223,22 @@ def _sync_external_expense_metadata_blocking(
                     "lookup_status": "unmatched",
                     "metadata_synced_at": timestamp,
                 }
+            if request_id in erp_owned_ids:
+                # Continue approval caching, while original money and identity
+                # remain the exact facts frozen when ERP claimed ownership.
+                identity = dingtalk_identity(dict(row), existing_source)
+                metadata = metadata_by_approval.get(approval_no, [{}])[0]
+                source_matches = (str(metadata.get("record_id") or metadata.get("source_id") or "")
+                                  == str(existing_source.get("record_id") or existing_source.get("source_id") or "")
+                                  and metadata.get("source_type") == existing_source.get("source_type"))
+                workflow_matches = (not workflow_process_instance_id or not identity["process_instance_id"]
+                                    or workflow_process_instance_id == identity["process_instance_id"])
+                approval_fields = {field: external_source.get(field) for field in
+                                   ("approval_status", "approval_result", "lookup_status", "metadata_synced_at")}
+                if not source_matches or not workflow_matches:
+                    approval_fields.update(approval_status=None, approval_result=None, lookup_status="conflict")
+                    request_workflows = []
+                external_source = {**existing_source, **approval_fields}
             raw_extra["external_source"] = external_source
             beneficiary = (
                 str(external_source.get("beneficiary") or "").strip()
@@ -6251,6 +6290,11 @@ def _sync_external_expense_metadata_blocking(
                     expected_payment_account_source,
                     external_expected_payment_account_candidate(metadata),
                 )
+            if request_id in erp_owned_ids:
+                payee_name, payee_account = row["payee_name"], row["payee_account"]
+                needed_payment_date, payment_account = row["needed_payment_date"], row["payment_account"]
+                expected_payment_account = row["expected_payment_account"]
+                expected_payment_account_source = row["expected_payment_account_source"]
             field_old_values: Dict[str, Any] = {}
             field_new_values: Dict[str, Any] = {}
             if payment_account != row["payment_account"] or project != row["project"]:
@@ -6376,7 +6420,11 @@ def _sync_external_expense_metadata_blocking(
                     if classification == "eligible" and request_counts_by_approval[approval_no] > 1:
                         classification = "review_required"
                         classification_reason = "同一钉钉单号关联多条请款，无法自动分配付款"
-                    if linked_payment_id:
+                    if request_id in erp_owned_ids:
+                        classification = "erp_owned"
+                        classification_reason = "付款由ERP管理，出纳端仅保留审批历史"
+                        skipped += 1
+                    elif linked_payment_id:
                         if (
                             existing_event
                             and existing_event["payment_record_id"]
@@ -6548,6 +6596,8 @@ def _sync_external_expense_metadata_blocking(
         for attachment in downloaded_attachments:
             file_object = register_file_object(conn, attachment)
             for request_id in attachment["request_ids"]:
+                if int(request_id) in erp_owned_ids:
+                    continue
                 attachment_synced += upsert_dingtalk_attachment_link(
                     conn,
                     request_id=int(request_id),
@@ -6619,6 +6669,7 @@ def _sync_dingtalk_attachments_phase(
         timings=timings,
     )
     with connect() as conn:
+        erp_owned_ids = erp_owned_request_ids(conn, batch_id)
         rows = conn.execute(
             """
             SELECT * FROM payment_requests
@@ -6648,6 +6699,8 @@ def _sync_dingtalk_attachments_phase(
         }
     request_contexts: Dict[str, list[Dict[str, Any]]] = {}
     for row in rows:
+        if int(row["id"]) in erp_owned_ids:
+            continue
         request_data = row_to_dict(row)
         approval_no = str(row["dingding_id"] or "").strip()
         external_source = dict((request_data.get("raw_extra") or {}).get("external_source") or {})
@@ -6752,6 +6805,7 @@ def _sync_dingtalk_attachments_phase(
     timestamp = now_iso()
     with cleanup_downloaded_dingtalk_files_on_error(downloaded_attachments), connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        erp_owned_ids = erp_owned_request_ids(conn, batch_id)
         batch = require_batch(conn, batch_id)
         if batch["status"] != "draft":
             raise HTTPException(status_code=400, detail="只能同步草稿批次的钉钉附件")
@@ -6762,6 +6816,8 @@ def _sync_dingtalk_attachments_phase(
         for attachment in downloaded_attachments:
             file_object = register_file_object(conn, attachment)
             for request_id in attachment["request_ids"]:
+                if int(request_id) in erp_owned_ids:
+                    continue
                 if int(request_id) not in current_request_ids:
                     continue
                 attachment_synced += upsert_dingtalk_attachment_link(
@@ -8423,7 +8479,10 @@ def external_expense_duplicate_map(conn, approval_nos: Iterable[Any]) -> Dict[st
 
 
 def require_request(conn, batch_id: int, request_id: int):
-    row = conn.execute("SELECT * FROM payment_requests WHERE id = ? AND batch_id = ?", (request_id, batch_id)).fetchone()
+    row = conn.execute("""SELECT requests.*, ownership.owner AS erp_payment_owner
+        FROM payment_requests requests LEFT JOIN erp_operating_expense_ownership ownership
+            ON ownership.logical_request_id=COALESCE(NULLIF(requests.logical_request_id,0), requests.id)
+        WHERE requests.id = ? AND requests.batch_id = ?""", (request_id, batch_id)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="请款记录不存在")
     return row

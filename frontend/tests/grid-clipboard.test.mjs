@@ -59,3 +59,12 @@ test("new foreign rows allow original currency and amount while saved rows requi
   assert.equal(helpers.canDirectlyEditGridField?.({ id: 42, currency: "CNY" }, "amount"), true);
   assert.equal(helpers.canDirectlyEditGridField?.({ __deleted: true }, "summary"), false);
 });
+
+test("ERP-owned requests lock money and source identity while approval comments remain editable", () => {
+  const owned = { id: 42, currency: "CNY", erp_payment_owner: "deeplinkerp" };
+  for (const field of ["amount", "currency", "paid_amount", "payment_account", "payee_account", "source_sheet", "dingding_id", "applicant", "payable_item_key"]) {
+    assert.equal(helpers.canDirectlyEditGridField(owned, field), false, field);
+  }
+  assert.equal(helpers.canDirectlyEditGridField(owned, "general_manager_opinion"), true);
+  assert.equal(helpers.canDirectlyEditGridField({ id: 43, currency: "CNY" }, "amount"), true);
+});

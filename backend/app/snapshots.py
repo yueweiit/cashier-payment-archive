@@ -7,8 +7,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from .db import DATA_DIR, now_iso, payment_record_hash, refresh_payment_summaries
+from .db import DATA_DIR, erp_owned_request_ids, erp_ownership_predicate, now_iso, payment_record_hash, refresh_payment_summaries
 from .excel_io import content_hash
+from .file_storage import store_path
 from .sheet_names import canonical_sheet_name, canonical_sheet_order
 
 
@@ -108,12 +109,36 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
     before_counts = batch_counts(conn, batch_id)
     pre_restore = create_batch_snapshot(conn, batch_id, SNAPSHOT_PRE_RESTORE, actor_id, replace_existing=False)
     payload = json.loads(snapshot["payload_json"])
+    preserved_ids = erp_owned_request_ids(conn, batch_id)
+    ownerships = [dict(row) for row in conn.execute("SELECT logical_request_id,external_source_id FROM erp_operating_expense_ownership")]
+    owned_roots = {row["logical_request_id"] for row in ownerships}
+    owned_external_ids = {row["external_source_id"] for row in ownerships}
+    excluded_snapshot_ids = set(preserved_ids)
+    for request in payload.get("requests", []):
+        try:
+            external = (json.loads(request.get("raw_extra_json") or "{}") or {}).get("external_source") or {}
+        except (TypeError, ValueError):
+            external = {}
+        external_owned = (isinstance(external, dict) and external.get("system") == "dingtalk_expense_database"
+                          and external.get("source_type") == "operation"
+                          and str(external.get("record_id") or external.get("source_id") or "") in owned_external_ids)
+        if request.get("logical_request_id") in owned_roots or request.get("copied_from_request_id") in preserved_ids or external_owned:
+            excluded_snapshot_ids.add(int(request["id"]))
+    excluded_payment_ids = {int(row["id"]) for row in payload.get("payments") or []
+                            if row.get("request_id") in excluded_snapshot_ids}
+    payload["requests"] = [row for row in payload.get("requests", []) if row.get("id") not in excluded_snapshot_ids]
+    payload["attachments"] = [row for row in payload.get("attachments", []) if row.get("request_id") not in excluded_snapshot_ids]
+    if payload.get("payments") is not None:
+        payload["payments"] = [row for row in payload["payments"] if row.get("request_id") not in excluded_snapshot_ids]
+    payload["payment_vouchers"] = [row for row in payload.get("payment_vouchers", []) if row.get("payment_id") not in excluded_payment_ids]
+    unowned_filter = f"AND NOT {erp_ownership_predicate('payment_requests')}"
 
     current_attachment_rows = conn.execute(
-        """
+        f"""
         SELECT attachment_links.* FROM attachment_links
         JOIN payment_requests ON payment_requests.id = attachment_links.request_id
         WHERE payment_requests.batch_id = ?
+          {unowned_filter}
         """,
         (batch_id,),
     ).fetchall()
@@ -126,11 +151,12 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
     delete_ids(conn, "attachment_links", current_attachment_ids)
 
     current_voucher_rows = conn.execute(
-        """
+        f"""
         SELECT payment_vouchers.* FROM payment_vouchers
         JOIN payment_records ON payment_records.id = payment_vouchers.payment_id
         JOIN payment_requests ON payment_requests.id = payment_records.request_id
         WHERE payment_requests.batch_id = ?
+          {unowned_filter}
         """,
         (batch_id,),
     ).fetchall()
@@ -145,10 +171,11 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
     current_payment_ids = {
         int(row["id"])
         for row in conn.execute(
-            """
+            f"""
             SELECT payment_records.id FROM payment_records
             JOIN payment_requests ON payment_requests.id = payment_records.request_id
             WHERE payment_requests.batch_id = ?
+              {unowned_filter}
             """,
             (batch_id,),
         ).fetchall()
@@ -156,11 +183,12 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
     current_payment_versions = {
         int(row["id"]): int(row["version"] or 1)
         for row in conn.execute(
-            """
+            f"""
             SELECT payment_records.id, payment_records.version
             FROM payment_records
             JOIN payment_requests ON payment_requests.id = payment_records.request_id
             WHERE payment_requests.batch_id = ?
+              {unowned_filter}
             """,
             (batch_id,),
         ).fetchall()
@@ -176,7 +204,7 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
     current_request_ids = {
         int(row["id"])
         for row in conn.execute("SELECT id FROM payment_requests WHERE batch_id = ?", (batch_id,)).fetchall()
-    }
+    } - preserved_ids
     current_request_versions = {
         int(row["id"]): int(row["version"] or 1)
         for row in conn.execute(
@@ -247,7 +275,7 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
 
     attachment_columns = table_columns(conn, "attachment_links")
     for attachment in payload.get("attachments", []):
-        restore_attachment_file(attachment)
+        restore_attachment_file(conn, attachment)
         values = {column: attachment.get(column) for column in attachment_columns if column in attachment}
         insert_columns = [column for column in attachment_columns if column in values]
         placeholders = ", ".join("?" for _ in insert_columns)
@@ -258,7 +286,7 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
 
     voucher_columns = table_columns(conn, "payment_vouchers")
     for voucher in payload.get("payment_vouchers", []):
-        restore_attachment_file(voucher)
+        restore_attachment_file(conn, voucher)
         values = {column: voucher.get(column) for column in voucher_columns if column in voucher}
         insert_columns = [column for column in voucher_columns if column in values]
         placeholders = ", ".join("?" for _ in insert_columns)
@@ -287,6 +315,7 @@ def restore_batch_from_baseline(conn: sqlite3.Connection, batch_id: int, actor_i
         "pre_restore_snapshot": pre_restore,
         "before": before_counts,
         "after": batch_counts(conn, batch_id),
+        "preserved_erp_owned_rows": len(preserved_ids),
     }
 
 
@@ -371,7 +400,7 @@ def copy_attachment_files_for_snapshot(
         attachment["_snapshot_file_path"] = str(target.relative_to(DATA_DIR))
 
 
-def restore_attachment_file(attachment: Dict[str, Any]) -> None:
+def restore_attachment_file(conn: sqlite3.Connection, attachment: Dict[str, Any]) -> None:
     if attachment.get("file_object_id"):
         return
     file_path = attachment.get("file_path")
@@ -381,6 +410,21 @@ def restore_attachment_file(attachment: Dict[str, Any]) -> None:
     source = resolve_data_file(snapshot_file_path)
     if not source.exists():
         raise FileNotFoundError(f"快照附件文件不存在: {snapshot_file_path}")
+    protected = conn.execute(f"""SELECT 1 FROM attachment_links attachment
+        JOIN payment_requests request ON request.id=attachment.request_id
+        WHERE attachment.file_path=? AND {erp_ownership_predicate('request')}
+        UNION ALL SELECT 1 FROM payment_vouchers voucher
+        JOIN payment_records payment ON payment.id=voucher.payment_id
+        JOIN payment_requests request ON request.id=payment.request_id
+        WHERE voucher.file_path=? AND {erp_ownership_predicate('request')} LIMIT 1""",
+        (file_path, file_path)).fetchone()
+    if protected:
+        # A legacy path can be shared by unrelated requests. Restore the other
+        # request into immutable storage rather than overwriting the ERP proof.
+        file_object = store_path(conn, source, mime_type=attachment.get("mime_type"))
+        attachment["file_object_id"] = file_object["id"]
+        attachment["file_path"] = file_object["storage_path"]
+        return
     target = resolve_data_file(file_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)

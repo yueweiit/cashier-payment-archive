@@ -543,6 +543,144 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             "INSERT INTO schema_migrations (key, applied_at) VALUES (?, ?)",
             (isolation_key, now_iso()),
         )
+    ensure_erp_operating_ownership(conn)
+
+
+ERP_OWNERSHIP_ERROR = "ERP_PAYMENT_OWNERSHIP_LOCKED"
+ERP_REQUEST_LOCKED_FIELDS = (
+    "id", "batch_id", "logical_request_id", "copied_from_request_id", "payable_item_key", "dingding_id", "applicant",
+    "source_sheet", "amount", "paid_amount", "pending_amount", "currency", "base_amount_cny",
+    "fx_rate_cny_per_unit", "fx_rate_date", "fx_rate_actual_date", "payment_account",
+    "expected_payment_account", "expected_payment_account_source", "payee_account", "payee_name",
+    "bank_name", "needed_payment_date", "actual_payment_date", "payer", "payment_status", "finance_review",
+)
+def erp_ownership_predicate(alias: str) -> str:
+    """Only internal SQL aliases are accepted by callers; no user SQL is composed."""
+    raw = f"CASE WHEN json_valid({alias}.raw_extra_json) THEN {alias}.raw_extra_json ELSE '{{}}' END"
+    return f"""EXISTS (SELECT 1 FROM erp_operating_expense_ownership ownership
+        WHERE ownership.logical_request_id = COALESCE(NULLIF({alias}.logical_request_id, 0), {alias}.id)
+           OR ownership.logical_request_id = (SELECT COALESCE(NULLIF(parent.logical_request_id, 0), parent.id)
+               FROM payment_requests parent WHERE parent.id = {alias}.copied_from_request_id)
+           OR (json_extract({raw}, '$.external_source.system') = 'dingtalk_expense_database'
+               AND (json_extract({raw}, '$.external_source.source_type') = 'operation'
+                    OR json_extract({raw}, '$.external_source.table') = 'approval_expense_operation')
+               AND ownership.external_source_id = CAST(COALESCE(
+                   json_extract({raw}, '$.external_source.record_id'),
+                   json_extract({raw}, '$.external_source.source_id')) AS TEXT)))"""
+
+
+def erp_owned_request_ids(conn: sqlite3.Connection, batch_id: Optional[int] = None, *, request_id: Optional[int] = None) -> set[int]:
+    params = [batch_id] if batch_id is not None else []
+    batch_filter = " AND requests.batch_id = ?" if batch_id is not None else ""
+    if request_id is not None:
+        params.append(request_id)
+        batch_filter += " AND requests.id = ?"
+    return {int(row["id"]) for row in conn.execute(
+        f"SELECT requests.id FROM payment_requests requests WHERE {erp_ownership_predicate('requests')}{batch_filter}", params)}
+
+
+def ensure_erp_operating_ownership(conn: sqlite3.Connection) -> None:
+    """Permanent root guards cover APIs, import tools, corrections and direct SQL.
+
+    Switching the feature flag off prevents new claims, never releases old ones.
+    Ownership contains one frozen export, not a second set of payment records.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS erp_operating_expense_ownership (
+        logical_request_id INTEGER PRIMARY KEY CHECK(logical_request_id > 0),
+        external_source_id TEXT NOT NULL UNIQUE,
+        source_sheet TEXT NOT NULL,
+        owner TEXT NOT NULL CHECK(owner = 'deeplinkerp'),
+        actor_fingerprint TEXT NOT NULL,
+        takeover_request_id TEXT NOT NULL,
+        claim_token TEXT NOT NULL UNIQUE,
+        claimed_at TEXT NOT NULL,
+        history_fingerprint TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json))
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_payment_records_logical_root ON payment_records(COALESCE(root_payment_id, id))")
+    request_changed = " OR ".join(f"OLD.{field} IS NOT NEW.{field}" for field in ERP_REQUEST_LOCKED_FIELDS)
+    source_values = []
+    for alias in ("OLD", "NEW"):
+        raw = f"CASE WHEN json_valid({alias}.raw_extra_json) THEN {alias}.raw_extra_json ELSE '{{}}' END"
+        source = f"CASE WHEN json_type({raw}, '$.external_source')='object' THEN json_extract({raw}, '$.external_source') ELSE '{{}}' END"
+        # Future or unknown original form fields can carry money/payee facts.
+        # Only approval lookup state may change after the whole source is frozen.
+        source_values.append(f"json_remove({source}, '$.approval_status', '$.approval_result', '$.lookup_status', '$.metadata_synced_at')")
+    # Compare decoded JSON nodes, not serialized spelling/order: normal approval
+    # syncs may re-encode Chinese text or reorder object keys without changing it.
+    source_trees = [f"SELECT fullkey,type,atom FROM json_tree({source})" for source in source_values]
+    request_changed += f" OR EXISTS ({source_trees[0]} EXCEPT {source_trees[1]}) OR EXISTS ({source_trees[1]} EXCEPT {source_trees[0]})"
+    predicates = {
+        ("payment_requests", "INSERT"): f"""{erp_ownership_predicate('NEW')}
+            OR EXISTS (SELECT 1 FROM payment_requests existing WHERE existing.id=NEW.id
+                       AND {erp_ownership_predicate('existing')})""",
+        ("payment_requests", "DELETE"): erp_ownership_predicate("OLD"),
+        ("payment_requests", "UPDATE"): f"({erp_ownership_predicate('OLD')} OR {erp_ownership_predicate('NEW')}) AND ({request_changed})",
+    }
+    for operation in ("INSERT", "UPDATE", "DELETE"):
+        aliases = ["OLD", "NEW"] if operation == "UPDATE" else ["NEW" if operation == "INSERT" else "OLD"]
+        predicates[("payment_records", operation)] = " OR ".join(
+            f"""EXISTS (SELECT 1 FROM payment_requests request WHERE request.id = {alias}.request_id
+                        AND {erp_ownership_predicate('request')})
+                OR EXISTS (SELECT 1 FROM payment_records original JOIN payment_requests request ON request.id = original.request_id
+                    WHERE (original.id = {alias}.copied_from_payment_id
+                        OR COALESCE(original.root_payment_id, original.id) = COALESCE({alias}.root_payment_id, {alias}.id))
+                      AND {erp_ownership_predicate('request')})""" for alias in aliases)
+        predicates[("erp_operating_expense_ownership", operation)] = "1" if operation != "INSERT" else """EXISTS (
+            SELECT 1 FROM erp_operating_expense_ownership existing
+            WHERE existing.logical_request_id=NEW.logical_request_id
+               OR existing.external_source_id=NEW.external_source_id OR existing.claim_token=NEW.claim_token)"""
+        predicates[("attachment_links", operation)] = " OR ".join(
+            f"EXISTS (SELECT 1 FROM payment_requests request WHERE request.id={alias}.request_id AND {erp_ownership_predicate('request')})"
+            for alias in aliases)
+        predicates[("payment_vouchers", operation)] = " OR ".join(
+            f"""EXISTS (SELECT 1 FROM payment_records payment JOIN payment_requests request ON request.id=payment.request_id
+                WHERE payment.id={alias}.payment_id AND {erp_ownership_predicate('request')})""" for alias in aliases)
+        if operation == "INSERT":
+            # REPLACE deletes the old conflicting row without DELETE triggers on
+            # default SQLite connections. Check that old row before any insert.
+            for table in ("payment_records", "attachment_links"):
+                predicates[(table, operation)] += f""" OR EXISTS (
+                    SELECT 1 FROM {table} existing JOIN payment_requests request ON request.id=existing.request_id
+                    WHERE existing.id=NEW.id AND {erp_ownership_predicate('request')})"""
+            predicates[("payment_vouchers", operation)] += f""" OR EXISTS (
+                SELECT 1 FROM payment_vouchers existing JOIN payment_records payment ON payment.id=existing.payment_id
+                JOIN payment_requests request ON request.id=payment.request_id
+                WHERE existing.id=NEW.id AND {erp_ownership_predicate('request')})"""
+        if operation != "INSERT":
+            predicates[("payable_history_versions", operation)] = " OR ".join(
+                f"EXISTS (SELECT 1 FROM erp_operating_expense_ownership ownership WHERE ownership.logical_request_id={alias}.logical_request_id)"
+                for alias in aliases)
+    predicates[("payable_history_versions", "INSERT")] = """EXISTS (
+        SELECT 1 FROM erp_operating_expense_ownership ownership WHERE ownership.logical_request_id=NEW.logical_request_id)
+        OR EXISTS (SELECT 1 FROM payable_history_versions existing JOIN erp_operating_expense_ownership ownership
+            ON ownership.logical_request_id=existing.logical_request_id
+            WHERE existing.id=NEW.id OR existing.event_key=NEW.event_key)"""
+
+    def file_owned(alias: str) -> str:
+        return f"""(EXISTS (SELECT 1 FROM attachment_links attachment JOIN payment_requests request ON request.id=attachment.request_id
+                WHERE attachment.file_object_id={alias}.id AND {erp_ownership_predicate('request')})
+            OR EXISTS (SELECT 1 FROM payment_vouchers voucher JOIN payment_records payment ON payment.id=voucher.payment_id
+                JOIN payment_requests request ON request.id=payment.request_id
+                WHERE voucher.file_object_id={alias}.id AND {erp_ownership_predicate('request')}))"""
+
+    file_fields = ("sha256", "size_bytes", "storage_backend", "storage_path", "status")
+    file_changed = " OR ".join(f"OLD.{field} IS NOT NEW.{field}" for field in ("id", *file_fields))
+    for operation in ("UPDATE", "DELETE"):
+        predicates[("file_objects", operation)] = f"({file_changed if operation == 'UPDATE' else '1'}) AND {file_owned('OLD')}"
+    file_insert_changed = " OR ".join(f"existing.{field} IS NOT NEW.{field}" for field in file_fields)
+    # NEW.id is -1 for an automatically allocated SQLite rowid. Preserve the
+    # existing object on exact deduplication, even when REPLACE was requested.
+    file_insert_changed += " OR (NEW.id != -1 AND existing.id IS NOT NEW.id)"
+    owned_file_collision = f"""SELECT 1 FROM file_objects existing WHERE (existing.id=NEW.id OR existing.sha256=NEW.sha256)
+        AND {file_owned('existing')}"""
+    predicates[("file_objects", "INSERT")] = f"EXISTS ({owned_file_collision} AND ({file_insert_changed}))"
+    conn.execute(f"""CREATE TRIGGER IF NOT EXISTS erp_guard_file_objects_reuse BEFORE INSERT ON file_objects
+        WHEN EXISTS ({owned_file_collision} AND NOT ({file_insert_changed})) BEGIN SELECT RAISE(IGNORE); END""")
+    for (table, operation), predicate in predicates.items():
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS erp_guard_{table}_{operation.lower()}
+            BEFORE {operation} ON {table} WHEN {predicate}
+            BEGIN SELECT RAISE(ABORT, '{ERP_OWNERSHIP_ERROR}'); END""")
 
 
 def get_daily_payables_history_start_date(conn: sqlite3.Connection) -> Optional[str]:
@@ -746,7 +884,12 @@ def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:
     ).fetchall()
     for row in rows:
         latest_by_logical.setdefault(int(row["logical_request_id"]), row)
+    ownership_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_operating_expense_ownership'").fetchone()
+    owned_roots = {int(row["logical_request_id"]) for row in conn.execute(
+        "SELECT logical_request_id FROM erp_operating_expense_ownership")} if ownership_exists else set()
     for logical_request_id, row in latest_by_logical.items():
+        if logical_request_id in owned_roots:
+            continue
         if conn.execute(
             "SELECT 1 FROM payable_history_versions WHERE logical_request_id = ? LIMIT 1",
             (logical_request_id,),
@@ -1070,15 +1213,20 @@ def ensure_batch_operations_table(conn: sqlite3.Connection) -> None:
 
 def migrate_currency_amount_anchors(conn: sqlite3.Connection) -> None:
     """Backfill safe CNY anchors without guessing historical foreign currencies."""
+    ownership_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_operating_expense_ownership'").fetchone()
+    request_filter = f"NOT {erp_ownership_predicate('payment_requests')}" if ownership_exists else "1"
+    payment_filter = (f"NOT EXISTS (SELECT 1 FROM payment_requests request WHERE request.id=payment_records.request_id AND {erp_ownership_predicate('request')})"
+                      if ownership_exists else "1")
     conn.execute(
-        """
+        f"""
         UPDATE payment_requests
         SET currency = 'CNY'
         WHERE UPPER(TRIM(COALESCE(currency, ''))) NOT IN ('CNY', 'USD', 'MXN')
+          AND {request_filter}
         """
     )
     conn.execute(
-        """
+        f"""
         UPDATE payment_requests
         SET base_amount_cny = CASE
                 WHEN base_amount_cny IS NOT NULL THEN base_amount_cny
@@ -1090,10 +1238,11 @@ def migrate_currency_amount_anchors(conn: sqlite3.Connection) -> None:
                 WHEN UPPER(TRIM(COALESCE(currency, 'CNY'))) = 'CNY' THEN 1
                 ELSE fx_rate_cny_per_unit
             END
+        WHERE {request_filter}
         """
     )
     conn.execute(
-        """
+        f"""
         UPDATE payment_records
         SET base_amount_cny = CASE
                 WHEN base_amount_cny IS NOT NULL THEN base_amount_cny
@@ -1120,6 +1269,7 @@ def migrate_currency_amount_anchors(conn: sqlite3.Connection) -> None:
             fx_rate_actual_date = COALESCE(fx_rate_actual_date, (
                 SELECT fx_rate_actual_date FROM payment_requests WHERE payment_requests.id = payment_records.request_id
             ))
+        WHERE {payment_filter}
         """
     )
 
@@ -1222,6 +1372,9 @@ def refresh_payment_summaries(
     *,
     bump_version: bool = True,
 ) -> None:
+    # Old claimed facts must remain frozen even if an approval sync runs later.
+    has_ownership = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_operating_expense_ownership'").fetchone()
+    owned = erp_owned_request_ids(conn, request_id=request_id) if has_ownership else set()
     if request_id is None:
         requests = conn.execute(
             """
@@ -1242,6 +1395,8 @@ def refresh_payment_summaries(
             (request_id,),
         ).fetchall()
     for request in requests:
+        if request["id"] in owned:
+            continue
         aggregate = conn.execute(
             "SELECT COALESCE(SUM(amount), 0) AS paid_amount, COUNT(*) AS payment_count FROM payment_records WHERE request_id = ?",
             (request["id"],),
