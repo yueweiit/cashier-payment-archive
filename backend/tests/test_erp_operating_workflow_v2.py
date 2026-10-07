@@ -121,6 +121,143 @@ def test_completed_permission_requires_explicit_agreement(v2_client, status, res
     assert response.json()['items'][0]['payment_eligibility']['can_register_payment'] is allowed
 
 
+@pytest.mark.parametrize('reverse_tasks', [False, True])
+@pytest.mark.parametrize('cancelled_result', ['NONE', '', 'REDIRECTED', 'AGREE', 'mixed'])
+def test_completed_agreed_allows_cancelled_assignees_with_exact_agreed_activity_peers(v2_client, reverse_tasks, cancelled_result):
+    client, data, _ = v2_client
+    instance = data['instances'][0]
+    instance.update(status='COMPLETED', result='agree', tasks=instance['tasks'][1:])
+    instance['tasks'].extend([{**task, 'taskId': 'cancelled-' + task['taskId'],
+        'userId': 'cancelled-' + task['userId'], 'taskGroupName': '不同显示名称',
+        'status': 'CANCELED', 'result': ('NONE' if index == 0 else 'REDIRECTED')
+            if cancelled_result == 'mixed' else cancelled_result}
+        for index, task in enumerate(instance['tasks'][:])])
+    if reverse_tasks:
+        instance['tasks'].reverse()
+    instance['operation_records'].append({'type': 'COMMENT', 'result': 'NONE'})
+    response = client.get(PREFIX + '/workflow', headers=HEADERS, params=IDENTITY)
+    assert response.status_code == 200, response.text
+    item = response.json()['items'][0]
+    assert item['approval_status'] == 'COMPLETED' and item['approval_result'] == 'agree'
+    assert item['current_tasks'] == []
+    assert item['payment_eligibility']['can_register_payment'] is True
+    assert item['payment_eligibility']['reason'] == 'completed_agreed'
+
+
+@pytest.mark.parametrize('change', ['no_peer', 'different_activity', 'missing_activity',
+    'missing_assignee', 'peer_missing_assignee', 'peer_none', 'unknown', 'active', 'running', 'terminated',
+    'unknown_result', 'refused', 'event_refused', 'withdrawn', 'conflict'])
+def test_completed_cancelled_task_exception_never_bypasses_payment_evidence(v2_client, change):
+    client, data, _ = v2_client
+    instance = data['instances'][0]
+    instance.update(status='COMPLETED', result='agree', tasks=instance['tasks'][1:])
+    peer = instance['tasks'][0]
+    cancelled = {**peer, 'taskId': 'cancelled-peer', 'userId': 'cancelled-user',
+        'status': 'CANCELED', 'result': 'NONE'}
+    instance['tasks'].append(cancelled)
+    if change == 'no_peer':
+        instance['tasks'].remove(peer)
+    elif change == 'different_activity':
+        cancelled['activityId'] = 'unrelated-activity'
+    elif change == 'missing_activity':
+        cancelled.pop('activityId')
+    elif change in {'missing_assignee', 'peer_missing_assignee'}:
+        (cancelled if change == 'missing_assignee' else peer)['verified_assignee_ids'] = []
+    elif change == 'peer_none':
+        peer['result'] = 'NONE'
+    elif change in {'unknown', 'active', 'running', 'terminated'}:
+        cancelled['status'] = change.upper()
+    elif change == 'unknown_result':
+        cancelled['result'] = 'UNKNOWN'
+    elif change == 'refused':
+        peer['result'] = 'REFUSE'
+    elif change == 'event_refused':
+        instance['operation_records'][0]['result'] = 'REFUSE'
+    elif change == 'withdrawn':
+        instance['operation_records'].append({'type': 'TERMINATE_PROCESS_INSTANCE', 'result': 'NONE'})
+    else:
+        instance['task_evidence_complete'] = False
+    response = client.get(PREFIX + '/workflow', headers=HEADERS, params=IDENTITY)
+    assert response.status_code == 200, response.text
+    decision = response.json()['items'][0]['payment_eligibility']
+    assert decision['can_register_payment'] is False
+    if change not in {'refused', 'event_refused', 'withdrawn'}:
+        assert decision['notice'] == '审批已结束，但付款条件待核实，暂不能登记付款'
+
+
+@pytest.mark.parametrize('cancelled_result', ['', 'REDIRECTED', 'AGREE'])
+@pytest.mark.parametrize('peer_evidence', ['missing', 'refused'])
+def test_completed_known_cancelled_results_cannot_replace_missing_or_refused_peer(v2_client, cancelled_result, peer_evidence):
+    client, data, _ = v2_client
+    instance = data['instances'][0]
+    instance.update(status='COMPLETED', result='agree', tasks=instance['tasks'][1:])
+    peer = instance['tasks'][0]
+    instance['tasks'].append({**peer, 'taskId': 'cancelled-peer', 'userId': 'cancelled-user',
+        'status': 'CANCELED', 'result': cancelled_result})
+    if peer_evidence == 'missing':
+        instance['tasks'].remove(peer)
+    else:
+        peer['result'] = 'REFUSE'
+    decision = client.get(PREFIX + '/workflow', headers=HEADERS, params=IDENTITY).json()['items'][0]['payment_eligibility']
+    assert decision['can_register_payment'] is False
+    assert decision['reason'] == ('approval_rejected_or_withdrawn' if peer_evidence == 'refused' else 'approval_incomplete')
+
+
+@pytest.mark.parametrize('duplicate,allowed', [('status_conflict', False), ('result_conflict', False),
+    ('activity_conflict', False), ('different_assignee', True), ('different_task', True), ('identical', True)])
+def test_completed_task_peer_decisions_are_consistent_per_exact_task_and_assignee(v2_client, duplicate, allowed):
+    client, data, _ = v2_client
+    instance = data['instances'][0]
+    instance.update(status='COMPLETED', result='agree', tasks=instance['tasks'][1:])
+    peer = instance['tasks'][0]
+    repeated = {**peer, 'status': 'CANCELED', 'result': 'NONE'}
+    if duplicate == 'result_conflict':
+        cancelled = {**repeated, 'taskId': 'cancelled-peer'}
+        instance['tasks'].append(cancelled)
+        repeated = {**cancelled, 'result': 'REDIRECTED'}
+    elif duplicate == 'activity_conflict':
+        repeated = {**peer, 'activityId': 'another-activity'}
+    elif duplicate == 'different_assignee':
+        repeated['userId'] = 'different-user'
+    elif duplicate == 'different_task':
+        repeated['taskId'] = 'different-task'
+    elif duplicate == 'identical':
+        repeated = dict(peer)
+    instance['tasks'].append(repeated)
+    decision = client.get(PREFIX + '/workflow', headers=HEADERS, params=IDENTITY).json()['items'][0]['payment_eligibility']
+    assert decision['can_register_payment'] is allowed
+
+
+@pytest.mark.parametrize('separation', ['corp', 'instance'])
+def test_completed_cancelled_task_cannot_borrow_agreed_peer_from_another_oa_identity(v2_client, monkeypatch, separation):
+    client, data, _ = v2_client
+    instance = data['instances'][0]
+    peer = instance['tasks'][1]
+    instance.update(status='COMPLETED', result='agree', tasks=[{**peer,
+        'taskId': 'cancelled-peer', 'status': 'CANCELED', 'result': 'NONE'}])
+    other = {**instance, 'id': 'other-source', 'tasks': [peer]}
+    other['corp_id' if separation == 'corp' else 'process_instance_id'] = 'other-' + separation
+    data['instances'].append(other)
+    monkeypatch.setenv('PAYMENT_ERP_OPERATING_OA_SCOPE', json.dumps([
+        SCOPE, {**SCOPE, 'corp_id': other['corp_id']}] if separation == 'corp' else [SCOPE]))
+    identities = [IDENTITY, {key: other[key] for key in ('corp_id', 'process_instance_id')}]
+    response = client.post(PREFIX + '/workflow', headers=HEADERS, json={'identities': identities})
+    assert response.status_code == 200, response.text
+    items = response.json()['items']
+    assert [item['lookup_status'] for item in items] == ['found', 'found']
+    assert [item['payment_eligibility']['can_register_payment'] for item in items] == [False, True]
+
+
+def test_running_policy_does_not_accept_completed_instance_cancelled_peer_exception(v2_client):
+    client, data, _ = v2_client
+    instance = data['instances'][0]
+    instance['tasks'].append({**instance['tasks'][1], 'taskId': 'cancelled-peer',
+        'userId': 'cancelled-user', 'status': 'CANCELED', 'result': 'NONE'})
+    decision = client.get(PREFIX + '/workflow', headers=HEADERS, params=IDENTITY).json()['items'][0]['payment_eligibility']
+    assert decision['can_register_payment'] is False
+    assert decision['reason'] == 'required_approvals_incomplete'
+
+
 @pytest.mark.parametrize('change', ['corp', 'source', 'duplicate', 'region', 'year', 'process'])
 def test_exact_identity_conflict_and_scope_never_disclose_history(v2_client, change):
     client, data, _ = v2_client
@@ -458,6 +595,7 @@ def test_completed_authorization_requires_explicit_complete_task_evidence(v2_cli
         row['task_evidence_complete'] = complete
     decision = client.get(PREFIX + '/workflow', headers=HEADERS, params=IDENTITY).json()['items'][0]['payment_eligibility']
     assert decision['can_register_payment'] is False
+    assert decision['notice'] == '审批已结束，但付款条件待核实，暂不能登记付款'
 
 
 @pytest.mark.parametrize('status', ['RUNNING', 'COMPLETED'])
@@ -626,13 +764,15 @@ def test_global_employee_map_is_not_company_authority_without_exact_corp_binding
     assert response.status_code == 409
 
 
-@pytest.mark.parametrize('status,result', [('UNKNOWN', 'NONE'), ('COMPLETED', 'NONE'), ('PENDING', 'NONE')])
+@pytest.mark.parametrize('status,result', [('UNKNOWN', 'NONE'), ('ACTIVE', 'NONE'),
+    ('COMPLETED', 'NONE'), ('PENDING', 'NONE'), ('CANCELED', 'NONE')])
 def test_completed_instance_cannot_hide_unresolved_canonical_tasks(v2_client, status, result):
     client, data, _ = v2_client
     data['instances'][0].update(status='COMPLETED', result='agree', tasks=[{
         'taskId': 'unresolved', 'activityId': 'cashier', 'userId': 'cashier-a', 'status': status, 'result': result}])
     decision = client.get(PREFIX + '/workflow', headers=HEADERS, params=IDENTITY).json()['items'][0]['payment_eligibility']
     assert decision['can_register_payment'] is False
+    assert decision['notice'] == '审批已结束，但付款条件待核实，暂不能登记付款'
 
 
 @pytest.mark.parametrize('raw_status,raw_result', [('COMPLETED', 'REFUSE'), ('TERMINATED', 'AGREE')])

@@ -1023,17 +1023,37 @@ def operating_payment_eligibility(workflow, lookup_status='found'):
     blocked = any(approval_result_is_disallowed(task.get('result')) for task in task_results) or any(approval_result_is_disallowed(event.get('result'))
                   or any(token in str(event.get('event_type') or '').upper() for token in ('TERMINAT', 'WITHDRAW', 'REVOK', 'CANCEL'))
                   for event in events)
-    allowed, reason, notice = False, 'approval_incomplete', '审批尚未完成，暂不能登记付款'
+    completed = workflow.get('status') == 'COMPLETED'
+    completed_notice = '审批已结束，但付款条件待核实，暂不能登记付款'
+    allowed, reason, notice = False, 'approval_incomplete', completed_notice if completed else '审批尚未完成，暂不能登记付款'
     if lookup_status != 'found':
         reason, notice = 'source_' + lookup_status, '审批来源未核实，暂不能登记付款'
     elif blocked or approval_result_is_disallowed(workflow.get('result')):
         reason, notice = 'approval_rejected_or_withdrawn', '审批已拒绝或撤回，不能登记付款'
     elif workflow.get('task_evidence_complete') is not True:
-        reason, notice = 'task_evidence_unverified', '审批任务证据未核实，暂不能登记付款'
-    elif (workflow.get('status') == 'COMPLETED' and workflow.get('result') == 'agree'
-            and not workflow.get('current_tasks') and all(task.get('status') == 'COMPLETED'
-                and task.get('result') == 'AGREE' and task.get('assignee_ids') for task in task_results)):
-        allowed, reason, notice = True, 'completed_agreed', '审批已通过'
+        reason, notice = 'task_evidence_unverified', completed_notice if completed else '审批任务证据未核实，暂不能登记付款'
+    elif completed:
+        # An agreed finished instance may cancel/redirect another assignee in
+        # the same activity. These are not individual agreements: an agreed
+        # peer is required within this exact OA instance, never by name or
+        # across batch items. Unknown/nonterminal decisions still fail closed.
+        agreed_activities, task_decisions, consistent = set(), {}, True
+        for task in task_results:
+            decision = (task.get('activity_id'), task.get('status'), task.get('result'))
+            for assignee in task.get('assignee_ids') or []:
+                # Contradictory snapshots of one task/assignee are not peers.
+                key = (task.get('id'), assignee)
+                if task_decisions.setdefault(key, decision) != decision:
+                    consistent = False
+            if (task.get('activity_id') and task.get('status') == 'COMPLETED'
+                    and task.get('result') == 'AGREE' and task.get('assignee_ids')):
+                agreed_activities.add(task['activity_id'])
+        terminal_tasks_verified = consistent and all(task.get('assignee_ids') and (
+            (task.get('status') == 'COMPLETED' and task.get('result') == 'AGREE')
+            or (task.get('status') == 'CANCELED' and task.get('result') in {'NONE', '', 'REDIRECTED', 'AGREE'}
+                and task.get('activity_id') in agreed_activities)) for task in task_results)
+        if workflow.get('result') == 'agree' and not workflow.get('current_tasks') and terminal_tasks_verified:
+            allowed, reason, notice = True, 'completed_agreed', '审批已通过'
     elif workflow.get('status') == 'RUNNING':
         reason, notice = 'approval_policy_unverified', '审批节点规则尚未核实，暂不能登记付款'
         required = policy.get('required_approval_activity_ids') if policy else None
