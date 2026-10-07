@@ -1731,7 +1731,16 @@ def parse_dingtalk_workflow_instance(
         "process_code": _text(instance.get("process_code")),
         "template_version": _text(instance.get("template_version")),
         "originator_user_id": _text(instance.get("originator_user_id")),
-        "task_evidence_complete": instance.get('task_evidence_complete', True),
+        "task_evidence_complete": instance.get('task_evidence_complete'),
+        # Keep ended/rejected/unknown tasks for authorization, not only the
+        # display projection of currently active tasks. Canonical scalar results
+        # certify only their actual normalized assignee, never a raw group.
+        "task_results": [{"id": _text(task.get('taskId') or task.get('id')),
+            "activity_id": _text(task.get('activityId')),
+            "status": (_text(task.get('status')) or '').upper(),
+            "result": (_text(task.get('result')) or '').upper(),
+            "assignee_ids": task['verified_assignee_ids'] if 'verified_assignee_ids' in task else _task_assignee_ids(task)}
+            for task in tasks],
         "status": (_text(instance.get("status")) or "").upper(),
         "result": (_text(instance.get("result")) or "").lower(),
         "title": _text(instance.get("title")),
@@ -1861,34 +1870,50 @@ def fetch_operating_workflow_sources(identities, scopes):
                 raise ExternalExpenseError('工作流待办超过查询范围')
             tasks = defaultdict(list)
             task_evidence = defaultdict(list)
+            canonical_assignees = defaultdict(set)
+            task_conflicts = set()
             for task in task_rows:
                 task_evidence[task['process_instance_id']].append(task)
                 raw = _json_object(task.get('raw_payload'))
+                if any(_text(raw.get(field)) and
+                        (_text(raw.get(field)) or '').upper() != (_text(task.get(field)) or '').upper()
+                        for field in ('status', 'result')):
+                    task_conflicts.add(task['process_instance_id'])
                 tasks[task['process_instance_id']].append({**raw, 'taskId': task['task_id'],
                     'activityId': task['activity_id'], 'taskGroupName': task['node_name'],
                     'status': task['status'], 'result': task['result'],
                     'userId': task['approver_user_id'], 'startTime': task['start_time'],
+                    'verified_assignee_ids': [_text(task['approver_user_id'])] if _text(task['approver_user_id']) else [],
                     'createTime': None, 'createdAt': None, 'updatedAt': None})
+                if _text(task['approver_user_id']):
+                    canonical_assignees[(task['process_instance_id'], _text(task['task_id']))].add(_text(task['approver_user_id']))
             corp_instances = []
             for row in rows:
                 raw = _json_object(row.get('raw_payload'))
                 forms = _json_list(row.get('form_component_values')) or _form_values(raw)
                 raw_tasks = {_text(task.get('taskId') or task.get('id')): task for task in _json_list(raw.get('tasks')) if isinstance(task, dict)}
                 merged_tasks, task_ids = [], set()
-                complete = True
+                complete = row['process_instance_id'] not in task_conflicts and all(not _text(raw.get(field)) or
+                    (_text(raw.get(field)) or '').upper() == (_text(row.get(field)) or '').upper()
+                    for field in ('status', 'result'))
                 for task in tasks.get(row['process_instance_id'], []):
                     task_id = _text(task.get('taskId'))
                     task_ids.add(task_id)
                     original = raw_tasks.get(task_id, {})
-                    if original.get('status') and str(original['status']).upper() != str(task.get('status') or '').upper():
+                    if any(_text(original.get(field)) and
+                            (_text(original.get(field)) or '').upper() != (_text(task.get(field)) or '').upper()
+                            for field in ('status', 'result')):
+                        complete = False
+                    if not set(_task_assignee_ids(original)) <= canonical_assignees[(row['process_instance_id'], task_id)]:
+                        complete = False
+                    if not task_id or not task['verified_assignee_ids']:
                         complete = False
                     merged_tasks.append({**original, **task})
                 for task_id, task in raw_tasks.items():
                     if task_id not in task_ids:
                         # A missing canonical task cannot establish a timezone.
                         merged_tasks.append({**task, 'startTime': None, 'createTime': None, 'createdAt': None, 'updatedAt': None})
-                        if str(task.get('status') or '').upper() in {'RUNNING', 'PROCESSING', 'PENDING'}:
-                            complete = False
+                        complete = False
                 corp_instances.append({**dict(row),
                     'raw_corp_id': raw.get('corpId') or raw.get('corp_id'),
                     'raw_process_instance_id': raw.get('processInstanceId'),
@@ -2076,6 +2101,15 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
     row = dict(raw_row)
     source_type = str(row.get("source_type") or "")
     raw_data = _json_object(row.get("raw_data"))
+    # Preserve exact identity through the real importer so OA ownership guards
+    # remain reachable even if the business number is subsequently changed.
+    identity_values = {field: {_text(value) for value in values if _text(value)} for field, values in {
+        'corp_id': [row.get('corp_id'), raw_data.get('corpId'), raw_data.get('corp_id')],
+        'process_instance_id': [row.get('process_instance_id'), raw_data.get('processInstanceId'),
+            raw_data.get('process_instance_id'), raw_data.get('processInstanceID')],
+    }.items()}
+    identity_conflict = any(len(values) > 1 for values in identity_values.values())
+    oa_identity = {field: next(iter(values)) for field, values in identity_values.items() if len(values) == 1} if not identity_conflict else {}
     form_values = _form_values(raw_data)
     invoice_value = _form_component_value(form_values, *INVOICE_COMPONENT_PREFIXES)
     invoice_account = _invoice_payment_account(invoice_value)
@@ -2174,6 +2208,8 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         errors.append("应付金额为 0，暂不导入")
     if not approval_no:
         errors.append("缺少钉钉单号")
+    if identity_conflict:
+        errors.append("审批身份冲突，暂不导入")
     if base_amount is None:
         errors.append("缺少应付金额")
     elif base_amount < 0:
@@ -2220,6 +2256,7 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "source_sheet": applicant_department or "未归属部门",
         "raw_extra": {
             "external_source": {
+                **oa_identity,
                 "system": "dingtalk_expense_database",
                 "table": SOURCE_TABLES.get(source_type, source_type),
                 "record_id": source_id,

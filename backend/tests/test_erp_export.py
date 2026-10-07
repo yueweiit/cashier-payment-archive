@@ -282,6 +282,27 @@ def test_applicant_company_lookup_bounds_batch_and_rejects_non_identity_values(e
     assert resolve_applicants(client, [{'user_id': {'directory': '*'}, 'employee_name': ''}]).status_code == 422
 
 
+@pytest.mark.parametrize('binding', [None, 'fake-corp', 'other-corp'])
+def test_exact_corp_applicant_lookup_never_uses_unbound_or_cross_corp_global_map(export_client, monkeypatch, binding):
+    client, path = export_client
+    seed_applicant_mappings(path)
+    if binding:
+        monkeypatch.setenv('PAYMENT_ERP_OPERATING_EMPLOYEE_MAPPING_CORP_ID', binding)
+    else:
+        monkeypatch.delenv('PAYMENT_ERP_OPERATING_EMPLOYEE_MAPPING_CORP_ID', raising=False)
+    applicants = [{'corp_id': 'fake-corp', 'user_id': 'raw-user', 'employee_name': '测试姓名'},
+        {'corp_id': 'other-corp', 'user_id': 'raw-user', 'employee_name': '测试姓名'},
+        {'corp_id': 'fake-corp', 'user_id': 'unknown-user', 'employee_name': '人工申请人'}]
+    response = resolve_applicants(client, applicants)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload['schema_version'] == 2
+    assert [item['corp_id'] for item in payload['items']] == [person['corp_id'] for person in applicants]
+    assert [item['assigned_department'] for item in payload['items']] == [
+        '运营' if binding == 'fake-corp' else None, '运营' if binding == 'other-corp' else None, None]
+    assert payload['items'][2]['status'] != 'matched'
+
+
 def test_applicant_company_lookup_is_read_only_and_does_not_initialize_missing_database(export_client, monkeypatch, tmp_path):
     from contextlib import contextmanager
     from backend.app import erp_export

@@ -70,6 +70,19 @@ npm run dev
 - `DINGTALK_AUTO_PAYMENT_MODE=preview` 仅标记可信财务“已支付”候选；核对无误后改为 `apply` 才会按待付款金额生成付款明细。复杂、部分或矛盾评论只进入待核对。
 - 来源固定只读取中国区的 `COMPLETED` 和 `RUNNING` 记录，排除已终止或明确拒绝项；钉钉单号在所有批次全局去重。
 
+## ERP 运营支出 OA 接口
+
+- 接口只有配置 `PAYMENT_ERP_EXPORT_TOKEN` 和非通配的 `PAYMENT_ERP_EXPORT_ALLOWED_SHEETS` 后开放；读接口不初始化或修改业务库，接管默认关闭。
+- `PAYMENT_ERP_OPERATING_OA_SCOPE` 是一个对象或对象数组，每项必须明确 `corp_id`、`process_code` 或 `process_codes`、`execution_region="中国"`、`year=2026`。可选 `source_sheet` 只能使用已授权、精确法人桥接的组织标签，不能凭审批模板猜测公司。
+- GET `/api/integrations/erp/operating-expenses/workflow` 支持精确 `corp_id` + `process_instance_id`；POST 同一地址接受 `{"identities":[{"corp_id":"...","process_instance_id":"...","source_id":"..."}]}`，最多 500 项。响应为 schema 2，`source_id` 为规范 OA 哈希，旧编号只能作为已核实的同身份别名；旧的只传编号 GET 保持 schema 1。
+- 批量旧编号别名使用一个只读快照，候选历史副本总数上限 500；超限时应缩小批次，不截断历史来判定资格。节点名称和真实全部待办人、已结束任务结果分别保留，不以“财务”名称判断是否出纳执行。
+- `resolve-applicant-companies` 的每个人可附带 `corp_id`，返回 schema 2 并回显该企业。只有进程环境中显式配置 `PAYMENT_ERP_OPERATING_EMPLOYEE_MAPPING_CORP_ID`，且与该企业精确相同，现有全局员工映射才能作为公司依据；严格调用只匹配员工 ID，不回退姓名。无企业的 schema 1 兼容调用不得用于 OA 多企业公司授权。
+- 付款资格使用规范任务、操作和来源状态证据：拒绝、撤回、矛盾、缺失任务证据或未知任务状态一律拦截。完整通过的审批也不能绕过任务证据检查。
+- RUNNING 提前登记还必须有经过独立核实的 `PAYMENT_ERP_OPERATING_PAYMENT_POLICY`（对象或数组），每项精确绑定 `corp_id`、`process_code`、来源 `template_version`、`policy_version`、`required_approval_activity_ids` 和 `cashier_activity_ids`；所有必要审批人的规范任务必须通过，最新有可靠时间的操作也必须同意，且仅有已知出纳节点待办。不能根据节点名、历史模板目录或调用者输入生成授权规则；未取得必经路线与版本证据时不配置生产 RUNNING 策略。
+- OA 接管必须用精确身份重新读取财务事实。旧出纳根的金额、币种、法人、原申请人和类型与新鲜 OA 不一致时拒绝冻结；已有人工显示姓名不被覆盖。没有出纳历史时，须由财务明确确认零历史并提供操作人，不能把未知历史自动写成零或伪造请款行。
+- 接管 claim 除预览 `expected_version` 外，schema 2 还须回传 `expected_eligibility_fingerprint`。启用新接管需要 `PAYMENT_ERP_TAKEOVER_ENABLED=true`；关闭开关不解除已存在的 ERP 所有权。OA 精确身份与非空审批号均用于阻止网站晚导入、复制和付款，空审批号不锁定无关手工记录。
+- 新鲜 OA 评论若含付款候选或待核对付款证据，两种 schema 2 接管路径均须先复核。缓存付款历史、相同金额或相同评论不能自动证明新鲜事件已登记；当前没有猜测性的事件对账放行。
+
 ## 内置 Excel 式录入
 
 - 在“工作台”中可以直接点击单元格录入。

@@ -219,25 +219,49 @@ def test_legacy_claim_with_corp_but_unknown_instance_preserves_v1_compatibility(
         assert conn.execute('SELECT corp_id,process_instance_id FROM erp_operating_expense_ownership').fetchone() == (None, None)
 
 
-def test_numeric_v2_takeover_keeps_real_cashier_history_and_returns_canonical_identity(takeover_client, monkeypatch):
+@pytest.mark.parametrize('change', [None, 'amount', 'currency', 'company', 'applicant_id', 'applicant_name', 'type', 'payment_comment', 'manual_applicant'])
+def test_numeric_v2_takeover_keeps_real_cashier_history_and_returns_canonical_identity(takeover_client, monkeypatch, change):
     from backend.app import erp_export
     client, path = takeover_client
+    label, company = '悦为智能 YW Tech_Ai', '悦为智能技术（东莞）有限公司'
+    monkeypatch.setenv('PAYMENT_ERP_EXPORT_ALLOWED_SHEETS', json.dumps(['运营', label]))
     monkeypatch.setenv('PAYMENT_ERP_OPERATING_OA_SCOPE', json.dumps({'corp_id': 'fake-corp', 'process_codes': ['fake-template'],
-        'execution_region': '中国', 'year': 2026, 'source_sheet': '运营'}))
+        'execution_region': '中国', 'year': 2026, 'source_sheet': label}))
     with sqlite3.connect(path) as conn:
-        conn.execute("UPDATE payment_requests SET raw_extra_json=json_set(raw_extra_json,'$.external_source.corp_id','fake-corp') WHERE logical_request_id=1")
-    monkeypatch.setattr(erp_export, 'fetch_operating_workflow_sources', lambda identities, scopes: {
-        'instances': [{'corp_id': 'fake-corp', 'process_instance_id': 'fake-process-1', 'process_code': 'fake-template',
+        conn.execute("UPDATE payment_requests SET source_sheet=?,raw_extra_json=json_set(raw_extra_json,'$.external_source.corp_id','fake-corp','$.external_source.legal_company_name',?) WHERE logical_request_id=1", (label, company))
+        if change == 'manual_applicant':
+            conn.execute("UPDATE payment_requests SET applicant='人工确认姓名' WHERE logical_request_id=1")
+    source = {'instances': [{'corp_id': 'fake-corp', 'process_instance_id': 'fake-process-1', 'process_code': 'fake-template',
             'effective_date': '2026-01-01', 'execution_region': '中国', 'status': 'COMPLETED', 'result': 'agree',
-            'operation_records': [], 'tasks': [], 'updated_at': '2026-01-12T00:00:00Z'}], 'user_names': {}})
+            'source_amount': '100', 'source_currency': 'CNY', 'source_company_raw': company, 'application_type_raw': '付款',
+            'originator_user_id': 'fake-user', 'task_evidence_complete': True,
+            'operation_records': [], 'tasks': [], 'updated_at': '2026-01-12T00:00:00Z'}], 'user_names': {'fake-user': '测试申请人'}}
+    changes = {'amount': ('source_amount', '101'), 'currency': ('source_currency', 'USD'),
+        'company': ('source_company_raw', '广州凌翔电子产品有限公司'), 'applicant_id': ('originator_user_id', 'another-user'),
+        'type': ('application_type_raw', '报销')}
+    if change in changes:
+        field, value = changes[change]
+        source['instances'][0][field] = value
+    elif change == 'applicant_name':
+        source['user_names']['fake-user'] = '另一申请人'
+    elif change == 'payment_comment':
+        source['instances'][0]['operation_records'] = [{'activityId': 'finance', 'showName': '财务审批',
+            'type': 'EXECUTE_TASK_NORMAL', 'userId': 'finance-user', 'result': 'AGREE',
+            'date': '2026-01-11T00:00:00Z', 'remark': '已支付100元'}]
+    monkeypatch.setattr(erp_export, 'fetch_operating_workflow_sources', lambda identities, scopes: source)
     identity = {'source_id': '1', 'corp_id': 'fake-corp', 'process_instance_id': 'fake-process-1'}
     response = client.post(PREFIX + '/takeover-preview', headers=HEADERS, json=identity)
+    if change not in {None, 'manual_applicant'}:
+        assert response.status_code == 409
+        return
     assert response.status_code == 200, response.text
     item = response.json()['items'][0]
     assert response.json()['schema_version'] == 2
     assert item['source_id'] == 'oa:' + erp_export.digest(['fake-corp', 'fake-process-1'])
     assert item['source_request_id'] == '1' and item['paid_amount'] == '20' and item['pending_amount'] == '80'
     assert [payment['amount'] for payment in item['payments']] == ['20']
+    if change == 'manual_applicant':
+        assert item['applicant'] == '人工确认姓名'
     response = client.post(PREFIX + '/takeover-claim', headers=HEADERS, json={**identity,
         'expected_version': item['version'], 'expected_eligibility_fingerprint': item['payment_eligibility']['evidence_fingerprint'],
         'request_id': 'fake-v2-real-history'})

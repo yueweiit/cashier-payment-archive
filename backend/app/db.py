@@ -571,7 +571,7 @@ def erp_ownership_predicate(alias: str) -> str:
                AND ownership.process_instance_id=COALESCE(
                    json_extract({raw}, '$.external_source.process_instance_id'),
                    json_extract({raw}, '$.external_source.workflow_process_instance_id')))
-           OR (ownership.approval_no IS NOT NULL AND ownership.approval_no=TRIM({alias}.dingding_id)
+           OR (NULLIF(TRIM(ownership.approval_no),'') IS NOT NULL AND TRIM(ownership.approval_no)=TRIM({alias}.dingding_id)
                AND (json_extract({raw}, '$.external_source.corp_id') IS NULL
                     OR ownership.corp_id=json_extract({raw}, '$.external_source.corp_id'))))"""
 
