@@ -660,10 +660,19 @@ def operating_takeover_item(conn, sheets, source_id, *, zero_history_confirmed=F
     amount = money(item['amount'])
     if amount is None or Decimal(amount) <= 0 or item['currency'] not in {'CNY', 'USD', 'MXN'}:
         raise HTTPException(409, 'Operating expense amount or currency is unverified')
+    if item['original_source_amount'] is not None:
+        original_amount = money(item['original_source_amount'])
+        if original_amount is None or Decimal(item['original_source_amount']) != Decimal(amount):
+            raise HTTPException(409, 'Operating expense original amount is malformed or differs from archived amount')
     if len({row.get('currency') for row in rows}) != 1:
         raise HTTPException(409, 'Operating expense history has conflicting currencies')
     payments = indexed(relations['payment_records'], 'request_id')
     for row in rows:
+        for payment in payments[row['id']]:
+            try:
+                date.fromisoformat(str(payment.get('payment_date') or '').strip())
+            except ValueError as exc:
+                raise HTTPException(409, 'Operating expense historical payment date is missing or invalid') from exc
         amounts = [money(payment['amount']) for payment in payments[row['id']]]
         if any(value is None or Decimal(value) <= 0 for value in amounts):
             raise HTTPException(409, 'Operating expense payment evidence is incomplete')

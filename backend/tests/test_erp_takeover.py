@@ -536,6 +536,64 @@ def test_takeover_requires_complete_exact_identity_and_original_money(takeover_c
     assert preview(client).status_code == 409
 
 
+@pytest.mark.parametrize('original_amount,allowed', [
+    ('200', False), ('NaN', False), ('Infinity', False), ('-Infinity', False),
+    ('not-an-amount', False), ('100', True), ('100.00', True), (None, True),
+])
+def test_takeover_requires_finite_matching_original_amount_when_present(takeover_client, original_amount, allowed):
+    client, path = takeover_client
+    prior = preview_item(client)
+    with sqlite3.connect(path) as conn:
+        if original_amount is None:
+            conn.execute("UPDATE payment_requests SET raw_extra_json=json_remove(raw_extra_json,'$.external_source.source_amount') WHERE id=2")
+        else:
+            conn.execute("UPDATE payment_requests SET raw_extra_json=json_set(raw_extra_json,'$.external_source.original_source_amount_raw',?) WHERE id=2", (original_amount,))
+    before = path.read_bytes()
+    exported = client.get(PREFIX, headers=HEADERS, params={'source_id': '1'})
+    assert exported.status_code == 200, exported.text
+    assert exported.json()['items'][0]['original_source_amount'] == original_amount
+    response = preview(client)
+    assert path.read_bytes() == before
+    assert response.status_code == (200 if allowed else 409), response.text
+    if allowed:
+        assert claim(client, response.json()['items'][0]).status_code == 200
+    else:
+        rejected = claim(client, prior)
+        assert rejected.status_code == 409, rejected.text
+        assert 'original' in rejected.json()['detail'].lower()
+        with sqlite3.connect(path) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM erp_operating_expense_ownership').fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM audit_logs WHERE action='erp.operating_expense.takeover_claim'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('payment_date,allowed', [
+    (None, False), ('', False), ('   ', False), ('not-a-date', False),
+    ('2026-02-30', False), ('2026/01/10', False), ('2026-01-10T08:00:00', False),
+    ('2026-01-10', True),
+])
+def test_takeover_requires_valid_dates_even_when_all_payment_copies_agree(takeover_client, payment_date, allowed):
+    client, path = takeover_client
+    prior = preview_item(client)
+    with sqlite3.connect(path) as conn:
+        conn.execute('UPDATE payment_records SET payment_date=?', (payment_date,))
+    before = path.read_bytes()
+    exported = client.get(PREFIX, headers=HEADERS, params={'source_id': '1'})
+    assert exported.status_code == 200, exported.text
+    assert exported.json()['items'][0]['payments'][0]['payment_date'] == payment_date
+    response = preview(client)
+    assert path.read_bytes() == before
+    assert response.status_code == (200 if allowed else 409), response.text
+    if allowed:
+        assert claim(client, response.json()['items'][0]).status_code == 200
+    else:
+        rejected = claim(client, prior)
+        assert rejected.status_code == 409, rejected.text
+        assert 'date' in rejected.json()['detail'].lower()
+        with sqlite3.connect(path) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM erp_operating_expense_ownership').fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM audit_logs WHERE action='erp.operating_expense.takeover_claim'").fetchone()[0] == 0
+
+
 def test_workflow_preserves_pending_current_event_without_approved_fabrication(takeover_client):
     client, path = takeover_client
     with sqlite3.connect(path) as conn:
