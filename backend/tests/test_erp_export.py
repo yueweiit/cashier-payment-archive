@@ -131,6 +131,59 @@ def test_preserved_fields_are_exported(export_client):
     assert item['source_company'] == '真实法人'
 
 
+def test_operating_display_projection_keeps_organization_separate_from_legal_company(export_client):
+    client, path = export_client
+    with sqlite3.connect(path) as conn:
+        for field in ('payment_account', 'project', 'general_manager_approval', 'remark'):
+            conn.execute(f'ALTER TABLE payment_requests ADD COLUMN {field} TEXT')
+        for rid in (1, 2):
+            raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=?', (rid,)).fetchone()[0])
+            raw['external_source']['source_company_raw'] = '真实法人'
+            conn.execute('UPDATE payment_requests SET raw_extra_json=? WHERE id=?', (json.dumps(raw), rid))
+        conn.execute('''UPDATE payment_requests SET payment_account='公户',project='项目 A',
+            needed_payment_date='2026-01-20',general_manager_approval='同意付款',remark='人工备注' WHERE id=2''')
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    item = get(client).json()['items'][1]
+    assert item['source_company'] == '真实法人'  # Legacy legal-company API remains compatible.
+    assert item['source_organization'] == '运营'
+    assert {key: item[key] for key in ('account_nature', 'project', 'needed_payment_date',
+                                     'general_manager_approval', 'remark')} == {
+        'account_nature': '公户', 'project': '项目 A', 'needed_payment_date': '2026-01-20',
+        'general_manager_approval': '同意付款', 'remark': '人工备注'}
+    assert item['projection_conflicts'] == []
+    assert item['projection_sources']['source_organization'] == 'cashier.source_sheet'
+    assert item['projection_sources']['general_manager_approval'] == 'cashier.general_manager_approval'
+    assert item['approvals']['eligibility'] == 'eligible'
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize('account,expected_conflicts', [(None, []), ('周汉军民生银行', ['account_nature'])])
+def test_display_projection_never_guesses_account_nature(export_client, account, expected_conflicts):
+    client, path = export_client
+    with sqlite3.connect(path) as conn:
+        conn.execute('ALTER TABLE payment_requests ADD COLUMN payment_account TEXT')
+        conn.execute('UPDATE payment_requests SET payment_account=? WHERE id=2', (account,))
+    item = get(client).json()['items'][1]
+    assert item['account_nature'] is None
+    assert item['projection_conflicts'] == expected_conflicts
+
+
+def test_display_projection_new_fields_participate_in_source_version_without_authorizing_payment(export_client):
+    client, path = export_client
+    with sqlite3.connect(path) as conn:
+        conn.execute('ALTER TABLE payment_requests ADD COLUMN general_manager_approval TEXT')
+        raw = json.loads(conn.execute('SELECT raw_extra_json FROM payment_requests WHERE id=2').fetchone()[0])
+        raw['external_source'].update(approval_status='RUNNING', approval_result='agree')
+        conn.execute("UPDATE payment_requests SET raw_extra_json=? WHERE id=2", (json.dumps(raw),))
+    before = get(client).json()['items'][1]
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE payment_requests SET general_manager_approval='同意付款' WHERE id=2")
+    item = get(client).json()['items'][1]
+    assert item['general_manager_approval'] == '同意付款'
+    assert item['version'] != before['version']
+    assert item['approvals']['eligibility'] == before['approvals']['eligibility'] == 'blocked'
+
+
 def test_local_attachment_scope_and_version(export_client, tmp_path, monkeypatch):
     from backend.app import file_storage
     client, path = export_client

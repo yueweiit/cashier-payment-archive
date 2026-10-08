@@ -48,6 +48,9 @@ OPERATING_COMPANY_BRIDGES = {
     '星铭HR人力资源中心': '东莞市星铭贸易有限公司',
     '星铭FC财务中心': '东莞市星铭贸易有限公司',
 }
+_DISPLAY_FIELDS = (('source_organization', 'source_sheet'), ('account_nature', 'payment_account'),
+                   ('needed_payment_date', 'needed_payment_date'), ('project', 'project'),
+                   ('general_manager_approval', 'general_manager_approval'), ('remark', 'remark'))
 
 
 class ApplicantIdentity(BaseModel):
@@ -423,6 +426,35 @@ def enrich_operating_identities(items, sheets, *, source_data=None):
             item['approval_identity_provenance'].update(corp_id=evidence['method'], process_instance_id=evidence['method'])
 
 
+def display_projection(selected):
+    """Publish explicit selected-copy fields without changing legal-company facts.
+
+    The old source_company API remains the legal entity used by legacy takeover
+    callers. Organization is a separate display field, never a company mapping.
+    Names of banks, payers or invoice choices do not establish account nature.
+    """
+    values, sources, conflicts = {}, {}, []
+    for field, source_field in _DISPLAY_FIELDS:
+        raw = selected.get(source_field)
+        value = raw.strip() if isinstance(raw, str) else None
+        invalid = raw is not None and not isinstance(raw, str)
+        if field == 'source_organization' and value in {'未归属公司', '未归属部门'}:
+            value = None
+        elif field == 'account_nature' and value and value not in {'公户', '私户'}:
+            invalid = True
+        elif field == 'needed_payment_date' and value:
+            try:
+                value = date.fromisoformat(value).isoformat()
+            except ValueError:
+                invalid = True
+        values[field] = None if invalid else value or None
+        if invalid:
+            conflicts.append(field)
+        if value or invalid:
+            sources[field] = 'cashier.' + source_field
+    return {**values, 'projection_sources': sources, 'projection_conflicts': conflicts}
+
+
 def collect(conn, sheets, source_id=None, source_type='operation'):
     source_reader = {'operation': operation_source, 'purchase': purchase_source}[source_type]
     if source_id is not None:
@@ -576,6 +608,7 @@ def collect(conn, sheets, source_id=None, source_type='operation'):
                 'approvals':{'raw':approval_raw,'eligibility':'eligible' if eligible else 'blocked'},
                 'source_status':selected.get('payment_status'),'payments':exported_payments,'attachments':list(attached.values()),
                 'updated_at':max(times)}
+        item.update(display_projection(selected))
         if source_type == 'purchase':
             item.update(source_type='purchase', application_type='purchase',
                         execution_region='china', execution_region_raw=external.get('execution_region'))

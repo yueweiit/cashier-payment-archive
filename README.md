@@ -76,6 +76,8 @@ npm run dev
 - `PAYMENT_ERP_OPERATING_OA_SCOPE` 是一个对象或对象数组，每项必须明确 `corp_id`、`process_code` 或 `process_codes`、`execution_region="中国"`、`year=2026`。可选 `source_sheet` 只能使用已授权、精确法人桥接的组织标签，不能凭审批模板猜测公司。
 - GET `/api/integrations/erp/operating-expenses/workflow` 支持精确 `corp_id` + `process_instance_id`；POST 同一地址接受 `{"identities":[{"corp_id":"...","process_instance_id":"...","source_id":"..."}]}`，最多 500 项。响应为 schema 2，`source_id` 为规范 OA 哈希，旧编号只能作为已核实的同身份别名；旧的只传编号 GET 保持 schema 1。
 - 批量旧编号别名使用一个只读快照，候选历史副本总数上限 500；超限时应缩小批次，不截断历史来判定资格。节点名称和真实全部待办人、已结束任务结果分别保留，不以“财务”名称判断是否出纳执行。
+- 列表展示投影增加 `source_organization`、`account_nature`、`needed_payment_date`、`project`、`general_manager_approval`、`remark`，读取最新有效出纳副本的明确字段，并返回 `projection_sources` / `projection_conflicts`。缺失为 `null`，无效值列入冲突，不根据银行名称或发票值猜公私户。`general_manager_approval` 只是来源展示标记，不参与付款授权。
+- 兼容旧接管调用：此来源 API 的 `source_company` 仍指法律公司，`source_organization` 单独指归属组织；ERP 适配后列表的 `source_company` 才指“应付款公司”。法律公司映射、原始审批证据及接管核对口径不变。组织与原单展示字段冲突时须核对，不能自动覆盖人工确认。
 - `resolve-applicant-companies` 的每个人可附带 `corp_id`，返回 schema 2 并回显该企业。只有进程环境中显式配置 `PAYMENT_ERP_OPERATING_EMPLOYEE_MAPPING_CORP_ID`，且与该企业精确相同，现有全局员工映射才能作为公司依据；严格调用只匹配员工 ID，不回退姓名。无企业的 schema 1 兼容调用不得用于 OA 多企业公司授权。
 - 付款资格使用规范任务、操作和来源状态证据：拒绝、撤回、矛盾、缺失任务证据或未知任务状态一律拦截。完整通过的审批也不能绕过任务证据检查。
 - RUNNING 提前登记还必须有经过独立核实的 `PAYMENT_ERP_OPERATING_PAYMENT_POLICY`（对象或数组），每项精确绑定 `corp_id`、`process_code`、来源 `template_version`、`policy_version`、`required_approval_activity_ids` 和 `cashier_activity_ids`；所有必要审批人的规范任务必须通过，最新有可靠时间的操作也必须同意，且仅有已知出纳节点待办。不能根据节点名、历史模板目录或调用者输入生成授权规则；未取得必经路线与版本证据时不配置生产 RUNNING 策略。
