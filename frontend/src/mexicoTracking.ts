@@ -29,6 +29,7 @@ export function mexicoSourceLabel(source: string | null | undefined, language: L
     operation: ["运营支出", "Gasto operativo"],
     purchase: ["采购支出", "Gasto de compra"],
     monthly: ["月结付款", "Pago mensual"],
+    logistics: ["物流费用支出", "Gastos logísticos"],
   };
   const value = labels[String(source || "")];
   if (!value) return source || "—";

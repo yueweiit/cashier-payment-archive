@@ -347,7 +347,7 @@ export type ExternalSourceSnapshot = {
   base_currency_amount?: number;
 };
 
-export type ExternalExpenseSourceType = "operation" | "purchase" | "monthly";
+export type ExternalExpenseSourceType = "operation" | "purchase" | "monthly" | "logistics";
 export type ExternalExpenseResultFilter = "matched" | "importable" | "duplicates" | "warnings" | "invalid";
 
 export type ExternalExpensePreviewRow = {

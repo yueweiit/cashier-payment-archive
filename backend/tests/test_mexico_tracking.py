@@ -782,6 +782,7 @@ def test_discovery_incremental_passes_each_cursor_and_rechecks_running() -> None
         ("operation", cursors["operation"], ("202608010001", "202608010002")),
         ("purchase", cursors["purchase"], ("202608010001", "202608010002")),
         ("monthly", cursors["monthly"], ("202608010001", "202608010002")),
+        ("logistics", None, ("202608010001", "202608010002")),
     ]
 
 

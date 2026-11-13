@@ -28,9 +28,14 @@ from .fx_rates import FxRateError, fetch_rates, multiply_money, normalize_curren
 from .mexico_tracking import resolve_region
 
 
-ALLOWED_SOURCE_TYPES = ("operation", "purchase", "monthly")
+ALLOWED_SOURCE_TYPES = ("operation", "purchase", "monthly", "logistics")
 STANDARD_SOURCE_TYPES = ("operation", "purchase")
 MONTHLY_PAYMENT_PROCESS_CODE = "PROC-EE85EDD4-5CF2-4C08-B948-1690A6ACC51C"
+LOGISTICS_PAYMENT_PROCESS_CODE = "PROC-8B1B8902-DC25-45AA-B976-2C920F639E77"
+PROCESS_SOURCE_CODES = {
+    "monthly": MONTHLY_PAYMENT_PROCESS_CODE,
+    "logistics": LOGISTICS_PAYMENT_PROCESS_CODE,
+}
 ALLOWED_APPROVAL_STATUSES = ("COMPLETED", "RUNNING")
 ALLOWED_EXECUTION_REGION_PATTERN = r"(中国|china|墨西哥|m[eé]xico)"
 CHINA_WORKBENCH_EXECUTION_REGION_PATTERN = r"(中国|china)"
@@ -73,11 +78,12 @@ SERVICE_SUBJECT_COMPONENT_PREFIXES = (
 )
 DISALLOWED_APPROVAL_RESULT_PATTERN = r"(refus|reject|cancel|terminat|revok|void|abort|作废|拒绝|撤销|撤回|取消|终止)"
 DISALLOWED_APPROVAL_RESULT_RE = re.compile(DISALLOWED_APPROVAL_RESULT_PATTERN, re.IGNORECASE)
-SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出", "monthly": "月结付款"}
+SOURCE_LABELS = {"operation": "运营支出", "purchase": "采购支出", "monthly": "月结付款", "logistics": "物流费用支出"}
 SOURCE_TABLES = {
     "operation": "approval_expense_operation",
     "purchase": "approval_expense_purchase",
     "monthly": "ding_approval_instance",
+    "logistics": "ding_approval_instance",
 }
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 FINANCE_STAGE_RE = re.compile(r"(财务|出纳|会计|付款|financ|cajer|tesorer|contab)", re.IGNORECASE)
@@ -366,8 +372,8 @@ class PostgresDiscoveryGateway:
         if source_type not in ALLOWED_SOURCE_TYPES:
             raise ExternalExpenseError("不支持的支出来源")
         running = list(running_approval_nos)
-        if source_type == "monthly":
-            return self._fetch_monthly_changes(cursor, running)
+        if source_type in PROCESS_SOURCE_CODES:
+            return self._fetch_process_changes(source_type, cursor, running)
         conditions = ["source_type = %s"]
         params: list[Any] = [source_type]
         if cursor:
@@ -393,13 +399,14 @@ class PostgresDiscoveryGateway:
         with source_connection() as conn:
             return conn.execute(query, params).fetchall()
 
-    def _fetch_monthly_changes(
+    def _fetch_process_changes(
         self,
+        source_type: str,
         cursor: Optional[Dict[str, str]],
         running_approval_nos: list[str],
     ) -> list[Dict[str, Any]]:
         conditions = ["deleted_at IS NULL", "process_code = %s"]
-        params: list[Any] = [MONTHLY_PAYMENT_PROCESS_CODE]
+        params: list[Any] = [PROCESS_SOURCE_CODES[source_type]]
         if cursor:
             updated_at = str(cursor.get("updated_at") or "").strip()
             source_id = str(cursor.get("source_id") or "").strip()
@@ -438,14 +445,14 @@ class PostgresDiscoveryGateway:
 
 
 def _discovery_cursor_value(source_type: str, row: Dict[str, Any]) -> tuple[str, str]:
-    updated = row.get("updated_at") if source_type == "monthly" else row.get("source_updated_at")
+    updated = row.get("updated_at") if source_type in PROCESS_SOURCE_CODES else row.get("source_updated_at")
     if updated is None:
-        updated = row.get("create_time") if source_type == "monthly" else row.get("source_created_at")
+        updated = row.get("create_time") if source_type in PROCESS_SOURCE_CODES else row.get("source_created_at")
     return _datetime_text(updated) or "", str(row.get("source_id") or "").strip()
 
 
 def _candidate_process_instance(source_type: str, row: Dict[str, Any]) -> Optional[str]:
-    if source_type == "monthly":
+    if source_type in PROCESS_SOURCE_CODES:
         return _text(row.get("process_instance_id"))
     raw_data = _json_object(row.get("raw_data"))
     return _first_text(
@@ -456,8 +463,8 @@ def _candidate_process_instance(source_type: str, row: Dict[str, Any]) -> Option
 
 
 def _candidate_process_code(source_type: str, row: Dict[str, Any]) -> Optional[str]:
-    if source_type == "monthly":
-        return _text(row.get("process_code")) or MONTHLY_PAYMENT_PROCESS_CODE
+    if source_type in PROCESS_SOURCE_CODES:
+        return _text(row.get("process_code")) or PROCESS_SOURCE_CODES[source_type]
     raw_data = _json_object(row.get("raw_data"))
     return _first_text(raw_data.get("processCode"), raw_data.get("process_code"))
 
@@ -468,8 +475,8 @@ def _map_discovery_candidate(
     user_names: Dict[str, str],
 ) -> Dict[str, Any]:
     mapped = (
-        map_monthly_payment(row, user_names)
-        if source_type == "monthly"
+        map_process_expense(row, user_names, source_type=source_type)
+        if source_type in PROCESS_SOURCE_CODES
         else map_external_expense(row, user_names)
     )
     external_source = (
@@ -554,7 +561,7 @@ def discover_expense_workflows(
     *,
     gateway: Optional[Any] = None,
 ) -> DiscoveryResult:
-    """Discover all three DingTalk sources independently of imported requests.
+    """Discover the supported DingTalk sources independently of imported requests.
 
     The first call intentionally has no historical date cutoff.  Later calls
     read changes after each source cursor while also re-reading every cached
@@ -604,7 +611,7 @@ def discover_expense_workflows(
     )
     applicant_ids: list[Any] = []
     for source_type, row in source_rows:
-        if source_type == "monthly":
+        if source_type in PROCESS_SOURCE_CODES:
             applicant_ids.append(_json_object(row.get("raw_payload")).get("originatorUserId"))
         else:
             applicant_ids.append(row.get("creator_name"))
@@ -634,8 +641,9 @@ def discover_expense_workflows(
     )
 
 
-def _monthly_payment_query(
+def _process_instance_query(
     *,
+    source_type: str = "monthly",
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
     approval_no: str = "",
@@ -644,7 +652,7 @@ def _monthly_payment_query(
     include_inactive: bool = False,
 ) -> list[Dict[str, Any]]:
     conditions = ["deleted_at IS NULL", "process_code = %s"]
-    params: list[Any] = [MONTHLY_PAYMENT_PROCESS_CODE]
+    params: list[Any] = [PROCESS_SOURCE_CODES[source_type]]
     normalized_approval_no = approval_no.strip()
     normalized_source_ids = sorted({str(value).strip() for value in source_ids or [] if str(value).strip()})
     if normalized_source_ids:
@@ -711,16 +719,6 @@ def _display_component_value(value: Any) -> Optional[str]:
     return _text(decoded)
 
 
-def _monthly_component(form_values: Iterable[Dict[str, Any]], *prefixes: str) -> Optional[str]:
-    for item in form_values:
-        name = _text(item.get("name")) or ""
-        if any(name.startswith(prefix) for prefix in prefixes):
-            value = _display_component_value(item.get("value"))
-            if value:
-                return value
-    return None
-
-
 def _form_component_value(form_values: Iterable[Dict[str, Any]], *prefixes: str, require_unique=False) -> Optional[str]:
     normalized_prefixes = tuple(prefix.casefold() for prefix in prefixes)
     matches = []
@@ -739,7 +737,7 @@ def _form_component_value(form_values: Iterable[Dict[str, Any]], *prefixes: str,
     return matches[0] if len(matches) == 1 else None
 
 
-def _monthly_payment_allowed_in_china_workbench(instance: Dict[str, Any]) -> bool:
+def _process_allowed_in_china_workbench(instance: Dict[str, Any]) -> bool:
     raw_payload = _json_object(instance.get("raw_payload"))
     execution_region = _form_component_value(
         _form_values(raw_payload),
@@ -823,7 +821,7 @@ def resolve_approval_currency(currency_value: Any, execution_region: Any) -> tup
     return inferred, "execution_region" if inferred else None
 
 
-def _monthly_money(value: Any) -> Optional[float]:
+def _component_money(value: Any) -> Optional[float]:
     text = _display_component_value(value)
     if not text:
         return None
@@ -831,10 +829,11 @@ def _monthly_money(value: Any) -> Optional[float]:
     return _number(match.group(0).replace(",", "")) if match else None
 
 
-def _monthly_payment_details(form_values: Iterable[Dict[str, Any]]) -> list[Dict[str, Any]]:
+def _process_payment_details(form_values: Iterable[Dict[str, Any]], source_type: str) -> list[Dict[str, Any]]:
+    table_prefix = "物流费用明细" if source_type == "logistics" else "申请付款明细"
     table_value: Any = None
     for item in form_values:
-        if (_text(item.get("name")) or "").startswith("申请付款明细"):
+        if (_text(item.get("name")) or "").startswith(table_prefix):
             table_value = _decoded_component_value(item.get("value"))
             break
     if not isinstance(table_value, list):
@@ -858,13 +857,17 @@ def _monthly_payment_details(form_values: Iterable[Dict[str, Any]]) -> list[Dict
             None,
         )
         amount = next(
-            (_monthly_money(value) for label, value in fields.items() if "金额" in label and _monthly_money(value) is not None),
+            (_component_money(value) for label, value in fields.items() if (label.startswith("本次申请付款金额") if source_type == "logistics" else "金额" in label) and _component_money(value) is not None),
             None,
         )
         description = next(
             (_display_component_value(value) for label, value in fields.items() if any(word in label for word in ("说明", "事由", "摘要", "备注")) and _display_component_value(value)),
             None,
         )
+        if source_type == "logistics":
+            waybill = next((_display_component_value(value) for label, value in fields.items() if label.startswith("对应物流单号")), None)
+            category = next((_display_component_value(value) for label, value in fields.items() if label.startswith("费用项目")), None)
+            description = " / ".join(part for part in (category, waybill, description) if part)
         details.append({
             "row_no": index,
             "payment_date": payment_date,
@@ -917,7 +920,7 @@ def _attachment_objects(value: Any) -> list[Dict[str, Any]]:
     return found
 
 
-def _monthly_attachments(instance: Dict[str, Any]) -> list[Dict[str, Any]]:
+def _process_attachments(instance: Dict[str, Any], *, source_type: str = "monthly") -> list[Dict[str, Any]]:
     raw_payload = _json_object(instance.get("raw_payload"))
     approval_no = _text(raw_payload.get("businessId")) or ""
     process_instance_id = _text(instance.get("process_instance_id")) or ""
@@ -930,19 +933,19 @@ def _monthly_attachments(instance: Dict[str, Any]) -> list[Dict[str, Any]]:
         file_id = _text(attachment.get("fileId")) or _text(attachment.get("file_id")) or ""
         if not file_id:
             continue
-        stable_id = f"monthly-{process_instance_id or source_id}-{file_id}"
+        stable_id = f"{source_type}-{process_instance_id or source_id}-{file_id}"
         try:
             file_size = int(attachment.get("fileSize")) if attachment.get("fileSize") is not None else None
         except (TypeError, ValueError):
             file_size = None
         unique.setdefault(stable_id, {
-            "source_type": "monthly",
+            "source_type": source_type,
             "source_id": source_id,
             "approval_no": approval_no,
             "attachment_id": stable_id,
             "row_no": None,
             "file_id": file_id,
-            "file_name": _first_text(attachment.get("fileName"), attachment.get("name")) or f"月结附件-{file_id}",
+            "file_name": _first_text(attachment.get("fileName"), attachment.get("name")) or f"{SOURCE_LABELS[source_type]}附件-{file_id}",
             "file_type": (_first_text(attachment.get("fileType"), attachment.get("type")) or "").lower(),
             "file_size": file_size,
             "created_at": _workflow_event_time(instance.get("create_time")),
@@ -951,10 +954,16 @@ def _monthly_attachments(instance: Dict[str, Any]) -> list[Dict[str, Any]]:
 
 
 def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    return map_process_expense(instance, user_names, source_type="monthly")
+
+
+def map_process_expense(instance: Dict[str, Any], user_names: Optional[Dict[str, str]] = None, *, source_type: str) -> Dict[str, Any]:
     raw_payload = _json_object(instance.get("raw_payload"))
     form_values = _form_values(raw_payload)
-    details = _monthly_payment_details(form_values)
-    declared_total = _monthly_money(_monthly_component(form_values, "合计总额", "总计"))
+    details = _process_payment_details(form_values, source_type)
+    label = SOURCE_LABELS[source_type]
+    total_prefixes = ("本次申请付款总额",) if source_type == "logistics" else ("合计总额", "总计")
+    declared_total = _component_money(_form_component_value(form_values, *total_prefixes))
     detail_amounts = [detail["amount"] for detail in details if detail.get("amount") is not None]
     calculated_total = round(sum(detail_amounts), 2) if detail_amounts else None
     total = declared_total if declared_total is not None else calculated_total
@@ -977,7 +986,7 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
             rate_error = str(exc)
     applicant_id = _text(raw_payload.get("originatorUserId")) or ""
     raw_row = {
-        "source_type": "monthly",
+        "source_type": source_type,
         "source_id": _text(instance.get("source_id")) or "",
         "effective_date": application_date,
         "approval_no": _text(raw_payload.get("businessId")) or "",
@@ -987,11 +996,11 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
         "approval_status": instance.get("status"),
         "approval_result": instance.get("result"),
         "execution_region": execution_region,
-        "beneficiary": _monthly_component(form_values, "收款账户信息", "收款信息", "收款账户"),
-        "expense_type": _monthly_component(form_values, "付款分类", "费用性质"),
-        "summary": _monthly_component(form_values, "申请事由", "付款事由") or next((detail.get("description") for detail in details if detail.get("description")), None),
+        "beneficiary": _form_component_value(form_values, "收款账户信息", "收款信息", "收款账户"),
+        "expense_type": label if source_type == "logistics" else _form_component_value(form_values, "付款分类", "费用性质"),
+        "summary": _form_component_value(form_values, "申请事由", "付款事由") or next((detail.get("description") for detail in details if detail.get("description")), None),
         "project": None,
-        "needed_payment_date": min((detail["payment_date"] for detail in details if detail.get("payment_date")), default=None),
+        "needed_payment_date": _date_text(_form_component_value(form_values, "期望付款日期")) or min((detail["payment_date"] for detail in details if detail.get("payment_date")), default=None),
         "source_currency": currency_text,
         "source_amount": total,
         "base_currency_amount": base_amount,
@@ -1002,15 +1011,21 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
     mapped = map_external_expense(raw_row, user_names)
     if rate_error:
         mapped["errors"] = [message for message in mapped["errors"] if message != "缺少应付金额"]
-        mapped["errors"].append(f"找不到月结付款汇率：{rate_error}")
+        mapped["errors"].append(f"找不到{label}汇率：{rate_error}")
         mapped["amount"] = total
         mapped["currency"] = currency
         mapped["request_data"]["amount"] = total
         mapped["request_data"]["currency"] = currency
     if declared_total is not None and calculated_total is not None and abs(declared_total - calculated_total) > 0.01:
-        mapped["warnings"].append("月结合计金额与付款明细合计不一致，请核对")
+        if source_type == "logistics":
+            mapped["errors"].append("物流付款总额与本次付款明细合计不一致，请核对")
+        else:
+            mapped["warnings"].append("月结合计金额与付款明细合计不一致，请核对")
+    if source_type == "logistics" and (not details or any(detail.get("amount") is None or detail["amount"] <= 0 for detail in details)):
+        mapped["errors"].append("物流明细的本次申请付款金额必须完整且大于 0")
+    detail_label = label if source_type == "logistics" else "月结"
     if len(details) > 1:
-        mapped["warnings"].append(f"月结包含 {len(details)} 行付款明细，已按合计金额生成一条请款")
+        mapped["warnings"].append(f"{detail_label}包含 {len(details)} 行付款明细，已按合计金额生成一条请款")
         detail_summaries = [
             str(detail.get("description") or "").strip()
             for detail in details
@@ -1021,19 +1036,19 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
             mapped["summary"] = f"{mapped['summary']}｜{concise_details}"[:500]
             mapped["request_data"]["summary"] = mapped["summary"]
     if currency not in {"CNY", "USD", "MXN"}:
-        mapped["errors"].append("月结付款缺少或无法识别币种")
+        mapped["errors"].append(f"{label}缺少或无法识别币种")
     related = _related_approval_nos(form_values)
     external_source = mapped["request_data"]["raw_extra"]["external_source"]
     external_source.update({
-        "system": "dingtalk_monthly_payment",
-        "process_code": MONTHLY_PAYMENT_PROCESS_CODE,
+        "system": "dingtalk_monthly_payment" if source_type == "monthly" else "dingtalk_logistics_expense",
+        "process_code": PROCESS_SOURCE_CODES[source_type],
         "process_instance_id": _text(instance.get("process_instance_id")),
-        "monthly_payment_details": details,
+        f"{source_type}_payment_details": details,
         "related_approval_nos": related,
         "fx_rate_actual_date": fx_actual_date,
     })
     invoice_account = _invoice_payment_account(_form_component_value(form_values, *INVOICE_COMPONENT_PREFIXES))
-    legacy_account = _monthly_component(form_values, "付款账户类型", "付款账户")
+    legacy_account = _form_component_value(form_values, "付款账户类型", "付款账户")
     payment_account = invoice_account if invoice_account is not None else legacy_account
     mapped["payment_account"] = payment_account
     mapped["request_data"]["payment_account"] = payment_account
@@ -1043,6 +1058,15 @@ def map_monthly_payment(instance: Dict[str, Any], user_names: Optional[Dict[str,
     mapped["related_approval_nos"] = related
     return mapped
 
+
+
+def _instance_source_type(instance: Dict[str, Any]) -> str:
+    code = instance.get("process_code")
+    return next(source for source, process_code in PROCESS_SOURCE_CODES.items() if process_code == code)
+
+
+def _map_process_source(instance: Dict[str, Any], user_names: Dict[str, str], source_type: str) -> Dict[str, Any]:
+    return map_monthly_payment(instance, user_names) if source_type == "monthly" else map_process_expense(instance, user_names, source_type=source_type)
 
 def _preview_conditions(
     date_from: Optional[date],
@@ -1117,41 +1141,28 @@ def preview_external_expenses(
         with source_connection() as conn:
             rows.extend(conn.execute(query, params).fetchall())
             applicant_rows.extend(conn.execute(option_query, option_params).fetchall())
-    monthly_rows: list[Dict[str, Any]] = []
-    monthly_option_rows: list[Dict[str, Any]] = []
-    if "monthly" in normalized_sources:
-        monthly_rows = _monthly_payment_query(
-            date_from=date_from,
-            date_to=date_to,
-            approval_no=approval_no,
-            applicant_ids=applicant_ids,
+    process_rows: list[tuple[str, Dict[str, Any]]] = []
+    for source_type in normalized_sources:
+        if source_type not in PROCESS_SOURCE_CODES:
+            continue
+        instances = _process_instance_query(
+            source_type=source_type, date_from=date_from, date_to=date_to,
+            approval_no=approval_no, applicant_ids=applicant_ids,
         )
-        monthly_option_rows = monthly_rows if not list(applicant_ids or []) else _monthly_payment_query(
-            date_from=date_from,
-            date_to=date_to,
-            approval_no=approval_no,
-            applicant_ids=[],
+        option_instances = instances if not list(applicant_ids or []) else _process_instance_query(
+            source_type=source_type, date_from=date_from, date_to=date_to,
+            approval_no=approval_no, applicant_ids=[],
         )
-        monthly_rows = [
-            row
-            for row in monthly_rows
-            if _monthly_payment_allowed_in_china_workbench(row)
-        ]
-        monthly_option_rows = [
-            row
-            for row in monthly_option_rows
-            if _monthly_payment_allowed_in_china_workbench(row)
-        ]
-        for instance in monthly_option_rows:
+        process_rows.extend((source_type, row) for row in instances if _process_allowed_in_china_workbench(row))
+        for instance in option_instances:
+            if not _process_allowed_in_china_workbench(instance):
+                continue
             raw_payload = _json_object(instance.get("raw_payload"))
             applicant_rows.append({
                 "creator_name": _text(raw_payload.get("originatorUserId")),
                 "applicant_department": _text(raw_payload.get("originatorDeptName")),
                 "approval_title": _first_text(instance.get("title"), raw_payload.get("title")),
-                "execution_region": _form_component_value(
-                    _form_values(raw_payload),
-                    *EXECUTION_REGION_COMPONENT_PREFIXES,
-                ),
+                "execution_region": _form_component_value(_form_values(raw_payload), *EXECUTION_REGION_COMPONENT_PREFIXES),
                 "count": 1,
             })
     applicant_rows = [
@@ -1167,12 +1178,12 @@ def preview_external_expenses(
             *[row.get("creator_name") for row in [*rows, *applicant_rows]],
             *[
                 _text(_json_object(instance.get("raw_payload")).get("originatorUserId"))
-                for instance in monthly_rows
+                for _, instance in process_rows
             ],
         ]
     )
     mapped_rows = [map_external_expense(row, user_names) for row in rows]
-    mapped_rows.extend(map_monthly_payment(instance, user_names) for instance in monthly_rows)
+    mapped_rows.extend(_map_process_source(instance, user_names, source_type) for source_type, instance in process_rows)
     mapped_rows = [
         row
         for row in mapped_rows
@@ -1219,12 +1230,12 @@ def fetch_external_expense_metadata(approval_nos: Iterable[str]) -> list[Dict[st
                 ORDER BY approval_no, source_updated_at DESC NULLS LAST, source_type, source_id
             """
             source_rows.extend(conn.execute(query, [chunk]).fetchall())
-    monthly_rows: list[Dict[str, Any]] = []
+    process_rows: list[Dict[str, Any]] = []
     config = source_database_config()
     with source_connection(config.user_dbname) as conn:
         for start in range(0, len(normalized), 500):
             chunk = normalized[start : start + 500]
-            monthly_rows.extend(
+            process_rows.extend(
                 conn.execute(
                     """
                     SELECT id::text AS source_id, process_instance_id, process_code,
@@ -1232,29 +1243,29 @@ def fetch_external_expense_metadata(approval_nos: Iterable[str]) -> list[Dict[st
                            raw_payload
                     FROM public.ding_approval_instance
                     WHERE deleted_at IS NULL
-                      AND process_code = %s
+                      AND process_code = ANY(%s)
                       AND BTRIM(raw_payload->>'businessId') = ANY(%s)
                     ORDER BY BTRIM(raw_payload->>'businessId'), updated_at DESC NULLS LAST, id DESC
                     """,
-                    [MONTHLY_PAYMENT_PROCESS_CODE, chunk],
+                    [list(PROCESS_SOURCE_CODES.values()), chunk],
                 ).fetchall()
             )
-    monthly_user_ids = [
+    process_user_ids = [
         _text(_json_object(row.get("raw_payload")).get("originatorUserId"))
-        for row in monthly_rows
+        for row in process_rows
     ]
     user_names = fetch_dingtalk_user_names([
         *[row.get("creator_name") for row in source_rows],
-        *monthly_user_ids,
+        *process_user_ids,
     ])
     metadata: list[Dict[str, Any]] = []
     for source_row in source_rows:
         metadata.append(
             _external_expense_metadata(map_external_expense(source_row, user_names))
         )
-    for monthly_row in monthly_rows:
+    for process_row in process_rows:
         metadata.append(
-            _external_expense_metadata(map_monthly_payment(monthly_row, user_names))
+            _external_expense_metadata(_map_process_source(process_row, user_names, _instance_source_type(process_row)))
         )
     return metadata
 
@@ -1340,25 +1351,25 @@ def fetch_external_expense_attachments(approval_nos: Iterable[str]) -> list[Dict
             }
         )
     config = source_database_config()
-    monthly_rows: list[Dict[str, Any]] = []
+    process_rows: list[Dict[str, Any]] = []
     with source_connection(config.user_dbname) as conn:
         for start in range(0, len(normalized), 500):
             chunk = normalized[start : start + 500]
-            monthly_rows.extend(
+            process_rows.extend(
                 conn.execute(
                     """
-                    SELECT id::text AS source_id, process_instance_id, create_time, raw_payload
+                    SELECT id::text AS source_id, process_instance_id, process_code, create_time, raw_payload
                     FROM public.ding_approval_instance
                     WHERE deleted_at IS NULL
-                      AND process_code = %s
+                      AND process_code = ANY(%s)
                       AND BTRIM(raw_payload->>'businessId') = ANY(%s)
                     ORDER BY BTRIM(raw_payload->>'businessId'), updated_at DESC NULLS LAST, id DESC
                     """,
-                    [MONTHLY_PAYMENT_PROCESS_CODE, chunk],
+                    [list(PROCESS_SOURCE_CODES.values()), chunk],
                 ).fetchall()
             )
-    for monthly_row in monthly_rows:
-        attachments.extend(_monthly_attachments(monthly_row))
+    for process_row in process_rows:
+        attachments.extend(_process_attachments(process_row, source_type=_instance_source_type(process_row)))
     return attachments
 
 
@@ -2179,8 +2190,8 @@ def fetch_external_expenses(items: Iterable[Dict[str, str]]) -> list[Dict[str, A
     keys = {(str(item.get("source_type") or ""), str(item.get("source_id") or "")) for item in items}
     operation_ids = sorted(source_id for source_type, source_id in keys if source_type == "operation" and source_id.isdigit())
     purchase_ids = sorted(source_id for source_type, source_id in keys if source_type == "purchase" and source_id.isdigit())
-    monthly_ids = sorted(source_id for source_type, source_id in keys if source_type == "monthly" and source_id.isdigit())
-    if not operation_ids and not purchase_ids and not monthly_ids:
+    process_ids = {source_type: sorted(source_id for kind, source_id in keys if kind == source_type and source_id.isdigit()) for source_type in PROCESS_SOURCE_CODES}
+    if not operation_ids and not purchase_ids and not any(process_ids.values()):
         return []
     key_conditions: list[str] = []
     params: list[Any] = []
@@ -2200,17 +2211,17 @@ def fetch_external_expenses(items: Iterable[Dict[str, str]]) -> list[Dict[str, A
         """
         with source_connection() as conn:
             source_rows = conn.execute(query, params).fetchall()
-    monthly_rows = _monthly_payment_query(source_ids=monthly_ids) if monthly_ids else []
-    monthly_user_ids = [
+    process_rows = [(source_type, row) for source_type, ids in process_ids.items() if ids for row in _process_instance_query(source_type=source_type, source_ids=ids)]
+    process_user_ids = [
         _text(_json_object(row.get("raw_payload")).get("originatorUserId"))
-        for row in monthly_rows
+        for _, row in process_rows
     ]
     user_names = fetch_dingtalk_user_names([
         *[row.get("creator_name") for row in source_rows],
-        *monthly_user_ids,
+        *process_user_ids,
     ])
     rows = [map_external_expense(row, user_names) for row in source_rows]
-    rows.extend(map_monthly_payment(row, user_names) for row in monthly_rows)
+    rows.extend(_map_process_source(row, user_names, source_type) for source_type, row in process_rows)
     approval_nos = sorted({str(row.get("approval_no") or "").strip() for row in rows if str(row.get("approval_no") or "").strip()})
     conflicts: set[str] = set()
     if approval_nos:

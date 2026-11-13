@@ -42,7 +42,7 @@ from backend.app.external_expenses import (
     mark_china_workbench_external_expense,
     map_monthly_payment,
     map_external_expense,
-    _monthly_attachments,
+    _process_attachments,
     valid_applicant_name,
 )
 from backend.app.excel_io import export_workbook
@@ -1888,6 +1888,7 @@ def external_expense_test_row(
         "operation": "运营支出",
         "purchase": "采购支出",
         "monthly": "月结付款",
+        "logistics": "物流费用支出",
     }[source_type]
     request_data = {
         "dingding_id": approval_no,
@@ -3720,7 +3721,7 @@ def test_monthly_payment_mapping_aggregates_details_and_extracts_attachments():
     assert mapped["related_approval_nos"] == ["202608091234000000001"]
     assert "月结包含 2 行付款明细" in "；".join(mapped["warnings"])
 
-    attachments = _monthly_attachments(instance)
+    attachments = _process_attachments(instance)
     assert {attachment["file_id"] for attachment in attachments} == {"231753805378", "detail-file"}
     contract = next(attachment for attachment in attachments if attachment["file_id"] == "231753805378")
     assert contract["file_name"] == "20260507电脑租赁合同.pdf"
@@ -3883,7 +3884,7 @@ def test_external_expense_preview_excludes_mexico_monthly_rows_and_applicants(mo
 
     monkeypatch.setattr(
         external_expenses_module,
-        "_monthly_payment_query",
+        "_process_instance_query",
         lambda **kwargs: [china_instance, mexico_instance],
     )
     monkeypatch.setattr(
@@ -3954,9 +3955,10 @@ def test_external_expense_zero_amount_is_not_importable():
     assert "应付金额为 0" not in zero_amount["warnings"]
 
 
-def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch):
-    duplicate_row = external_expense_test_row("EXT-DUPLICATE", "701")
-    new_row = external_expense_test_row("EXT-NEW", "702", status="COMPLETED", warnings=["缺少收款信息"], beneficiary="")
+@pytest.mark.parametrize("source_type", ["operation", "logistics"])
+def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch, source_type):
+    duplicate_row = external_expense_test_row("EXT-DUPLICATE", "701", source_type=source_type)
+    new_row = external_expense_test_row("EXT-NEW", "702", source_type=source_type, status="COMPLETED", warnings=["缺少收款信息"], beneficiary="")
     new_row["payment_account"] = "公户"
     new_row["project"] = "导入项目"
     new_row["request_data"]["payment_account"] = "公户"
@@ -3964,7 +3966,7 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
     new_row["request_data"]["raw_extra"]["external_source"].update({
         "payment_account": "公户", "project": "导入项目",
     })
-    invalid_row = external_expense_test_row("EXT-INVALID", "703")
+    invalid_row = external_expense_test_row("EXT-INVALID", "703", source_type=source_type)
     invalid_row["errors"] = ["金额缺失"]
 
     def fake_preview(**kwargs):
@@ -3974,7 +3976,7 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
         else:
             assert kwargs["date_from"] == date(2026, 7, 1)
             assert kwargs["date_to"] == date(2026, 7, 15)
-        assert kwargs["source_types"] == ["operation", "purchase"]
+        assert kwargs["source_types"] == [source_type, "purchase"]
         assert kwargs["applicant_ids"] == []
         return {
             "rows": [duplicate_row, new_row, invalid_row],
@@ -4003,7 +4005,7 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
             "batch_id": target_id,
             "date_from": "2026-07-01",
             "date_to": "2026-07-15",
-            "source_types": ["operation", "purchase"],
+            "source_types": [source_type, "purchase"],
             "approval_no": "",
             "applicant_ids": [],
             "page": 1,
@@ -4060,7 +4062,7 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
 
         imported = client.post(
             f"/api/batches/{target_id}/imports/external-expenses",
-            json={"items": [{"source_type": "operation", "source_id": "702"}]},
+            json={"items": [{"source_type": source_type, "source_id": "702"}]},
         )
         assert imported.status_code == 200
         assert imported.json()["imported_rows"] == 1
@@ -4083,7 +4085,7 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch)
 
         repeated = client.post(
             f"/api/batches/{target_id}/imports/external-expenses",
-            json={"items": [{"source_type": "operation", "source_id": "702"}]},
+            json={"items": [{"source_type": source_type, "source_id": "702"}]},
         )
         assert repeated.status_code == 200
         assert repeated.json()["imported_rows"] == 0
