@@ -562,6 +562,12 @@ def test_automatic_dingtalk_payment_skips_claimed_roots_but_keeps_approval_cache
     with sqlite3.connect(path) as conn:
         source_metadata = [json.loads(row[0])['external_source'] for row in conn.execute(
             'SELECT raw_extra_json FROM payment_requests WHERE id IN (2,3)')]
+        frozen_details = conn.execute(
+            'SELECT id,payee_name,payee_account,bank_name,invoice_status FROM payment_requests WHERE id IN (1,2) ORDER BY id'
+        ).fetchall()
+    for source in source_metadata:
+        source.update(payee_name='钉钉新姓名', payee_account='0012345678',
+                      bank_name='钉钉新银行', invoice_status='否')
     monkeypatch.setenv('DINGTALK_AUTO_PAYMENT_MODE', 'apply')
     monkeypatch.setattr(main, 'fetch_external_expense_metadata', lambda approval_nos: source_metadata)
     monkeypatch.setattr(main, 'fetch_dingtalk_workflows', lambda approval_nos: [
@@ -574,6 +580,10 @@ def test_automatic_dingtalk_payment_skips_claimed_roots_but_keeps_approval_cache
         'id': 1, 'role': 'admin', 'username': 'fake-admin'}, include_attachments=False)
     assert result['auto_payments'] == 1
     with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            'SELECT id,payee_name,payee_account,bank_name,invoice_status FROM payment_requests WHERE id IN (1,2) ORDER BY id'
+        ).fetchall() == frozen_details
+        assert conn.execute('SELECT bank_name,invoice_status FROM payment_requests WHERE id=3').fetchone() == ('钉钉新银行', '否')
         assert conn.execute('SELECT COUNT(*) FROM payment_records WHERE request_id IN (1,2)').fetchone()[0] == 2
         assert conn.execute('SELECT SUM(amount) FROM payment_records WHERE request_id=3').fetchone()[0] == 100
         assert conn.execute("SELECT classification FROM dingtalk_workflow_events WHERE request_id=2 AND event_key='new-paid-fake-source-1'").fetchone()[0] == 'erp_owned'

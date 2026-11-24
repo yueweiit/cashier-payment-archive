@@ -66,7 +66,10 @@ EXECUTION_REGION_COMPONENT_PREFIXES = (
     "país",
     "pais",
 )
-INVOICE_COMPONENT_PREFIXES = ("是否有发票", "existe factura")
+INVOICE_COMPONENT_PREFIXES = ("是否有发票", "existe factura", "¿existe factura")
+PAYEE_NAME_COMPONENT_PREFIXES = ("收款人", "收款方", "beneficiario")
+PAYEE_ACCOUNT_COMPONENT_PREFIXES = ("收款账户", "cuenta de cobro")
+PAYEE_BANK_COMPONENT_PREFIXES = ("收款银行", "banco receptor")
 PROJECT_COMPONENT_PREFIXES = ("项目归属", "pertenencia del proyecto")
 EXPECTED_PAYMENT_ACCOUNT_COMPONENT_PREFIXES = (
     "预计支付账户",
@@ -2266,17 +2269,46 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
     )
     beneficiary_values: list[str]
     if source_type == "purchase":
-        beneficiary_values = _component_values(form_values, "收款人")
+        beneficiary_values = []
+        for component in form_values:
+            value = _form_component_value([component], *PAYEE_NAME_COMPONENT_PREFIXES)
+            if value and value not in beneficiary_values:
+                beneficiary_values.append(value)
         beneficiary = " / ".join(beneficiary_values)
         detail_values = _component_values(form_values, "规格明细需求说明") or _component_values(form_values, "需求明细")
         summary = detail_values[0] if detail_values else _first_text(row.get("product_name"), row.get("order_name"), row.get("project"), row.get("expense_type"))
         payment_date_values = _component_values(form_values, "付款日期")
         needed_payment_date = _date_text(payment_date_values[0]) if payment_date_values else None
     else:
-        beneficiary = _text(row.get("beneficiary")) or ""
+        beneficiary = (
+            _form_component_value(form_values, *PAYEE_NAME_COMPONENT_PREFIXES)
+            or _text(row.get("beneficiary"))
+            or ""
+        )
         beneficiary_values = [beneficiary] if beneficiary else []
         summary = _text(row.get("summary"))
         needed_payment_date = _date_text(row.get("needed_payment_date"))
+
+    payee_account = beneficiary or None
+    explicit_payee_account = None
+    bank_name = None
+    # A purchase may aggregate several recipients. Without a row relationship,
+    # a single account or bank must not be assigned to the entire group.
+    if source_type != "purchase" or len(beneficiary_values) <= 1:
+        account_components = [
+            component for component in form_values
+            if not (_first_text(component.get("name"), component.get("label")) or "").casefold().startswith(
+                ("收款账户信息", "收款账户cuenta beneficiaria")
+            )
+        ]
+        explicit_payee_account = _form_component_value(account_components, *PAYEE_ACCOUNT_COMPONENT_PREFIXES, require_unique=True)
+        payee_account = (
+            explicit_payee_account
+            or (_text(row.get("beneficiary")) if source_type != "purchase" else None)
+            or beneficiary
+            or None
+        )
+        bank_name = _form_component_value(form_values, *PAYEE_BANK_COMPONENT_PREFIXES, require_unique=True)
 
     approval_no = _text(row.get("approval_no")) or ""
     approval_status = (_text(row.get("approval_status")) or "").upper()
@@ -2389,7 +2421,9 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         "expected_payment_account": expected_account.value,
         "expected_payment_account_source": expected_account.source,
         "payee_name": beneficiary or None,
-        "payee_account": beneficiary or None,
+        "payee_account": payee_account,
+        "bank_name": bank_name,
+        "invoice_status": invoice_value,
         "needed_payment_date": needed_payment_date,
         "source_sheet": applicant_department or "未归属部门",
         "raw_extra": {
@@ -2407,6 +2441,11 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 "applicant_department": applicant_department,
                 "application_date": application_date,
                 "beneficiary": beneficiary or None,
+                "payee_name": beneficiary or None,
+                "payee_account": payee_account,
+                "payee_account_source": "form" if explicit_payee_account else ("beneficiary_fallback" if payee_account else None),
+                "bank_name": bank_name,
+                "invoice_status": invoice_value,
                 "source_created_at": _datetime_text(row.get("source_created_at")),
                 "source_updated_at": _datetime_text(row.get("source_updated_at")),
                 "source_currency": source_currency,

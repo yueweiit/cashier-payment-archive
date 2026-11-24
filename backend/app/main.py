@@ -5841,6 +5841,61 @@ def external_expected_payment_account_candidate(
     return ExpectedPaymentAccountCandidate(value=value, source=source)
 
 
+def legacy_dingtalk_account_is_automatic(conn, row, previous_source, metadata) -> bool:
+    """Require import provenance and no account edits before replacing a legacy name."""
+    account = str(row["payee_account"] or "").strip()
+    fallback = str(previous_source.get(
+        "payee_account" if previous_source.get("payee_account_source") == "beneficiary_fallback" else "beneficiary"
+    ) or "").strip()
+    if (
+        not account
+        or account != fallback
+        or ("payee_account" in previous_source and previous_source.get("payee_account_source") != "beneficiary_fallback")
+        or previous_source.get("system") != "dingtalk_expense_database"
+        or str(previous_source.get("record_id") or "") != str(metadata.get("source_id") or "")
+    ):
+        return False
+    identity = {
+        "source_type": metadata.get("source_type"),
+        "source_id": metadata.get("source_id"),
+        "approval_no": str(row["dingding_id"] or "").strip(),
+    }
+    proven_import = False
+    for job in conn.execute(
+        "SELECT mapping_json FROM import_jobs WHERE batch_id=? AND kind='external-expenses' AND status='imported'",
+        (row["batch_id"],),
+    ):
+        try:
+            mapping = json.loads(job["mapping_json"] or "{}")
+            request_ids, items = mapping["request_ids"], mapping["source_items"]
+            if len(request_ids) == len(items):
+                proven_import = any(
+                    request_id == row["id"] and item == identity
+                    for request_id, item in zip(request_ids, items)
+                )
+        except (ValueError, TypeError, KeyError):
+            return False
+        if proven_import:
+            break
+    proven_sync = False
+    for audit in conn.execute(
+        "SELECT action,old_value_json,new_value_json FROM audit_logs WHERE entity_type='payment_request' AND entity_id=?",
+        (row["id"],),
+    ):
+        try:
+            old, new = (json.loads(audit[key] or "{}") for key in ("old_value_json", "new_value_json"))
+            if ("payee_account" in old or "payee_account" in new) and old.get("payee_account") != new.get("payee_account"):
+                if (audit["action"] == "external_expenses.metadata_sync.request_fields"
+                    and not str(old.get("payee_account") or "").strip()
+                    and str(new.get("payee_account") or "").strip() == fallback):
+                    proven_sync = True
+                else:
+                    return False
+        except (ValueError, TypeError, AttributeError):
+            return False
+    return proven_import or proven_sync
+
+
 def dingtalk_sync_business_state(
     conn: sqlite3.Connection,
     request_id: int,
@@ -6188,13 +6243,25 @@ def _sync_external_expense_metadata_blocking(
             request_data = row_to_dict(row)
             raw_extra = dict(request_data.get("raw_extra") or {})
             existing_source = dict(raw_extra.get("external_source") or {})
+            metadata = metadata_by_approval.get(approval_no, [{}])[0]
+            metadata_matches_existing_source = all(
+                not old or not new or str(old) == str(new)
+                for old, new in (
+                    (existing_source.get("record_id") or existing_source.get("source_id"),
+                     metadata.get("record_id") or metadata.get("source_id")),
+                    (existing_source.get("source_type"), metadata.get("source_type")),
+                    (existing_source.get("table"), metadata.get("table")),
+                    (existing_source.get("process_instance_id"), metadata.get("process_instance_id")),
+                    (existing_source.get("corp_id"), metadata.get("corp_id")),
+                )
+            )
             request_workflows = workflows_by_approval.get(approval_no, [])
             workflow_process_instance_id = (
                 str(request_workflows[0].get("process_instance_id") or "").strip()
                 if len(request_workflows) == 1
                 else ""
             )
-            if approval_no in matched:
+            if approval_no in matched and metadata_matches_existing_source:
                 external_source = {
                     **existing_source,
                     **metadata_by_approval[approval_no][0],
@@ -6203,7 +6270,8 @@ def _sync_external_expense_metadata_blocking(
                     "metadata_synced_at": timestamp,
                     "workflow_process_instance_id": workflow_process_instance_id or None,
                 }
-            elif approval_no in conflicts:
+            elif approval_no in conflicts or (approval_no in matched and not metadata_matches_existing_source):
+                request_workflows = []
                 external_source = {
                     **existing_source,
                     "system": "dingtalk_expense_database",
@@ -6245,16 +6313,23 @@ def _sync_external_expense_metadata_blocking(
                 if approval_no in matched
                 else ""
             )
-            payee_name = (
-                row["payee_name"]
-                if str(row["payee_name"] or "").strip()
-                else beneficiary or None
-            )
-            payee_account = (
-                row["payee_account"]
-                if str(row["payee_account"] or "").strip()
-                else beneficiary or None
-            )
+            payment_details = {field: row[field] for field in (
+                "payee_name", "payee_account", "bank_name", "invoice_status",
+            )}
+            if approval_no in matched and metadata_matches_existing_source and request_id not in erp_owned_ids:
+                metadata = metadata_by_approval[approval_no][0]
+                for field in payment_details:
+                    candidate = str(metadata.get(field) or "").strip()
+                    if field in {"payee_name", "payee_account"} and field not in metadata:
+                        candidate = beneficiary
+                    replace_legacy = (
+                        field == "payee_account" and candidate
+                        and metadata.get("payee_account_source") == "form"
+                        and candidate != str(payment_details[field] or "").strip()
+                        and legacy_dingtalk_account_is_automatic(conn, row, existing_source, metadata)
+                    )
+                    if candidate and (not str(payment_details[field] or "").strip() or replace_legacy):
+                        payment_details[field] = candidate
             manager_approval = row["general_manager_approval"]
             manager_approval_date = row["general_manager_approval_date"]
             if not str(manager_approval or "").strip() and len(request_workflows) == 1:
@@ -6265,7 +6340,7 @@ def _sync_external_expense_metadata_blocking(
                     manager_approval = derived_manager[0]
                     manager_approval_date = manager_approval_date or derived_manager[1]
             needed_payment_date = row["needed_payment_date"]
-            if not str(needed_payment_date or "").strip() and approval_no in matched:
+            if not str(needed_payment_date or "").strip() and approval_no in matched and metadata_matches_existing_source:
                 needed_payment_date = (
                     external_needed_payment_date(
                         metadata_by_approval[approval_no][0].get("needed_payment_date")
@@ -6276,7 +6351,7 @@ def _sync_external_expense_metadata_blocking(
             project = row["project"]
             expected_payment_account = row["expected_payment_account"]
             expected_payment_account_source = row["expected_payment_account_source"]
-            if approval_no in matched:
+            if approval_no in matched and metadata_matches_existing_source:
                 metadata = metadata_by_approval[approval_no][0]
                 if not str(payment_account or "").strip():
                     payment_account = external_payment_account(metadata.get("payment_account")) or payment_account
@@ -6291,12 +6366,15 @@ def _sync_external_expense_metadata_blocking(
                     external_expected_payment_account_candidate(metadata),
                 )
             if request_id in erp_owned_ids:
-                payee_name, payee_account = row["payee_name"], row["payee_account"]
                 needed_payment_date, payment_account = row["needed_payment_date"], row["payment_account"]
                 expected_payment_account = row["expected_payment_account"]
                 expected_payment_account_source = row["expected_payment_account_source"]
             field_old_values: Dict[str, Any] = {}
             field_new_values: Dict[str, Any] = {}
+            for field, value in payment_details.items():
+                if value != row[field]:
+                    field_old_values[field] = row[field]
+                    field_new_values[field] = value
             if payment_account != row["payment_account"] or project != row["project"]:
                 field_old_values.update({
                     "payment_account": row["payment_account"],
@@ -6335,6 +6413,7 @@ def _sync_external_expense_metadata_blocking(
                 """
                 UPDATE payment_requests
                 SET raw_extra_json = ?, payee_name = ?, payee_account = ?,
+                    bank_name = ?, invoice_status = ?,
                     needed_payment_date = ?, payment_account = ?, project = ?,
                     expected_payment_account = ?,
                     expected_payment_account_source = ?,
@@ -6343,8 +6422,10 @@ def _sync_external_expense_metadata_blocking(
                 """,
                 (
                     json.dumps(raw_extra, ensure_ascii=False, default=str),
-                    payee_name,
-                    payee_account,
+                    payment_details["payee_name"],
+                    payment_details["payee_account"],
+                    payment_details["bank_name"],
+                    payment_details["invoice_status"],
                     needed_payment_date,
                     payment_account,
                     project,

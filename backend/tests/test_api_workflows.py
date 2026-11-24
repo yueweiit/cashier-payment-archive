@@ -4791,6 +4791,152 @@ def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(mo
         assert unchanged["raw_extra"] == {"kept": True}
 
 
+@pytest.mark.parametrize("mode", ["blank", "legacy", "manual", "unproven", "conflict", "unmatched", "source_changed"])
+def test_dingtalk_sync_payment_details_and_proven_legacy_account(monkeypatch, mode):
+    approval_no = f"PAYMENT-DETAILS-{mode}"
+    legacy = external_expense_test_row(
+        approval_no, "230550", beneficiary="测试收款人", execution_region="中国China",
+        source_sheet="悦为智能",
+    )
+    legacy["request_data"]["payee_name"] = "测试收款人"
+    legacy["request_data"]["raw_extra"]["external_source"]["beneficiary"] = "测试收款人"
+    metadata = {
+        "approval_no": approval_no, "source_type": "operation", "source_id": "230550",
+        "record_id": "230550", "approval_status": "RUNNING", "execution_region": "中国China",
+        "beneficiary": "测试收款人", "payee_name": "测试收款人",
+        "payee_account": "0012 3456 7890 1234", "bank_name": "测试银行分行",
+        "invoice_status": "否", "payee_account_source": "form",
+    }
+    if mode == "source_changed":
+        metadata["source_id"] = metadata["record_id"] = "999999"
+    source_metadata = [] if mode == "unmatched" else [metadata, metadata] if mode == "conflict" else [metadata]
+    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda keys: [legacy])
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda ids: source_metadata)
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda ids: [])
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda ids: [])
+    monkeypatch.setenv("DINGTALK_AUTO_PAYMENT_MODE", "off")
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": approval_no}).json()["batch"]["id"]
+        if mode in {"legacy", "manual"}:
+            imported = client.post(f"/api/batches/{batch_id}/imports/external-expenses", json={
+                "items": [{"source_type": "operation", "source_id": "230550"}],
+            })
+            assert imported.status_code == 200, imported.text
+            assert imported.json()["imported_rows"] == 1
+            row = client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]
+        else:
+            data = dict(legacy["request_data"])
+            if mode != "unproven":
+                data.update(payee_name=None, payee_account=None)
+            row = client.post(f"/api/batches/{batch_id}/requests", json=data).json()["request"]
+        request_id = row["id"]
+        if mode == "manual":
+            # Even a user account changed back to the old name must be retained.
+            for account in ("人工账户", "测试收款人"):
+                changed = client.patch(f"/api/batches/{batch_id}/requests/{request_id}", json={
+                    "payee_account": account, "bank_name": "人工银行", "invoice_status": "人工开票记录",
+                })
+                assert changed.status_code == 200
+        for _ in range(2):
+            synced = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
+            assert synced.status_code == 200, synced.text
+        row = client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]
+        if mode in {"blank", "legacy"}:
+            assert row["payee_account"] == metadata["payee_account"]
+        elif mode in {"manual", "unproven"}:
+            assert row["payee_account"] == "测试收款人"
+        else:
+            assert row["payee_account"] is None
+        if mode == "manual":
+            assert row["bank_name"] == "人工银行"
+            assert row["invoice_status"] == "人工开票记录"
+        elif mode in {"conflict", "unmatched", "source_changed"}:
+            assert row["bank_name"] is None
+            assert row["invoice_status"] is None
+        else:
+            assert row["bank_name"] == metadata["bank_name"]
+            assert row["invoice_status"] == "否"
+        assert row["amount"] == 123.45
+        assert row["paid_amount"] == 0
+        with connect() as conn:
+            audits = conn.execute("""SELECT old_value_json,new_value_json FROM audit_logs
+                WHERE entity_type='payment_request' AND entity_id=?
+                AND action='external_expenses.metadata_sync.request_fields'""", (request_id,)).fetchall()
+        if mode in {"blank", "legacy", "unproven"}:
+            assert len(audits) == 1
+            assert json.loads(audits[0]["new_value_json"])["bank_name"] == metadata["bank_name"]
+        else:
+            assert not audits
+
+
+@pytest.mark.parametrize("imported", [True, False], ids=["imported", "synced"])
+@pytest.mark.parametrize("fallback", ["测试收款人", "测试收款人 旧银行 旧账号"], ids=["name", "combined"])
+def test_dingtalk_sync_upgrades_fallback_when_source_later_supplies_account(monkeypatch, imported, fallback):
+    approval_no = f"LATER-ACCOUNT-{imported}-{fallback}"
+    legacy = external_expense_test_row(
+        approval_no, "230552", beneficiary="测试收款人", execution_region="中国China", source_sheet="悦为智能",
+    )
+    external = legacy["request_data"]["raw_extra"]["external_source"]
+    external.update(beneficiary="测试收款人", payee_account=fallback, payee_account_source="beneficiary_fallback")
+    legacy["request_data"]["payee_account"] = fallback
+    metadata = {**external, "source_type": "operation", "source_id": "230552"}
+    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda keys: [legacy])
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda ids: [metadata.copy()])
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda ids: [])
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda ids: [])
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": approval_no}).json()["batch"]["id"]
+        if imported:
+            response = client.post(f"/api/batches/{batch_id}/imports/external-expenses", json={
+                "items": [{"source_type": "operation", "source_id": "230552"}],
+            })
+        else:
+            response = client.post(f"/api/batches/{batch_id}/requests", json={
+                "dingding_id": approval_no, "source_sheet": "悦为智能", "amount": 123.45,
+            })
+        assert response.status_code == 200, response.text
+        response = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
+        assert response.status_code == 200, response.text
+        assert client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]["payee_account"] == fallback
+        metadata.update(payee_account="0012345678901234", payee_account_source="form")
+        response = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
+        assert response.status_code == 200, response.text
+        assert client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]["payee_account"] == "0012345678901234"
+
+
+def test_dingtalk_payment_details_survive_import_and_drawer_save(monkeypatch):
+    mapped = map_external_expense({
+        "source_type": "operation", "source_id": "230551", "approval_no": "DETAIL-IMPORT-SAVE",
+        "approval_status": "RUNNING", "execution_region": "中国China",
+        "base_currency_amount": 97.31, "beneficiary": "测试收款人", "raw_data": {"formComponentValues": [
+            {"name": "收款人beneficiario", "value": "测试收款人"},
+            {"name": "收款账户Cuenta de cobro", "value": "0012 3456 7890 1234"},
+            {"name": "收款银行（分行）Banco receptor (sucursal)", "value": "测试银行分行"},
+            {"name": "是否有发票¿Existe factura?", "value": "否"},
+        ]},
+    })
+    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda keys: [mapped])
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": "payment-details-import"}).json()["batch"]["id"]
+        result = client.post(f"/api/batches/{batch_id}/imports/external-expenses", json={
+            "items": [{"source_type": "operation", "source_id": "230551"}],
+        })
+        assert result.status_code == 200, result.text
+        row = client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]
+        expected = {"payee_name": "测试收款人", "payee_account": "0012 3456 7890 1234",
+                    "bank_name": "测试银行分行", "invoice_status": "否"}
+        assert {key: row[key] for key in expected} == expected
+        saved = client.patch(f"/api/batches/{batch_id}/requests/{row['id']}", json={
+            **expected, "summary": "保存抽屉", "expected_version": row["version"],
+        })
+        assert saved.status_code == 200, saved.text
+        again = client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]
+        assert {key: again[key] for key in expected} == expected
+
+
 def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_manual_values(monkeypatch):
     approval_nos = (
         "SYNC-FILL-BLANK",
@@ -4918,9 +5064,14 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
                 """,
                 (blank["id"],),
             ).fetchone()
-            assert json.loads(field_audit["old_value_json"]) == {"payment_account": None, "project": None}
-            assert json.loads(field_audit["new_value_json"]) == {"payment_account": "公户", "project": "钉钉项目 A"}
-            for request in (manual, invalid_source):
+            assert json.loads(field_audit["old_value_json"]) == {
+                "payment_account": None, "project": None, "payee_name": None, "payee_account": None,
+            }
+            assert json.loads(field_audit["new_value_json"]) == {
+                "payment_account": "公户", "project": "钉钉项目 A",
+                "payee_name": "钉钉收款人", "payee_account": "钉钉收款人",
+            }
+            for request in (manual,):
                 assert conn.execute(
                     "SELECT 1 FROM audit_logs WHERE entity_id = ? AND action = 'external_expenses.metadata_sync.request_fields'",
                     (request["id"],),
