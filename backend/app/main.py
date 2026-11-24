@@ -92,6 +92,7 @@ from .external_expenses import (
     general_manager_approval_from_workflow_events,
     mark_china_workbench_external_expense,
     preview_external_expenses,
+    valid_dingtalk_payee_account,
 )
 from .expected_payment_account import (
     AUTO_EXPECTED_PAYMENT_ACCOUNT_SOURCES,
@@ -171,6 +172,7 @@ from .snapshots import (
     cleanup_batch_snapshot_files,
     create_batch_snapshot,
     ensure_draft_baselines,
+    latest_baseline_snapshot,
     restore_batch_from_baseline,
 )
 
@@ -5842,25 +5844,85 @@ def external_expected_payment_account_candidate(
 
 
 def legacy_dingtalk_account_is_automatic(conn, row, previous_source, metadata) -> bool:
-    """Require import provenance and no account edits before replacing a legacy name."""
+    """Use original import or sync evidence, including for weekly copies."""
     account = str(row["payee_account"] or "").strip()
-    fallback = str(previous_source.get(
-        "payee_account" if previous_source.get("payee_account_source") == "beneficiary_fallback" else "beneficiary"
-    ) or "").strip()
-    if (
-        not account
-        or account != fallback
-        or ("payee_account" in previous_source and previous_source.get("payee_account_source") != "beneficiary_fallback")
-        or previous_source.get("system") != "dingtalk_expense_database"
-        or str(previous_source.get("record_id") or "") != str(metadata.get("source_id") or "")
-    ):
-        return False
     identity = {
         "source_type": metadata.get("source_type"),
-        "source_id": metadata.get("source_id"),
+        "source_id": str(metadata.get("source_id") or ""),
         "approval_no": str(row["dingding_id"] or "").strip(),
     }
-    proven_import = False
+    if not account or not all(identity.values()):
+        return False
+
+    def source_is_same(candidate, source):
+        return (
+            str(candidate["dingding_id"] or "").strip() == identity["approval_no"]
+            and source.get("system") == "dingtalk_expense_database"
+            and str(source.get("record_id") or source.get("source_id") or "") == identity["source_id"]
+            and all(not source.get(key) or not metadata.get(key) or source[key] == metadata[key]
+                    for key in ("source_type", "table", "process_instance_id", "corp_id"))
+        )
+
+    seen = set()
+    proven_sync = False
+    while True:
+        request_id = row["id"]
+        if request_id in seen or not source_is_same(row, previous_source):
+            return False
+        seen.add(request_id)
+        fallback_key = ("payee_account" if previous_source.get("payee_account_source") == "beneficiary_fallback"
+                        else "beneficiary")
+        matches_fallback = account == str(previous_source.get(fallback_key) or "").strip()
+        repaired_fallback = False
+        for audit in conn.execute(
+            "SELECT action,old_value_json,new_value_json FROM audit_logs WHERE entity_type='payment_request' AND entity_id=?",
+            (request_id,),
+        ):
+            try:
+                old, new = (json.loads(audit[key] or "{}") for key in ("old_value_json", "new_value_json"))
+                before = str(old.get("payee_account") or "").strip()
+                after = str(new.get("payee_account") or "").strip()
+            except (ValueError, TypeError, AttributeError):
+                return False
+            if before == after:
+                continue
+            if audit["action"] != "external_expenses.metadata_sync.request_fields":
+                return False
+            if not before and after == account:
+                proven_sync = True
+            elif before == account and after == str(row["payee_account"] or "").strip():
+                repaired_fallback = True
+            else:
+                return False
+
+        parent_id = row["copied_from_request_id"]
+        if not parent_id:
+            if not (matches_fallback or repaired_fallback or proven_sync):
+                return False
+            break
+
+        # The rollover baseline proves which value came from the parent. The
+        # latest DingTalk metadata can already contain the correct account.
+        snapshot = latest_baseline_snapshot(conn, row["batch_id"])
+        try:
+            original = next((entry for entry in json.loads(snapshot["payload_json"]).get("requests", [])
+                             if entry.get("id") == request_id), None) if snapshot else None
+            if not original or original.get("copied_from_request_id") != parent_id:
+                return False
+            original_source = json.loads(original.get("raw_extra_json") or "{}").get("external_source") or {}
+            if (str(original.get("payee_account") or "").strip() != account
+                or not source_is_same(original, original_source)):
+                return False
+            parent = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (parent_id,)).fetchone()
+            if parent is None or parent["logical_request_id"] != row["logical_request_id"]:
+                return False
+            previous_source = (row_to_dict(parent).get("raw_extra") or {}).get("external_source") or {}
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return False
+        row = parent
+
+    if proven_sync:
+        return True
     for job in conn.execute(
         "SELECT mapping_json FROM import_jobs WHERE batch_id=? AND kind='external-expenses' AND status='imported'",
         (row["batch_id"],),
@@ -5868,32 +5930,13 @@ def legacy_dingtalk_account_is_automatic(conn, row, previous_source, metadata) -
         try:
             mapping = json.loads(job["mapping_json"] or "{}")
             request_ids, items = mapping["request_ids"], mapping["source_items"]
-            if len(request_ids) == len(items):
-                proven_import = any(
-                    request_id == row["id"] and item == identity
-                    for request_id, item in zip(request_ids, items)
-                )
+            if len(request_ids) == len(items) and any(
+                request_id == row["id"] and item == identity for request_id, item in zip(request_ids, items)
+            ):
+                return True
         except (ValueError, TypeError, KeyError):
             return False
-        if proven_import:
-            break
-    proven_sync = False
-    for audit in conn.execute(
-        "SELECT action,old_value_json,new_value_json FROM audit_logs WHERE entity_type='payment_request' AND entity_id=?",
-        (row["id"],),
-    ):
-        try:
-            old, new = (json.loads(audit[key] or "{}") for key in ("old_value_json", "new_value_json"))
-            if ("payee_account" in old or "payee_account" in new) and old.get("payee_account") != new.get("payee_account"):
-                if (audit["action"] == "external_expenses.metadata_sync.request_fields"
-                    and not str(old.get("payee_account") or "").strip()
-                    and str(new.get("payee_account") or "").strip() == fallback):
-                    proven_sync = True
-                else:
-                    return False
-        except (ValueError, TypeError, AttributeError):
-            return False
-    return proven_import or proven_sync
+    return False
 
 
 def dingtalk_sync_business_state(
@@ -6320,11 +6363,15 @@ def _sync_external_expense_metadata_blocking(
                 metadata = metadata_by_approval[approval_no][0]
                 for field in payment_details:
                     candidate = str(metadata.get(field) or "").strip()
-                    if field in {"payee_name", "payee_account"} and field not in metadata:
+                    if field == "payee_name" and field not in metadata:
                         candidate = beneficiary
+                    if field == "payee_account" and (
+                        metadata.get("payee_account_source") != "form"
+                        or not valid_dingtalk_payee_account(candidate, payee_names=(metadata.get("payee_name"), beneficiary))
+                    ):
+                        continue
                     replace_legacy = (
                         field == "payee_account" and candidate
-                        and metadata.get("payee_account_source") == "form"
                         and candidate != str(payment_details[field] or "").strip()
                         and legacy_dingtalk_account_is_automatic(conn, row, existing_source, metadata)
                     )

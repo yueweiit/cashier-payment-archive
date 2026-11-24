@@ -68,7 +68,7 @@ EXECUTION_REGION_COMPONENT_PREFIXES = (
 )
 INVOICE_COMPONENT_PREFIXES = ("是否有发票", "existe factura", "¿existe factura")
 PAYEE_NAME_COMPONENT_PREFIXES = ("收款人", "收款方", "beneficiario")
-PAYEE_ACCOUNT_COMPONENT_PREFIXES = ("收款账户", "cuenta de cobro")
+PAYEE_ACCOUNT_COMPONENT_PREFIXES = ("收款账户", "收款账号", "银行账号", "账号", "cuenta de cobro")
 PAYEE_BANK_COMPONENT_PREFIXES = ("收款银行", "banco receptor")
 PROJECT_COMPONENT_PREFIXES = ("项目归属", "pertenencia del proyecto")
 EXPECTED_PAYMENT_ACCOUNT_COMPONENT_PREFIXES = (
@@ -738,6 +738,25 @@ def _form_component_value(form_values: Iterable[Dict[str, Any]], *prefixes: str,
         if value:
             return value
     return matches[0] if len(matches) == 1 else None
+
+
+def valid_dingtalk_payee_account(value: Any, *, payee_names: Iterable[Any] = ()) -> bool:
+    """Accept account shapes without treating names or freeform details as accounts."""
+    text = _text(value)
+    if not text:
+        return False
+    known_names = {" ".join(str(name).split()).casefold() for name in payee_names if _text(name)}
+    if " ".join(text.split()).casefold() in known_names:
+        return False
+    if re.fullmatch(r"[0-9]+(?:[ -]+[0-9]+)*", text):
+        return True
+    if re.fullmatch(
+        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}",
+        text,
+    ):
+        return True
+    iban = text.replace(" ", "").replace("-", "")
+    return re.fullmatch(r"[A-Za-z]{2}[0-9]{2}[A-Za-z0-9]{1,30}", iban) is not None
 
 
 def _process_allowed_in_china_workbench(instance: Dict[str, Any]) -> bool:
@@ -2267,13 +2286,19 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         explicit_expected_account,
         service_subject,
     )
+    form_payee_names = []
+    for component in form_values:
+        value = _form_component_value([component], *PAYEE_NAME_COMPONENT_PREFIXES)
+        if not value:
+            continue
+        decoded = _decoded_component_value(component.get("value"))
+        names = [_display_component_value(item) for item in decoded] if source_type == "purchase" and isinstance(decoded, list) else [value]
+        for name in names:
+            if name and name not in form_payee_names:
+                form_payee_names.append(name)
     beneficiary_values: list[str]
     if source_type == "purchase":
-        beneficiary_values = []
-        for component in form_values:
-            value = _form_component_value([component], *PAYEE_NAME_COMPONENT_PREFIXES)
-            if value and value not in beneficiary_values:
-                beneficiary_values.append(value)
+        beneficiary_values = form_payee_names
         beneficiary = " / ".join(beneficiary_values)
         detail_values = _component_values(form_values, "规格明细需求说明") or _component_values(form_values, "需求明细")
         summary = detail_values[0] if detail_values else _first_text(row.get("product_name"), row.get("order_name"), row.get("project"), row.get("expense_type"))
@@ -2281,7 +2306,7 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         needed_payment_date = _date_text(payment_date_values[0]) if payment_date_values else None
     else:
         beneficiary = (
-            _form_component_value(form_values, *PAYEE_NAME_COMPONENT_PREFIXES)
+            next(iter(form_payee_names), None)
             or _text(row.get("beneficiary"))
             or ""
         )
@@ -2289,25 +2314,23 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
         summary = _text(row.get("summary"))
         needed_payment_date = _date_text(row.get("needed_payment_date"))
 
-    payee_account = beneficiary or None
-    explicit_payee_account = None
+    payee_account = None
     bank_name = None
     # A purchase may aggregate several recipients. Without a row relationship,
     # a single account or bank must not be assigned to the entire group.
     if source_type != "purchase" or len(beneficiary_values) <= 1:
         account_components = [
             component for component in form_values
-            if not (_first_text(component.get("name"), component.get("label")) or "").casefold().startswith(
-                ("收款账户信息", "收款账户cuenta beneficiaria")
+            if not re.sub(r"\s+", "", _first_text(component.get("name"), component.get("label")) or "").casefold().startswith(
+                ("收款账户信息", "收款账户cuentabeneficiaria")
             )
         ]
-        explicit_payee_account = _form_component_value(account_components, *PAYEE_ACCOUNT_COMPONENT_PREFIXES, require_unique=True)
-        payee_account = (
-            explicit_payee_account
-            or (_text(row.get("beneficiary")) if source_type != "purchase" else None)
-            or beneficiary
-            or None
-        )
+        payee_account = _form_component_value(account_components, *PAYEE_ACCOUNT_COMPONENT_PREFIXES, require_unique=True)
+        known_payee_names = [*form_payee_names]
+        if source_type in STANDARD_SOURCE_TYPES:
+            known_payee_names.append(row.get("beneficiary"))
+        if not valid_dingtalk_payee_account(payee_account, payee_names=known_payee_names):
+            payee_account = None
         bank_name = _form_component_value(form_values, *PAYEE_BANK_COMPONENT_PREFIXES, require_unique=True)
 
     approval_no = _text(row.get("approval_no")) or ""
@@ -2443,7 +2466,7 @@ def map_external_expense(raw_row: Dict[str, Any], user_names: Optional[Dict[str,
                 "beneficiary": beneficiary or None,
                 "payee_name": beneficiary or None,
                 "payee_account": payee_account,
-                "payee_account_source": "form" if explicit_payee_account else ("beneficiary_fallback" if payee_account else None),
+                "payee_account_source": "form" if payee_account else None,
                 "bank_name": bank_name,
                 "invoice_status": invoice_value,
                 "source_created_at": _datetime_text(row.get("source_created_at")),

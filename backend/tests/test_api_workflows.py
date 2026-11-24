@@ -3477,7 +3477,7 @@ def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
     assert purchase["amount"] == 100.25
     assert purchase["beneficiary"] == "供应商A 账号1 / 供应商B 账号2"
     assert purchase["request_data"]["payee_name"] == purchase["beneficiary"]
-    assert purchase["request_data"]["payee_account"] == purchase["beneficiary"]
+    assert purchase["request_data"]["payee_account"] is None
     assert (
         purchase["request_data"]["raw_extra"]["external_source"]["beneficiary"]
         == purchase["beneficiary"]
@@ -3486,7 +3486,6 @@ def test_external_expense_mapping_uses_base_currency_and_purchase_form_values():
     assert purchase["needed_payment_date"] == "2026-07-20"
     assert "存在多个收款人，请确认" in purchase["warnings"]
     assert purchase["request_data"]["currency"] == "CNY"
-    assert purchase["request_data"]["payee_account"] == purchase["beneficiary"]
     assert purchase["request_data"]["raw_extra"]["external_source"]["approval_status"] == "RUNNING"
     assert purchase["applicant"] == "快照表姓名"
     assert purchase["applicant_id"] == "user-purchase-501"
@@ -4899,11 +4898,61 @@ def test_dingtalk_sync_upgrades_fallback_when_source_later_supplies_account(monk
         assert response.status_code == 200, response.text
         response = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
         assert response.status_code == 200, response.text
-        assert client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]["payee_account"] == fallback
+        assert client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]["payee_account"] == (fallback if imported else None)
         metadata.update(payee_account="0012345678901234", payee_account_source="form")
         response = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
         assert response.status_code == 200, response.text
         assert client.get(f"/api/batches/{batch_id}/requests").json()["requests"][0]["payee_account"] == "0012345678901234"
+
+
+@pytest.mark.parametrize("manual_edit", [False, True], ids=["inherited", "edited"])
+def test_dingtalk_sync_repairs_inherited_account_after_source_cache_refresh(monkeypatch, manual_edit):
+    approval_no = f"ROLLED-ACCOUNT-{manual_edit}"
+    source_id = "223128"
+    legacy = external_expense_test_row(
+        approval_no, source_id, beneficiary="原单收款人", execution_region="中国China", source_sheet="悦为智能",
+    )
+    legacy["request_data"]["payee_name"] = "原单收款人"
+    original_source = legacy["request_data"]["raw_extra"]["external_source"]
+    original_source.update(source_type="operation", beneficiary="原单收款人")
+    metadata = {**original_source, "source_id": source_id, "payee_account": "0012345678907839",
+                "payee_account_source": "form", "bank_name": "测试分行"}
+    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda keys: [legacy])
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda ids: [metadata])
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda ids: [])
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda ids: [])
+    monkeypatch.setenv("DINGTALK_AUTO_PAYMENT_MODE", "off")
+    with TestClient(app) as client:
+        login(client)
+        root_batch = client.post("/api/batches", json={"name": approval_no}).json()["batch"]["id"]
+        imported = client.post(f"/api/batches/{root_batch}/imports/external-expenses", json={
+            "items": [{"source_type": "operation", "source_id": source_id}],
+        })
+        assert imported.json()["imported_rows"] == 1
+        copy_batch = root_batch
+        for index in range(2):
+            rolled = client.post(f"/api/batches/{copy_batch}/rollover", json={
+                "name": f"{approval_no}-{index}", "copy_mode": "all",
+            })
+            assert rolled.status_code == 200, rolled.text
+            copy_batch = rolled.json()["batch"]["id"]
+        copied = client.get(f"/api/batches/{copy_batch}/requests").json()["requests"][0]
+        assert copied["payee_account"] == "原单收款人"
+        # The previous release updated the source cache before correcting this copy.
+        with connect() as conn:
+            conn.execute("UPDATE payment_requests SET raw_extra_json = ? WHERE id = ?", (
+                json.dumps({"external_source": metadata}), copied["id"],
+            ))
+        if manual_edit:
+            for account in ("人工账号", "原单收款人"):
+                edited = client.patch(f"/api/batches/{copy_batch}/requests/{copied['id']}", json={"payee_account": account})
+                assert edited.status_code == 200, edited.text
+        for batch_id in (root_batch, copy_batch, copy_batch):
+            result = client.post(f"/api/batches/{batch_id}/external-expenses/sync-metadata")
+            assert result.status_code == 200, result.text
+        row = client.get(f"/api/batches/{copy_batch}/requests").json()["requests"][0]
+        assert row["payee_name"] == "原单收款人"
+        assert row["payee_account"] == ("原单收款人" if manual_edit else metadata["payee_account"])
 
 
 def test_dingtalk_payment_details_survive_import_and_drawer_save(monkeypatch):
@@ -5065,11 +5114,11 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
                 (blank["id"],),
             ).fetchone()
             assert json.loads(field_audit["old_value_json"]) == {
-                "payment_account": None, "project": None, "payee_name": None, "payee_account": None,
+                "payment_account": None, "project": None, "payee_name": None,
             }
             assert json.loads(field_audit["new_value_json"]) == {
                 "payment_account": "公户", "project": "钉钉项目 A",
-                "payee_name": "钉钉收款人", "payee_account": "钉钉收款人",
+                "payee_name": "钉钉收款人",
             }
             for request in (manual,):
                 assert conn.execute(
@@ -5111,7 +5160,7 @@ def test_dingtalk_sync_fills_blank_payee_and_manager_fields_without_overwriting_
 
     blank_row = by_id[blank["id"]]
     assert blank_row["payee_name"] == "钉钉收款人"
-    assert blank_row["payee_account"] == "钉钉收款人"
+    assert blank_row["payee_account"] is None
     assert blank_row["general_manager_approval"] == "同意付款"
     assert blank_row["general_manager_approval_date"] == "2026-08-24"
 
