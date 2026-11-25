@@ -68,6 +68,7 @@ from .excel_io import (
     content_hash,
     detect_table_headers,
     export_workbook,
+    normalize_header,
     normalize_request_business_fields,
     parse_batch_dates,
     parse_dingtalk_file,
@@ -328,6 +329,7 @@ class RequestIn(BaseModel):
 class RequestPatch(RequestIn):
     reason: Optional[str] = None
     expected_version: Optional[int] = None
+    workbench_sheet_target: Optional[str] = None
 
 
 class CurrencyConversionIn(BaseModel):
@@ -425,6 +427,7 @@ class UserIn(BaseModel):
     display_name: str
     active: bool = True
     sheet_permissions: list[str] = Field(default_factory=list)
+    sheet_group_changes: Dict[str, bool] = Field(default_factory=dict)
     mexico_access_scope: str = "none"
     mexico_identity_name: Optional[str] = None
 
@@ -435,6 +438,7 @@ class UserPatch(BaseModel):
     display_name: Optional[str] = None
     active: Optional[bool] = None
     sheet_permissions: Optional[list[str]] = None
+    sheet_group_changes: Optional[Dict[str, bool]] = None
     mexico_access_scope: Optional[str] = None
     mexico_identity_name: Optional[str] = None
 
@@ -645,6 +649,29 @@ def load_user_sheet_permissions(conn, user_id: int) -> list[str]:
     ]
 
 
+def load_user_sheet_group_overrides(conn, user_id: int) -> Dict[str, bool]:
+    return {
+        str(row["sheet_name"]): bool(row["allowed"])
+        for row in conn.execute(
+            "SELECT sheet_name, allowed FROM user_workbench_sheet_permissions WHERE user_id = ?",
+            (user_id,),
+        )
+    }
+
+
+def save_sheet_group_changes(conn, user_id: int, changes: Dict[str, bool]) -> None:
+    if any(group not in DINGTALK_WORKBENCH_SHEETS for group in changes):
+        raise HTTPException(status_code=400, detail="请选择已有的公司分组")
+    conn.executemany(
+        """
+        INSERT INTO user_workbench_sheet_permissions (user_id, sheet_name, allowed)
+        VALUES (?, ?, ?)
+        ON CONFLICT (user_id, sheet_name) DO UPDATE SET allowed = excluded.allowed
+        """,
+        [(user_id, group, int(allowed)) for group, allowed in changes.items()],
+    )
+
+
 def replace_user_sheet_permissions(
     conn,
     user_id: int,
@@ -705,6 +732,33 @@ def available_sheet_names(conn) -> list[str]:
         if isinstance(stored_order, list):
             names.update(canonical_sheet_order(stored_order))
     return sorted(names, key=lambda value: value)
+
+
+def sheet_permission_display_groups(conn) -> Dict[str, set[str]]:
+    groups: Dict[str, set[str]] = {}
+    for row in conn.execute(
+        "SELECT DISTINCT source_sheet, workbench_sheet(source_sheet, raw_extra_json) AS group_name FROM payment_requests"
+    ):
+        groups.setdefault(canonical_sheet_name(row["source_sheet"]), set()).add(row["group_name"])
+    return groups
+
+
+def admin_user_public(conn, row, groups_by_source: Dict[str, set[str]]) -> Dict[str, Any]:
+    user = user_public_with_permissions(conn, row)
+    overrides = load_user_sheet_group_overrides(conn, int(user["id"]))
+    legacy_groups: set[str] = set()
+    unmapped = []
+    for sheet in user["sheet_permissions"]:
+        groups = groups_by_source.get(sheet, {workbench_sheet_name(sheet)})
+        legacy_groups.update(groups)
+        if not groups.issubset(DINGTALK_WORKBENCH_SHEETS):
+            unmapped.append(sheet)
+    user["sheet_group_states"] = {
+        group: ("all" if overrides[group] else "none") if group in overrides else ("partial" if group in legacy_groups else "none")
+        for group in DINGTALK_WORKBENCH_SHEETS
+    }
+    user["unmapped_sheet_permissions"] = unmapped
+    return user
 
 
 def attachment_public(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -783,22 +837,35 @@ def sheet_access_filter(
 ) -> tuple[str, list[Any]]:
     if not user_has_restricted_sheet_access(user):
         return "1 = 1", []
-    allowed = load_user_sheet_permissions(conn, int(user["id"]))
-    if not allowed:
+    user_id = int(user["id"])
+    raw_sheets = load_user_sheet_permissions(conn, user_id)
+    overrides = load_user_sheet_group_overrides(conn, user_id)
+    allowed_groups = [group for group, allowed in overrides.items() if allowed]
+    denied_groups = [group for group, allowed in overrides.items() if not allowed]
+    raw_column = f"COALESCE(NULLIF(TRIM({column}), ''), '未分 Sheet')"
+    raw_extra_column = column.removesuffix("source_sheet") + "raw_extra_json"
+    group_column = f"workbench_sheet({column}, {raw_extra_column})"
+    allow = [
+        f"{field} IN ({', '.join('?' for _ in values)})"
+        for field, values in ((raw_column, raw_sheets), (group_column, allowed_groups)) if values
+    ]
+    if not allow:
         return "0 = 1", []
-    placeholders = ", ".join("?" for _ in allowed)
-    return (
-        f"COALESCE(NULLIF(TRIM({column}), ''), '未分 Sheet') IN ({placeholders})",
-        allowed,
-    )
+    condition = "(" + " OR ".join(allow) + ")"
+    if denied_groups:
+        condition += f" AND {group_column} NOT IN ({', '.join('?' for _ in denied_groups)})"
+    return "(" + condition + ")", [*raw_sheets, *allowed_groups, *denied_groups]
 
 
-def daily_payables_allowed_sheets(conn, user: Dict[str, Any]) -> Optional[set[str]]:
+def daily_payables_sheet_access(conn, user: Dict[str, Any]) -> Dict[str, set[str]]:
     if not user_has_restricted_sheet_access(user):
-        return None
+        return {}
+    user_id = int(user["id"])
+    overrides = load_user_sheet_group_overrides(conn, user_id)
     return {
-        canonical_sheet_name(sheet_name)
-        for sheet_name in load_user_sheet_permissions(conn, int(user["id"]))
+        "allowed_sheets": set(load_user_sheet_permissions(conn, user_id)),
+        "allowed_groups": {group for group, allowed in overrides.items() if allowed},
+        "denied_groups": {group for group, allowed in overrides.items() if not allowed},
     }
 
 
@@ -833,11 +900,15 @@ def ensure_sheet_access(
     conn,
     user: Dict[str, Any],
     source_sheet: Any,
+    raw_extra: Any = None,
 ) -> None:
     if not user_has_restricted_sheet_access(user):
         return
-    allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
-    if normalize_sheet_permission(source_sheet) not in allowed:
+    user_id = int(user["id"])
+    override = load_user_sheet_group_overrides(conn, user_id).get(workbench_sheet_name(source_sheet, raw_extra))
+    if override is True:
+        return
+    if override is False or normalize_sheet_permission(source_sheet) not in load_user_sheet_permissions(conn, user_id):
         raise HTTPException(status_code=403, detail="无权访问该 Sheet")
 
 
@@ -885,7 +956,11 @@ def ensure_business_can_create_in_sheet(
     if not user_has_restricted_sheet_access(user):
         return
     sheet_name = canonical_sheet_name(source_sheet)
-    if sheet_name not in set(batch_registered_sheet_names(conn, batch_id)):
+    registered = batch_registered_sheet_names(conn, batch_id)
+    group_granted = load_user_sheet_group_overrides(conn, int(user["id"])).get(sheet_name)
+    if sheet_name not in registered and not (
+        group_granted and sheet_name in workbench_sheet_layout(conn, batch_id, registered, user)
+    ):
         raise HTTPException(status_code=403, detail="业务人员只能在当前批次已存在的授权 Sheet 中新增请款")
 
 
@@ -905,7 +980,7 @@ def ensure_request_access(
     user: Dict[str, Any],
     request_row,
 ) -> None:
-    ensure_sheet_access(conn, user, request_row["source_sheet"])
+    ensure_sheet_access(conn, user, request_row["source_sheet"], request_row["raw_extra_json"])
 
 
 def require_accessible_request(
@@ -996,13 +1071,22 @@ def batch_public_for_user(
         [data["id"], *access_params],
     ).fetchall()
     data["currency_totals"] = rows_to_dicts(currency_rows)
+    overrides = {}
     if restricted:
-        allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
-        data["sheet_order"] = [sheet for sheet in data["sheet_order"] if normalize_sheet_permission(sheet) in allowed]
+        user_id = int(user["id"])
+        allowed = set(load_user_sheet_permissions(conn, user_id))
+        overrides = load_user_sheet_group_overrides(conn, user_id)
+        data["sheet_order"] = [
+            sheet for sheet in data["sheet_order"]
+            if overrides.get(workbench_sheet_name(sheet), normalize_sheet_permission(sheet) in allowed)
+        ]
     layout = workbench_sheet_layout(conn, int(data["id"]), data["sheet_order"], user)
+    data["workbench_sheet_options"] = list(DINGTALK_WORKBENCH_SHEETS)
     data["workbench_sheet_order"] = list(layout)
     data["workbench_sheet_targets"] = {
-        group: next((sheet for sheet in sheets if workbench_sheet_name(sheet) == group), sheets[0] if restricted else group)
+        group: group if overrides.get(group) else next(
+            (sheet for sheet in sheets if workbench_sheet_name(sheet) == group), sheets[0] if restricted else group,
+        )
         for group, sheets in layout.items()
     }
     return data
@@ -1066,6 +1150,10 @@ def enforce_request_field_permissions(
     if not restricted:
         return dict(data)
     payload = dict(data)
+    if role == ROLE_BUSINESS:
+        # Imported workflow metadata determines the effective company Sheet.
+        payload.pop("raw_extra", None)
+        payload.pop("raw_extra_json", None)
     if creating:
         for field in restricted:
             payload.pop(field, None)
@@ -1454,8 +1542,8 @@ def get_daily_payables_summary(
             return daily_snapshot(
                 conn,
                 selected_date,
-                allowed_sheets=daily_payables_allowed_sheets(conn, user),
                 china_only=False,
+                **daily_payables_sheet_access(conn, user),
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1475,9 +1563,9 @@ def get_daily_payables_details(
             result = daily_snapshot(
                 conn,
                 selected_date,
-                allowed_sheets=daily_payables_allowed_sheets(conn, user),
                 include_details=True,
                 china_only=False,
+                **daily_payables_sheet_access(conn, user),
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1501,8 +1589,8 @@ def get_daily_payables_trend(
                 conn,
                 start,
                 end,
-                allowed_sheets=daily_payables_allowed_sheets(conn, user),
                 china_only=False,
+                **daily_payables_sheet_access(conn, user),
             )
     except DailyPayablesError as exc:
         raise daily_payables_http_error(exc) from exc
@@ -1528,9 +1616,9 @@ def export_daily_payables(
                     conn,
                     start,
                     end,
-                    allowed_sheets=daily_payables_allowed_sheets(conn, user),
                     include_details=True,
                     china_only=False,
+                    **daily_payables_sheet_access(conn, user),
                 )
             )
     except DailyPayablesError as exc:
@@ -2153,7 +2241,7 @@ def workbench_pending_sql(prefix: str = "") -> str:
     return f"CASE WHEN {dingtalk_payment_refused_sql(prefix + 'raw_extra_json')} THEN 0 ELSE COALESCE({prefix}pending_amount, 0) END"
 
 
-def workbench_request(row: sqlite3.Row, *, for_export: bool = False) -> Dict[str, Any]:
+def workbench_request(row: sqlite3.Row | Dict[str, Any], *, for_export: bool = False) -> Dict[str, Any]:
     request = row_to_dict(row)
     if not for_export:
         request["workbench_sheet"] = workbench_sheet_name(request.get("source_sheet"), request.get("raw_extra"))
@@ -2438,8 +2526,6 @@ def bulk_save_requests(
             expected_version = item.get("expected_version")
             changes = {key: value for key, value in item.items() if key not in {"id", "expected_version"}}
             ensure_business_sheet_unchanged(user, row_to_dict(old_row), changes)
-            if "source_sheet" in changes:
-                ensure_sheet_access(conn, user, changes.get("source_sheet"))
             if not changes:
                 continue
             if not update_request_row(
@@ -2538,8 +2624,6 @@ def update_request(
         reason = data.pop("reason", None)
         expected_version = data.pop("expected_version", None)
         ensure_business_sheet_unchanged(user, row_to_dict(old_row), data)
-        if "source_sheet" in data:
-            ensure_sheet_access(conn, user, data.get("source_sheet"))
         changed = update_request_row(
             conn,
             request_id,
@@ -2844,7 +2928,7 @@ def apply_foreign_request_amount_correction(
             },
             reason=payload.reason,
         )
-    return {"status": "ok", "preview": preview, "request": updated}
+    return {"status": "ok", "preview": preview, "request": workbench_request(updated)}
 
 
 @app.post("/api/batches/{batch_id}/requests/{request_id}/currency-conversion/preview")
@@ -3006,7 +3090,7 @@ def apply_request_currency_conversion(
             reason=payload.reason,
         )
         payment_rows = payment_records_public(conn, request_id)
-    return {"status": "ok", "preview": preview, "request": updated, "payments": payment_rows}
+    return {"status": "ok", "preview": preview, "request": workbench_request(updated), "payments": payment_rows}
 
 
 def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
@@ -3081,6 +3165,7 @@ def historical_currency_candidates(conn, batch_id: int) -> list[Dict[str, Any]]:
                 "applicant": row.get("applicant") or external.get("applicant"),
                 "summary": row.get("summary"),
                 "source_sheet": row.get("source_sheet"),
+                "workbench_sheet": workbench_sheet_name(row.get("source_sheet"), row.get("raw_extra")),
                 "current_currency": current_currency,
                 "current_amount": row.get("amount"),
                 "source_currency": source_currency,
@@ -3468,7 +3553,7 @@ def create_request_payment(
         request_after = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         touch_batch(conn, batch_id)
         payment = payment_record_public(conn, row)
-    return {"payment": payment, "request": row_to_dict(request_after)}
+    return {"payment": payment, "request": workbench_request(request_after)}
 
 
 @app.patch("/api/batches/{batch_id}/requests/{request_id}/payments/{payment_id}")
@@ -3592,7 +3677,7 @@ def update_request_payment(
         request_after = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         touch_batch(conn, batch_id)
         payment = payment_record_public(conn, row)
-    return {"payment": payment, "request": row_to_dict(request_after)}
+    return {"payment": payment, "request": workbench_request(request_after)}
 
 
 @app.delete("/api/batches/{batch_id}/requests/{request_id}/payments/{payment_id}")
@@ -3660,7 +3745,7 @@ def delete_request_payment(
         touch_batch(conn, batch_id)
         for voucher in vouchers:
             delete_payment_voucher_file_if_unused(conn, voucher)
-    return {"status": "ok", "request": row_to_dict(request_after)}
+    return {"status": "ok", "request": workbench_request(request_after)}
 
 
 @app.post("/api/batches/{batch_id}/requests/{request_id}/payments/{payment_id}/vouchers")
@@ -3728,7 +3813,7 @@ def get_payment_voucher_file(voucher_id: int, user: Dict[str, Any] = Depends(cur
     with connect() as conn:
         row = conn.execute(
             """
-            SELECT payment_vouchers.*, payment_requests.source_sheet
+            SELECT payment_vouchers.*, payment_requests.source_sheet, payment_requests.raw_extra_json
             FROM payment_vouchers
             JOIN payment_records ON payment_records.id = payment_vouchers.payment_id
             JOIN payment_requests ON payment_requests.id = payment_records.request_id
@@ -3737,7 +3822,7 @@ def get_payment_voucher_file(voucher_id: int, user: Dict[str, Any] = Depends(cur
             (voucher_id,),
         ).fetchone()
         if row:
-            ensure_sheet_access(conn, user, row["source_sheet"])
+            ensure_request_access(conn, user, row)
             path, _ = resolve_attachment_path(row, conn)
     if not row:
         raise HTTPException(status_code=404, detail="付款凭证不存在")
@@ -3932,7 +4017,7 @@ def get_attachment_file(attachment_id: int, user: Dict[str, Any] = Depends(curre
     with connect() as conn:
         row = conn.execute(
             """
-            SELECT attachment_links.*, payment_requests.source_sheet
+            SELECT attachment_links.*, payment_requests.source_sheet, payment_requests.raw_extra_json
             FROM attachment_links
             JOIN payment_requests ON payment_requests.id = attachment_links.request_id
             WHERE attachment_links.id = ?
@@ -3940,7 +4025,7 @@ def get_attachment_file(attachment_id: int, user: Dict[str, Any] = Depends(curre
             (attachment_id,),
         ).fetchone()
         if row:
-            ensure_sheet_access(conn, user, row["source_sheet"])
+            ensure_request_access(conn, user, row)
             path, _ = resolve_attachment_path(row, conn)
     if not row:
         raise HTTPException(status_code=404, detail="附件不存在")
@@ -3989,7 +4074,8 @@ MERGE_PAYMENT_FIELDS = ("amount", "payment_date", "payer", "payment_account", "b
 
 
 def weekly_merge_row_id(row: Dict[str, Any]) -> str:
-    return f"request:{canonical_sheet_name(row.get('source_sheet'))}:{int(row.get('source_row') or 0)}"
+    sheet = row.get("_workbook_sheet") or canonical_sheet_name(row.get("source_sheet"))
+    return f"request:{sheet}:{int(row.get('source_row') or 0)}"
 
 
 def weekly_merge_payment_key(detail: Dict[str, Any]) -> str:
@@ -4019,17 +4105,20 @@ def merge_request_payload(row: Dict[str, Any], *, creating: bool) -> Dict[str, A
 def merge_field_changes(existing: Dict[str, Any], payload: Dict[str, Any]) -> list[Dict[str, Any]]:
     changes = []
     for field, value in payload.items():
-        if field in {"raw_extra", "source_row"}:
+        if field in {"raw_extra", "source_row", "workbench_sheet_target"}:
             continue
-        if not request_values_equal(existing.get(field), value):
-            changes.append(
-                {
-                    "field": field,
-                    "label": CORE_FIELDS.get(field, {"source_sheet": "来源 Sheet"}.get(field, field)),
-                    "old": existing.get(field),
-                    "new": value,
-                }
-            )
+        group_target = payload.get("workbench_sheet_target") if field == "source_sheet" else None
+        if group_target or not request_values_equal(existing.get(field), value):
+            change = {
+                "field": field,
+                "label": CORE_FIELDS.get(field, {"source_sheet": "所属 Sheet"}.get(field, field)),
+                "old": existing.get(field),
+                "new": value,
+            }
+            if field == "source_sheet":
+                change["display_old"] = workbench_sheet_name(existing.get(field), existing.get("raw_extra"))
+                change["display_new"] = group_target or workbench_sheet_name(value, existing.get("raw_extra"))
+            changes.append(change)
     return changes
 
 
@@ -4155,6 +4244,13 @@ def build_weekly_merge_plan(
             errors.append("该文件由其他批次导出，不能直接合并到当前批次")
 
         payload = merge_request_payload(row, creating=action == "create")
+        incoming_group = row.get("_workbench_sheet")
+        if (
+            existing and incoming_group in DINGTALK_WORKBENCH_SHEETS
+            and incoming_group == payload["source_sheet"]
+            and incoming_group != workbench_sheet_name(existing.get("source_sheet"), existing.get("raw_extra"))
+        ):
+            payload["workbench_sheet_target"] = incoming_group
         if existing and "currency" in payload:
             incoming_currency = normalize_currency(payload.get("currency"), default="CNY")
             existing_currency = normalize_currency(existing.get("currency"), default="CNY")
@@ -4489,9 +4585,10 @@ def build_weekly_merge_plan(
     incoming_order = canonical_sheet_order(meta.get("workbook_sheet_order") or [])
     old_order = batch_sheet_order(row_to_dict(require_batch(conn, batch_id)))
     existing_sheets = [
-        canonical_sheet_name(row["source_sheet"])
+        canonical_sheet_name(row["sheet_name"])
         for row in conn.execute(
-            "SELECT DISTINCT source_sheet FROM payment_requests WHERE batch_id = ? ORDER BY id",
+            f"""SELECT DISTINCT workbench_registered_sheet(source_sheet, raw_extra_json) AS sheet_name
+            FROM payment_requests WHERE batch_id = ? AND NOT {dingtalk_terminated_sql()} ORDER BY id""",
             (batch_id,),
         ).fetchall()
     ]
@@ -4519,6 +4616,10 @@ def build_weekly_merge_plan(
             "dingding_id": item["row"].get("dingding_id"),
             "applicant": item["row"].get("applicant"),
             "source_sheet": item["row"].get("source_sheet"),
+            "workbench_sheet": item["row"].get("_workbench_sheet") or workbench_sheet_name(
+                item["row"].get("source_sheet"),
+                (item["existing"] or {}).get("raw_extra") or item["row"].get("raw_extra_json"),
+            ),
             "amount": item["row"].get("amount"),
             "old_paid_amount": item["old_paid_amount"],
             "new_paid_amount": item["new_paid_amount"],
@@ -4595,13 +4696,14 @@ def cleanup_expired_weekly_merge_jobs(conn) -> None:
 def apply_import_target_sheet(rows: list[Dict[str, Any]], meta: Dict[str, Any], target_sheet: Optional[str]) -> None:
     if not str(target_sheet or "").strip():
         return
-    if len({row.get("source_sheet") for row in rows}) > 1:
+    if len({row.get("_workbook_sheet") or row.get("source_sheet") for row in rows}) > 1:
         raise HTTPException(status_code=400, detail="指定目标 Sheet 时，请上传仅包含一张请款明细的文件")
     if any(row.get("_request_id") for row in rows) or meta.get("payment_details"):
         raise HTTPException(status_code=400, detail="包含请款标识或付款明细的系统导出文件，请保留原 Sheet 合并")
     sheet = canonical_sheet_name(target_sheet)
     for row in rows:
         row["source_sheet"] = sheet
+        row["_workbench_sheet"] = workbench_sheet_name(sheet)
     meta["workbook_sheet_order"] = [sheet]
 
 
@@ -5304,12 +5406,33 @@ async def import_weekly_excel(
     }
 
 
+def apply_dingtalk_workbench_assignment(data: Dict[str, Any], sheet: str, *, automatic: bool) -> None:
+    source = canonical_sheet_name(data.get("source_sheet"))
+    raw_extra = dict(data.get("raw_extra") or {})
+    raw_extra["dingtalk_workbench_assignment"] = {
+        "source_sheet": source,
+        "sheet": sheet,
+        "mode": "auto" if automatic else "manual",
+    }
+    data.update(source_sheet=source, raw_extra=raw_extra)
+    data.pop("raw_extra_json", None)
+
+
+def dingtalk_file_group_value(values: Dict[str, Any], *prefixes: str) -> Optional[str]:
+    matched = {
+        str(value).strip() for header, value in values.items()
+        if value not in (None, "") and normalize_header(header).casefold().startswith(prefixes)
+    } - {""}
+    return next(iter(matched)) if len(matched) == 1 else None
+
+
 @app.post("/api/import/dingtalk")
 @leased_batch_operation("dingtalk-file-import", lambda arguments: arguments.get("batch_id"))
 async def import_dingtalk(
     file: UploadFile = File(...),
     batch_id: Optional[int] = Form(None),
     mapping_json: Optional[str] = Form(None),
+    workbench_sheet: Optional[str] = Form(None),
     user: Dict[str, Any] = Depends(require_roles(*FINANCE_FIELD_ROLES)),
 ) -> Dict[str, Any]:
     saved_path = await save_upload(file)
@@ -5321,7 +5444,11 @@ async def import_dingtalk(
             "target_fields": TARGET_FIELDS,
             "suggested_mapping": suggest_mapping(headers),
             "preview": preview,
+            "workbench_sheet_options": list(DINGTALK_WORKBENCH_SHEETS),
         }
+    fallback_group = str(workbench_sheet or "").strip() or None
+    if fallback_group and fallback_group not in DINGTALK_WORKBENCH_SHEETS:
+        raise HTTPException(status_code=400, detail="钉钉导入只能选择已有公司分组")
     mapping = json.loads(mapping_json)
     rows, meta = await run_in_threadpool(parse_dingtalk_file, saved_path, mapping)
     canonicalize_import_sheet_names(rows, meta)
@@ -5330,6 +5457,26 @@ async def import_dingtalk(
     meta["source_copy"] = str(saved_path.relative_to(DATA_DIR))
     start_date, end_date, default_name = parse_batch_dates(file.filename or saved_path.name)
     with connect() as conn:
+        assigned_rows = []
+        unresolved = 0
+        for row in rows:
+            raw = json.loads(row.get("raw_extra_json") or "{}")
+            department = dingtalk_file_group_value(raw, "申请人部门", "申请人所属部门", "发起人部门", "部门")
+            subject = dingtalk_file_group_value(raw, "服务主体", "sujetodeservicio")
+            extra = {**raw, "service_subject": subject} if subject else raw
+            mapped, _, _ = apply_employee_department_mapping(conn, {
+                **row, "source_sheet": department or row["source_sheet"], "raw_extra": extra,
+            })
+            automatic_group = resolve_dingtalk_workbench_sheet(mapped.get("source_sheet"), mapped.get("raw_extra"))
+            group = automatic_group or fallback_group
+            if not group:
+                unresolved += 1
+                continue
+            apply_dingtalk_workbench_assignment(mapped, group, automatic=bool(automatic_group))
+            assigned_rows.append(mapped)
+        if unresolved:
+            raise HTTPException(status_code=400, detail=f"有 {unresolved} 条钉钉记录无法自动归组，请为它们选择已有公司分组")
+        rows = assigned_rows
         created_new_batch = batch_id is None
         existing_request_count = 0
         if batch_id is None:
@@ -5393,11 +5540,11 @@ async def import_employee_departments(
         old_order = batch_sheet_order(row_to_dict(batch))
         before_sheet_rows = conn.execute(
             """
-            SELECT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name,
+            SELECT workbench_registered_sheet(source_sheet, raw_extra_json) AS sheet_name,
                    COUNT(*) AS row_count
             FROM payment_requests
             WHERE batch_id = ?
-            GROUP BY COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet')
+            GROUP BY sheet_name
             """,
             (batch_id,),
         ).fetchall()
@@ -5463,11 +5610,11 @@ async def import_employee_departments(
 
         after_sheet_rows = conn.execute(
             """
-            SELECT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name,
+            SELECT workbench_registered_sheet(source_sheet, raw_extra_json) AS sheet_name,
                    MIN(id) AS first_request_id
             FROM payment_requests
             WHERE batch_id = ?
-            GROUP BY COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet')
+            GROUP BY sheet_name
             ORDER BY first_request_id
             """,
             (batch_id,),
@@ -5714,13 +5861,7 @@ def import_external_expense_rows(
                 )
                 invalid_rows.append({**source_row, "errors": [detail]})
                 continue
-            raw_extra["dingtalk_workbench_assignment"] = {
-                "source_sheet": raw_sheet,
-                "sheet": target_sheet,
-                "mode": "auto" if automatic_sheet else "manual",
-            }
-            request_data.update(source_sheet=raw_sheet, raw_extra=raw_extra)
-            request_data.pop("raw_extra_json", None)
+            apply_dingtalk_workbench_assignment(request_data, target_sheet, automatic=bool(automatic_sheet))
             request_id = insert_request(
                 conn,
                 batch_id,
@@ -8420,7 +8561,9 @@ def export_batch(
             vouchers_by_payment.setdefault(int(voucher["payment_id"]), []).append(voucher)
         for payment in payments:
             payment["vouchers"] = vouchers_by_payment.get(int(payment["id"]), [])
-        content = export_workbook(batch_public_for_user(conn, batch, user), records, attachments, payments)
+        content = export_workbook(
+            batch_public_for_user(conn, batch, user), records, attachments, payments, project_workbench_sheets=True,
+        )
     suffix = "_筛选结果" if filtered else ""
     filename = f"{batch['name']}{suffix}.xlsx".replace("/", "_")
     return StreamingResponse(
@@ -8454,9 +8597,10 @@ def list_audit(
 def list_users(user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
     with connect() as conn:
         rows = conn.execute("SELECT * FROM users WHERE deleted_at IS NULL ORDER BY id").fetchall()
-        public_users = [user_public_with_permissions(conn, row) for row in rows]
+        groups_by_source = sheet_permission_display_groups(conn)
+        public_users = [admin_user_public(conn, row, groups_by_source) for row in rows]
         sheets = available_sheet_names(conn)
-    return {"users": public_users, "available_sheets": sheets}
+    return {"users": public_users, "available_sheets": sheets, "available_sheet_groups": list(DINGTALK_WORKBENCH_SHEETS)}
 
 
 @app.post("/api/admin/users")
@@ -8497,15 +8641,18 @@ def create_user(payload: UserIn, user: Dict[str, Any] = Depends(require_roles(*G
             if "UNIQUE" in str(exc).upper():
                 raise HTTPException(status_code=400, detail="账号已存在") from exc
             raise
-        sheet_permissions = replace_user_sheet_permissions(
+        replace_user_sheet_permissions(
             conn,
             int(cursor.lastrowid),
             payload.sheet_permissions,
             int(user["id"]),
         )
+        save_sheet_group_changes(conn, int(cursor.lastrowid), payload.sheet_group_changes)
         row = conn.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
-        public_user = user_public(row_to_dict(row), sheet_permissions)
-        write_audit(conn, user["id"], "user.create", "user", cursor.lastrowid, new_value=public_user)
+        public_user = admin_user_public(conn, row, sheet_permission_display_groups(conn))
+        write_audit(conn, user["id"], "user.create", "user", cursor.lastrowid, new_value={
+            **public_user, "sheet_group_overrides": payload.sheet_group_changes,
+        })
     return {"user": public_user}
 
 
@@ -8513,6 +8660,7 @@ def create_user(payload: UserIn, user: Dict[str, Any] = Depends(require_roles(*G
 def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends(require_roles(*GENERAL_MANAGER_ROLES))) -> Dict[str, Any]:
     updates = payload.dict(exclude_unset=True)
     sheet_permissions = updates.pop("sheet_permissions", None)
+    sheet_group_changes = updates.pop("sheet_group_changes", None) or {}
     if "password" in updates:
         password = updates.pop("password")
         if password:
@@ -8521,7 +8669,7 @@ def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends
             updates["password_hash"] = hash_password(password)
     if "active" in updates:
         updates["active"] = int(updates["active"])
-    if not updates and sheet_permissions is None:
+    if not updates and sheet_permissions is None and not sheet_group_changes:
         raise HTTPException(status_code=400, detail="没有需要更新的字段")
     allowed = {
         "password_hash",
@@ -8543,9 +8691,10 @@ def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends
             updates["mexico_access_scope"] = normalized_scope
             updates["mexico_identity_name"] = normalized_identity
         columns = [key for key in updates if key in allowed]
-        if not columns and sheet_permissions is None:
+        if not columns and sheet_permissions is None and not sheet_group_changes:
             raise HTTPException(status_code=400, detail="没有需要更新的字段")
         old_public = user_public_with_permissions(conn, old)
+        old_public["sheet_group_overrides"] = load_user_sheet_group_overrides(conn, user_id)
         ensure_can_change_user(conn, old, user, updates)
         if "display_name" in updates:
             updates["display_name"] = str(updates["display_name"]).strip()
@@ -8556,10 +8705,13 @@ def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends
             )
         if sheet_permissions is not None:
             replace_user_sheet_permissions(conn, user_id, sheet_permissions, int(user["id"]))
+        if sheet_group_changes:
+            save_sheet_group_changes(conn, user_id, sheet_group_changes)
         if "active" in updates and updates["active"] == 0:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        audit_new_value = user_public_with_permissions(conn, row)
+        public_user = admin_user_public(conn, row, sheet_permission_display_groups(conn))
+        audit_new_value = {**public_user, "sheet_group_overrides": load_user_sheet_group_overrides(conn, user_id)}
         if "password_hash" in updates:
             audit_new_value["password_reset"] = True
         action = "user.update"
@@ -8568,7 +8720,7 @@ def update_user(user_id: int, payload: UserPatch, user: Dict[str, Any] = Depends
         elif "active" in updates and old["active"] != updates["active"]:
             action = "user.activate" if updates["active"] else "user.deactivate"
         write_audit(conn, user["id"], action, "user", user_id, old_value=old_public, new_value=audit_new_value)
-    return {"user": audit_new_value}
+    return {"user": {**public_user, **({"password_reset": True} if "password_hash" in updates else {})}}
 
 
 @app.post("/api/admin/users/{user_id}/reset-password")
@@ -9310,6 +9462,17 @@ def update_request_row(
     if not existing_row:
         raise HTTPException(status_code=404, detail="请款记录不存在")
     existing = row_to_dict(existing_row)
+    sheet_target = data.get("workbench_sheet_target")
+    if sheet_target is not None:
+        if user_role == ROLE_BUSINESS:
+            raise HTTPException(status_code=403, detail="业务人员不能修改请款所属 Sheet")
+        if sheet_target not in DINGTALK_WORKBENCH_SHEETS:
+            raise HTTPException(status_code=400, detail="请选择已有的公司分组")
+        raw_extra = existing.get("raw_extra")
+        raw_extra = dict(raw_extra) if isinstance(raw_extra, dict) else {}
+        raw_extra.pop("dingtalk_workbench_assignment", None)
+        payload["source_sheet"] = sheet_target
+        payload["raw_extra_json"] = json.dumps(raw_extra, ensure_ascii=False, default=str)
     if (
         "expected_payment_account" in payload
         and request_values_equal(
@@ -9423,8 +9586,10 @@ def update_request_row(
         if not current:
             raise HTTPException(status_code=404, detail="请款记录不存在")
         raise_version_conflict("payment_request", request_id, int(current["version"] or 1))
-    if "source_sheet" in changed_payload:
-        register_batch_sheet(conn, int(existing["batch_id"]), changed_payload["source_sheet"])
+    if sheet_target or "source_sheet" in changed_payload:
+        register_batch_sheet(conn, int(existing["batch_id"]), workbench_registered_sheet(
+            merged.get("source_sheet"), merged.get("raw_extra_json"),
+        ))
     refresh_payment_summaries(conn, request_id, bump_version=False)
     persist_request_region(conn, request_id, actor_id=user_id)
     row = row_to_dict(conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone())

@@ -64,6 +64,7 @@ import {
   PaymentVoucher,
   RequestGridPreference,
   RolloverCopyMode,
+  SheetGroupPermissionState,
   User,
   UserRole,
   WeeklyMergeApplyResult,
@@ -80,6 +81,9 @@ import { defaultDailyPayablesExportRange, shanghaiIsoDate, validateDailyPayables
 import { matchesPaymentStatusFilter, paymentStatusCounts, requestCanAddPayment, requestIsCompleted, requestIsPaymentRefused, requestOutstandingAmount, requestPaymentStatus } from "./paymentStatus";
 import { batchWorkbenchSheetOrder, canRenameWorkbenchSheet, moveToWorkbenchSheet, normalizeWorkbenchSheet, requestWorkbenchSheet, shouldResetWorkbenchSheets, withoutWorkbenchSheet, workbenchGridColumnOrder, workbenchGridColumnVisible, workbenchSheetTarget } from "./workbenchSheets";
 import { assignExternalExpenseGroup, externalExpenseImportPlan, externalExpenseRowKey, toggleExternalExpenseKeys } from "./externalExpenseGroups";
+import { requestEditorSheetChoices, selectRequestEditorSheet } from "./requestEditorSheets";
+import { weeklyImportSheetTarget } from "./weeklyImportSheets";
+import { changeLegacySheetPermission, changeSheetGroupPermission, sheetGroupPermissionState, sheetPermissionPatch, type SheetGroupChanges } from "./sheetPermissionGroups";
 
 type Tab = AppTab;
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
@@ -1103,7 +1107,7 @@ function DailyPayableStatus({ item }: { item: DailyPayableDetail }) {
 function DailyPayableDetailRow({ item }: { item: DailyPayableDetail }) {
   return <tr>
     <td><DailyPayableStatus item={item} /></td>
-    <td>{item.source_sheet || "—"}</td>
+    <td>{item.workbench_sheet || item.source_sheet || "—"}</td>
     <td>{item.applicant || "—"}</td>
     <td className="daily-summary-cell" title={item.summary || ""}>{item.summary || "—"}</td>
     <td>{item.needed_payment_date}</td>
@@ -1116,7 +1120,7 @@ function DailyPayableDetailRow({ item }: { item: DailyPayableDetail }) {
 function DailyPayableDetailCard({ item }: { item: DailyPayableDetail }) {
   const { t } = useLanguage();
   return <article className="daily-detail-card">
-    <header><DailyPayableStatus item={item} /><strong>{item.source_sheet || "—"}</strong></header>
+    <header><DailyPayableStatus item={item} /><strong>{item.workbench_sheet || item.source_sheet || "—"}</strong></header>
     <p>{item.summary || "—"}</p>
     <div className="daily-detail-meta"><span>{t("申请人", "Solicitante")}：{item.applicant || "—"}</span><span>{t("需求付款日期", "Fecha requerida")}：{item.needed_payment_date}</span></div>
     <div className="daily-detail-amounts">
@@ -1147,6 +1151,9 @@ function TopbarImportActions({
   const [mapping, setMapping] = useState<Record<string, string> | null>(null);
   const [headers, setHeaders] = useState<string[]>([]);
   const [mappingOpen, setMappingOpen] = useState(false);
+  const [mappingGroupOptions, setMappingGroupOptions] = useState<string[]>([]);
+  const [mappingGroup, setMappingGroup] = useState("");
+  const [mappingError, setMappingError] = useState("");
   const [externalImportOpen, setExternalImportOpen] = useState(false);
   const [mergePreview, setMergePreview] = useState<WeeklyMergePreview | null>(null);
   const [importToolsOpen, setImportToolsOpen] = useState(false);
@@ -1160,7 +1167,9 @@ function TopbarImportActions({
   const syncFinishedRef = useRef<string | null>(null);
   const syncRefreshPendingRef = useRef<string | null>(null);
   const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
-  const importTargetSheet = selectedBatch?.sheet_order?.includes(weeklyTargetSheet) ? weeklyTargetSheet : "";
+  const weeklyTargetOptions = batchWorkbenchSheetOrder(selectedBatch);
+  const importTargetGroup = weeklyTargetOptions.includes(weeklyTargetSheet) ? weeklyTargetSheet : "";
+  const importTargetSheet = weeklyImportSheetTarget(importTargetGroup, selectedBatch);
 
   useEffect(() => {
     setWeeklyTargetSheet("");
@@ -1212,13 +1221,22 @@ function TopbarImportActions({
   }
 
   async function uploadDingTalk(withMapping: boolean) {
-    if (!dingtalkFile) return;
+    if (!dingtalkFile || busyAction !== null) return;
+    if (withMapping && mappingGroup && !mappingGroupOptions.includes(mappingGroup)) {
+      setMappingError("请选择现有分组");
+      return;
+    }
     setBusyAction("dingtalk");
+    setMappingError("");
     try {
-      const res = await api.uploadDingTalk(dingtalkFile, selectedBatch?.id, withMapping ? mapping || undefined : undefined);
+      const res = await api.uploadDingTalk(dingtalkFile, selectedBatch?.id, withMapping ? mapping || undefined : undefined,
+        withMapping && mappingGroup ? mappingGroup : undefined);
       if (res.status === "needs_mapping") {
         setHeaders(res.headers as string[]);
         setMapping(res.suggested_mapping as Record<string, string>);
+        setMappingGroupOptions(Array.isArray(res.workbench_sheet_options)
+          ? res.workbench_sheet_options.filter((group): group is string => typeof group === "string" && Boolean(group.trim())) : []);
+        setMappingGroup("");
         setMappingOpen(true);
         setMessage("请确认钉钉字段映射");
         return;
@@ -1227,9 +1245,15 @@ function TopbarImportActions({
       setDingtalkInputKey((value) => value + 1);
       setMapping(null);
       setHeaders([]);
+      setMappingGroupOptions([]);
+      setMappingGroup("");
       setMappingOpen(false);
       await refreshAfterImport("钉钉导出表已导入");
     } catch (err) {
+      if (withMapping) {
+        setMappingError((err as Error).message);
+        setMappingOpen(true);
+      }
       setMessage((err as Error).message);
     } finally {
       setBusyAction(null);
@@ -1480,9 +1504,9 @@ function TopbarImportActions({
             </button>
             {selectedBatch && <label className="weekly-target-sheet">
               导入目标 Sheet
-              <select value={importTargetSheet} onChange={(event) => setWeeklyTargetSheet(event.target.value)} disabled={busyAction !== null}>
+              <select value={importTargetGroup} onChange={(event) => setWeeklyTargetSheet(event.target.value)} disabled={busyAction !== null}>
                 <option value="">保留 Excel 原 Sheet</option>
-                {(selectedBatch.sheet_order || []).map((sheet) => <option value={sheet} key={sheet}>{sheet}</option>)}
+                {weeklyTargetOptions.map((sheet) => <option value={sheet} key={sheet}>{sheet}</option>)}
               </select>
             </label>}
           </div>
@@ -1494,10 +1518,15 @@ function TopbarImportActions({
                 key={dingtalkInputKey}
                 type="file"
                 accept=".xlsx,.xls,.csv"
+                disabled={busyAction !== null}
                 onChange={(event) => {
                   setDingtalkFile(event.target.files?.[0] || null);
                   setMapping(null);
                   setHeaders([]);
+                  setMappingGroupOptions([]);
+                  setMappingGroup("");
+                  setMappingError("");
+                  setMappingOpen(false);
                 }}
               />
             </label>
@@ -1539,12 +1568,21 @@ function TopbarImportActions({
         </div>}
       </section>
       {mappingOpen && mapping && (
-        <Modal title="钉钉字段映射" onClose={() => setMappingOpen(false)}>
+        <Modal title="钉钉字段映射" onClose={() => { if (busyAction === null) setMappingOpen(false); }}>
+          {mappingError && <div className="form-error" role="alert">{mappingError}</div>}
+          {mappingGroupOptions.length > 0 && <label className="editor-field">
+            未识别记录归入
+            <select aria-label="未识别记录归入" value={mappingGroup} onChange={(event) => { setMappingGroup(event.target.value); setMappingError(""); }} disabled={busyAction !== null}>
+              <option value="">仅自动识别</option>
+              {mappingGroupOptions.map((group) => <option key={group} value={group}>{group}</option>)}
+            </select>
+            <small className="muted-text">可识别记录按原规则归组，仅未识别记录使用此分组。</small>
+          </label>}
           <div className="mapping-table compact-mapping-table">
             {Object.keys(fieldLabels).map((field) => (
               <label key={field}>
                 {fieldLabels[field]}
-                <select value={mapping[field] || ""} onChange={(event) => setMapping({ ...mapping, [field]: event.target.value })}>
+                <select value={mapping[field] || ""} onChange={(event) => setMapping({ ...mapping, [field]: event.target.value })} disabled={busyAction !== null}>
                   <option value="">不导入</option>
                   {headers.map((header) => (
                     <option key={header} value={header}>{header}</option>
@@ -1609,6 +1647,22 @@ function mergeDisplayValue(value: unknown) {
   if (value === null || value === undefined || value === "") return "空";
   if (typeof value === "number") return value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
   return String(value);
+}
+
+function WeeklyMergeChangeList({ changes }: { changes: WeeklyMergeRow["changes"] }) {
+  const visibleChanges = changes.filter((change) => !(change.display_old !== undefined
+    && change.display_new !== undefined && change.display_old === change.display_new));
+  if (!visibleChanges.length) return <span className="muted">无字段变化</span>;
+  return (
+    <div className="merge-change-list">
+      {visibleChanges.slice(0, 5).map((change) => {
+        const oldValue = mergeDisplayValue(change.display_old ?? change.old);
+        const newValue = mergeDisplayValue(change.display_new ?? change.new);
+        return <span key={change.field} title={`${oldValue} → ${newValue}`}>{change.label}：{oldValue} → {newValue}</span>;
+      })}
+      {visibleChanges.length > 5 && <span>另有 {visibleChanges.length - 5} 项</span>}
+    </div>
+  );
 }
 
 function WeeklyMergeDialog({
@@ -1743,7 +1797,7 @@ function WeeklyMergeDialog({
                 </td>
                 <td>
                   <strong>{row.applicant || "未填写"}</strong>
-                  <small>{row.source_sheet || "未分 Sheet"}</small>
+                  <small>{row.workbench_sheet || row.source_sheet || "未分 Sheet"}</small>
                 </td>
                 <td>
                   <span>应付 ¥{Number(row.amount || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2 })}</span>
@@ -1753,18 +1807,7 @@ function WeeklyMergeDialog({
                   </small>
                 </td>
                 <td>
-                  {row.changes.length === 0 ? (
-                    <span className="muted">无字段变化</span>
-                  ) : (
-                    <div className="merge-change-list">
-                      {row.changes.slice(0, 5).map((change) => (
-                        <span key={change.field} title={`${mergeDisplayValue(change.old)} → ${mergeDisplayValue(change.new)}`}>
-                          {change.label}：{mergeDisplayValue(change.old)} → {mergeDisplayValue(change.new)}
-                        </span>
-                      ))}
-                      {row.changes.length > 5 && <span>另有 {row.changes.length - 5} 项</span>}
-                    </div>
-                  )}
+                  <WeeklyMergeChangeList changes={row.changes} />
                 </td>
                 <td>
                   {row.errors.map((message) => <div className="merge-error-text" key={message}>{message}</div>)}
@@ -2482,10 +2525,15 @@ function Workspace({
   async function saveRequest(payload: Partial<PaymentRequest>) {
     if (!selectedBatch) return;
     const writablePayload = withoutDerivedPaymentFields(payload);
+    delete writablePayload.raw_extra;
     let savedRequest: PaymentRequest;
     if (payload.id) {
+      const group = requestWorkbenchSheet(payload);
+      const movedToFixedGroup = editing && requestWorkbenchSheet(editing) !== group
+        && selectedBatch.workbench_sheet_options?.includes(group);
       const result = await api.updateRequest(selectedBatch.id, payload.id, {
         ...writablePayload,
+        ...(movedToFixedGroup ? { workbench_sheet_target: group } : {}),
         expected_version: Number(payload.version || 1),
         reason,
       });
@@ -2633,6 +2681,10 @@ function Workspace({
           dirtyCells,
           calculatedRequestFields as unknown as ReadonlySet<string>,
         ),
+        ...(dirtyCells.has(`${row.__localId}:source_sheet`)
+          && selectedBatch.workbench_sheet_options?.includes(requestWorkbenchSheet(row))
+          ? { workbench_sheet_target: requestWorkbenchSheet(row) }
+          : {}),
       }));
     const deletes = Array.from(deletedLocalIds)
       .map((localId) => gridRows.find((row) => row.__localId === localId))
@@ -4202,7 +4254,7 @@ function HistoricalCurrencyRestoreDialog({ batch, onClose, onApplied }: { batch:
                 setSelected(next);
               }}
             />
-            <span><strong>{row.dingding_id || `请款 ${row.request_id}`}</strong><small>{row.source_sheet || "未分 Sheet"} · {row.applicant || "申请人未知"}</small></span>
+            <span><strong>{row.dingding_id || `请款 ${row.request_id}`}</strong><small>{row.workbench_sheet || row.source_sheet || "未分 Sheet"} · {row.applicant || "申请人未知"}</small></span>
             <span>{row.status === "recoverable" ? `${formatMoney(Number(row.base_amount_cny || 0))} → ${formatMoney(Number(row.source_amount || 0), row.source_currency)}` : (row.reasons || []).join("；")}</span>
           </label>
         ))}
@@ -4881,6 +4933,7 @@ function RequestEditor({
     "general_manager_opinion",
     "remark",
     "source_sheet",
+    "workbench_sheet",
   ];
   const isDirty = requestFormDirty(request, form, fields);
   const erpOwned = form.erp_payment_owner === "deeplinkerp";
@@ -4996,12 +5049,14 @@ function RequestEditor({
 
   function renderField(field: keyof PaymentRequest, options: { span?: boolean } = {}) {
     const fieldEditable = canEditField(field)
+      && !(field === "source_sheet" && user.role === "business")
       && !isErpLockedRequestField(form, field)
       && !((requestDingTalkTerminated(form) || requestIsPaymentRefused(form)) && generalManagerControlledFields.has(field))
       && !(field === "amount" && currencyCode(form.currency) !== "CNY" && !["finance", "general_manager", "admin"].includes(user.role));
     const className = options.span ? "editor-field span-2" : "editor-field";
     const label = fieldLabels[field] || field;
-    const value = field === "applicant" ? requestApplicantName(form)
+    const value = field === "source_sheet" ? requestWorkbenchSheet(form)
+      : field === "applicant" ? requestApplicantName(form)
       : field === "finance_review" ? requestPaymentStatus(form)
         : field === "pending_amount" ? requestOutstandingAmount(form) : form[field];
     if (!fieldEditable) {
@@ -5014,6 +5069,22 @@ function RequestEditor({
             <strong>{moneyFields.has(field) ? formatMoney(Number(value || 0), form.currency) : String(value || "未填写")}</strong>
           )}
         </div>
+      );
+    }
+    if (field === "source_sheet") {
+      const choices = requestEditorSheetChoices(batch);
+      const current = String(value);
+      const options = choices.includes(current) ? choices : [current, ...choices];
+      return (
+        <label className={className} key={field}>
+          {label}
+          <select
+            value={current}
+            onChange={(event) => setForm(selectRequestEditorSheet(request, form, event.target.value, batch, fieldEditable))}
+          >
+            {options.map((group) => <option key={group} value={group} disabled={!choices.includes(group)}>{group}</option>)}
+          </select>
+        </label>
       );
     }
     return (
@@ -6078,21 +6149,34 @@ function auditDetail(log: AuditLog) {
 }
 
 function SheetPermissionPicker({
-  value,
   options,
+  states = {},
+  changes,
   onChange,
+  originalPermissions = [],
+  legacyPermissions = [],
+  unmappedPermissions = [],
+  onLegacyChange,
   disabled = false,
 }: {
-  value: string[];
   options: string[];
-  onChange: (value: string[]) => void;
+  states?: Record<string, SheetGroupPermissionState>;
+  changes: SheetGroupChanges;
+  onChange: (changes: SheetGroupChanges) => void;
+  originalPermissions?: string[];
+  legacyPermissions?: string[];
+  unmappedPermissions?: string[];
+  onLegacyChange?: (permissions: string[]) => void;
   disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
   const [popoverPosition, setPopoverPosition] = useState({ top: 0, left: 0, width: 320, maxHeight: 320 });
-  const allOptions = Array.from(new Set([...options, ...value])).sort((left, right) => left.localeCompare(right, "zh-CN"));
+  const allOptions = Array.from(new Set(options));
+  const partialCount = allOptions.filter((group) => sheetGroupPermissionState(group, states, changes) === "partial").length;
+  const selectedCount = allOptions.filter((group) => sheetGroupPermissionState(group, states, changes) !== "none").length;
+  const legacyOptions = unmappedPermissions.filter((permission) => originalPermissions.includes(permission));
 
   function updatePopoverPosition() {
     const trigger = triggerRef.current;
@@ -6156,32 +6240,52 @@ function SheetPermissionPicker({
         disabled={disabled}
         onClick={() => setOpen((current) => !current)}
       >
-        {disabled ? "角色可查看全部 Sheet" : `已授权 ${value.length} 个 Sheet`}
+        {disabled ? "角色可查看全部分组" : allOptions.length
+          ? `已授权 ${selectedCount} 个分组${partialCount ? `（${partialCount} 个部分授权）` : ""}`
+          : "分组权限暂不可用"}
       </button>
+      {!disabled && legacyOptions.length > 0 && <small className="muted-text">另有 {legacyOptions.length} 项历史单独授权</small>}
       {!disabled && open && createPortal(
         <div
           ref={popoverRef}
           className="sheet-permission-options"
           role="dialog"
-          aria-label="选择可访问的 Sheet"
+          aria-label="选择可访问的公司分组"
           style={popoverPosition}
         >
-          {allOptions.length === 0 && <span className="muted-text">暂无可授权的 Sheet</span>}
-          {allOptions.map((sheetName) => (
-            <label key={sheetName}>
+          {allOptions.length === 0 && <span className="muted-text">暂时无法读取分组，已有权限保持不变。</span>}
+          {partialCount > 0 && <small className="muted-text">部分授权保留原有范围；勾选可授权整个分组，也可直接撤销。</small>}
+          {allOptions.map((group) => {
+            const state = sheetGroupPermissionState(group, states, changes);
+            return (
+              <div key={group} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <label style={{ flex: 1 }}>
+                  <input
+                    type="checkbox"
+                    checked={state === "all"}
+                    aria-checked={state === "partial" ? "mixed" : state === "all"}
+                    ref={(element) => { if (element) element.indeterminate = state === "partial"; }}
+                    onChange={(event) => onChange(changeSheetGroupPermission(changes, group, event.target.checked))}
+                  />
+                  <span title={group}>{group}{state === "partial" && <small className="muted-text"> · 保留原有范围</small>}</span>
+                </label>
+                {state === "partial" && <button type="button" className="ghost-button" aria-label={`撤销${group}权限`} onClick={() => onChange(changeSheetGroupPermission(changes, group, false))}>撤销</button>}
+              </div>
+            );
+          })}
+          {Object.keys(changes).length > 0 && <button type="button" className="ghost-button" onClick={() => onChange({})}>恢复原分组权限</button>}
+          {legacyOptions.length > 0 && onLegacyChange && <details>
+            <summary>历史单独授权（{legacyOptions.length}）</summary>
+            <small className="muted-text">这些历史授权已保留。取消勾选可撤销，保存前可恢复。</small>
+            {legacyOptions.map((permission) => <label key={permission}>
               <input
                 type="checkbox"
-                checked={value.includes(sheetName)}
-                onChange={(event) => {
-                  const next = event.target.checked
-                    ? [...value, sheetName]
-                    : value.filter((item) => item !== sheetName);
-                  onChange(Array.from(new Set(next)));
-                }}
+                checked={legacyPermissions.includes(permission)}
+                onChange={(event) => onLegacyChange(changeLegacySheetPermission(originalPermissions, legacyPermissions, permission, event.target.checked))}
               />
-              <span title={sheetName}>{sheetName}</span>
-            </label>
-          ))}
+              <span title={permission}>{permission}</span>
+            </label>)}
+          </details>}
         </div>,
         document.body,
       )}
@@ -6197,6 +6301,7 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
     display_name: string;
     active: boolean;
     sheet_permissions: string[];
+    sheet_group_changes: SheetGroupChanges;
     mexico_access_scope: MexicoAccessScope;
     mexico_identity_name: string;
   };
@@ -6206,11 +6311,12 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
     active: boolean;
     password: string;
     sheet_permissions: string[];
+    sheet_group_changes: SheetGroupChanges;
     mexico_access_scope: MexicoAccessScope;
     mexico_identity_name: string;
   };
   const [users, setUsers] = useState<User[]>([]);
-  const [availableSheets, setAvailableSheets] = useState<string[]>([]);
+  const [availableSheetGroups, setAvailableSheetGroups] = useState<string[]>([]);
   const emptyUserForm = (): UserForm => ({
     username: "",
     password: authMode === "eims" ? "" : "Yuewei123",
@@ -6218,6 +6324,7 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
     display_name: "",
     active: true,
     sheet_permissions: [],
+    sheet_group_changes: {},
     mexico_access_scope: "none",
     mexico_identity_name: "",
   });
@@ -6241,6 +6348,7 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
         item.mexico_access_scope,
         item.mexico_identity_name,
         ...(item.sheet_permissions || []),
+        ...Object.entries(item.sheet_group_states || {}).filter(([, state]) => state !== "none").map(([group]) => group),
       ]
         .some((value) => String(value || "").toLowerCase().includes(query));
     });
@@ -6249,13 +6357,14 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
   async function load() {
     const userRes = await api.users();
     setUsers(userRes.users);
-    setAvailableSheets(userRes.available_sheets);
+    setAvailableSheetGroups(userRes.available_sheet_groups || []);
     setUserDrafts(Object.fromEntries(userRes.users.map((item) => [item.id, {
       display_name: item.display_name,
       role: item.role,
       active: item.active,
       password: "",
       sheet_permissions: item.sheet_permissions || [],
+      sheet_group_changes: {},
       mexico_access_scope: item.mexico_access_scope,
       mexico_identity_name: item.mexico_identity_name || "",
     }])));
@@ -6307,6 +6416,7 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
         username,
         display_name: displayName,
         sheet_permissions: userForm.role === "business" ? userForm.sheet_permissions : [],
+        sheet_group_changes: userForm.role === "business" ? userForm.sheet_group_changes : {},
         mexico_identity_name: userForm.mexico_access_scope === "none" ? null : mexicoIdentityName || null,
       });
       await load();
@@ -6338,7 +6448,7 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
       display_name: draft.display_name,
       role: draft.role,
       active: draft.active,
-      sheet_permissions: draft.sheet_permissions,
+      ...(draft.role === "business" ? sheetPermissionPatch(item.sheet_permissions || [], draft.sheet_permissions, draft.sheet_group_changes) : {}),
       mexico_access_scope: draft.mexico_access_scope,
       mexico_identity_name: draft.mexico_access_scope === "none" ? null : mexicoIdentityName || null,
       ...(draft.password ? { password: draft.password } : {}),
@@ -6398,6 +6508,7 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
                   active: item.active,
                   password: "",
                   sheet_permissions: item.sheet_permissions || [],
+                  sheet_group_changes: {},
                   mexico_access_scope: item.mexico_access_scope,
                   mexico_identity_name: item.mexico_identity_name || "",
                 };
@@ -6421,10 +6532,15 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
                     </td>
                     <td>
                       <SheetPermissionPicker
-                        value={draft.sheet_permissions}
-                        options={availableSheets}
+                        options={availableSheetGroups}
+                        states={item.sheet_group_states}
+                        changes={draft.sheet_group_changes}
+                        originalPermissions={item.sheet_permissions || []}
+                        legacyPermissions={draft.sheet_permissions}
+                        unmappedPermissions={item.unmapped_sheet_permissions}
                         disabled={draft.role !== "business"}
-                        onChange={(sheet_permissions) => updateUserDraft(item.id, { sheet_permissions })}
+                        onChange={(sheet_group_changes) => updateUserDraft(item.id, { sheet_group_changes })}
+                        onLegacyChange={(sheet_permissions) => updateUserDraft(item.id, { sheet_permissions })}
                       />
                     </td>
                     <td>
@@ -6518,6 +6634,7 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
                     ...userForm,
                     role,
                     sheet_permissions: role === "business" ? userForm.sheet_permissions : [],
+                    sheet_group_changes: role === "business" ? userForm.sheet_group_changes : {},
                   });
                 }}
                 disabled={creatingUser}
@@ -6561,15 +6678,15 @@ function AdminView({ authMode, setMessage }: { authMode: AuthMode; setMessage: (
             <label className="span-2">
               Sheet 权限
               <SheetPermissionPicker
-                value={userForm.sheet_permissions}
-                options={availableSheets}
+                options={availableSheetGroups}
+                changes={userForm.sheet_group_changes}
                 disabled={userForm.role !== "business"}
-                onChange={(sheet_permissions) => setUserForm({ ...userForm, sheet_permissions })}
+                onChange={(sheet_group_changes) => setUserForm({ ...userForm, sheet_group_changes })}
               />
               <small>
                 {userForm.role === "business"
-                  ? "未选择时，该用户登录后看不到任何 Sheet。"
-                  : "该角色按照系统权限查看全部 Sheet，无需单独授权。"}
+                  ? "未选择分组时，该用户登录后看不到任何 Sheet。"
+                  : "该角色按照系统权限查看全部分组，无需单独授权。"}
               </small>
             </label>
             <label className="inline-check create-user-active span-2">

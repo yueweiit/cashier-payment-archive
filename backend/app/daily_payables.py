@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from .db import get_daily_payables_history_start_date
-from .sheet_names import canonical_sheet_name
+from .sheet_names import ambiguous_legacy_workbench_groups, canonical_sheet_name, workbench_sheet_name
 
 
 MAX_TREND_DAYS = 93
@@ -66,10 +66,6 @@ def validate_daily_export_range(conn: sqlite3.Connection, start: date, end: date
     return history_start
 
 
-def _row_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return dict(row)
-
-
 def _load_events(conn: sqlite3.Connection, end: date) -> list[Dict[str, Any]]:
     rows = conn.execute(
         """
@@ -80,7 +76,10 @@ def _load_events(conn: sqlite3.Connection, end: date) -> list[Dict[str, Any]]:
         """,
         (_day_end(end),),
     ).fetchall()
-    return [_row_dict(row) for row in rows]
+    events = [dict(row) for row in rows]
+    for event in events:
+        event["workbench_sheet"] = event.get("workbench_sheet") or workbench_sheet_name(event.get("source_sheet"))
+    return events
 
 
 def _currency(row: Dict[str, Any]) -> str:
@@ -106,6 +105,8 @@ def _visible(
     row: Dict[str, Any],
     allowed_sheets: Optional[set[str]],
     *,
+    allowed_groups: Optional[set[str]] = None,
+    denied_groups: Optional[set[str]] = None,
     china_only: bool = False,
 ) -> bool:
     if not int(row.get("included") or 0) or int(row.get("deleted") or 0):
@@ -115,9 +116,18 @@ def _visible(
         or str(row.get("region_review_status") or "").strip().lower() != "resolved"
     ):
         return False
-    if allowed_sheets is None:
+    group = row["workbench_sheet"]
+    if denied_groups and (
+        group in denied_groups
+        or (group == "待归组" and not denied_groups.isdisjoint(ambiguous_legacy_workbench_groups(row.get("source_sheet"))))
+    ):
+        return False
+    if allowed_sheets is None and allowed_groups is None:
         return True
-    return canonical_sheet_name(row.get("source_sheet")) in allowed_sheets
+    return bool(
+        (allowed_groups and group in allowed_groups)
+        or (allowed_sheets and canonical_sheet_name(row.get("source_sheet")) in allowed_sheets)
+    )
 
 
 def _empty_totals() -> Dict[str, float]:
@@ -190,6 +200,8 @@ def _snapshot_payload(
     payment_deltas: Dict[tuple[str, int], Dict[str, float]],
     allowed_sheets: Optional[set[str]],
     *,
+    allowed_groups: Optional[set[str]] = None,
+    denied_groups: Optional[set[str]] = None,
     include_details: bool,
     china_only: bool = False,
 ) -> Dict[str, Any]:
@@ -202,7 +214,9 @@ def _snapshot_payload(
     overdue_count = 0
 
     for logical_id, state in _deduplicated_states(states):
-        if not _visible(state, allowed_sheets, china_only=china_only):
+        if not _visible(
+            state, allowed_sheets, allowed_groups=allowed_groups, denied_groups=denied_groups, china_only=china_only,
+        ):
             continue
         due_date = str(state.get("needed_payment_date") or "").strip()[:10]
         if not due_date or due_date > selected_iso:
@@ -243,6 +257,7 @@ def _snapshot_payload(
                     "source_batch_id": state.get("source_batch_id"),
                     "dingding_id": state.get("dingding_id"),
                     "source_sheet": canonical_sheet_name(state.get("source_sheet")),
+                    "workbench_sheet": state["workbench_sheet"],
                     "applicant": state.get("applicant"),
                     "summary": state.get("summary"),
                     "needed_payment_date": due_date,
@@ -266,7 +281,7 @@ def _snapshot_payload(
         key=lambda item: (
             0 if item["is_overdue"] else 1,
             item["needed_payment_date"],
-            item["source_sheet"],
+            item["workbench_sheet"],
             item["logical_request_id"],
         )
     )
@@ -295,6 +310,8 @@ def daily_snapshot(
     selected: date,
     *,
     allowed_sheets: Optional[set[str]] = None,
+    allowed_groups: Optional[set[str]] = None,
+    denied_groups: Optional[set[str]] = None,
     include_details: bool = False,
     china_only: bool = False,
 ) -> Dict[str, Any]:
@@ -306,6 +323,8 @@ def daily_snapshot(
         states,
         deltas,
         allowed_sheets,
+        allowed_groups=allowed_groups,
+        denied_groups=denied_groups,
         include_details=include_details,
         china_only=china_only,
     )
@@ -319,6 +338,8 @@ def daily_trend(
     end: date,
     *,
     allowed_sheets: Optional[set[str]] = None,
+    allowed_groups: Optional[set[str]] = None,
+    denied_groups: Optional[set[str]] = None,
     china_only: bool = False,
 ) -> Dict[str, Any]:
     history_start = _validate_date(conn, start)
@@ -337,6 +358,8 @@ def daily_trend(
             start,
             end,
             allowed_sheets=allowed_sheets,
+            allowed_groups=allowed_groups,
+            denied_groups=denied_groups,
             include_details=False,
             china_only=china_only,
         )
@@ -356,6 +379,8 @@ def iter_daily_snapshots(
     end: date,
     *,
     allowed_sheets: Optional[set[str]] = None,
+    allowed_groups: Optional[set[str]] = None,
+    denied_groups: Optional[set[str]] = None,
     include_details: bool = False,
     china_only: bool = False,
 ) -> Iterable[Dict[str, Any]]:
@@ -393,6 +418,8 @@ def iter_daily_snapshots(
             states,
             deltas,
             allowed_sheets,
+            allowed_groups=allowed_groups,
+            denied_groups=denied_groups,
             include_details=include_details,
             china_only=china_only,
         )

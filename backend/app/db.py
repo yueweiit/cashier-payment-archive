@@ -138,6 +138,13 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_user_sheet_permissions_sheet
             ON user_sheet_permissions(sheet_name, user_id);
 
+            CREATE TABLE IF NOT EXISTS user_workbench_sheet_permissions (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                sheet_name TEXT NOT NULL,
+                allowed INTEGER NOT NULL CHECK(allowed IN (0, 1)),
+                PRIMARY KEY (user_id, sheet_name)
+            );
+
             CREATE TABLE IF NOT EXISTS user_ui_preferences (
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 preference_key TEXT NOT NULL,
@@ -806,9 +813,9 @@ def _insert_payable_baseline(
             amount, paid_amount, pending_amount, currency,
             base_amount_cny, base_paid_amount_cny, base_pending_amount_cny,
             fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date,
-            source_sheet, summary, applicant, approval_status, approval_result,
+            source_sheet, workbench_sheet, summary, applicant, approval_status, approval_result,
             resolved_region, region_review_status, included, deleted, created_by
-        ) VALUES (?, ?, ?, ?, ?, ?, 'baseline', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'baseline', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
         """,
         (
             logical_request_id,
@@ -830,6 +837,7 @@ def _insert_payable_baseline(
             row["fx_rate_date"],
             row["fx_rate_actual_date"],
             canonical_sheet_name(row["source_sheet"]),
+            workbench_sheet_name(row["source_sheet"], row["raw_extra_json"]),
             row["summary"],
             row["applicant"],
             approval_status,
@@ -877,6 +885,7 @@ def ensure_daily_payable_history_tables(conn: sqlite3.Connection) -> None:
             fx_rate_date TEXT,
             fx_rate_actual_date TEXT,
             source_sheet TEXT,
+            workbench_sheet TEXT,
             summary TEXT,
             applicant TEXT,
             approval_status TEXT,
@@ -899,6 +908,7 @@ def ensure_daily_payable_history_tables(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "payable_history_versions", "source_batch_id", "INTEGER")
     ensure_column(conn, "payable_history_versions", "dingding_id", "TEXT")
     ensure_column(conn, "payable_history_versions", "payable_item_key", "TEXT")
+    ensure_column(conn, "payable_history_versions", "workbench_sheet", "TEXT")
 
 
 def ensure_daily_payable_history_schema(conn: sqlite3.Connection) -> None:

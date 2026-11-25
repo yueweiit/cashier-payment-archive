@@ -4,6 +4,7 @@ import asyncio
 import gc
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import uuid
@@ -22,7 +23,7 @@ from backend.app import daily_payables_export
 import backend.app.main as main_module
 from backend.app.db import connect, get_daily_payables_history_start_date, now_iso
 from backend.app.main import app
-from backend.app.daily_payables import daily_snapshot, daily_trend
+from backend.app.daily_payables import daily_snapshot, daily_trend, iter_daily_snapshots
 from backend.app.payable_history import payment_effective_at, record_request_state
 from backend.app.security import hash_password
 
@@ -105,7 +106,7 @@ def shift_calendar_months(value: date, months: int) -> date:
 def test_record_request_state_is_idempotent_and_keeps_full_state():
     with TestClient(app) as client:
         login(client)
-        request = create_request(client)
+        request = create_request(client, source_sheet="凌翔供应链及采购执行单元")
         event_key = f"test:{uuid.uuid4().hex}"
         with connect() as conn:
             record_request_state(
@@ -141,7 +142,8 @@ def test_record_request_state_is_idempotent_and_keeps_full_state():
             assert row["paid_amount"] == 0
             assert row["pending_amount"] == 20000
             assert row["needed_payment_date"] == "2026-08-21"
-            assert row["source_sheet"] == "每日应付测试公司"
+            assert row["source_sheet"] == "凌翔供应链及采购执行单元"
+            assert row["workbench_sheet"] == "广州凌翔"
             assert row["included"] == 1
 
 
@@ -448,6 +450,58 @@ def test_daily_payables_export_generates_summary_and_detail_workbook():
         assert detail_row[6] == "'=HYPERLINK(\"https://example.invalid\", \"中转站290\")"
         assert detail.cell(2, 7).data_type == "s"
         assert detail_row[8:13] == [290, 0, 0, 290, "CNY"]
+
+
+def test_daily_sheet_projection_and_permissions_follow_as_of_group():
+    first_day = date(2026, 11, 24)
+    second_day = date(2026, 11, 25)
+    with sqlite3.connect(":memory:") as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE app_settings (key TEXT, value TEXT);
+            INSERT INTO app_settings VALUES ('daily_payables_history_start_date', '2026-11-24');
+            CREATE TABLE payable_history_versions (
+                id INTEGER PRIMARY KEY, logical_request_id INTEGER, effective_at TEXT,
+                source_sheet TEXT, workbench_sheet TEXT, needed_payment_date TEXT,
+                amount REAL, pending_amount REAL, included INTEGER
+            );
+            INSERT INTO payable_history_versions VALUES
+                (1, 101, '2026-11-24T09:00:00', '凌翔供应链及采购执行单元', NULL, '2026-11-24', 20, 20, 1),
+                (2, 102, '2026-11-24T10:00:00', '凌翔/星铭供应链及职能中心', '星铭 财务', '2026-11-24', 30, 30, 1),
+                (3, 102, '2026-11-25T10:00:00', '凌翔/星铭供应链及职能中心', '广州凌翔', '2026-11-24', 30, 30, 1),
+                (4, 103, '2026-11-24T11:00:00', '拉丁购LATINGO', NULL, '2026-11-24', 40, 40, 1);
+        """)
+        report = daily_snapshot(conn, first_day, include_details=True)
+        assert {item["source_sheet"]: item["workbench_sheet"] for item in report["items"]} == {
+            "凌翔供应链及采购执行单元": "广州凌翔",
+            "凌翔/星铭供应链及职能中心": "星铭 财务",
+            "拉丁购LATINGO": "待归组",
+        }
+        distinct_legacy_scope = {"allowed_sheets": {"拉丁购LATINGO"}}
+        permitted = daily_snapshot(conn, first_day, **distinct_legacy_scope, denied_groups={"星铭 财务"})
+        assert permitted["totals_cny"]["end_pending"] == 40
+        blocked = daily_snapshot(conn, first_day, **distinct_legacy_scope, denied_groups={"拉丁购"})
+        assert blocked["totals_cny"]["end_pending"] == 0
+
+        scope = {
+            "allowed_sheets": {"凌翔/星铭供应链及职能中心"},
+            "allowed_groups": {"广州凌翔"},
+            "denied_groups": {"星铭 财务"},
+        }
+        trend = daily_trend(conn, first_day, second_day, **scope)
+        assert [point["totals_cny"]["end_pending"] for point in trend["points"]] == [20, 50]
+        report = daily_snapshot(conn, first_day, include_details=True, **scope)
+        assert [item["logical_request_id"] for item in report["items"]] == [101]
+
+        path = daily_payables_export.export_daily_payables_workbook(
+            iter_daily_snapshots(conn, first_day, second_day, include_details=True, **scope)
+        )
+    try:
+        workbook = load_workbook(path, data_only=True)
+        details = workbook["逐日明细"]
+        assert [details.cell(row, 5).value for row in range(2, 5)] == ["广州凌翔"] * 3
+    finally:
+        path.unlink()
 
 
 def test_daily_payables_export_validates_historical_six_month_range():

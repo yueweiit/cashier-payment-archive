@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Any, Dict, Optional
 
 from .db import erp_owned_request_ids, now_iso
-from .sheet_names import canonical_sheet_name
+from .sheet_names import canonical_sheet_name, workbench_sheet_name
 
 
 def ensure_logical_request_id(conn: sqlite3.Connection, request_id: int) -> int:
@@ -153,9 +153,9 @@ def record_request_state(
             amount, paid_amount, pending_amount, currency,
             base_amount_cny, base_paid_amount_cny, base_pending_amount_cny,
             fx_rate_cny_per_unit, fx_rate_date, fx_rate_actual_date,
-            source_sheet, summary, applicant, approval_status, approval_result,
+            source_sheet, workbench_sheet, summary, applicant, approval_status, approval_result,
             resolved_region, region_review_status, included, deleted, created_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             logical_request_id,
@@ -179,6 +179,7 @@ def record_request_state(
             row["fx_rate_date"],
             row["fx_rate_actual_date"],
             canonical_sheet_name(row["source_sheet"]),
+            workbench_sheet_name(row["source_sheet"], row["raw_extra_json"]),
             row["summary"],
             row["applicant"],
             state["approval_status"],

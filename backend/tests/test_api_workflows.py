@@ -1258,6 +1258,66 @@ def test_workbench_sheet_groups_keep_original_access_and_do_not_restore_terminat
         assert get_batch()["workbench_sheet_targets"] == {"广州凌翔": "凌翔产品&开发"}
 
 
+def test_admin_workbench_group_permissions_keep_legacy_access_until_explicit_change():
+    with TestClient(app) as admin, TestClient(app) as business:
+        login(admin)
+        batch_id = admin.post("/api/batches", json={"name": "分组权限"}).json()["batch"]["id"]
+        requests = f"/api/batches/{batch_id}/requests"
+
+        def create(raw, subject):
+            response = admin.post(requests, json={
+                "source_sheet": raw, "amount": 12,
+                "raw_extra": {"external_source": {"approval_status": "RUNNING", "service_subject": subject}},
+            })
+            assert response.status_code == 200, response.text
+            return response.json()["request"]["id"]
+
+        def visible_ids():
+            return {item["id"] for item in business.get(requests).json()["requests"]}
+
+        mixed = "LatínGo拉丁购"
+        china = create(mixed, "拉丁购")
+        international = create(mixed, "LATINGO")
+        separate = create("拉丁购", "拉丁购")
+        created = admin.post("/api/admin/users", json={
+            "username": "group-permissions", "password": "password123", "display_name": "分组用户",
+            "role": "business", "sheet_permissions": [mixed],
+        })
+        assert created.status_code == 200, created.text
+        user_id = created.json()["user"]["id"]
+        public = admin.get("/api/admin/users").json()
+        assert {"悦为智能", "拉丁购", "LATINGO"} <= set(public["available_sheet_groups"])
+        before = next(user for user in public["users"] if user["id"] == user_id)
+        assert before["sheet_group_states"]["拉丁购"] == before["sheet_group_states"]["LATINGO"] == "partial"
+        login(business, "group-permissions", "password123")
+        assert visible_ids() == {china, international}
+
+        url = f"/api/admin/users/{user_id}"
+        renamed = admin.patch(url, json={"display_name": "更新姓名"}).json()["user"]
+        assert renamed["sheet_permissions"] == [mixed]
+        assert visible_ids() == {china, international}
+        assert admin.patch(url, json={"sheet_group_changes": {"新增分组": True}}).status_code == 400
+        changed = admin.patch(url, json={"sheet_group_changes": {"拉丁购": True, "LATINGO": False}})
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["user"]["sheet_permissions"] == [mixed]
+        assert visible_ids() == {china, separate}
+        assert business.get(f"{requests}/{international}/attachments").status_code == 403
+        assert business.get(f"{requests}/{china}/attachments").status_code == 200
+        assert business.patch(f"{requests}/{china}", json={
+            "summary": "更新摘要", "raw_extra": {"external_source": {"service_subject": "LATINGO"}},
+        }).status_code == 200
+        assert visible_ids() == {china, separate}
+        batch = business.get(f"/api/batches/{batch_id}").json()["batch"]
+        assert batch["workbench_sheet_order"] == ["拉丁购"]
+        assert batch["workbench_sheet_targets"] == {"拉丁购": "拉丁购"}
+        exported = business.get(f"/api/batches/{batch_id}/export.xlsx")
+        assert exported.status_code == 200, exported.text
+        workbook = load_workbook(io.BytesIO(exported.content))
+        assert workbook.sheetnames == ["全部", "拉丁购", "付款明细", "_系统信息"]
+        sheet_info = [row for row in workbook["_系统信息"].values if row[0] == "request_sheet"]
+        assert {row[1] for row in sheet_info} == {china, separate}
+
+
 def test_dingtalk_preview_and_import_use_same_workbench_sheet(monkeypatch):
     approval_no = "DINGTALK-COMPANY-SHEET-GROUP"
     source = external_expense_test_row(
@@ -1333,10 +1393,66 @@ def test_dingtalk_import_only_registers_fixed_workbench_groups(monkeypatch):
         assert rolled.status_code == 200, rolled.text
         next_id = rolled.json()["batch"]["id"]
         assert client.get(f"/api/batches/{next_id}").json()["batch"]["workbench_sheet_order"] == ["LATINGO", "柠檬树"]
+        baseline = client.post(f"{batch_url}/snapshots/baseline")
+        assert baseline.status_code == 200, baseline.text
+        restored = client.post(f"{batch_url}/restore-baseline")
+        assert restored.status_code == 200, restored.text
         with connect() as conn:
             for current in (batch_id, next_id):
                 stored = conn.execute("SELECT sheet_order_json FROM request_batches WHERE id=?", (current,)).fetchone()
                 assert json.loads(stored["sheet_order_json"]) == ["LATINGO", "柠檬树"]
+
+
+def test_dingtalk_file_uses_known_groups_and_requires_fallback_for_unknown_rows():
+    content = "钉钉单号,应付金额,申请人,申请人部门,服务主体\nFILE-1,100,甲,,柠檬树\nFILE-2,200,乙,新部门,\n".encode()
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": "钉钉文件归组"}).json()["batch"]["id"]
+        url = "/api/import/dingtalk"
+
+        def upload(data):
+            return client.post(url, data={"batch_id": batch_id, **data}, files={"file": ("钉钉导出.csv", content)})
+
+        recognized = upload({})
+        assert recognized.status_code == 200, recognized.text
+        assert "悦为智能" in recognized.json()["workbench_sheet_options"]
+        mapping = json.dumps({"dingding_id": "钉钉单号", "amount": "应付金额", "applicant": "申请人"})
+        assert upload({"mapping_json": mapping}).status_code == 400
+        assert client.get(f"/api/batches/{batch_id}/requests").json()["requests"] == []
+        assert upload({"mapping_json": mapping, "workbench_sheet": "某新组"}).status_code == 400
+        result = upload({"mapping_json": mapping, "workbench_sheet": "LATINGO"})
+        assert result.status_code == 200, result.text
+        requests = client.get(f"/api/batches/{batch_id}/requests").json()["requests"]
+        assert {row["dingding_id"]: row["workbench_sheet"] for row in requests} == {"FILE-1": "柠檬树", "FILE-2": "LATINGO"}
+        batch = client.get(f"/api/batches/{batch_id}").json()["batch"]
+        assert batch["sheet_order"] == batch["workbench_sheet_order"] == ["柠檬树", "LATINGO"]
+
+
+def test_explicit_projected_sheet_move_replaces_pin_even_when_raw_sheet_is_unchanged():
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": "抽屉归组"}).json()["batch"]["id"]
+        path = f"/api/batches/{batch_id}/requests"
+        row = client.post(path, json={
+            "source_sheet": "LATINGO", "amount": 100,
+            "raw_extra": {"dingtalk_workbench_assignment": {"source_sheet": "LATINGO", "sheet": "拉丁购", "mode": "manual"}},
+        }).json()["request"]
+        assert row["workbench_sheet"] == "拉丁购"
+        with connect() as conn:
+            merge = main_module.build_weekly_merge_plan(conn, batch_id, [{
+                "_request_id": row["id"], "source_sheet": "LATINGO", "source_row": 2,
+                "_workbench_sheet": "LATINGO", "_workbook_sheet": "LATINGO",
+            }], {"format_version": 3, "export_batch_id": batch_id, "workbook_sheet_order": ["LATINGO"]})
+        assert merge["request_plans"][0]["payload"]["workbench_sheet_target"] == "LATINGO"
+        assert merge["rows"][0]["action"] == "update"
+        assert merge["rows"][0]["changes"][0]["display_old"] == "拉丁购"
+        assert merge["rows"][0]["changes"][0]["display_new"] == "LATINGO"
+        path += f"/{row['id']}"
+        saved = client.patch(path, json={"source_sheet": "LATINGO", "summary": "只改摘要"})
+        assert saved.json()["request"]["workbench_sheet"] == "拉丁购"
+        moved = client.patch(path, json={"workbench_sheet_target": "LATINGO"})
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["request"]["source_sheet"] == moved.json()["request"]["workbench_sheet"] == "LATINGO"
 
 
 def test_empty_sheet_registry_and_business_sheet_boundaries():
@@ -3050,7 +3166,7 @@ def test_image_attachment_upload_and_export():
         exported = client.get(f"/api/batches/{batch_id}/export.xlsx")
         assert exported.status_code == 200
         workbook = load_workbook(io.BytesIO(exported.content))
-        worksheet = workbook["凌翔产品&开发"]
+        worksheet = workbook["广州凌翔"]
         headers = [cell.value for cell in next(worksheet.iter_rows(max_row=1))]
         assert "图片附件" in headers
         assert "财务付款时间" in headers

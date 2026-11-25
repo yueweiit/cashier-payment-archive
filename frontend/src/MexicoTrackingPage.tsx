@@ -40,6 +40,7 @@ import {
   compactDateTime,
   copyTextWithFallback,
   formatOriginalMoney,
+  mexicoCompanyLabel,
   mexicoSourceLabel,
   mexicoSyncPhaseLabel,
 } from "./mexicoTracking";
@@ -570,7 +571,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
                   <td><button className="link-button" onClick={() => openDetail(item.id)}>{item.approval_no}</button><small>{mexicoSourceLabel(item.source_type, language)} · {item.request_date || "—"}</small></td>
                   <td className="mexico-request-cell">
                     <strong title={item.applicant_name || "—"}>{item.applicant_name || "—"}</strong>
-                    <span className="mexico-company-clamp" title={item.company_name || item.source_sheet || "—"}>{item.company_name || item.source_sheet || "—"}</span>
+                    <span className="mexico-company-clamp" title={mexicoCompanyLabel(item)}>{mexicoCompanyLabel(item)}</span>
                     {item.applicant_department && <small title={item.applicant_department}>{item.applicant_department}</small>}
                   </td>
                   <td className="mexico-summary-cell"><span className="mexico-summary-clamp" title={item.summary || "—"}>{item.summary || "—"}</span><small>{formatOriginalMoney(item.amount, item.currency, language)}</small></td>
@@ -583,7 +584,7 @@ export function MexicoTrackingPage({ user, setMessage }: Props) {
               <article key={item.id} className={`mexico-tracking-card warning-${item.warning_level}`} onClick={() => openDetail(item.id)}>
                 <header><span className={`mexico-warning-chip ${item.warning_level}`}>{warningLabel(item.warning_level, language)}</span><strong>{item.age_days} {t("天", "días")}</strong></header>
                 <h3>{item.summary || item.approval_no}</h3>
-                <p>{item.company_name || item.source_sheet || "—"}</p>
+                <p>{mexicoCompanyLabel(item)}</p>
                 <dl><div><dt>{t("申请人", "Solicitante")}</dt><dd>{item.applicant_name || "—"}</dd></div><div><dt>{t("当前节点", "Etapa")}</dt><dd><CurrentNodes item={item} /></dd></div><div><dt>{t("当前审批人", "Aprobador")}</dt><dd><CurrentApprovers item={item} /></dd></div><div><dt>{t("金额", "Importe")}</dt><dd>{formatOriginalMoney(item.amount, item.currency, language)}</dd></div></dl>
                 <footer><span>{item.approval_no}</span><div>{item.reminder && <button onClick={(event) => { event.stopPropagation(); copyReminder(item); }}><ClipboardCopy size={15} />{t("提醒", "Recordar")}</button>}<MexicoOriginalLink workflowUrl={item.workflow_url} label={t("原单", "Original")} /><button>{t("查看", "Ver")}</button></div></footer>
               </article>
@@ -732,7 +733,7 @@ function MexicoDetailDrawer({
             {canAdmin && item.region_review_status === "pending" && <section className="mexico-region-review"><AlertTriangle /><div><strong>{t("执行地区待核对", "Región por revisar")}</strong><p>{item.region_conflict_reason || t("来源信息存在冲突，请人工确认。", "La información de origen es inconsistente.")}</p></div><div><button disabled={resolving} onClick={() => resolveRegion("china")}>{t("归为中国", "Asignar a China")}</button><button className="primary" disabled={resolving} onClick={() => resolveRegion("mexico")}>{t("归为墨西哥", "Asignar a México")}</button></div></section>}
             <section className="mexico-detail-meta">
               <h3>{t("申请信息", "Información de solicitud")}</h3>
-              <dl><div><dt>{t("子公司", "Empresa")}</dt><dd>{item.company_name || item.source_sheet || "—"}</dd></div><div><dt>{t("申请人", "Solicitante")}</dt><dd>{item.applicant_name || "—"}</dd></div><div><dt>{t("部门", "Departamento")}</dt><dd>{item.applicant_department || "—"}</dd></div><div><dt>{t("来源", "Origen")}</dt><dd>{mexicoSourceLabel(item.source_type, language)}</dd></div><div><dt>{t("申请日期", "Fecha de solicitud")}</dt><dd>{item.request_date || "—"}</dd></div><div><dt>{t("最近同步", "Última sincronización")}</dt><dd>{compactDateTime(item.last_synced_at, language)}</dd></div></dl>
+              <dl><div><dt>{t("子公司", "Empresa")}</dt><dd>{mexicoCompanyLabel(item)}</dd></div><div><dt>{t("申请人", "Solicitante")}</dt><dd>{item.applicant_name || "—"}</dd></div><div><dt>{t("部门", "Departamento")}</dt><dd>{item.applicant_department || "—"}</dd></div><div><dt>{t("来源", "Origen")}</dt><dd>{mexicoSourceLabel(item.source_type, language)}</dd></div><div><dt>{t("申请日期", "Fecha de solicitud")}</dt><dd>{item.request_date || "—"}</dd></div><div><dt>{t("最近同步", "Última sincronización")}</dt><dd>{compactDateTime(item.last_synced_at, language)}</dd></div></dl>
               {item.workflow_url && <a className="mexico-workflow-link" href={item.workflow_url} target="_blank" rel="noreferrer"><ExternalLink size={15} />{t("在钉钉中查看流程", "Ver flujo en DingTalk")}</a>}
             </section>
             <section className="mexico-timeline-section"><h3>{t("审批时间线", "Línea de aprobación")} <span>{item.events.length}</span></h3>{!item.events.length ? <div className="mexico-inline-empty">{t("尚未同步到流程节点", "Todavía no hay etapas sincronizadas")}</div> : <ol className="mexico-timeline">{item.events.map((event) => <li key={event.event_key || event.id} className={event.is_current ? "current" : ""}><i /><div className="mexico-timeline-card"><header><div><strong>{event.node_name || event.event_type || t("流程事件", "Evento")}</strong>{event.is_current && <span>{t("当前节点", "Actual")}</span>}</div><time>{compactDateTime(event.event_time, language)}</time></header><p className="mexico-event-operator"><UserRound size={14} />{event.operator_name || "—"}{event.result && ` · ${event.result}`}</p>{event.remark && <blockquote>{event.remark}</blockquote>}{((event.images?.length || 0) + (event.attachments?.length || 0)) > 0 && <small><Paperclip size={13} />{t("流程包含附件", "El evento contiene archivos")} {event.images?.length || 0} + {event.attachments?.length || 0}</small>}</div></li>)}</ol>}</section>

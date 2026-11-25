@@ -1,4 +1,9 @@
 import type { Language } from "./i18n";
+import type { MexicoTrackingItem } from "./api";
+
+export function mexicoCompanyLabel(item: Pick<MexicoTrackingItem, "company_display_name" | "company_name" | "source_sheet">): string {
+  return item.company_display_name || item.company_name || item.source_sheet || "—";
+}
 
 export async function copyTextWithFallback(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {

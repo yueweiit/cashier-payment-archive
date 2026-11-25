@@ -295,7 +295,7 @@ def export_daily_payables_workbook(snapshots: Iterable[dict[str, Any]]) -> Path:
                     _detail_status(item),
                     item.get("logical_request_id"),
                     item.get("dingding_id"),
-                    item.get("source_sheet"),
+                    item.get("workbench_sheet") or item.get("source_sheet"),
                     item.get("applicant"),
                     item.get("summary"),
                     _date_value(item.get("needed_payment_date")),

@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from openpyxl import load_workbook
 
 from backend.app.excel_io import export_workbook, normalize_request_business_fields, parse_weekly_excel, safe_sheet_title
+from backend.app.sheet_names import workbench_sheet_name
 
 
 SAMPLE = Path("/Users/smk/Downloads/20260626~20260707请款明细.xlsx")
@@ -247,3 +248,47 @@ def test_all_sheet_is_first_and_skipped_during_roundtrip_parse(tmp_path):
     assert {row["_request_id"] for row in rows} == {1, 2}
     assert meta["workbook_sheet_order"] == ["财务中心", "采购中心"]
     assert any(item.get("sheet") == "全部" and item.get("skipped") == "view_sheet" for item in meta["sheets"])
+
+
+def test_projected_workbench_export_uses_visible_groups_and_recovers_raw_sources(tmp_path):
+    mixed = "凌翔/星铭供应链及职能中心"
+    pinned = "未归属部门"
+    old_alias = "凌翔供应链及采购执行单元"
+    records = [
+        {"id": 1, "source_sheet": mixed, "summary": "财务请款", "amount": 100, "raw_extra": {"external_source": {"service_subject": "星铭 财务"}}},
+        {"id": 2, "source_sheet": old_alias, "amount": 200, "expected_payment_account": "账户原值"},
+        {"id": 3, "source_sheet": mixed, "summary": "凌翔请款", "amount": 300, "raw_extra": {"external_source": {"service_subject": "广州凌翔"}}},
+        {"id": 4, "source_sheet": pinned, "summary": "人工归组请款", "amount": 400, "raw_extra": {"dingtalk_workbench_assignment": {"source_sheet": pinned, "sheet": "广州凌翔", "mode": "manual"}}},
+        {"id": 5, "source_sheet": None, "summary": "无来源请款", "amount": 500},
+    ]
+    content = export_workbook(
+        {"id": 7, "workbench_sheet_order": ["星铭 财务", "广州凌翔", "未分 Sheet"]}, records, {},
+        [{"id": 100, "request_id": 1, "request_source_sheet": mixed, "amount": 5}],
+        project_workbench_sheets=True,
+    )
+    exported = tmp_path / "projected-groups.xlsx"
+    exported.write_bytes(content)
+    workbook = load_workbook(exported)
+    assert workbook.sheetnames == ["全部", "星铭 财务", "广州凌翔", "未分 Sheet", "付款明细", "_系统信息"]
+    assert workbook["_系统信息"].sheet_state == "veryHidden"
+    all_sheet = workbook["全部"]
+    source_col = next(cell.column for cell in all_sheet[2] if cell.value == "来源 Sheet")
+    assert [all_sheet.cell(row, source_col).value for row in (3, 4, 5, 6)] == ["星铭 财务", "广州凌翔", "广州凌翔", "广州凌翔"]
+    assert workbook["付款明细"]["D2"].value == "星铭 财务"
+
+    parsed, metadata = parse_weekly_excel(exported)
+    assert metadata["format_version"] == 3
+    assert metadata["workbook_sheet_order"] == [mixed, old_alias, "广州凌翔", "未分 Sheet"]
+    assert metadata["payment_details"][0]["source_sheet"] == mixed
+    assert [(row["_request_id"], row["source_sheet"], row["_workbench_sheet"]) for row in parsed] == [
+        (1, mixed, "星铭 财务"), (2, old_alias, "广州凌翔"), (3, mixed, "广州凌翔"), (4, pinned, "广州凌翔"), (5, "未分 Sheet", "未分 Sheet"),
+    ]
+    assert [workbench_sheet_name(row["source_sheet"], row["raw_extra_json"]) for row in parsed] == [
+        "星铭 财务", "广州凌翔", "广州凌翔", "广州凌翔", "未分 Sheet",
+    ]
+    assert parsed[1]["expected_payment_account"] == "账户原值"
+
+    workbook["星铭 财务"].title = "柠檬树"
+    workbook.save(exported)
+    moved, _ = parse_weekly_excel(exported)
+    assert moved[0]["source_sheet"] == "柠檬树"

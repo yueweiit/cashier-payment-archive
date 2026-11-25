@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, Optional
 from zoneinfo import ZoneInfo
 
+from .sheet_names import DINGTALK_WORKBENCH_SHEETS, workbench_sheet_name
+
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -2018,6 +2020,13 @@ def _mexico_tracking_public(
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     payload = dict(row)
+    company = str(payload.get("company_name") or "").strip()
+    source_sheet = str(payload.get("source_sheet") or "").strip()
+    group = workbench_sheet_name(source_sheet)
+    payload["company_display_name"] = (
+        group if group in DINGTALK_WORKBENCH_SHEETS and company in ("", source_sheet)
+        else company or source_sheet or None
+    )
     entered_at = _parse_datetime(payload.get("current_node_entered_at"))
     age_days = node_age_days(entered_at, now=now) if entered_at is not None else 0
     payload["age_days"] = age_days

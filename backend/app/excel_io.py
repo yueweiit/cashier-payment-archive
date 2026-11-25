@@ -8,13 +8,15 @@ import re
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import AbstractSet, Any, Dict, Iterable, List, Optional, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.comments import Comment
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+from .sheet_names import DINGTALK_WORKBENCH_SHEETS, canonical_sheet_name, workbench_registered_sheet, workbench_sheet_name
 
 
 CORE_FIELDS = {
@@ -185,6 +187,7 @@ PAYMENT_DETAIL_HEADERS = [
 ]
 SYSTEM_INFO_SHEET = "_系统信息"
 EXPORT_FORMAT_VERSION = 2
+PROJECTED_EXPORT_FORMAT_VERSION = 3
 
 
 def parse_batch_dates(filename: str) -> Tuple[Optional[str], Optional[str], str]:
@@ -522,6 +525,8 @@ def row_from_sheet(
     row_idx: int,
     header_columns: List[Tuple[int, str]],
     source_sheet: str,
+    *,
+    exported_request_ids: AbstractSet[int] = frozenset(),
 ) -> Optional[Dict[str, Any]]:
     values_by_header, raw_extra = collect_values(ws_values, ws_formulas, row_idx, header_columns)
     finance_review_raw = first_value(values_by_header, ["财务审核", "财务审批"])
@@ -584,7 +589,7 @@ def row_from_sheet(
         except Exception:
             pass
     normalize_request_business_fields(row)
-    if not should_keep_row(row, formula_amount):
+    if not should_keep_row(row, formula_amount) and row["_request_id"] not in exported_request_ids:
         return None
     row["content_hash"] = content_hash(row)
     return row
@@ -700,6 +705,8 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
     system_info = parse_system_info(wb_values)
     sheet_name_map = system_info.get("sheet_name_map") or {}
     view_sheets = set(system_info.get("view_sheets") or [])
+    projected = (system_info.get("format_version") or 0) >= PROJECTED_EXPORT_FORMAT_VERSION
+    request_sheets = system_info.get("request_sheets", {}) if projected else {}
     workbook_sheet_order: List[str] = []
     for ws_values in wb_values.worksheets:
         ws_formulas = wb_formulas[ws_values.title]
@@ -708,6 +715,10 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
         if normalize_header(ws_values.title) == normalize_header(PAYMENT_DETAIL_SHEET):
             payment_detail_sheet_present = True
             parsed_details, detail_summary = parse_payment_detail_sheet(ws_values)
+            for detail in parsed_details:
+                origin = request_sheets.get(detail["request_id"])
+                if origin and detail["source_sheet"] == origin["group"]:
+                    detail["source_sheet"] = origin["source_sheet"]
             payment_details.extend(parsed_details)
             sheet_summaries.append(detail_summary)
             continue
@@ -715,9 +726,10 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
             sheet_summaries.append({"sheet": ws_values.title, "imported": 0, "skipped": "view_sheet"})
             continue
         full_source_sheet = str(sheet_name_map.get(ws_values.title) or ws_values.title)
-        workbook_sheet_order.append(full_source_sheet)
+        registered_this_sheet = []
         header_row = detect_header_row(ws_values)
         if not header_row:
+            workbook_sheet_order.append(full_source_sheet)
             image_counts = collect_embedded_images(ws_values, {})
             for key in image_summary:
                 image_summary[key] += image_counts[key]
@@ -727,11 +739,34 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
         imported = 0
         rows_by_source_row: Dict[int, Dict[str, Any]] = {}
         for row_idx in range(header_row + 1, ws_values.max_row + 1):
-            parsed = row_from_sheet(ws_values, ws_formulas, row_idx, header_columns, full_source_sheet)
+            parsed = row_from_sheet(
+                ws_values, ws_formulas, row_idx, header_columns, full_source_sheet,
+                exported_request_ids=request_sheets.keys(),
+            )
             if parsed:
+                if projected:
+                    parsed["_workbook_sheet"] = ws_values.title
+                    parsed["_workbench_sheet"] = full_source_sheet
+                    origin = request_sheets.get(parsed["_request_id"])
+                    if origin and full_source_sheet == origin["group"]:
+                        source_sheet = origin["source_sheet"]
+                        parsed["source_sheet"] = source_sheet
+                        registered = origin["registered_sheet"]
+                        if full_source_sheet in DINGTALK_WORKBENCH_SHEETS and (
+                            registered != source_sheet or workbench_sheet_name(source_sheet) != full_source_sheet
+                        ):
+                            raw_extra = json.loads(parsed["raw_extra_json"])
+                            raw_extra["dingtalk_workbench_assignment"] = {
+                                "source_sheet": source_sheet, "sheet": full_source_sheet, "mode": "manual",
+                            }
+                            parsed["raw_extra_json"] = json.dumps(raw_extra, ensure_ascii=False)
+                        registered_this_sheet.append(registered)
+                    else:
+                        registered_this_sheet.append(full_source_sheet)
                 imported += 1
                 rows_by_source_row[row_idx] = parsed
                 rows.append(parsed)
+        workbook_sheet_order.extend(dict.fromkeys(registered_this_sheet or [full_source_sheet]))
         image_counts = collect_embedded_images(ws_values, rows_by_source_row)
         for key in image_summary:
             image_summary[key] += image_counts[key]
@@ -746,7 +781,7 @@ def parse_weekly_excel(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]
         "export_batch_updated_at": system_info.get("batch_updated_at"),
         "exported_at": system_info.get("exported_at"),
         "sheet_name_map": sheet_name_map,
-        "workbook_sheet_order": workbook_sheet_order,
+        "workbook_sheet_order": list(dict.fromkeys(workbook_sheet_order)) if projected else workbook_sheet_order,
     }
 
 
@@ -761,7 +796,7 @@ def parse_system_info(workbook) -> Dict[str, Any]:
     )
     if matching is None:
         return {}
-    info: Dict[str, Any] = {"sheet_name_map": {}, "view_sheets": []}
+    info: Dict[str, Any] = {"sheet_name_map": {}, "view_sheets": [], "request_sheets": {}}
     for row_idx in range(1, matching.max_row + 1):
         key = stringify(matching.cell(row_idx, 1).value)
         value = stringify(matching.cell(row_idx, 2).value)
@@ -774,6 +809,14 @@ def parse_system_info(workbook) -> Dict[str, Any]:
                 info["sheet_name_map"][workbook_name] = source_name
         if key == "view_sheet" and value:
             info["view_sheets"].append(value)
+        if key == "request_sheet":
+            request_id = integer_value(value)
+            source_names = [stringify(matching.cell(row_idx, col).value) for col in (3, 4, 5)]
+            if request_id is not None and all(source_names):
+                source_sheet, group, registered_sheet = source_names
+                info["request_sheets"][request_id] = {
+                    "source_sheet": source_sheet, "group": group, "registered_sheet": registered_sheet,
+                }
     return info
 
 
@@ -923,13 +966,13 @@ def parse_dingtalk_file(path: Path, mapping: Dict[str, str]) -> Tuple[List[Dict[
 
 
 def sheet_kind(sheet_name: str) -> str:
-    if "模具" in sheet_name:
+    if "模具" in sheet_name or sheet_name == "YW MODELS":
         return "mold"
     if "YUEWEI" in sheet_name or "OEM" in sheet_name:
         return "yuewei"
     if "物流" in sheet_name:
         return "logistics"
-    if "人事" in sheet_name:
+    if "人事" in sheet_name or sheet_name == "星铭 HR":
         return "hr"
     if "员工报销" in sheet_name:
         return "reimburse"
@@ -943,17 +986,31 @@ def export_workbook(
     records: List[Dict[str, Any]],
     attachments: Dict[int, List[Dict[str, Any]]],
     payments: Optional[List[Dict[str, Any]]] = None,
+    *,
+    project_workbench_sheets: bool = False,
 ) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
     groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    request_sheet_info = {}
+    export_records = []
     for record in records:
         source = record.get("source_sheet") or "汇总"
+        if project_workbench_sheets:
+            source = canonical_sheet_name(record.get("source_sheet"))
+            raw_extra = record.get("raw_extra") or record.get("raw_extra_json")
+            group = workbench_sheet_name(source, raw_extra)
+            registered = workbench_registered_sheet(source, raw_extra)
+            if record.get("id") is not None:
+                request_sheet_info[int(record["id"])] = (source, group, registered)
+            record = dict(record, source_sheet=group)
+            source = group
+        export_records.append(record)
         groups[source].append(record)
     if not groups:
         groups[sheet_name_for_summary(batch.get("end_date"))] = []
 
-    raw_sheet_order = batch.get("sheet_order")
+    raw_sheet_order = batch.get("workbench_sheet_order") if project_workbench_sheets else batch.get("sheet_order")
     if not isinstance(raw_sheet_order, list) and batch.get("sheet_order_json"):
         try:
             raw_sheet_order = json.loads(batch["sheet_order_json"])
@@ -974,7 +1031,7 @@ def export_workbook(
     used_sheet_titles: set[str] = {PAYMENT_DETAIL_SHEET, SYSTEM_INFO_SHEET}
     all_sheet_title = safe_sheet_title(ALL_EXPORT_SHEET, used_sheet_titles)
     all_ws = wb.create_sheet(all_sheet_title)
-    write_sheet(all_ws, "all", ALL_EXPORT_SHEET, records, {})
+    write_sheet(all_ws, "all", ALL_EXPORT_SHEET, export_records, {})
 
     sheet_name_map: Dict[str, str] = {}
     for sheet_name, sheet_records in ordered_groups:
@@ -985,8 +1042,16 @@ def export_workbook(
         write_sheet(ws, kind, sheet_name, sheet_records, attachments)
 
     payment_ws = wb.create_sheet(PAYMENT_DETAIL_SHEET)
-    write_payment_detail_sheet(payment_ws, payments or [])
-    write_system_info_sheet(wb, batch, sheet_name_map, [all_sheet_title])
+    export_payments = [
+        dict(payment, request_source_sheet=request_sheet_info[payment["request_id"]][1])
+        if payment.get("request_id") in request_sheet_info else payment
+        for payment in payments or []
+    ]
+    write_payment_detail_sheet(payment_ws, export_payments)
+    write_system_info_sheet(
+        wb, batch, sheet_name_map, [all_sheet_title],
+        request_sheet_info=request_sheet_info if project_workbench_sheets else None,
+    )
 
     output = io.BytesIO()
     wb.save(output)
@@ -1088,16 +1153,20 @@ def write_system_info_sheet(
     batch: Dict[str, Any],
     sheet_name_map: Dict[str, str],
     view_sheet_titles: Optional[List[str]] = None,
+    *,
+    request_sheet_info: Optional[Dict[int, tuple[str, str, str]]] = None,
 ) -> None:
     ws = workbook.create_sheet(SYSTEM_INFO_SHEET)
     rows = [
-        ("format_version", EXPORT_FORMAT_VERSION, None),
+        ("format_version", PROJECTED_EXPORT_FORMAT_VERSION if request_sheet_info is not None else EXPORT_FORMAT_VERSION, None),
         ("batch_id", batch.get("id"), None),
         ("batch_updated_at", batch.get("updated_at"), None),
         ("exported_at", datetime.now().replace(microsecond=0).isoformat(), None),
     ]
     rows.extend(("view_sheet", sheet_title, "read_only_summary") for sheet_title in (view_sheet_titles or []))
     rows.extend(("sheet_map", workbook_name, source_name) for workbook_name, source_name in sheet_name_map.items())
+    if request_sheet_info:
+        rows.extend(("request_sheet", request_id, *names) for request_id, names in request_sheet_info.items())
     for row_idx, values in enumerate(rows, start=1):
         for col_idx, value in enumerate(values, start=1):
             ws.cell(row_idx, col_idx, value)

@@ -170,6 +170,18 @@ def workbench_registered_sheet(source_sheet: Any, raw_extra: Any) -> str:
     return pinned_dingtalk_workbench_sheet(source_sheet, raw_extra) or canonical_sheet_name(source_sheet)
 
 
+def ambiguous_legacy_workbench_groups(source_sheet: Any) -> frozenset[str]:
+    """Return the known candidate groups of a mixed source without its metadata."""
+    key = _workbench_name_key(source_sheet)
+    if key in _WORKBENCH_MIXED_LATIN_NAMES:
+        return frozenset(("拉丁购", "LATINGO"))
+    if key == _WORKBENCH_MIXED_CENTER:
+        return frozenset(("广州凌翔", "星铭 HR", "星铭 财务"))
+    if key == _workbench_name_key("星铭"):
+        return frozenset(("星铭 HR", "星铭 财务"))
+    return frozenset()
+
+
 def workbench_sheet_name(value: Any, raw_extra_json: Any = None) -> str:
     """Project an organization into a display group without changing its identity."""
     pinned = pinned_dingtalk_workbench_sheet(value, raw_extra_json)

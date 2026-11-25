@@ -1483,6 +1483,14 @@ def test_mexico_tracking_list_separates_pending_history_and_review(isolated_db) 
         review = list_mexico_tracking(conn, view="review", now=now)
 
         assert [item["id"] for item in pending["items"]] == [pending_id]
+        assert pending["items"][0]["company_display_name"] == "YUEWEI MX"
+        assert pending["items"][0]["company_name"] == "YUEWEI MX核心制造"
+        assert pending["items"][0]["source_sheet"] == "YUEWEI MX核心制造"
+        detail = get_mexico_tracking_detail(conn, pending_id, now=now)
+        assert detail["company_display_name"] == "YUEWEI MX"
+        conn.execute("UPDATE mexico_approval_tracking SET company_name = ? WHERE id = ?", ("Nombre fiscal distinto", pending_id))
+        detail = get_mexico_tracking_detail(conn, pending_id, now=now)
+        assert detail["company_display_name"] == "Nombre fiscal distinto"
         assert [item["approval_no"] for item in history["items"]] == ["MX-DONE"]
         assert [item["approval_no"] for item in review["items"]] == ["MX-REVIEW"]
         assert pending["items"][0]["age_days"] == 4

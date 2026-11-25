@@ -445,10 +445,13 @@ def restore_batch_fields(conn: sqlite3.Connection, batch_id: int, snapshot_batch
         normalized_order = canonical_sheet_order(restored_order if isinstance(restored_order, list) else [])
         registered = set(normalized_order)
         for row in conn.execute(
-            "SELECT DISTINCT source_sheet FROM payment_requests WHERE batch_id = ? ORDER BY id",
+            """
+            SELECT DISTINCT workbench_registered_sheet(source_sheet, raw_extra_json) AS sheet_name
+            FROM payment_requests WHERE batch_id = ? ORDER BY id
+            """,
             (batch_id,),
         ).fetchall():
-            sheet_name = canonical_sheet_name(row["source_sheet"])
+            sheet_name = row["sheet_name"]
             if sheet_name not in registered:
                 normalized_order.append(sheet_name)
                 registered.add(sheet_name)

@@ -2,6 +2,7 @@ import { translateKnownError } from "./i18n";
 
 export type MexicoAccessScope = "all" | "participant" | "none";
 export type AuthMode = "local" | "hybrid" | "eims";
+export type SheetGroupPermissionState = "none" | "partial" | "all";
 
 export type User = {
   id: number;
@@ -10,6 +11,8 @@ export type User = {
   role: "business" | "finance" | "general_manager" | "admin";
   active: boolean;
   sheet_permissions: string[];
+  sheet_group_states?: Record<string, SheetGroupPermissionState>;
+  unmapped_sheet_permissions?: string[];
   mexico_access_scope: MexicoAccessScope;
   mexico_identity_name: string | null;
 };
@@ -54,6 +57,7 @@ export type MexicoTrackingItem = {
   applicant_name?: string | null;
   applicant_department?: string | null;
   company_name?: string | null;
+  company_display_name?: string | null;
   source_sheet?: string | null;
   summary?: string | null;
   amount?: number | null;
@@ -208,6 +212,7 @@ export type Batch = {
   sheet_order?: string[];
   workbench_sheet_order?: string[];
   workbench_sheet_targets?: Record<string, string>;
+  workbench_sheet_options?: string[];
   request_count?: number;
   total_amount?: number;
   total_paid_amount?: number;
@@ -233,6 +238,7 @@ export type DailyPayableDetail = {
   source_batch_id?: number;
   dingding_id?: string;
   source_sheet?: string;
+  workbench_sheet?: string;
   applicant?: string;
   summary?: string;
   needed_payment_date: string;
@@ -572,10 +578,11 @@ export type WeeklyMergeRow = {
   dingding_id?: string;
   applicant?: string;
   source_sheet?: string;
+  workbench_sheet?: string;
   amount?: number;
   old_paid_amount: number;
   new_paid_amount: number;
-  changes: Array<{ field: string; label: string; old?: unknown; new?: unknown }>;
+  changes: Array<{ field: string; label: string; old?: unknown; new?: unknown; display_old?: string; display_new?: string }>;
   payment_change: boolean;
   attachment_change: boolean;
   payment_changes: Array<{
@@ -717,6 +724,7 @@ export type HistoricalCurrencyRestoreRow = {
   dingding_id?: string;
   applicant?: string;
   source_sheet?: string;
+  workbench_sheet?: string;
   current_currency: string;
   source_currency?: CurrencyCode;
   source_currency_raw?: string;
@@ -809,13 +817,14 @@ export type UserPayload = {
   display_name: string;
   active: boolean;
   sheet_permissions: string[];
+  sheet_group_changes?: Record<string, boolean>;
   mexico_access_scope: MexicoAccessScope;
   mexico_identity_name: string | null;
 };
 export type UserUpdatePayload = Partial<Pick<User,
   "role" | "display_name" | "active" | "sheet_permissions" |
   "mexico_access_scope" | "mexico_identity_name"
->> & { password?: string };
+>> & { password?: string; sheet_group_changes?: Record<string, boolean> };
 export type ChangePasswordPayload = {
   current_password: string;
   new_password: string;
@@ -967,7 +976,7 @@ export const api = {
     }),
   createRequest: (batchId: number, payload: Partial<PaymentRequest>) =>
     request<{ request: PaymentRequest }>(`/api/batches/${batchId}/requests`, { method: "POST", body: JSON.stringify(payload) }),
-  updateRequest: (batchId: number, requestId: number, payload: Partial<PaymentRequest> & { expected_version: number; reason?: string }) =>
+  updateRequest: (batchId: number, requestId: number, payload: Partial<PaymentRequest> & { expected_version: number; reason?: string; workbench_sheet_target?: string }) =>
     request<{ request: PaymentRequest }>(`/api/batches/${batchId}/requests/${requestId}`, { method: "PATCH", body: JSON.stringify(payload) }),
   previewCurrencyConversion: (batchId: number, requestId: number, payload: { target_currency: CurrencyCode; rate_date: string; mode?: "convert" | "correct"; reason?: string; expected_version: number; expected_updated_at?: string }) =>
     request<{ preview: CurrencyConversionPreview }>(`/api/batches/${batchId}/requests/${requestId}/currency-conversion/preview`, { method: "POST", body: JSON.stringify(payload) }),
@@ -1066,11 +1075,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  uploadDingTalk: (file: File, batchId?: number, mapping?: Record<string, string>) => {
+  uploadDingTalk: (file: File, batchId?: number, mapping?: Record<string, string>, workbenchSheet?: string) => {
     const body = new FormData();
     body.append("file", file);
     if (batchId) body.append("batch_id", String(batchId));
     if (mapping) body.append("mapping_json", JSON.stringify(mapping));
+    if (workbenchSheet) body.append("workbench_sheet", workbenchSheet);
     return request<Record<string, unknown>>("/api/import/dingtalk", { method: "POST", body });
   },
   previewExternalExpenses: (payload: ExternalExpensePreviewFilter) =>
@@ -1167,7 +1177,7 @@ export const api = {
     request<{ dictionary: Dictionary }>("/api/admin/dictionaries", { method: "POST", body: JSON.stringify(payload) }),
   updateDictionary: (id: number, payload: Partial<Dictionary>) =>
     request<{ dictionary: Dictionary }>(`/api/admin/dictionaries/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
-  users: () => request<{ users: User[]; available_sheets: string[] }>("/api/admin/users"),
+  users: () => request<{ users: User[]; available_sheets: string[]; available_sheet_groups?: string[] }>("/api/admin/users"),
   createUser: (payload: UserPayload) =>
     request<{ user: User }>("/api/admin/users", { method: "POST", body: JSON.stringify(payload) }),
   updateUser: (id: number, payload: UserUpdatePayload) =>
