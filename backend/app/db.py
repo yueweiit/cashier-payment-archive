@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Union
 
 from .security import hash_password
-from .sheet_names import canonical_sheet_name, canonical_sheet_order, workbench_sheet_name
+from .sheet_names import canonical_sheet_name, canonical_sheet_order, workbench_registered_sheet, workbench_sheet_name
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -37,6 +37,7 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=15.0)
     conn.row_factory = sqlite3.Row
     conn.create_function("workbench_sheet", 2, workbench_sheet_name, deterministic=True)
+    conn.create_function("workbench_registered_sheet", 2, workbench_registered_sheet, deterministic=True)
     conn.execute("PRAGMA busy_timeout = 15000")
     conn.execute("PRAGMA synchronous = FULL")
     conn.execute("PRAGMA foreign_keys = ON")

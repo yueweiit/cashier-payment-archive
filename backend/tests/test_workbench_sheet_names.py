@@ -12,6 +12,7 @@ def metadata(subject=None, **source_fields):
 
 
 @pytest.mark.parametrize(("raw_name", "expected"), [
+    ("悦为智能 YW Tech_Ai", "悦为智能"),
     ("凌翔", "广州凌翔"),
     ("凌翔产品&开发", "广州凌翔"),
     ("凌翔供应链及采购执行单元", "广州凌翔"),
@@ -226,3 +227,89 @@ def test_legacy_mould_canonicalization_is_preserved_without_new_persistent_alias
     assert sheet_names.workbench_sheet_name("赣瑞模具（7月前）") == "赣瑞模具"
     assert sheet_names.canonical_sheet_name("YW MOLDES MX模具") == "YW MOLDES MX模具"
     assert sheet_names.canonical_sheet_name("凌翔产品&开发") == "凌翔产品&开发"
+
+
+def test_dingtalk_workbench_sheet_choices_are_ordered_fixed_groups():
+    assert sheet_names.DINGTALK_WORKBENCH_SHEETS == (
+        "悦为智能", "广州凌翔", "星铭 HR", "星铭 财务", "YW MODELS", "YUEWEI MX",
+        "LEMOS MX", "拉丁购", "LATINGO", "柠檬树",
+    )
+
+
+@pytest.mark.parametrize(("name", "subject", "expected"), [
+    ("悦为智能 YW Tech_Ai", None, "悦为智能"),
+    ("原财务部门", "悦为智能 YW Tech_Ai/行政管理", "悦为智能"),
+    ("原财务部门", "YW Tech_Ai", "悦为智能"),
+    ("原财务部门", "Yuewei Intelligent", "悦为智能"),
+    ("原财务部门", "悦为智能技术（东莞）有限公司", "悦为智能"),
+    ("YUEWEI", None, None),
+    ("原财务部门", "YUEWEI", None),
+    ("原财务部门", "YUEWEI/行政管理", None),
+    ("原财务部门", "YUEWEI MX", "YUEWEI MX"),
+    ("原财务部门", "广州凌翔", "广州凌翔"),
+    ("原财务部门", "未知主体", None),
+    ("LatínGo拉丁购", "拉丁购/拉丁购", "拉丁购"),
+    ("LatínGo拉丁购", "LATINGO", "LATINGO"),
+    ("LatínGo拉丁购", "悦为智能", None),
+    ("拉丁购LATINGO", "拉丁购/LATINGO", None),
+    ("凌翔/星铭供应链及职能中心", "凌翔/星铭供应链及职能中心", None),
+    ("凌翔/星铭供应链及职能中心", "星铭", None),
+    ("凌翔/星铭供应链及职能中心", "东莞星铭/FC", "星铭 财务"),
+    ("YUEWEI MX核心制造", "悦为智能", "YUEWEI MX"),
+    ("拉丁购", "LATINGO", "拉丁购"),
+    ("星铭", "广州凌翔", None),
+])
+def test_new_dingtalk_group_resolution_requires_a_fixed_unambiguous_company(name, subject, expected):
+    raw_extra = metadata(subject)
+    before = deepcopy(raw_extra)
+
+    assert sheet_names.resolve_dingtalk_workbench_sheet(name, raw_extra) == expected
+    assert raw_extra == before
+
+
+def assignment(source_sheet="凌翔产品&开发", sheet="YW MODELS", mode="manual"):
+    return {"dingtalk_workbench_assignment": {"source_sheet": source_sheet, "sheet": sheet, "mode": mode}}
+
+
+@pytest.mark.parametrize("mode", ["auto", "manual"])
+@pytest.mark.parametrize("encode", [lambda value: value, json.dumps], ids=["dict", "saved-json"])
+def test_valid_pin_controls_display_and_registry_without_changing_raw_source(mode, encode):
+    raw_name = "凌翔产品&开发"
+    raw_extra = assignment(raw_name, mode=mode)
+    before = deepcopy(raw_extra)
+
+    assert sheet_names.pinned_dingtalk_workbench_sheet(raw_name, encode(raw_extra)) == "YW MODELS"
+    assert sheet_names.workbench_sheet_name(raw_name, encode(raw_extra)) == "YW MODELS"
+    assert sheet_names.resolve_dingtalk_workbench_sheet(raw_name, encode(raw_extra)) == "YW MODELS"
+    assert sheet_names.workbench_registered_sheet(raw_name, encode(raw_extra)) == "YW MODELS"
+    assert sheet_names.canonical_sheet_name(raw_name) == raw_name
+    assert raw_extra == before
+
+
+@pytest.mark.parametrize("raw_extra", [
+    None, "invalid-json", {"dingtalk_workbench_assignment": []},
+    assignment(source_sheet="凌翔供应链及采购执行单元"),
+    assignment(sheet="未指定公司"), assignment(sheet="凌翔产品&开发"), assignment(sheet=" YW MODELS"),
+    assignment(mode="MANUAL"), assignment(mode=""), assignment(mode=None),
+    {"dingtalk_workbench_assignment": {"sheet": "YW MODELS", "mode": "manual"}},
+    {"dingtalk_workbench_assignment": {"source_sheet": "凌翔产品&开发", "sheet": ["YW MODELS"], "mode": "manual"}},
+    {"external_source": assignment()["dingtalk_workbench_assignment"]},
+])
+def test_invalid_or_differently_bound_pins_do_not_change_projection(raw_extra):
+    raw_name = "凌翔产品&开发"
+
+    assert sheet_names.pinned_dingtalk_workbench_sheet(raw_name, raw_extra) is None
+    assert sheet_names.workbench_sheet_name(raw_name, raw_extra) == "广州凌翔"
+    assert sheet_names.workbench_registered_sheet(raw_name, raw_extra) == raw_name
+
+
+def test_pin_binding_uses_raw_canonical_identity_instead_of_display_aliases():
+    raw_extra = assignment(source_sheet="yw moldes mx模具", sheet="悦为智能")
+    assert sheet_names.pinned_dingtalk_workbench_sheet("YW MOLDES MX模具", raw_extra) is None
+    assert sheet_names.workbench_sheet_name("YW MOLDES MX模具", raw_extra) == "YW MODELS"
+    assert sheet_names.pinned_dingtalk_workbench_sheet("赣瑞模具（7月前）", assignment("赣瑞模具（7月后）")) == "YW MODELS"
+
+
+@pytest.mark.parametrize("raw_name", ["手工自定义组", "凌翔产品&开发", "悦为智能 YW Tech_Ai", "赣瑞模具（7月前）"])
+def test_unpinned_registry_preserves_canonical_raw_source(raw_name):
+    assert sheet_names.workbench_registered_sheet(raw_name, metadata("悦为智能")) == sheet_names.canonical_sheet_name(raw_name)

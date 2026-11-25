@@ -1287,6 +1287,58 @@ def test_dingtalk_preview_and_import_use_same_workbench_sheet(monkeypatch):
         assert row["expected_payment_account"] == "测试账户"
 
 
+def test_dingtalk_import_only_registers_fixed_workbench_groups(monkeypatch):
+    clear = external_expense_test_row("IMPORT-FIXED-CLEAR", "398151", execution_region="中国China", source_sheet="未归属部门")
+    unknown = external_expense_test_row("IMPORT-FIXED-UNKNOWN", "398152", execution_region="中国China", source_sheet="新部门名称")
+    rows = (clear, unknown)
+    clear["request_data"]["raw_extra"]["external_source"]["service_subject"] = "柠檬树"
+    monkeypatch.setattr(main_module, "preview_external_expenses", lambda **kwargs: {"rows": list(rows), "applicant_options": []})
+    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda items: [
+        row for row in rows if any(item["source_id"] == row["source_id"] for item in items)
+    ])
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": "钉钉固定归组"}).json()["batch"]["id"]
+        preview = client.post("/api/external-expenses/preview", json={
+            "batch_id": batch_id, "approval_no": "IMPORT-FIXED", "source_types": ["operation"],
+        }).json()
+        assert "悦为智能" in preview["workbench_sheet_options"]
+        assert "悦为智能 YW Tech_Ai" not in preview["workbench_sheet_options"]
+        assert [(row["workbench_sheet"], row["needs_workbench_sheet"]) for row in preview["rows"]] == [
+            ("柠檬树", False), (None, True),
+        ]
+        url = f"/api/batches/{batch_id}/imports/external-expenses"
+        first = {"source_type": "operation", "source_id": "398151"}
+        second = {"source_type": "operation", "source_id": "398152"}
+        rejected = client.post(url, json={"items": [{**second, "workbench_sheet": "临时新分组"}]})
+        assert rejected.status_code == 400
+        imported = client.post(url, json={"items": [first, second]}).json()
+        assert imported["imported_rows"] == 1 and imported["invalid_rows"] == 1
+        selected = client.post(url, json={"items": [{**second, "workbench_sheet": "LATINGO"}]})
+        assert selected.status_code == 200 and selected.json()["imported_rows"] == 1, selected.text
+        requests_url = f"/api/batches/{batch_id}/requests"
+        batch_url = f"/api/batches/{batch_id}"
+        requests = client.get(requests_url).json()["requests"]
+        assert {(row["source_sheet"], row["workbench_sheet"]) for row in requests} == {
+            ("未归属部门", "柠檬树"), ("新部门名称", "LATINGO"),
+        }
+        batch = client.get(batch_url).json()["batch"]
+        assert batch["workbench_sheet_order"] == ["柠檬树", "LATINGO"]
+        updated = client.put(batch_url + "/sheet-order", json={
+            "sheet_order": ["LATINGO", "柠檬树"], "workbench_groups": True,
+            "expected_batch_version": batch["version"],
+        })
+        assert updated.status_code == 200 and updated.json()["batch"]["workbench_sheet_order"] == ["LATINGO", "柠檬树"]
+        rolled = client.post(batch_url + "/rollover", json={"name": "钉钉固定归组下一周", "copy_mode": "all"})
+        assert rolled.status_code == 200, rolled.text
+        next_id = rolled.json()["batch"]["id"]
+        assert client.get(f"/api/batches/{next_id}").json()["batch"]["workbench_sheet_order"] == ["LATINGO", "柠檬树"]
+        with connect() as conn:
+            for current in (batch_id, next_id):
+                stored = conn.execute("SELECT sheet_order_json FROM request_batches WHERE id=?", (current,)).fetchone()
+                assert json.loads(stored["sheet_order_json"]) == ["LATINGO", "柠檬树"]
+
+
 def test_empty_sheet_registry_and_business_sheet_boundaries():
     with TestClient(app) as admin_client, TestClient(app) as business_client:
         login(admin_client)
@@ -1959,7 +2011,7 @@ def external_expense_test_row(
     beneficiary: str = "测试收款信息",
     warnings=None,
     execution_region: str = "",
-    source_sheet: str = "测试部门",
+    source_sheet: str = "悦为智能",
     expected_payment_account: str = "",
     expected_payment_account_source: str = "",
 ) -> dict:
@@ -4058,7 +4110,7 @@ def test_external_expense_preview_import_global_dedupe_and_rollback(monkeypatch,
         assert kwargs["applicant_ids"] == []
         return {
             "rows": [duplicate_row, new_row, invalid_row],
-            "applicant_options": [{"id": "test-user-id", "name": "测试申请人", "department": "测试部门", "count": 3}],
+            "applicant_options": [{"id": "test-user-id", "name": "测试申请人", "department": "悦为智能", "count": 3}],
         }
 
     def fake_fetch(items):
@@ -5109,6 +5161,7 @@ def test_dingtalk_payment_details_survive_import_and_drawer_save(monkeypatch):
         "source_type": "operation", "source_id": "230551", "approval_no": "DETAIL-IMPORT-SAVE",
         "approval_status": "RUNNING", "execution_region": "中国China",
         "base_currency_amount": 97.31, "beneficiary": "测试收款人", "raw_data": {"formComponentValues": [
+            {"name": "服务主体", "value": "悦为智能"},
             {"name": "收款人beneficiario", "value": "测试收款人"},
             {"name": "收款账户Cuenta de cobro", "value": "0012 3456 7890 1234"},
             {"name": "收款银行（分行）Banco receptor (sucursal)", "value": "测试银行分行"},

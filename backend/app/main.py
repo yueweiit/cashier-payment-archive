@@ -169,7 +169,15 @@ from .eims_sso import (
     userinfo_for_code,
 )
 from .security import new_session_token, verify_password, hash_password
-from .sheet_names import canonical_sheet_name, canonical_sheet_order, workbench_sheet_name
+from .sheet_names import (
+    DINGTALK_WORKBENCH_SHEETS,
+    canonical_sheet_name,
+    canonical_sheet_order,
+    pinned_dingtalk_workbench_sheet,
+    resolve_dingtalk_workbench_sheet,
+    workbench_registered_sheet,
+    workbench_sheet_name,
+)
 from .snapshots import (
     cleanup_batch_snapshot_files,
     create_batch_snapshot,
@@ -391,6 +399,7 @@ class ExternalExpensePreviewIn(BaseModel):
 class ExternalExpenseKey(BaseModel):
     source_type: str
     source_id: str
+    workbench_sheet: Optional[str] = None
 
 
 class ExternalExpenseImportIn(BaseModel):
@@ -952,9 +961,11 @@ def batch_public_for_user(
     access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
     active_sql = f"NOT {dingtalk_terminated_sql('p.raw_extra_json')}"
     region_sql = workbench_scope(conn, "p")
+    restricted = user_has_restricted_sheet_access(user)
+    registered_sheet = ("p.source_sheet" if restricted else "workbench_registered_sheet(p.source_sheet, p.raw_extra_json)")
     visible_sheet_rows = conn.execute(
         f"""
-        SELECT DISTINCT COALESCE(NULLIF(TRIM(p.source_sheet), ''), '未分 Sheet') AS sheet_name
+        SELECT DISTINCT COALESCE(NULLIF(TRIM({registered_sheet}), ''), '未分 Sheet') AS sheet_name
         FROM payment_requests p
         WHERE p.batch_id = ? AND {access_sql} AND {active_sql} AND {region_sql}
         ORDER BY p.id
@@ -985,7 +996,6 @@ def batch_public_for_user(
         [data["id"], *access_params],
     ).fetchall()
     data["currency_totals"] = rows_to_dicts(currency_rows)
-    restricted = user_has_restricted_sheet_access(user)
     if restricted:
         allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
         data["sheet_order"] = [sheet for sheet in data["sheet_order"] if normalize_sheet_permission(sheet) in allowed]
@@ -1821,27 +1831,28 @@ def update_batch_sheet_order(
         )
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理调整 Sheet 顺序")
-        old_order = batch_sheet_order(row_to_dict(batch))
-        if payload.workbench_groups:
-            layout = workbench_sheet_layout(conn, batch_id, old_order, user)
-            # One historical name can contain records for two distinct groups.
-            # Keep a separate order entry when neither group has its own name.
-            usage = Counter(sheet for sheets in layout.values() for sheet in sheets)
-            requested_order = canonical_sheet_order(
-                raw_sheet for group in requested_order
-                for raw_sheet in ([sheet for sheet in layout.get(group, []) if usage[sheet] == 1] or [group])
-            )
         row_backed_names = {
             canonical_sheet_name(row["sheet_name"])
             for row in conn.execute(
                 f"""
-                SELECT DISTINCT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name
+                SELECT DISTINCT workbench_registered_sheet(source_sheet, raw_extra_json) AS sheet_name
                 FROM payment_requests
                 WHERE batch_id = ? AND NOT {dingtalk_terminated_sql()}
                 """,
                 (batch_id,),
             ).fetchall()
         }
+        old_order = batch_sheet_order(row_to_dict(batch))
+        if payload.workbench_groups:
+            layout = workbench_sheet_layout(conn, batch_id, old_order, user)
+            # Display groups can share one historical source name. Only
+            # registered names can be reused without introducing a new tab.
+            usage = Counter(sheet for sheets in layout.values() for sheet in sheets)
+            registered_names = set(old_order) | row_backed_names
+            requested_order = canonical_sheet_order(
+                raw_sheet for group in requested_order
+                for raw_sheet in ([sheet for sheet in layout.get(group, []) if usage[sheet] == 1 and sheet in registered_names] or [group])
+            )
         final_order = list(requested_order)
         final_order.extend(sorted(row_backed_names - set(final_order)))
         timestamp = now_iso()
@@ -5566,7 +5577,7 @@ def preview_external_expense_rows(
     for source_row in rows:
         row = {key: value for key, value in source_row.items() if key != "request_data"}
         request_data = source_row.get("request_data") or {}
-        row["workbench_sheet"] = workbench_sheet_name(request_data.get("source_sheet"), request_data.get("raw_extra"))
+        row["workbench_sheet"] = resolve_dingtalk_workbench_sheet(request_data.get("source_sheet"), request_data.get("raw_extra"))
         approval_no = row.get("approval_no") or ""
         if approval_no in conflict_approval_nos:
             row["source_conflict"] = True
@@ -5581,6 +5592,7 @@ def preview_external_expense_rows(
             row["warnings"].append(f"关联审批已存在：{'、'.join(related_existing)}")
         row["duplicate"] = duplicates.get(approval_no)
         row["importable"] = not row["errors"] and row["duplicate"] is None
+        row["needs_workbench_sheet"] = row["importable"] and row["workbench_sheet"] is None
         public_rows.append(row)
 
     summary = {
@@ -5608,6 +5620,7 @@ def preview_external_expense_rows(
     return {
         "rows": page_rows,
         "all_rows": public_rows,
+        "workbench_sheet_options": list(DINGTALK_WORKBENCH_SHEETS),
         "applicant_options": applicant_options,
         "summary": summary,
         "pagination": {
@@ -5630,15 +5643,20 @@ def import_external_expense_rows(
     if len(payload.items) > 200:
         raise HTTPException(status_code=400, detail="单次最多导入 200 条来源记录")
     keys: list[Dict[str, str]] = []
-    seen_keys: set[tuple[str, str]] = set()
+    selected_sheets: dict[tuple[str, str], Optional[str]] = {}
     for item in payload.items:
         source_type = item.source_type.strip()
         source_id = item.source_id.strip()
         if source_type not in ALLOWED_SOURCE_TYPES or not source_id.isdigit():
             raise HTTPException(status_code=400, detail="来源记录标识无效")
+        selected_sheet = (item.workbench_sheet or "").strip() or None
+        if selected_sheet and selected_sheet not in DINGTALK_WORKBENCH_SHEETS:
+            raise HTTPException(status_code=400, detail="钉钉导入只能选择已有公司分组")
         key = (source_type, source_id)
-        if key not in seen_keys:
-            seen_keys.add(key)
+        if key in selected_sheets and selected_sheets[key] != selected_sheet:
+            raise HTTPException(status_code=400, detail="同一来源记录不能选择多个分组")
+        if key not in selected_sheets:
+            selected_sheets[key] = selected_sheet
             keys.append({"source_type": source_type, "source_id": source_id})
     with connect() as conn:
         initial_batch = require_batch(conn, batch_id)
@@ -5654,7 +5672,7 @@ def import_external_expense_rows(
         mark_china_workbench_external_expense(source_row)
 
     rows_by_key = {(row["source_type"], row["source_id"]): row for row in source_rows}
-    missing_keys = [key for key in seen_keys if key not in rows_by_key]
+    missing_keys = [key for key in selected_sheets if key not in rows_by_key]
     invalid_rows = [row for row in source_rows if row.get("errors")]
     candidate_rows = [row for row in source_rows if not row.get("errors")]
     imported_ids: list[int] = []
@@ -5684,7 +5702,25 @@ def import_external_expense_rows(
                     "existing": duplicate,
                 })
                 continue
-            request_data = dict(source_row["request_data"])
+            request_data, _, _ = apply_employee_department_mapping(conn, dict(source_row["request_data"]))
+            raw_sheet = canonical_sheet_name(request_data.get("source_sheet"))
+            raw_extra = dict(request_data.get("raw_extra") or {})
+            automatic_sheet = resolve_dingtalk_workbench_sheet(raw_sheet, raw_extra)
+            selected_sheet = selected_sheets.get((source_row["source_type"], source_row["source_id"]))
+            target_sheet = automatic_sheet or selected_sheet
+            if not target_sheet or (automatic_sheet and selected_sheet and automatic_sheet != selected_sheet):
+                detail = (
+                    "钉钉归组已更新，请重新查询后导入" if target_sheet else "无法确认钉钉归属，请在预览中选择已有公司分组"
+                )
+                invalid_rows.append({**source_row, "errors": [detail]})
+                continue
+            raw_extra["dingtalk_workbench_assignment"] = {
+                "source_sheet": raw_sheet,
+                "sheet": target_sheet,
+                "mode": "auto" if automatic_sheet else "manual",
+            }
+            request_data.update(source_sheet=raw_sheet, raw_extra=raw_extra)
+            request_data.pop("raw_extra_json", None)
             request_id = insert_request(
                 conn,
                 batch_id,
@@ -9081,7 +9117,8 @@ def insert_request(
         data,
         preserve_trusted_source=preserve_expected_payment_account_source,
     )
-    if user_role != ROLE_BUSINESS and not (manual_entry and str(data.get("source_sheet") or "").strip()):
+    pinned = pinned_dingtalk_workbench_sheet(data.get("source_sheet"), data.get("raw_extra") or data.get("raw_extra_json"))
+    if user_role != ROLE_BUSINESS and not pinned and not (manual_entry and str(data.get("source_sheet") or "").strip()):
         data, _, _ = apply_employee_department_mapping(conn, data)
     summary_paid_amount = data.get("paid_amount")
     summary_payment_date = data.get("actual_payment_date")
@@ -9123,7 +9160,7 @@ def insert_request(
         conn.execute("UPDATE payment_requests SET payable_item_key = ? WHERE id = ?", (item_key, request_id))
     elif manual_entry:
         conn.execute("UPDATE payment_requests SET payable_item_key = ? WHERE id = ?", (uuid.uuid4().hex, request_id))
-    register_batch_sheet(conn, batch_id, payload.get("source_sheet"))
+    register_batch_sheet(conn, batch_id, workbench_registered_sheet(payload.get("source_sheet"), payload.get("raw_extra_json")))
     if create_summary_payment and summary_paid_amount not in (None, "") and float(summary_paid_amount or 0) > 0:
         insert_payment_record_internal(
             conn,

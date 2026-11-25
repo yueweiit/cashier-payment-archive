@@ -79,6 +79,7 @@ import { MexicoTrackingPage } from "./MexicoTrackingPage";
 import { defaultDailyPayablesExportRange, shanghaiIsoDate, validateDailyPayablesExportRange } from "./dailyPayablesExport";
 import { matchesPaymentStatusFilter, paymentStatusCounts, requestCanAddPayment, requestIsCompleted, requestIsPaymentRefused, requestOutstandingAmount, requestPaymentStatus } from "./paymentStatus";
 import { batchWorkbenchSheetOrder, canRenameWorkbenchSheet, moveToWorkbenchSheet, normalizeWorkbenchSheet, requestWorkbenchSheet, shouldResetWorkbenchSheets, withoutWorkbenchSheet, workbenchGridColumnOrder, workbenchGridColumnVisible, workbenchSheetTarget } from "./workbenchSheets";
+import { assignExternalExpenseGroup, externalExpenseImportPlan, externalExpenseRowKey, toggleExternalExpenseKeys } from "./externalExpenseGroups";
 
 type Tab = AppTab;
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
@@ -1870,17 +1871,21 @@ function ExternalExpenseImportDialog({
   const [resultFilter, setResultFilter] = useState<ExternalExpenseResultFilter>("importable");
   const [previewPage, setPreviewPage] = useState(1);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [groupAssignments, setGroupAssignments] = useState<Record<string, string>>({});
+  const [bulkGroup, setBulkGroup] = useState("");
+  const previewQueryRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<ExternalExpenseImportResult | null>(null);
+  const busy = loading || importing;
 
   useEffect(() => {
     void queryPreview(true);
   }, []);
 
   function rowKey(row: Pick<ExternalExpensePreviewRow, "source_type" | "source_id">) {
-    return `${row.source_type}:${row.source_id}`;
+    return externalExpenseRowKey(row);
   }
 
   function validateFilters() {
@@ -1897,14 +1902,21 @@ function ExternalExpenseImportDialog({
   }
 
   async function queryPreview(resetSelection = false) {
+    if (importing && resetSelection) return;
     const validationError = validateFilters();
     if (validationError) {
       setError(validationError);
       return;
     }
+    const queryId = ++previewQueryRef.current;
     setLoading(true);
     setError("");
-    if (resetSelection) setResult(null);
+    if (resetSelection) {
+      setResult(null);
+      setSelectedKeys(new Set());
+      setGroupAssignments({});
+      setBulkGroup("");
+    }
     try {
       const payload: ExternalExpensePreviewFilter = {
         batch_id: batch.id,
@@ -1918,6 +1930,7 @@ function ExternalExpenseImportDialog({
         page_size: 50,
       };
       const response = await api.previewExternalExpenses(payload);
+      if (queryId !== previewQueryRef.current) return;
       setPreview(response);
       setPreviewPage(1);
       if (resetSelection) {
@@ -1925,58 +1938,68 @@ function ExternalExpenseImportDialog({
         setSelectedKeys(new Set());
       }
     } catch (err) {
-      setError((err as Error).message);
+      if (queryId === previewQueryRef.current) setError((err as Error).message);
     } finally {
-      setLoading(false);
+      if (queryId === previewQueryRef.current) setLoading(false);
     }
   }
 
   function toggleSource(sourceType: ExternalExpenseSourceType) {
+    if (busy) return;
     setSourceTypes((current) => current.includes(sourceType) ? current.filter((value) => value !== sourceType) : [...current, sourceType]);
   }
 
   function toggleApplicant(id: string) {
+    if (busy) return;
     setApplicantIds((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
   }
 
   function toggleRow(row: ExternalExpensePreviewRow) {
-    if (!row.importable) return;
+    if (busy || !row.importable) return;
     const key = rowKey(row);
-    setSelectedKeys((current) => {
-      const next = new Set(current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+    setSelectedKeys((current) => toggleExternalExpenseKeys(current, [key]));
   }
 
   function toggleCurrentPage() {
-    if (!preview) return;
+    if (busy || !preview) return;
     const keys = pagePreviewRows.filter((row) => row.importable).map(rowKey);
-    const allSelected = keys.length > 0 && keys.every((key) => selectedKeys.has(key));
-    setSelectedKeys((current) => {
-      const next = new Set(current);
-      keys.forEach((key) => allSelected ? next.delete(key) : next.add(key));
-      return next;
-    });
+    setSelectedKeys((current) => toggleExternalExpenseKeys(current, keys));
+  }
+
+  function assignRowGroup(row: ExternalExpensePreviewRow, group: string) {
+    if (busy || !row.importable || !row.needs_workbench_sheet || (group && !groupOptions.includes(group))) return;
+    setGroupAssignments((current) => ({ ...current, [rowKey(row)]: group }));
+  }
+
+  function assignSelectedGroups() {
+    if (busy || !bulkGroup) return;
+    try {
+      setGroupAssignments(assignExternalExpenseGroup(allPreviewRows, selectedKeys, groupAssignments, bulkGroup, groupOptions));
+      setError("");
+    } catch (err) {
+      setError((err as Error).message);
+    }
   }
 
   async function importSelected() {
-    if (!selectedKeys.size || selectedKeys.size > 200) return;
+    if (busy || !selectedKeys.size || selectedKeys.size > 200) return;
+    if (importPlan.unavailableKeys.length) {
+      setError("已选记录已变化，请重新查询后选择");
+      return;
+    }
+    if (importPlan.missingKeys.length) {
+      setError(`请先为 ${importPlan.missingKeys.length} 条已选记录选择导入归组`);
+      return;
+    }
     setImporting(true);
     setError("");
     setResult(null);
     try {
-      const items = Array.from(selectedKeys).map((key) => {
-        const separator = key.indexOf(":");
-        return {
-          source_type: key.slice(0, separator) as ExternalExpenseSourceType,
-          source_id: key.slice(separator + 1),
-        };
-      });
-      const response = await api.importExternalExpenses(batch.id, items);
+      const response = await api.importExternalExpenses(batch.id, importPlan.items);
       setResult(response);
       setSelectedKeys(new Set());
+      setGroupAssignments({});
+      setBulkGroup("");
       await onImported();
       await queryPreview(false);
       const summaryMessage = `中间表导入完成：新增 ${response.imported_rows} 条，重复 ${response.duplicate_rows} 条，无效 ${response.invalid_rows} 条`;
@@ -1993,6 +2016,9 @@ function ExternalExpenseImportDialog({
     return option.name.toLowerCase().includes(query) || String(option.department || "").toLowerCase().includes(query);
   });
   const allPreviewRows = preview?.all_rows || preview?.rows || [];
+  const groupOptions = preview?.workbench_sheet_options || [];
+  const importPlan = externalExpenseImportPlan(allPreviewRows, selectedKeys, groupAssignments, groupOptions);
+  const selectedNeedsGroupCount = allPreviewRows.filter((row) => row.importable && row.needs_workbench_sheet && selectedKeys.has(rowKey(row))).length;
   const filteredPreviewRows = allPreviewRows.filter((row) => {
     if (resultFilter === "importable") return row.importable;
     if (resultFilter === "duplicates") return row.duplicate != null;
@@ -2022,21 +2048,21 @@ function ExternalExpenseImportDialog({
       <form className="external-expense-filters" onSubmit={(event) => { event.preventDefault(); void queryPreview(true); }}>
         <div className="external-source-selector">
           <span>支出来源</span>
-          <label><input type="checkbox" checked={sourceTypes.includes("operation")} onChange={() => toggleSource("operation")} />运营支出</label>
-          <label><input type="checkbox" checked={sourceTypes.includes("purchase")} onChange={() => toggleSource("purchase")} />采购支出</label>
-          <label><input type="checkbox" checked={sourceTypes.includes("monthly")} onChange={() => toggleSource("monthly")} />月结付款</label>
-          <label><input type="checkbox" checked={sourceTypes.includes("logistics")} onChange={() => toggleSource("logistics")} />物流费用支出</label>
+          <label><input type="checkbox" disabled={busy} checked={sourceTypes.includes("operation")} onChange={() => toggleSource("operation")} />运营支出</label>
+          <label><input type="checkbox" disabled={busy} checked={sourceTypes.includes("purchase")} onChange={() => toggleSource("purchase")} />采购支出</label>
+          <label><input type="checkbox" disabled={busy} checked={sourceTypes.includes("monthly")} onChange={() => toggleSource("monthly")} />月结付款</label>
+          <label><input type="checkbox" disabled={busy} checked={sourceTypes.includes("logistics")} onChange={() => toggleSource("logistics")} />物流费用支出</label>
         </div>
-        <label title={approvalNo.trim() ? "已按钉钉单号精确查询，日期范围不参与筛选" : undefined}>申请开始日期<input type="date" value={dateFrom} disabled={Boolean(approvalNo.trim())} onChange={(event) => setDateFrom(event.target.value)} /></label>
-        <label title={approvalNo.trim() ? "已按钉钉单号精确查询，日期范围不参与筛选" : undefined}>申请结束日期<input type="date" value={dateTo} disabled={Boolean(approvalNo.trim())} onChange={(event) => setDateTo(event.target.value)} /></label>
-        <label>钉钉单号<input value={approvalNo} onChange={(event) => { setApprovalNo(event.target.value); if (event.target.value.trim()) setError(""); }} placeholder="精确匹配，忽略日期" /></label>
+        <label title={approvalNo.trim() ? "已按钉钉单号精确查询，日期范围不参与筛选" : undefined}>申请开始日期<input type="date" value={dateFrom} disabled={busy || Boolean(approvalNo.trim())} onChange={(event) => setDateFrom(event.target.value)} /></label>
+        <label title={approvalNo.trim() ? "已按钉钉单号精确查询，日期范围不参与筛选" : undefined}>申请结束日期<input type="date" value={dateTo} disabled={busy || Boolean(approvalNo.trim())} onChange={(event) => setDateTo(event.target.value)} /></label>
+        <label>钉钉单号<input disabled={busy} value={approvalNo} onChange={(event) => { setApprovalNo(event.target.value); if (event.target.value.trim()) setError(""); }} placeholder="精确匹配，忽略日期" /></label>
         <div className="external-applicant-picker">
-          <label>申请人<input value={applicantQuery} onChange={(event) => setApplicantQuery(event.target.value)} placeholder="搜索并多选申请人" /></label>
+          <label>申请人<input disabled={busy} value={applicantQuery} onChange={(event) => setApplicantQuery(event.target.value)} placeholder="搜索并多选申请人" /></label>
           <div className="external-applicant-options">
             {filteredApplicantOptions.length === 0 && <span>查询后显示申请人选项</span>}
             {filteredApplicantOptions.map((option) => (
               <label key={option.id} title={`钉钉用户 ID：${option.id}`}>
-                <input type="checkbox" checked={applicantIds.includes(option.id)} onChange={() => toggleApplicant(option.id)} />
+                <input type="checkbox" disabled={busy} checked={applicantIds.includes(option.id)} onChange={() => toggleApplicant(option.id)} />
                 <span className="external-applicant-option-text">
                   <strong>{option.name}</strong>
                   <small>{option.department || "部门未知"}</small>
@@ -2055,7 +2081,7 @@ function ExternalExpenseImportDialog({
         <div className="external-selected-applicants">
           {applicantIds.map((id) => {
             const option = preview?.applicant_options.find((candidate) => candidate.id === id);
-            return <button type="button" key={id} onClick={() => toggleApplicant(id)} title={`钉钉用户 ID：${id}`}>{option?.name || "未识别人员"} ×</button>;
+            return <button type="button" disabled={busy} key={id} onClick={() => toggleApplicant(id)} title={`钉钉用户 ID：${id}`}>{option?.name || "未识别人员"} ×</button>;
           })}
         </div>
       )}
@@ -2088,7 +2114,7 @@ function ExternalExpenseImportDialog({
             <table className="data-table external-preview-table">
               <thead>
                 <tr>
-                  <th className="external-select-col"><input type="checkbox" aria-label="选择当前页可导入记录" checked={allPageSelected} onChange={toggleCurrentPage} /></th>
+                  <th className="external-select-col"><input type="checkbox" aria-label="选择当前页可导入记录" disabled={busy || !pageImportableKeys.length} checked={allPageSelected} onChange={toggleCurrentPage} /></th>
                   <th>来源</th><th>申请日期</th><th>钉钉单号</th><th>申请人</th><th>状态</th><th>摘要</th><th>金额</th><th>收款信息</th><th>校验结果</th>
                 </tr>
               </thead>
@@ -2096,14 +2122,23 @@ function ExternalExpenseImportDialog({
                 {pagePreviewRows.length === 0 && <tr><td colSpan={10} className="external-empty-row">没有符合条件的记录</td></tr>}
                 {pagePreviewRows.map((row) => (
                   <tr key={rowKey(row)} className={!row.importable ? "external-row-disabled" : row.warnings.length ? "external-row-warning" : ""}>
-                    <td className="external-select-col"><input type="checkbox" aria-label={`选择 ${row.approval_no}`} disabled={!row.importable} checked={selectedKeys.has(rowKey(row))} onChange={() => toggleRow(row)} /></td>
+                    <td className="external-select-col"><input type="checkbox" aria-label={`选择 ${row.approval_no}`} disabled={busy || !row.importable} checked={selectedKeys.has(rowKey(row))} onChange={() => toggleRow(row)} /></td>
                     <td>{row.source_label}</td>
                     <td>{row.application_date || "—"}</td>
                     <td className="mono">{row.approval_no || "—"}</td>
                     <td title={row.applicant_id ? `钉钉用户 ID：${row.applicant_id}` : undefined}>
                       <strong>{row.applicant || "—"}</strong>
                       <small>{row.original_applicant_department || row.applicant_department || ""}</small>
-                      {row.workbench_sheet && <small>导入归组：{row.workbench_sheet}</small>}
+                      {row.needs_workbench_sheet ? (
+                        <label>
+                          <small>导入归组</small>
+                          <select aria-label={`导入归组 ${row.approval_no}`} value={groupAssignments[rowKey(row)] || ""} disabled={busy || !row.importable || !groupOptions.length} onChange={(event) => assignRowGroup(row, event.target.value)}>
+                            <option value="">请选择现有分组</option>
+                            {groupOptions.map((group) => <option key={group} value={group}>{group}</option>)}
+                          </select>
+                          {!groupOptions.length && <small>请重新查询获取可选分组</small>}
+                        </label>
+                      ) : row.workbench_sheet && <small>导入归组：{row.workbench_sheet}</small>}
                     </td>
                     <td><ExternalApprovalBadge status={row.approval_status} result={row.approval_result} /></td>
                     <td className="external-summary-cell" title={row.summary}>{row.summary || "—"}</td>
@@ -2118,15 +2153,26 @@ function ExternalExpenseImportDialog({
           <div className="external-pagination">
             <span>第 {currentPreviewPage} / {previewTotalPages} 页，共 {filteredPreviewRows.length} 条</span>
             <div>
-              <button className="ghost-button" type="button" disabled={loading || currentPreviewPage <= 1} onClick={() => setPreviewPage(currentPreviewPage - 1)}><ChevronLeft size={15} />上一页</button>
-              <button className="ghost-button" type="button" disabled={loading || currentPreviewPage >= previewTotalPages} onClick={() => setPreviewPage(currentPreviewPage + 1)}>下一页<ChevronRight size={15} /></button>
+              <button className="ghost-button" type="button" disabled={busy || currentPreviewPage <= 1} onClick={() => setPreviewPage(currentPreviewPage - 1)}><ChevronLeft size={15} />上一页</button>
+              <button className="ghost-button" type="button" disabled={busy || currentPreviewPage >= previewTotalPages} onClick={() => setPreviewPage(currentPreviewPage + 1)}>下一页<ChevronRight size={15} /></button>
             </div>
           </div>
         </>
       )}
+      {selectedNeedsGroupCount > 1 && (
+        <div className="external-import-actions">
+          <label>统一导入归组
+            <select aria-label="所选记录统一导入归组" value={bulkGroup} disabled={busy} onChange={(event) => setBulkGroup(event.target.value)}>
+              <option value="">请选择现有分组</option>
+              {groupOptions.map((group) => <option key={group} value={group}>{group}</option>)}
+            </select>
+          </label>
+          <button className="ghost-button" type="button" disabled={busy || !bulkGroup} onClick={assignSelectedGroups}>应用到所选 {selectedNeedsGroupCount} 条需归组记录</button>
+        </div>
+      )}
       <div className="external-import-actions">
-        <span>{selectedKeys.size > 200 ? "单次最多选择 200 条" : `已选择 ${selectedKeys.size} 条`}</span>
-        <button className="primary-button" type="button" onClick={importSelected} disabled={importing || selectedKeys.size === 0 || selectedKeys.size > 200}>
+        <span>{selectedKeys.size > 200 ? "单次最多选择 200 条" : `已选择 ${selectedKeys.size} 条`}{importPlan.missingKeys.length > 0 && `，其中 ${importPlan.missingKeys.length} 条需选择导入归组`}{importPlan.unavailableKeys.length > 0 && "，已选记录已变化，请重新查询"}</span>
+        <button className="primary-button" type="button" onClick={importSelected} disabled={busy || selectedKeys.size === 0 || selectedKeys.size > 200 || importPlan.missingKeys.length > 0 || importPlan.unavailableKeys.length > 0}>
           <Download size={16} />{importing ? "导入中" : `导入选中 ${selectedKeys.size} 条`}
         </button>
       </div>

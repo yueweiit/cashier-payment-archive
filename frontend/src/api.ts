@@ -363,7 +363,8 @@ export type ExternalExpensePreviewRow = {
   applicant: string;
   applicant_department?: string;
   original_applicant_department?: string;
-  workbench_sheet?: string;
+  workbench_sheet?: string | null;
+  needs_workbench_sheet?: boolean;
   approval_status: "COMPLETED" | "RUNNING" | string;
   approval_result?: string;
   summary: string;
@@ -389,6 +390,7 @@ export type ExternalExpensePreviewRow = {
 export type ExternalExpensePreview = {
   rows: ExternalExpensePreviewRow[];
   all_rows: ExternalExpensePreviewRow[];
+  workbench_sheet_options: string[];
   applicant_options: Array<{ id: string; name: string; department?: string; count: number }>;
   summary: {
     matched: number;
@@ -415,6 +417,12 @@ export type ExternalExpensePreviewFilter = {
   result_filter: ExternalExpenseResultFilter;
   page: number;
   page_size: number;
+};
+
+export type ExternalExpenseImportItem = {
+  source_type: ExternalExpenseSourceType;
+  source_id: string;
+  workbench_sheet?: string;
 };
 
 export type ExternalExpenseImportResult = {
@@ -1072,7 +1080,7 @@ export const api = {
     }),
   importExternalExpenses: (
     batchId: number,
-    items: Array<{ source_type: ExternalExpenseSourceType; source_id: string }>,
+    items: ExternalExpenseImportItem[],
   ) =>
     request<ExternalExpenseImportResult>(`/api/batches/${batchId}/imports/external-expenses`, {
       method: "POST",

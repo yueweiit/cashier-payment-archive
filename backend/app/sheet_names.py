@@ -38,6 +38,7 @@ def _workbench_name_key(value: Any) -> str:
 
 
 _WORKBENCH_GROUP_ALIASES = {
+    "悦为智能": ("悦为智能 YW Tech_Ai",),
     "广州凌翔": (
         "凌翔", "凌翔产品&开发", "凌翔供应链及采购执行单元", "凌翔产品&开发及供应链",
         "Guangzhou Lingxiang广州凌翔", "Guangzhou Lingxiang", "广州凌翔Guangzhou Lingxiang",
@@ -54,6 +55,7 @@ _WORKBENCH_GROUP_ALIASES = {
     "LATINGO": (),
     "柠檬树": (),
 }
+DINGTALK_WORKBENCH_SHEETS: tuple[str, ...] = tuple(_WORKBENCH_GROUP_ALIASES)
 _WORKBENCH_ALIAS_GROUPS = {
     _workbench_name_key(alias): group
     for group, aliases in _WORKBENCH_GROUP_ALIASES.items()
@@ -75,6 +77,9 @@ _WORKBENCH_XINGMING_GROUPS = {"星铭", "星铭 HR", "星铭 财务"}
 _WORKBENCH_SUBJECT_ROOTS = {
     **_WORKBENCH_ALIAS_GROUPS,
     **{_workbench_name_key(alias): group for alias, group in (
+        ("YW Tech_Ai", "悦为智能"),
+        ("Yuewei Intelligent", "悦为智能"),
+        ("悦为智能技术（东莞）有限公司", "悦为智能"),
         ("凌翔", "广州凌翔"),
         ("星铭", "星铭"),
         ("东莞星铭", "星铭"),
@@ -148,8 +153,28 @@ def _workbench_subject_group(value: Any, depth: int = 0) -> str | None:
     return None
 
 
+def pinned_dingtalk_workbench_sheet(source_sheet: Any, raw_extra: Any) -> str | None:
+    """Read a fixed-group choice only while its original Sheet identity matches."""
+    assignment = _workbench_json_object(raw_extra).get("dingtalk_workbench_assignment")
+    if not isinstance(assignment, dict) or assignment.get("mode") not in ("auto", "manual"):
+        return None
+    original = assignment.get("source_sheet")
+    group = assignment.get("sheet")
+    if not isinstance(original, str) or canonical_sheet_name(original) != canonical_sheet_name(source_sheet):
+        return None
+    return group if isinstance(group, str) and group in DINGTALK_WORKBENCH_SHEETS else None
+
+
+def workbench_registered_sheet(source_sheet: Any, raw_extra: Any) -> str:
+    """Register a pinned display group while retaining the request's raw Sheet."""
+    return pinned_dingtalk_workbench_sheet(source_sheet, raw_extra) or canonical_sheet_name(source_sheet)
+
+
 def workbench_sheet_name(value: Any, raw_extra_json: Any = None) -> str:
     """Project an organization into a display group without changing its identity."""
+    pinned = pinned_dingtalk_workbench_sheet(value, raw_extra_json)
+    if pinned:
+        return pinned
     name = canonical_sheet_name(value)
     key = _workbench_name_key(name)
     if key in _WORKBENCH_ALIAS_GROUPS:
@@ -193,3 +218,17 @@ def workbench_sheet_name(value: Any, raw_extra_json: Any = None) -> str:
         if subject:
             return subject
     return name
+
+
+def resolve_dingtalk_workbench_sheet(source_sheet: Any, raw_extra: Any) -> str | None:
+    """Resolve a new external import into fixed groups; unknowns need a choice."""
+    projected = workbench_sheet_name(source_sheet, raw_extra)
+    if projected in DINGTALK_WORKBENCH_SHEETS:
+        return projected
+    key = _workbench_name_key(canonical_sheet_name(source_sheet))
+    if key in _WORKBENCH_MIXED_LATIN_NAMES or key in {_WORKBENCH_MIXED_CENTER, _workbench_name_key("星铭")}:
+        return None
+    extra = _workbench_json_object(raw_extra)
+    source = _workbench_json_object(extra["external_source"]) if "external_source" in extra else extra
+    subject = _workbench_subject_group(source.get("service_subject"))
+    return subject if subject in DINGTALK_WORKBENCH_SHEETS else None
