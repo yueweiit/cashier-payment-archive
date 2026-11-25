@@ -37,6 +37,9 @@ PROCESS_SOURCE_CODES = {
     "logistics": LOGISTICS_PAYMENT_PROCESS_CODE,
 }
 ALLOWED_APPROVAL_STATUSES = ("COMPLETED", "RUNNING")
+DINGTALK_EXPLICIT_REFUSAL_RESULTS = frozenset({
+    "refuse", "refused", "reject", "rejected", "disagree", "disagreed",
+})
 ALLOWED_EXECUTION_REGION_PATTERN = r"(中国|china|墨西哥|m[eé]xico)"
 CHINA_WORKBENCH_EXECUTION_REGION_PATTERN = r"(中国|china)"
 CHINA_WORKBENCH_REGION_ERROR = "执行地区为墨西哥，不允许导入中国请款工作台"
@@ -1440,6 +1443,36 @@ def general_manager_approval_from_workflow_events(
     if str(latest.get("result") or "").upper() != "AGREE" or not approval_date:
         return None
     return "同意付款", approval_date
+
+
+def resolve_effective_dingtalk_approval(
+    source: Dict[str, Any],
+    workflow: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Optional[str]]:
+    """Let an explicit completed instance refusal supersede stale expense state.
+
+    Callers select a unique, valid workflow. Missing optional identity fields
+    do not establish a conflict; conflicting explicit identities block override.
+    Node decisions and termination results do not establish instance refusal.
+    """
+    original = {field: source.get(field) for field in ("approval_status", "approval_result")}
+    if not isinstance(workflow, dict):
+        return original
+    status = (_text(workflow.get("status")) or "").upper()
+    result = (_text(workflow.get("result")) or "").casefold()
+    if status != "COMPLETED" or result not in DINGTALK_EXPLICIT_REFUSAL_RESULTS:
+        return original
+    for source_key, workflow_key in (
+        ("approval_no", "approval_no"),
+        ("process_instance_id", "process_instance_id"),
+        ("workflow_process_instance_id", "process_instance_id"),
+        ("corp_id", "corp_id"),
+    ):
+        source_identity = _text(source.get(source_key))
+        workflow_identity = _text(workflow.get(workflow_key))
+        if source_identity and workflow_identity and source_identity != workflow_identity:
+            return original
+    return {"approval_status": "COMPLETED", "approval_result": "refuse"}
 
 
 def _json_list(value: Any) -> list[Any]:

@@ -77,6 +77,7 @@ import { canDirectlyEditGridField, isErpLockedRequestField, normalizeCellValue, 
 import { AppNavigation, type AppTab } from "./AppNavigation";
 import { MexicoTrackingPage } from "./MexicoTrackingPage";
 import { defaultDailyPayablesExportRange, shanghaiIsoDate, validateDailyPayablesExportRange } from "./dailyPayablesExport";
+import { matchesPaymentStatusFilter, paymentStatusCounts, requestCanAddPayment, requestIsCompleted, requestIsPaymentRefused, requestOutstandingAmount, requestPaymentStatus } from "./paymentStatus";
 
 type Tab = AppTab;
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
@@ -186,7 +187,7 @@ type GridRow = Partial<PaymentRequest> & {
 };
 
 type GridHeaderLanguage = "zh" | "es";
-type MobileQuickFilter = "all" | "pending_approval" | "unpaid" | "partial" | "paid";
+type MobileQuickFilter = "all" | "pending_approval" | "unpaid" | "partial" | "paid" | "refused" | "completed";
 type MobileViewOverride = "cards" | "table" | null;
 
 type GridColumn = {
@@ -2292,13 +2293,10 @@ function Workspace({
   );
   const visibleCurrencyTotals = useMemo(() => currencySubtotals(visibleActiveRows), [visibleActiveRows]);
   const financeReviewCounts = useMemo(
-    () => ({
-      paid: visibleActiveRows.filter((row) => row.finance_review === "已付款").length,
-      partial: visibleActiveRows.filter((row) => row.finance_review === "部分付款").length,
-      unpaid: visibleActiveRows.filter((row) => row.finance_review === "未付款").length,
-    }),
+    () => paymentStatusCounts(visibleActiveRows),
     [visibleActiveRows],
   );
+  const batchCompletion = useMemo(() => paymentStatusCounts(gridRows.filter((row) => !row.__deleted)), [gridRows]);
   const showFilteredAmounts = hasActiveExportFilter;
   const mobileQuickFilter: MobileQuickFilter = filters.general_manager_approval === GENERAL_MANAGER_EMPTY_FILTER
     ? "pending_approval"
@@ -2308,7 +2306,9 @@ function Workspace({
         ? "partial"
         : filters.finance_review === "已付款"
           ? "paid"
-          : "all";
+          : filters.finance_review === "拒绝付款"
+            ? "refused"
+            : filters.finance_review === "已完成" ? "completed" : "all";
   const firstVisibleSheet = sheetTabs.find((tab) => tab.key !== ALL_SHEET)?.key || "";
   const defaultSourceSheet = activeSheet === ALL_SHEET
     ? (user.role === "business" ? firstVisibleSheet : "手工录入")
@@ -2323,8 +2323,8 @@ function Workspace({
   const canReorderSheets = canManageSheets && canEditGrid && !hasUnsavedChanges && !sheetOrderSaving;
   const batchPayableAmount = Number(selectedBatch?.total_amount) || 0;
   const batchPaidAmount = Number(selectedBatch?.total_paid_amount) || 0;
-  const paymentProgress = batchPayableAmount > 0
-    ? Math.min(100, Math.max(0, (batchPaidAmount / batchPayableAmount) * 100))
+  const paymentProgress = batchCompletion.total > 0
+    ? (batchCompletion.completed / batchCompletion.total) * 100
     : 0;
   const activeSheetPendingDeleteCount = activeSheetRows.filter((row) => row.__deleted).length;
   const canDeleteActiveSheet = canEditGrid
@@ -2523,7 +2523,9 @@ function Workspace({
           ? "部分付款"
           : filter === "paid"
             ? "已付款"
-            : "",
+            : filter === "refused"
+              ? "拒绝付款"
+              : filter === "completed" ? "已完成" : "",
       general_manager_approval: filter === "pending_approval" ? GENERAL_MANAGER_EMPTY_FILTER : "",
     }));
   }
@@ -3106,10 +3108,10 @@ function Workspace({
         </div>
         <div className="payment-progress">
           <div className="payment-progress-label">
-            <span>付款进度</span>
-            <strong>{paymentProgress.toFixed(1)}%</strong>
+            <span>处理进度</span>
+            <strong>{language === "es" ? `Completadas ${batchCompletion.completed}/${batchCompletion.total}` : `已完成 ${batchCompletion.completed}/${batchCompletion.total} 单`} · {paymentProgress.toFixed(1)}%</strong>
           </div>
-          <div className="payment-progress-track" role="progressbar" aria-label="批次付款进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Number(paymentProgress.toFixed(1))}>
+          <div className="payment-progress-track" role="progressbar" aria-label="批次处理进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Number(paymentProgress.toFixed(1))}>
             <div className="payment-progress-fill" style={{ width: `${paymentProgress}%` }} />
           </div>
         </div>
@@ -3205,6 +3207,8 @@ function Workspace({
                 ["unpaid", gridHeaderLanguage === "es" ? "No pagado" : "未付款"],
                 ["partial", gridHeaderLanguage === "es" ? "Pago parcial" : "部分付款"],
                 ["paid", gridHeaderLanguage === "es" ? "Pagado" : "已付款"],
+                ["refused", gridHeaderLanguage === "es" ? "Pago rechazado" : "拒绝付款"],
+                ["completed", gridHeaderLanguage === "es" ? "Completadas" : "已完成"],
               ] as Array<[MobileQuickFilter, string]>).map(([value, label]) => (
                 <button
                   key={value}
@@ -3243,6 +3247,8 @@ function Workspace({
             <select value={filters.finance_review} onChange={(event) => setFilters({ ...filters, finance_review: event.target.value })} aria-label="财务审批">
               <option value="">全部财务审批</option>
               {financeApprovalOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+              <option value="拒绝付款">拒绝付款</option>
+              <option value="已完成">已完成</option>
             </select>
             <select value={filters.general_manager_approval} onChange={(event) => setFilters({ ...filters, general_manager_approval: event.target.value })} aria-label="总经理审批">
               <option value="">全部总经理审批</option>
@@ -3266,8 +3272,8 @@ function Workspace({
                 <option value="mexico">{gridHeaderLanguage === "es" ? "México" : "墨西哥"}</option>
               </select>
               {user.role !== "business" && (
-                <select value={filters.dingtalk_lifecycle} onChange={(event) => setFilters({ ...filters, dingtalk_lifecycle: event.target.value })} aria-label="钉钉流程范围" disabled={hasUnsavedChanges || editorDirty} title={hasUnsavedChanges || editorDirty ? "请先保存或放弃未保存修改" : "选择是否查看已终止或已拒绝的钉钉流程"}>
-                  <option value="active">正常流程</option>
+                <select value={filters.dingtalk_lifecycle} onChange={(event) => setFilters({ ...filters, dingtalk_lifecycle: event.target.value })} aria-label="钉钉流程范围" disabled={hasUnsavedChanges || editorDirty} title={hasUnsavedChanges || editorDirty ? "请先保存或放弃未保存修改" : "当前流程包含拒绝付款，也可单独查看已终止或已拒绝的流程"}>
+                  <option value="active">当前流程（含拒绝付款）</option>
                   <option value="inactive">已终止/已拒绝</option>
                   <option value="all">全部流程</option>
                 </select>
@@ -3337,6 +3343,8 @@ function Workspace({
             <button className={`summary-status paid${filters.finance_review === "已付款" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "已付款" ? "" : "已付款" })}>{language === "es" ? `Pagado ${financeReviewCounts.paid}` : `已付款 ${financeReviewCounts.paid} 单`}</button>
             <button className={`summary-status partial${filters.finance_review === "部分付款" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "部分付款" ? "" : "部分付款" })}>{language === "es" ? `Pago parcial ${financeReviewCounts.partial}` : `部分付款 ${financeReviewCounts.partial} 单`}</button>
             <button className={`summary-status unpaid${filters.finance_review === "未付款" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "未付款" ? "" : "未付款" })}>{language === "es" ? `No pagado ${financeReviewCounts.unpaid}` : `未付款 ${financeReviewCounts.unpaid} 单`}</button>
+            <button className={`summary-status refused${filters.finance_review === "拒绝付款" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "拒绝付款" ? "" : "拒绝付款" })}>{language === "es" ? `Pago rechazado ${financeReviewCounts.refused}` : `拒绝付款 ${financeReviewCounts.refused} 单`}</button>
+            <button className={`summary-status paid${filters.finance_review === "已完成" ? " active" : ""}`} type="button" onClick={() => setFilters({ ...filters, finance_review: filters.finance_review === "已完成" ? "" : "已完成" })}>{language === "es" ? `Completadas ${financeReviewCounts.completed}` : `已完成 ${financeReviewCounts.completed} 单`}</button>
           </div>
         </div>
         <div className="sheet-tabs" role="tablist" aria-label="Sheet 分页">
@@ -4187,7 +4195,8 @@ function RolloverPanel({
       setEndDate("");
       setNameTouched(false);
       onCreated(res.batch);
-      setMessage(copyMode === "all" ? `已生成本周草稿，复制全部 ${res.copied_count} 条记录` : `已生成本周草稿，复制 ${res.copied_count} 条未完成记录`);
+      const copiedMessage = copyMode === "all" ? `已生成本周草稿，复制 ${res.copied_count} 条记录` : `已生成本周草稿，复制 ${res.copied_count} 条未完成记录`;
+      setMessage(res.workflow_check_unavailable ? `${copiedMessage}。钉钉暂时无法连接，已按本地审批状态结转。` : copiedMessage);
     } catch (error) {
       const detail = (error as Error).message || "生成本周批次失败";
       setRolloverError(detail);
@@ -4253,6 +4262,7 @@ function RolloverPanel({
           {copyingMode === "all" ? "复制中" : "复制全部"}
         </button>
       </div>
+      <p className="rollover-policy-note">拒绝付款已完成处理，两种复制方式均不结转到下一周。</p>
     </div>
   );
 }
@@ -4315,11 +4325,11 @@ function MobileRequestCardList({
         const source = row.raw_extra?.external_source;
         const applicant = requestApplicantName(row) || (isSpanish ? "Sin completar" : "未填写");
         const attachmentCount = row.id ? Number(attachmentCounts[row.id] || 0) : 0;
-        const canApprove = user.role === "general_manager" && Boolean(row.id) && !requestDingTalkTerminated(row);
+        const canApprove = user.role === "general_manager" && Boolean(row.id) && !requestDingTalkTerminated(row) && !requestIsPaymentRefused(row);
         return (
           <article className="mobile-request-card" key={row.__localId}>
             <header className="mobile-request-card-head">
-              <StatusPill value={String(row.finance_review || "未付款")} />
+              <StatusPill value={requestPaymentStatus(row)} />
               {source ? <ExternalApprovalBadge source={source} snapshot /> : <span className="external-status-empty">—</span>}
             </header>
             <div className="mobile-request-card-title">
@@ -4335,7 +4345,7 @@ function MobileRequestCardList({
             <div className="mobile-request-amounts">
               <div><span>{labels.payable}</span><strong>{formatMoney(Number(row.amount || 0), row.currency)}</strong></div>
               <div><span>{labels.paid}</span><strong>{formatMoney(Number(row.paid_amount || 0), row.currency)}</strong></div>
-              <div className="pending"><span>{labels.pending}</span><strong>{formatMoney(Number(row.pending_amount || 0), row.currency)}</strong></div>
+              <div className="pending"><span>{labels.pending}</span><strong>{formatMoney(requestOutstandingAmount(row), row.currency)}</strong></div>
             </div>
             <dl className="mobile-request-meta">
               <div><dt>{labels.neededDate}</dt><dd>{row.needed_payment_date || "—"}</dd></div>
@@ -4596,7 +4606,7 @@ function EditablePaymentGrid({
                 </td>
                 <td className="payment-detail-col fixed-grid-column">
                   <button
-                    className={`payment-detail-chip${Number(row.payment_count || 0) > 0 ? " has-payments" : ""}`}
+                    className={`payment-detail-chip${requestIsPaymentRefused(row) ? " refused" : Number(row.payment_count || 0) > 0 ? " has-payments" : ""}`}
                     type="button"
                     disabled={!row.id}
                     onClick={(event) => {
@@ -4604,7 +4614,7 @@ function EditablePaymentGrid({
                       if (row.id) onEdit(row as PaymentRequest, "payments");
                     }}
                   >
-                    {row.erp_payment_owner === "deeplinkerp" ? (headerLanguage === "es" ? "Pago en ERP" : "付款由ERP管理") : Number(row.payment_count || 0) > 0
+                    {requestIsPaymentRefused(row) ? (headerLanguage === "es" ? "Pago rechazado" : "拒绝付款") : row.erp_payment_owner === "deeplinkerp" ? (headerLanguage === "es" ? "Pago en ERP" : "付款由ERP管理") : Number(row.payment_count || 0) > 0
                       ? (headerLanguage === "es" ? `${Number(row.payment_count || 0)} pago(s)` : `付款 ${Number(row.payment_count || 0)} 笔`)
                       : (headerLanguage === "es" ? "No pagado" : "未付款")}
                   </button>
@@ -4614,7 +4624,7 @@ function EditablePaymentGrid({
 	                  const cellValue = cellDisplayValue(row, column);
 	                  const selectOptions = selectOptionsForField(column.key, cellValue);
 	                  const shouldWrap = wrapText && wrappableColumnKeys.has(column.key) && column.type !== "number" && column.type !== "date";
-	                  const terminatedManagerField = requestDingTalkTerminated(row) && generalManagerControlledFields.has(column.key);
+	                  const terminatedManagerField = (requestDingTalkTerminated(row) || requestIsPaymentRefused(row)) && generalManagerControlledFields.has(column.key);
 	                  const cellReadOnly = readOnly || row.__deleted || !canEditField(column.key) || terminatedManagerField
 	                    || isErpLockedRequestField(row, column.key)
 	                    || (column.key !== "currency" && !canDirectlyEditGridField(row, column.key));
@@ -4808,7 +4818,7 @@ function RequestEditor({
   const canCorrectArchived = batch.status === "archived" && isPrivilegedRole(user.role);
   const payableAmount = Number(form.amount || 0);
   const paidAmount = Number(form.paid_amount || 0);
-  const pendingAmount = Number(form.pending_amount ?? Math.max(0, payableAmount - paidAmount));
+  const pendingAmount = requestOutstandingAmount({ ...form, pending_amount: form.pending_amount ?? Math.max(0, payableAmount - paidAmount) });
 
   useEffect(() => {
     setForm(request);
@@ -4915,11 +4925,13 @@ function RequestEditor({
   function renderField(field: keyof PaymentRequest, options: { span?: boolean } = {}) {
     const fieldEditable = canEditField(field)
       && !isErpLockedRequestField(form, field)
-      && !(requestDingTalkTerminated(form) && generalManagerControlledFields.has(field))
+      && !((requestDingTalkTerminated(form) || requestIsPaymentRefused(form)) && generalManagerControlledFields.has(field))
       && !(field === "amount" && currencyCode(form.currency) !== "CNY" && !["finance", "general_manager", "admin"].includes(user.role));
     const className = options.span ? "editor-field span-2" : "editor-field";
     const label = fieldLabels[field] || field;
-    const value = field === "applicant" ? requestApplicantName(form) : form[field];
+    const value = field === "applicant" ? requestApplicantName(form)
+      : field === "finance_review" ? requestPaymentStatus(form)
+        : field === "pending_amount" ? requestOutstandingAmount(form) : form[field];
     if (!fieldEditable) {
       return (
         <div className={`${className} editor-readonly-field`} key={field}>
@@ -5048,7 +5060,7 @@ function RequestEditor({
           <div className="request-editor-title">
             <div>
               <h2>{form.id ? "编辑请款" : "新增请款"}</h2>
-              <StatusPill value={String(form.finance_review || "未付款")} />
+              <StatusPill value={requestPaymentStatus(form)} />
               {form.raw_extra?.external_source && (
                 <ExternalApprovalBadge source={form.raw_extra.external_source} snapshot />
               )}
@@ -5451,6 +5463,7 @@ function PaymentDetailsPanel({
 
   const editingPayment = payments.find((payment) => payment.id === editingPaymentId);
   const maxPayable = roundMoney(Number(summary.pending_amount || 0) + Number(editingPayment?.amount || 0));
+  const canAddPayment = canManage && requestCanAddPayment({ ...request, pending_amount: maxPayable });
   const paymentProgress = Number(summary.amount || 0) > 0
     ? Math.min(100, Math.max(0, (Number(summary.paid_amount || 0) / Number(summary.amount || 0)) * 100))
     : 0;
@@ -5462,6 +5475,7 @@ function PaymentDetailsPanel({
   }
 
   function beginCreatePayment() {
+    if (!canAddPayment) return;
     resetPaymentForm(false);
     setError("");
     setPaymentFormOpen(true);
@@ -5482,6 +5496,10 @@ function PaymentDetailsPanel({
   }
 
   async function savePayment() {
+    if (!editingPaymentId && requestIsPaymentRefused(request)) {
+      setError("该请款已拒绝付款，不能新增付款");
+      return;
+    }
     if (!canManage || !paymentForm.payment_date || Number(paymentForm.amount) <= 0) {
       setError("请填写有效的本次金额和付款日期");
       return;
@@ -5595,8 +5613,8 @@ function PaymentDetailsPanel({
           <small>汇总金额和付款状态由明细自动计算</small>
         </div>
         <div className="payment-section-actions">
-          <StatusPill value={summary.finance_review} />
-          {canManage && maxPayable > 0 && !paymentFormOpen && (
+          <StatusPill value={requestPaymentStatus({ ...request, finance_review: summary.finance_review })} />
+          {canAddPayment && !paymentFormOpen && (
             <button className="primary-button" type="button" onClick={beginCreatePayment}>
               <Plus size={16} />新增付款
             </button>
@@ -5606,7 +5624,7 @@ function PaymentDetailsPanel({
       <div className="payment-summary-grid">
         <div><span>应付金额</span><strong>{formatMoney(summary.amount || 0, request.currency)}</strong></div>
         <div><span>累计已付</span><strong>{formatMoney(summary.paid_amount || 0, request.currency)}</strong></div>
-        <div><span>待付款</span><strong>{formatMoney(summary.pending_amount || 0, request.currency)}</strong></div>
+        <div><span>待付款</span><strong>{formatMoney(requestOutstandingAmount({ ...request, pending_amount: summary.pending_amount }), request.currency)}</strong></div>
       </div>
       <div className="payment-detail-progress">
         <div><span>付款进度</span><strong>{paymentProgress.toFixed(1)}%</strong></div>
@@ -5619,7 +5637,7 @@ function PaymentDetailsPanel({
         {payments.length === 0 && (
           <div className="empty-payment-state">
             <span>尚无付款记录</span>
-            {canManage && maxPayable > 0 && !paymentFormOpen && (
+            {canAddPayment && !paymentFormOpen && (
               <button className="primary-button" type="button" onClick={beginCreatePayment}>录入第一笔付款</button>
             )}
           </div>
@@ -5681,7 +5699,7 @@ function PaymentDetailsPanel({
           </article>
         ))}
       </div>
-      {canManage && paymentFormOpen && (
+      {canManage && paymentFormOpen && (Boolean(editingPaymentId) || !requestIsPaymentRefused(request)) && (
         <div className="payment-entry-form" ref={paymentFormRef}>
           <div className="payment-form-title span-2">
             <div><strong>{editingPaymentId ? "编辑付款" : "新增付款"}</strong><span>金额和付款日期为必填项</span></div>
@@ -6582,6 +6600,7 @@ function selectOptionsForField(field: keyof PaymentRequest, currentValue: string
   const options = field === "currency" ? [...baseOptions] : ["", ...baseOptions];
   const value = currentValue.trim();
   if (strictSelectFields.has(field)) {
+    if (field === "finance_review" && value === "拒绝付款") options.push(value);
     if (field === "general_manager_approval" && value === "无需审批") options.push(value);
     return options;
   }
@@ -6639,14 +6658,14 @@ function rowMatchesFilters(
   const pendingAmountMax = optionalNumber(filters.pending_amount_max);
   if (pendingAmountMin !== undefined && pendingAmount < pendingAmountMin) return false;
   if (pendingAmountMax !== undefined && pendingAmount > pendingAmountMax) return false;
-  if (filters.finance_review.trim() && String(row.finance_review || "") !== filters.finance_review.trim()) return false;
+  if (!matchesPaymentStatusFilter(row, filters.finance_review)) return false;
   if (filters.general_manager_approval === GENERAL_MANAGER_EMPTY_FILTER) {
     if (String(row.general_manager_approval || "").trim()) return false;
     const externalSource = row.raw_extra?.external_source;
     const externalStatus = String(externalSource?.approval_status || "").trim().toUpperCase();
     const externalResult = String(externalSource?.approval_result || "").trim().toLowerCase();
     const fullyPaid = String(row.finance_review || "") === "已付款" || (Number(row.amount || 0) > 0 && pendingAmount <= 0);
-    if (fullyPaid || externalStatus === "TERMINATED" || externalResult === "refuse") return false;
+    if (fullyPaid || requestIsCompleted(row) || externalStatus === "TERMINATED" || ["refuse", "rejected"].includes(externalResult)) return false;
   }
   if (
     filters.general_manager_approval.trim()
@@ -6782,6 +6801,8 @@ function roundMoney(value: number) {
 
 function cellDisplayValue(row: GridRow, column: GridColumn) {
   if (column.key === "applicant") return requestApplicantName(row);
+  if (column.key === "finance_review") return requestPaymentStatus(row);
+  if (column.key === "pending_amount") return String(requestOutstandingAmount(row));
   const value = row[column.key];
   if (value === undefined || value === null) return "";
   return String(value);
@@ -6874,7 +6895,7 @@ function ExternalApprovalBadge({
     ? "conflict"
     : lookupStatus === "unmatched"
       ? "unmatched"
-      : normalizedResult === "refuse"
+      : ["refuse", "rejected"].includes(normalizedResult)
         ? "refused"
         : normalized === "TERMINATED"
           ? "terminated"
@@ -6906,7 +6927,7 @@ function ExternalApprovalBadge({
 }
 
 function StatusPill({ value }: { value?: string }) {
-  return <span className={`status-pill ${value === "已付款" || value === "已归档" ? "done" : ""}`}>{value || "未填写"}</span>;
+  return <span className={`status-pill ${value === "拒绝付款" ? "done refused" : value === "已付款" || value === "已归档" ? "done" : ""}`}>{value || "未填写"}</span>;
 }
 
 function countAttachmentsByRequest(attachments: AttachmentLink[]) {
@@ -6974,6 +6995,7 @@ function requestFxRate(request: Partial<PaymentRequest>) {
 }
 
 function requestAmountCny(request: Partial<PaymentRequest>, field: "amount" | "paid_amount" | "pending_amount") {
+  if (field === "pending_amount") return roundMoney(requestOutstandingAmount(request) * requestFxRate(request));
   if (field === "amount" && request.base_amount_cny !== undefined && request.base_amount_cny !== null) {
     return Number(request.base_amount_cny) || 0;
   }
@@ -6987,7 +7009,7 @@ function currencySubtotals(rows: Array<Partial<PaymentRequest>>) {
     const current = totals.get(currency) || { currency, amount: 0, paid_amount: 0, pending_amount: 0 };
     current.amount = roundMoney(current.amount + (Number(row.amount) || 0));
     current.paid_amount = roundMoney(current.paid_amount + (Number(row.paid_amount) || 0));
-    current.pending_amount = roundMoney(current.pending_amount + (Number(row.pending_amount) || 0));
+    current.pending_amount = roundMoney(current.pending_amount + requestOutstandingAmount(row));
     totals.set(currency, current);
   });
   return ["CNY", "USD", "MXN"].map((code) => totals.get(code)).filter(Boolean) as Array<{ currency: string; amount: number; paid_amount: number; pending_amount: number }>;

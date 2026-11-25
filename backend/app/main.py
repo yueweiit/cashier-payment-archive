@@ -76,6 +76,7 @@ from .excel_io import (
 )
 from .external_expenses import (
     ALLOWED_SOURCE_TYPES,
+    DINGTALK_EXPLICIT_REFUSAL_RESULTS,
     DingtalkAttachmentClient,
     ExternalExpenseError,
     PostgresDiscoveryGateway,
@@ -92,6 +93,7 @@ from .external_expenses import (
     general_manager_approval_from_workflow_events,
     mark_china_workbench_external_expense,
     preview_external_expenses,
+    resolve_effective_dingtalk_approval,
     valid_dingtalk_payee_account,
 )
 from .expected_payment_account import (
@@ -915,7 +917,7 @@ def batch_public_for_user(
     data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
     data["sheet_order"] = batch_sheet_order(data)
     access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
-    active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
+    active_sql = f"NOT {dingtalk_terminated_sql('p.raw_extra_json')}"
     region_sql = workbench_scope(conn, "p")
     visible_sheet_rows = conn.execute(
         f"""
@@ -938,10 +940,10 @@ def batch_public_for_user(
                COUNT(*) AS request_count,
                COALESCE(SUM(p.amount), 0) AS amount,
                COALESCE(SUM(p.paid_amount), 0) AS paid_amount,
-               COALESCE(SUM(p.pending_amount), 0) AS pending_amount,
+               COALESCE(SUM({workbench_pending_sql('p.')}), 0) AS pending_amount,
                COALESCE(SUM(COALESCE(p.base_amount_cny, p.amount)), 0) AS amount_cny,
                COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS paid_amount_cny,
-               COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS pending_amount_cny
+               COALESCE(SUM(({workbench_pending_sql('p.')}) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS pending_amount_cny
         FROM payment_requests p
         WHERE p.batch_id = ? AND {access_sql} AND {active_sql} AND {region_sql}
         GROUP BY UPPER(COALESCE(NULLIF(TRIM(p.currency), ''), 'CNY'))
@@ -1526,14 +1528,14 @@ def export_daily_payables(
 def list_batches(user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
     with connect() as conn:
         access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
-        active_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
+        active_sql = f"NOT {dingtalk_terminated_sql('p.raw_extra_json')}"
         region_sql = workbench_scope(conn, "p")
         rows = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
                    COALESCE(SUM(COALESCE(p.base_amount_cny, p.amount)), 0) AS total_amount,
                    COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_paid_amount,
-                   COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
+                   COALESCE(SUM(({workbench_pending_sql('p.')}) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
             FROM request_batches b
             LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql} AND {active_sql} AND {region_sql}
             GROUP BY b.id
@@ -1576,6 +1578,32 @@ def rollover_batch(
         raise HTTPException(status_code=400, detail="新批次名称不能为空")
     if payload.copy_mode not in {"unfinished", "all"}:
         raise HTTPException(status_code=400, detail="复制模式无效")
+    unfinished_only = (
+        "AND COALESCE(NULLIF(TRIM(finance_review), ''), '未付款') != '已付款'"
+        if payload.copy_mode == "unfinished" else ""
+    )
+    source_rows_sql = f"""
+        SELECT * FROM payment_requests
+        WHERE batch_id = ? AND NOT {dingtalk_payment_refused_sql()} {unfinished_only}
+        ORDER BY source_sheet, source_row, id
+    """
+    with connect() as conn:
+        initial_source = require_batch(conn, source_batch_id)
+        initial_version = checked_expected_version(initial_source, payload.expected_batch_version, "request_batch", source_batch_id)
+        approval_nos = {
+            str(row["dingding_id"]).strip()
+            for row in conn.execute(source_rows_sql, (source_batch_id,))
+            if row["dingding_id"] and linked_dingtalk_workflow_instance(request_external_source(row))
+        }
+    workflows_by_approval: Dict[str, list[Dict[str, Any]]] = {}
+    workflow_check_unavailable = False
+    if approval_nos:
+        try:
+            for workflow in fetch_dingtalk_workflows(sorted(approval_nos)):
+                workflows_by_approval.setdefault(str(workflow.get("approval_no") or "").strip(), []).append(workflow)
+        except ExternalExpenseError:
+            workflow_check_unavailable = True
+
     operation_id = uuid.uuid4().hex
     timestamp = now_iso()
     with connect() as conn:
@@ -1584,7 +1612,7 @@ def rollover_batch(
         source = require_batch(conn, source_batch_id)
         checked_expected_version(
             source,
-            payload.expected_batch_version,
+            initial_version,
             "request_batch",
             source_batch_id,
         )
@@ -1609,25 +1637,7 @@ def rollover_batch(
             ),
         )
         target_batch_id = cursor.lastrowid
-        if payload.copy_mode == "all":
-            source_rows = conn.execute(
-                """
-                SELECT * FROM payment_requests
-                WHERE batch_id = ?
-                ORDER BY source_sheet, source_row, id
-                """,
-                (source_batch_id,),
-            ).fetchall()
-        else:
-            source_rows = conn.execute(
-                """
-                SELECT * FROM payment_requests
-                WHERE batch_id = ?
-                  AND COALESCE(NULLIF(TRIM(finance_review), ''), '未付款') != '已付款'
-                ORDER BY source_sheet, source_row, id
-                """,
-                (source_batch_id,),
-            ).fetchall()
+        source_rows = conn.execute(source_rows_sql, (source_batch_id,)).fetchall()
         copied_count = 0
         skipped_duplicate_rows = 0
         erp_owned_ids = erp_owned_request_ids(conn, source_batch_id)
@@ -1639,6 +1649,12 @@ def rollover_batch(
                 continue
             source_data = row_to_dict(source_row)
             approval_no = str(source_data.get("dingding_id") or "").strip()
+            workflows = workflows_by_approval.get(approval_no, [])
+            external_source = request_external_source(source_row)
+            instance = linked_dingtalk_workflow_instance(external_source)
+            if len(workflows) == 1 and instance and instance == str(workflows[0].get("process_instance_id") or "").strip():
+                if dingtalk_payment_refused(resolve_effective_dingtalk_approval(external_source, workflows[0])):
+                    continue
             duplicate_key = (
                 approval_no,
                 normalize_currency(source_data.get("currency")),
@@ -1689,6 +1705,7 @@ def rollover_batch(
                 "copied_count": copied_count,
                 "skipped_duplicate_rows": skipped_duplicate_rows,
                 "skipped_erp_owned_rows": skipped_erp_owned_rows,
+                "workflow_check_unavailable": workflow_check_unavailable,
                 "copy_mode": payload.copy_mode,
             },
             operation_id=operation_id,
@@ -1699,6 +1716,7 @@ def rollover_batch(
         "copied_count": copied_count,
         "skipped_duplicate_rows": skipped_duplicate_rows,
         "skipped_erp_owned_rows": skipped_erp_owned_rows,
+        "workflow_check_unavailable": workflow_check_unavailable,
         "copy_mode": payload.copy_mode,
         "operation_id": operation_id,
     }
@@ -1708,14 +1726,14 @@ def rollover_batch(
 def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
     with connect() as conn:
         access_sql, access_params = sheet_access_filter(conn, user, "p.source_sheet")
-        active_join_sql = f"NOT {dingtalk_inactive_sql('p.raw_extra_json')}"
+        active_join_sql = f"NOT {dingtalk_terminated_sql('p.raw_extra_json')}"
         region_join_sql = workbench_scope(conn, "p")
         row = conn.execute(
             f"""
             SELECT b.*, COUNT(p.id) AS request_count,
                    COALESCE(SUM(COALESCE(p.base_amount_cny, p.amount)), 0) AS total_amount,
                    COALESCE(SUM(COALESCE(p.paid_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_paid_amount,
-                   COALESCE(SUM(COALESCE(p.pending_amount, 0) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
+                   COALESCE(SUM(({workbench_pending_sql('p.')}) * COALESCE(p.fx_rate_cny_per_unit, 1)), 0) AS total_pending_amount
             FROM request_batches b
             LEFT JOIN payment_requests p ON p.batch_id = b.id AND {access_sql} AND {active_join_sql} AND {region_join_sql}
             WHERE b.id = ?
@@ -1726,14 +1744,14 @@ def get_batch(batch_id: int, user: Dict[str, Any] = Depends(current_user)) -> Di
         if not row:
             raise HTTPException(status_code=404, detail="批次不存在")
         stats_access_sql, stats_access_params = sheet_access_filter(conn, user, "source_sheet")
-        active_stats_sql = f"NOT {dingtalk_inactive_sql('raw_extra_json')}"
+        active_stats_sql = f"NOT {dingtalk_terminated_sql()}"
         region_stats_sql = workbench_scope(conn)
         stats = conn.execute(
             f"""
             SELECT payment_account, invoice_status, project, COUNT(*) AS count,
                    COALESCE(SUM(COALESCE(base_amount_cny, amount)), 0) AS amount,
                    COALESCE(SUM(COALESCE(paid_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS paid_amount,
-                   COALESCE(SUM(COALESCE(pending_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS pending_amount
+                   COALESCE(SUM(({workbench_pending_sql()}) * COALESCE(fx_rate_cny_per_unit, 1)), 0) AS pending_amount
             FROM payment_requests
             WHERE batch_id = ? AND {stats_access_sql} AND {active_stats_sql} AND {region_stats_sql}
             GROUP BY payment_account, invoice_status, project
@@ -2034,21 +2052,64 @@ def correct_archived_request(
                 row_to_dict(new_row),
                 payload.reason,
             )
-    return {"request": row_to_dict(new_row)}
+    return {"request": workbench_request(new_row)}
 
 
-def dingtalk_inactive_sql(raw_extra_column: str = "raw_extra_json") -> str:
-    status = (
+def dingtalk_approval_field_sql(raw_extra_column: str, field: str) -> str:
+    return (
         f"CASE WHEN json_valid(COALESCE({raw_extra_column}, '')) "
-        f"THEN UPPER(TRIM(COALESCE(json_extract({raw_extra_column}, '$.external_source.approval_status'), ''))) "
+        f"THEN LOWER(TRIM(COALESCE(json_extract({raw_extra_column}, '$.external_source.{field}'), ''))) "
         "ELSE '' END"
     )
-    result = (
-        f"CASE WHEN json_valid(COALESCE({raw_extra_column}, '')) "
-        f"THEN LOWER(TRIM(COALESCE(json_extract({raw_extra_column}, '$.external_source.approval_result'), ''))) "
-        "ELSE '' END"
+
+
+def dingtalk_terminated_sql(raw_extra_column: str = "raw_extra_json") -> str:
+    status = dingtalk_approval_field_sql(raw_extra_column, "approval_status")
+    return f"(({status}) = 'terminated')"
+
+
+def dingtalk_payment_refused_sql(raw_extra_column: str = "raw_extra_json") -> str:
+    result = dingtalk_approval_field_sql(raw_extra_column, "approval_result")
+    refusals = ", ".join(f"'{value}'" for value in sorted(DINGTALK_EXPLICIT_REFUSAL_RESULTS))
+    return f"(({result}) IN ({refusals}) AND NOT {dingtalk_terminated_sql(raw_extra_column)})"
+
+
+def dingtalk_payment_refused(source: Dict[str, Any]) -> bool:
+    return (
+        str(source.get("approval_status") or "").strip().upper() != "TERMINATED"
+        and str(source.get("approval_result") or "").strip().lower() in DINGTALK_EXPLICIT_REFUSAL_RESULTS
     )
-    return f"(({status}) = 'TERMINATED' OR ({result}) = 'refuse')"
+
+
+def request_external_source(row: sqlite3.Row) -> Dict[str, Any]:
+    raw_extra = row_to_dict(row).get("raw_extra")
+    source = raw_extra.get("external_source") if isinstance(raw_extra, dict) else None
+    return source if isinstance(source, dict) else {}
+
+
+def linked_dingtalk_workflow_instance(source: Dict[str, Any]) -> str:
+    if source.get("lookup_status") == "conflict":
+        return ""
+    return str(source.get("process_instance_id") or source.get("workflow_process_instance_id") or "").strip()
+
+
+def workbench_pending_sql(prefix: str = "") -> str:
+    return f"CASE WHEN {dingtalk_payment_refused_sql(prefix + 'raw_extra_json')} THEN 0 ELSE COALESCE({prefix}pending_amount, 0) END"
+
+
+def workbench_request(row: sqlite3.Row, *, for_export: bool = False) -> Dict[str, Any]:
+    request = row_to_dict(row)
+    refused = request.pop("payment_refused", None)
+    if refused is None:
+        raw_extra = request.get("raw_extra")
+        source = raw_extra.get("external_source") if isinstance(raw_extra, dict) else None
+        refused = isinstance(source, dict) and dingtalk_payment_refused(source)
+    if refused:
+        request["payment_status"] = "拒绝付款"
+        request["pending_amount"] = 0
+        if for_export:
+            request["finance_review"] = "拒绝付款"
+    return request
 
 
 def dingtalk_execution_region_sql(raw_extra_column: str = "raw_extra_json") -> str:
@@ -2094,11 +2155,12 @@ def payment_request_filter_parts(
         raise HTTPException(status_code=400, detail="执行地区筛选值无效")
     conditions = ["batch_id = ?"]
     params: list[Any] = [batch_id]
-    inactive_condition = dingtalk_inactive_sql()
+    terminated = dingtalk_terminated_sql()
+    refused = dingtalk_payment_refused_sql()
     if dingtalk_lifecycle == "active":
-        conditions.append(f"NOT {inactive_condition}")
+        conditions.append(f"NOT {terminated}")
     elif dingtalk_lifecycle == "inactive":
-        conditions.append(inactive_condition)
+        conditions.append(f"({terminated} OR {refused})")
     if q:
         conditions.append(
             """
@@ -2120,14 +2182,18 @@ def payment_request_filter_parts(
         conditions.append("invoice_status LIKE ?")
         params.append(f"%{invoice_status}%")
     if pending_amount_min is not None:
-        conditions.append("COALESCE(pending_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1) >= ?")
+        conditions.append(f"({workbench_pending_sql()}) * COALESCE(fx_rate_cny_per_unit, 1) >= ?")
         params.append(pending_amount_min)
     if pending_amount_max is not None:
-        conditions.append("COALESCE(pending_amount, 0) * COALESCE(fx_rate_cny_per_unit, 1) <= ?")
+        conditions.append(f"({workbench_pending_sql()}) * COALESCE(fx_rate_cny_per_unit, 1) <= ?")
         params.append(pending_amount_max)
     normalized_finance_review = finance_review or {"未支付": "未付款", "已支付": "已付款"}.get(payment_status, payment_status)
-    if normalized_finance_review:
-        conditions.append("finance_review = ?")
+    if normalized_finance_review == "拒绝付款":
+        conditions.append(refused)
+    elif normalized_finance_review == "已完成":
+        conditions.append(f"(finance_review = '已付款' OR {refused})")
+    elif normalized_finance_review:
+        conditions.append(f"(finance_review = ? AND NOT {refused})")
         params.append(normalized_finance_review)
     if general_manager_approval == "__empty_general_manager_approval__":
         conditions.append("(general_manager_approval IS NULL OR TRIM(general_manager_approval) = '')")
@@ -2191,6 +2257,7 @@ def list_requests(
         rows = conn.execute(
             f"""
             SELECT payment_requests.*,
+                   {dingtalk_payment_refused_sql('payment_requests.raw_extra_json')} AS payment_refused,
                    erp_ownership.owner AS erp_payment_owner,
                    (SELECT COUNT(*) FROM payment_records WHERE payment_records.request_id = payment_requests.id) AS payment_count
             FROM payment_requests
@@ -2206,12 +2273,12 @@ def list_requests(
             SELECT COUNT(*) AS count,
                    COALESCE(SUM(amount), 0) AS amount,
                    COALESCE(SUM(paid_amount), 0) AS paid_amount,
-                   COALESCE(SUM(pending_amount), 0) AS pending_amount
+                   COALESCE(SUM({workbench_pending_sql()}), 0) AS pending_amount
             FROM payment_requests WHERE {' AND '.join(conditions)}
             """,
             params,
         ).fetchone()
-    return {"requests": rows_to_dicts(rows), "totals": row_to_dict(totals)}
+    return {"requests": [workbench_request(row) for row in rows], "totals": row_to_dict(totals)}
 
 
 @app.post("/api/batches/{batch_id}/requests")
@@ -2237,7 +2304,7 @@ def create_request(
         request_id = insert_request(conn, batch_id, data, user["id"], user["role"], create_summary_payment=False, manual_entry=True)
         row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
         write_audit(conn, user["id"], "request.create", "payment_request", request_id, batch_id, new_value=row_to_dict(row))
-    return {"request": row_to_dict(row)}
+    return {"request": workbench_request(row)}
 
 
 @app.patch("/api/batches/{batch_id}/requests/bulk")
@@ -2430,7 +2497,7 @@ def update_request(
                 row_to_dict(new_row),
                 reason,
             )
-    return {"request": row_to_dict(new_row)}
+    return {"request": workbench_request(new_row)}
 
 
 def parse_fx_rate_date(value: str) -> date:
@@ -3301,6 +3368,8 @@ def create_request_payment(
             "payment_request",
             request_id,
         )
+        if workbench_request(request_row)["payment_status"] == "拒绝付款":
+            raise HTTPException(status_code=409, detail="该请款已拒绝付款，不能新增付款明细")
         payment_id = insert_payment_record_internal(
             conn,
             request_id,
@@ -6350,6 +6419,16 @@ def _sync_external_expense_metadata_blocking(
                     approval_fields.update(approval_status=None, approval_result=None, lookup_status="conflict")
                     request_workflows = []
                 external_source = {**existing_source, **approval_fields}
+            else:
+                confirmed_refusal = existing_source.get("workflow_payment_refused") is True
+                if metadata_matches_existing_source and approval_no not in conflicts and len(request_workflows) == 1:
+                    workflow_source = {**existing_source, **metadata, "approval_status": None, "approval_result": None}
+                    effective = resolve_effective_dingtalk_approval(workflow_source, request_workflows[0])
+                    confirmed_refusal = confirmed_refusal or effective["approval_result"] == "refuse"
+                if confirmed_refusal:
+                    # Delayed or conflicting metadata cannot reopen an
+                    # instance whose final refusal was already verified.
+                    external_source.update(approval_status="COMPLETED", approval_result="refuse", workflow_payment_refused=True)
             raw_extra["external_source"] = external_source
             beneficiary = (
                 str(external_source.get("beneficiary") or "").strip()
@@ -6540,7 +6619,7 @@ def _sync_external_expense_metadata_blocking(
                     )
                     source_inactive = (
                         str(external_source.get("approval_status") or "").strip().upper() == "TERMINATED"
-                        or str(external_source.get("approval_result") or "").strip().lower() == "refuse"
+                        or dingtalk_payment_refused(external_source)
                     )
                     if source_inactive and classification == "eligible":
                         classification = "ignored"
@@ -8181,16 +8260,14 @@ def export_batch(
         conditions.append(access_sql)
         params.extend(access_params)
         conditions.append(workbench_scope(conn))
-        records = rows_to_dicts(
-            conn.execute(
-                f"""
-                SELECT * FROM payment_requests
-                WHERE {' AND '.join(conditions)}
-                ORDER BY source_sheet, source_row, id
-                """,
-                params,
-            ).fetchall()
-        )
+        records = [workbench_request(row, for_export=True) for row in conn.execute(
+            f"""
+            SELECT *, {dingtalk_payment_refused_sql()} AS payment_refused FROM payment_requests
+            WHERE {' AND '.join(conditions)}
+            ORDER BY source_sheet, source_row, id
+            """,
+            params,
+        )]
         record_ids = {int(record["id"]) for record in records}
         links = rows_to_dicts(
             conn.execute(

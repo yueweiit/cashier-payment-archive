@@ -4570,6 +4570,76 @@ def test_identical_expected_account_sync_does_not_bump_business_versions(monkeyp
         assert history_after_second == history_after_first
 
 
+def test_refused_workflow_remains_in_current_batch_and_is_never_carried_forward(monkeypatch):
+    approval_no = "REFUSED-PAYMENT-KEEP-CURRENT"
+    metadata = {
+        "approval_no": approval_no, "source_type": "purchase", "source_id": "240", "record_id": "240",
+        "process_instance_id": "refused-workflow", "lookup_status": "matched", "execution_region": "中国China",
+        "approval_status": "RUNNING", "approval_result": "agree",
+    }
+    workflows = [{"approval_no": approval_no, "process_instance_id": "refused-workflow",
+                  "status": "COMPLETED", "result": "refuse", "events": []}]
+    metadata_rows = [metadata]
+    monkeypatch.setattr(main_module, "fetch_external_expense_metadata", lambda nos: metadata_rows)
+    monkeypatch.setattr(main_module, "fetch_dingtalk_workflows", lambda nos: workflows)
+    monkeypatch.setattr(main_module, "fetch_external_expense_attachments", lambda nos: [])
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": "refused-payments-current"}).json()["batch"]["id"]
+        rejected = client.post(f"/api/batches/{batch_id}/requests", json={
+            "dingding_id": approval_no, "source_sheet": "凌翔供应链及采购执行单元", "amount": 7800,
+            "raw_extra": {"external_source": metadata},
+        }).json()["request"]
+        unpaid = client.post(f"/api/batches/{batch_id}/requests", json={
+            "source_sheet": "凌翔供应链及采购执行单元", "amount": 300,
+            "raw_extra": {"external_source": {"execution_region": "中国China"}},
+        }).json()["request"]
+        assert unpaid["id"] != rejected["id"]
+        # DingTalk may refuse the request after the last workbench sync.
+        fresh_rollover = client.post(f"/api/batches/{batch_id}/rollover", json={
+            "name": "refused-payment-next-before-sync", "copy_mode": "unfinished",
+        }).json()
+        assert fresh_rollover["copied_count"] == 1
+        sync_url = f"/api/batches/{batch_id}/external-expenses/sync-metadata"
+        assert client.post(sync_url).status_code == 200
+        # A refresh that only has the stale intermediate-table record must not reopen it.
+        workflows.clear()
+        assert client.post(sync_url).status_code == 200
+        metadata_rows.append({**metadata, "source_id": "999", "record_id": "999"})
+        conflicted = client.post(sync_url).json()
+        assert conflicted["conflicts"] == 1
+        url = f"/api/batches/{batch_id}/requests"
+        listing = client.get(url).json()
+        row = next(row for row in listing["requests"] if row["id"] == rejected["id"])
+        assert row["payment_status"] == "拒绝付款"
+        assert row["raw_extra"]["external_source"]["approval_result"] == "refuse"
+        assert (row["amount"], row["paid_amount"], row["pending_amount"]) == (7800, 0, 0)
+        assert listing["totals"]["pending_amount"] == 300
+        assert client.get(f"/api/batches/{batch_id}").json()["batch"]["total_pending_amount"] == 300
+        for status, expected_ids in (("已完成", [rejected["id"]]), ("拒绝付款", [rejected["id"]]), ("未付款", [unpaid["id"]])):
+            result = client.get(url, params={"finance_review": status}).json()
+            assert [row["id"] for row in result["requests"]] == expected_ids
+        found = client.get(url, params={"q": approval_no}).json()["requests"]
+        assert [item["id"] for item in found] == [rejected["id"]]
+        saved = client.patch(f"{url}/{rejected['id']}", json={"remark": "拒付说明"}).json()["request"]
+        assert saved["payment_status"] == "拒绝付款"
+        payment = client.post(f"{url}/{rejected['id']}/payments", json={
+            "amount": 1, "payment_date": date.today().isoformat(), "payer": "测试付款人",
+        })
+        assert payment.status_code == 409
+        for mode in ("unfinished", "all"):
+            rollover = client.post(f"/api/batches/{batch_id}/rollover", json={
+                "name": f"refused-payment-next-{mode}", "copy_mode": mode,
+            }).json()
+            assert rollover["copied_count"] == 1
+            next_id = rollover["batch"]["id"]
+            rows = client.get(f"/api/batches/{next_id}/requests").json()["requests"]
+            assert [row["copied_from_request_id"] for row in rows] == [unpaid["id"]]
+        with connect() as conn:
+            stored = conn.execute("SELECT amount,paid_amount,pending_amount FROM payment_requests WHERE id=?", (rejected["id"],)).fetchone()
+            assert tuple(stored) == (7800, 0, 7800)
+
+
 def test_external_expense_metadata_sync_statuses_conflicts_and_atomic_failure(monkeypatch):
     metadata = [
         {

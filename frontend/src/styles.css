@@ -1145,6 +1145,7 @@ textarea {
 
 .filtered-summary-statuses {
   flex: 0 0 auto;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 7px;
 }
@@ -1175,6 +1176,19 @@ textarea {
 .summary-status.unpaid {
   color: #5f6f78;
   background: #e9eef1;
+}
+
+.summary-status.refused,
+.status-pill.refused,
+.payment-detail-chip.refused {
+  color: #944b42;
+  background: #faeeeb;
+}
+
+.rollover-policy-note {
+  color: #5f6f78;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .bulk-bar {

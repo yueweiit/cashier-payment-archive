@@ -924,7 +924,7 @@ export const api = {
   deleteBatch: (id: number, expectedBatchVersion: number) =>
     request<{ status: string }>(`/api/batches/${id}?expected_batch_version=${expectedBatchVersion}`, { method: "DELETE" }),
   rolloverBatch: (sourceBatchId: number, payload: RolloverPayload) =>
-    request<{ batch: Batch; copied_count: number; copy_mode: RolloverCopyMode; operation_id: string }>(`/api/batches/${sourceBatchId}/rollover`, { method: "POST", body: JSON.stringify(payload) }),
+    request<{ batch: Batch; copied_count: number; copy_mode: RolloverCopyMode; operation_id: string; workflow_check_unavailable?: boolean }>(`/api/batches/${sourceBatchId}/rollover`, { method: "POST", body: JSON.stringify(payload) }),
   batch: (id: number) => request<{ batch: Batch; stats: Array<Record<string, unknown>> }>(`/api/batches/${id}`),
   updateSheetOrder: (id: number, sheetOrder: string[], expectedBatchVersion: number) =>
     request<{ batch: Batch }>(`/api/batches/${id}/sheet-order`, {
