@@ -169,7 +169,7 @@ from .eims_sso import (
     userinfo_for_code,
 )
 from .security import new_session_token, verify_password, hash_password
-from .sheet_names import canonical_sheet_name, canonical_sheet_order
+from .sheet_names import canonical_sheet_name, canonical_sheet_order, workbench_sheet_name
 from .snapshots import (
     cleanup_batch_snapshot_files,
     create_batch_snapshot,
@@ -275,6 +275,7 @@ class RolloverIn(BaseModel):
 class SheetOrderIn(BaseModel):
     sheet_order: list[str] = Field(default_factory=list)
     expected_batch_version: Optional[int] = None
+    workbench_groups: bool = False
 
 
 class RequestIn(BaseModel):
@@ -909,6 +910,38 @@ def require_accessible_request(
     return row
 
 
+def workbench_sheet_layout(conn, batch_id: int, registered: list[str], user: Dict[str, Any]) -> dict[str, list[str]]:
+    """Order the workspace groups after applying the original Sheet permissions."""
+    access_sql, params = sheet_access_filter(conn, user, "p.source_sheet")
+    rows = conn.execute(
+        f"""
+        SELECT p.source_sheet, workbench_sheet(p.source_sheet, p.raw_extra_json) AS group_name,
+               MAX(NOT {dingtalk_terminated_sql('p.raw_extra_json')}) AS visible
+        FROM payment_requests p
+        WHERE p.batch_id = ? AND {access_sql} AND {workbench_scope(conn, 'p')}
+        GROUP BY p.source_sheet, group_name
+        ORDER BY MIN(p.id)
+        """,
+        [batch_id, *params],
+    )
+    groups_by_source: dict[str, list[str]] = {}
+    for row in rows:
+        groups = groups_by_source.setdefault(canonical_sheet_name(row["source_sheet"]), [])
+        if row["visible"]:
+            groups.append(row["group_name"])
+
+    layout: dict[str, list[str]] = {}
+    registered_names = set(registered)
+    for source_sheet in dict.fromkeys([*registered, *groups_by_source]):
+        groups = groups_by_source.get(source_sheet, [])
+        if not groups and source_sheet in registered_names:
+            group = workbench_sheet_name(source_sheet)
+            groups = [] if group == "待归组" else [group]
+        for group in groups:
+            layout.setdefault(group, []).append(source_sheet)
+    return layout
+
+
 def batch_public_for_user(
     conn,
     row,
@@ -952,14 +985,16 @@ def batch_public_for_user(
         [data["id"], *access_params],
     ).fetchall()
     data["currency_totals"] = rows_to_dicts(currency_rows)
-    if not user_has_restricted_sheet_access(user):
-        return data
-    allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
-    data["sheet_order"] = [
-        sheet_name
-        for sheet_name in data.get("sheet_order", [])
-        if normalize_sheet_permission(sheet_name) in allowed
-    ]
+    restricted = user_has_restricted_sheet_access(user)
+    if restricted:
+        allowed = set(load_user_sheet_permissions(conn, int(user["id"])))
+        data["sheet_order"] = [sheet for sheet in data["sheet_order"] if normalize_sheet_permission(sheet) in allowed]
+    layout = workbench_sheet_layout(conn, int(data["id"]), data["sheet_order"], user)
+    data["workbench_sheet_order"] = list(layout)
+    data["workbench_sheet_targets"] = {
+        group: next((sheet for sheet in sheets if workbench_sheet_name(sheet) == group), sheets[0] if restricted else group)
+        for group, sheets in layout.items()
+    }
     return data
 
 
@@ -1786,20 +1821,29 @@ def update_batch_sheet_order(
         )
         if batch["status"] == "archived" and user["role"] not in PRIVILEGED_ROLES:
             raise HTTPException(status_code=403, detail="归档批次只能由管理员或总经理调整 Sheet 顺序")
+        old_order = batch_sheet_order(row_to_dict(batch))
+        if payload.workbench_groups:
+            layout = workbench_sheet_layout(conn, batch_id, old_order, user)
+            # One historical name can contain records for two distinct groups.
+            # Keep a separate order entry when neither group has its own name.
+            usage = Counter(sheet for sheets in layout.values() for sheet in sheets)
+            requested_order = canonical_sheet_order(
+                raw_sheet for group in requested_order
+                for raw_sheet in ([sheet for sheet in layout.get(group, []) if usage[sheet] == 1] or [group])
+            )
         row_backed_names = {
             canonical_sheet_name(row["sheet_name"])
             for row in conn.execute(
-                """
+                f"""
                 SELECT DISTINCT COALESCE(NULLIF(TRIM(source_sheet), ''), '未分 Sheet') AS sheet_name
                 FROM payment_requests
-                WHERE batch_id = ?
+                WHERE batch_id = ? AND NOT {dingtalk_terminated_sql()}
                 """,
                 (batch_id,),
             ).fetchall()
         }
         final_order = list(requested_order)
         final_order.extend(sorted(row_backed_names - set(final_order)))
-        old_order = batch_sheet_order(row_to_dict(batch))
         timestamp = now_iso()
         cursor = conn.execute(
             """
@@ -1823,7 +1867,8 @@ def update_batch_sheet_order(
             old_value={"sheet_order": old_order},
             new_value={"sheet_order": final_order},
         )
-    return {"batch": row_to_dict(updated)}
+        public_batch = batch_public_for_user(conn, updated, user)
+    return {"batch": public_batch}
 
 
 @app.post("/api/batches/{batch_id}/archive")
@@ -2099,6 +2144,8 @@ def workbench_pending_sql(prefix: str = "") -> str:
 
 def workbench_request(row: sqlite3.Row, *, for_export: bool = False) -> Dict[str, Any]:
     request = row_to_dict(row)
+    if not for_export:
+        request["workbench_sheet"] = workbench_sheet_name(request.get("source_sheet"), request.get("raw_extra"))
     refused = request.pop("payment_refused", None)
     if refused is None:
         raw_extra = request.get("raw_extra")
@@ -2140,6 +2187,7 @@ def payment_request_filter_parts(
     general_manager_approval: str = "",
     payment_status: str = "",
     source_sheet: str = "",
+    workbench_sheet: str = "",
     dingtalk_lifecycle: str = "active",
     execution_region: str = "",
 ) -> tuple[list[str], list[Any]]:
@@ -2150,6 +2198,7 @@ def payment_request_filter_parts(
     general_manager_approval = general_manager_approval.strip()
     payment_status = payment_status.strip()
     source_sheet = canonical_sheet_name(source_sheet) if source_sheet.strip() else ""
+    workbench_sheet = workbench_sheet.strip()
     execution_region = execution_region.strip().lower()
     if execution_region not in {"", "china", "mexico"}:
         raise HTTPException(status_code=400, detail="执行地区筛选值无效")
@@ -2203,6 +2252,9 @@ def payment_request_filter_parts(
     if source_sheet:
         conditions.append("source_sheet = ?")
         params.append(source_sheet)
+    if workbench_sheet:
+        conditions.append("workbench_sheet(source_sheet, raw_extra_json) = ?")
+        params.append(workbench_sheet)
     if execution_region:
         region_sql = dingtalk_execution_region_sql()
         if execution_region == "china":
@@ -2229,6 +2281,7 @@ def list_requests(
     general_manager_approval: str = "",
     payment_status: str = "",
     source_sheet: str = "",
+    workbench_sheet: str = "",
     dingtalk_lifecycle: str = "active",
     execution_region: str = "",
     user: Dict[str, Any] = Depends(current_user),
@@ -2245,6 +2298,7 @@ def list_requests(
         general_manager_approval=general_manager_approval,
         payment_status=payment_status,
         source_sheet=source_sheet,
+        workbench_sheet=workbench_sheet,
         dingtalk_lifecycle=resolved_lifecycle,
         execution_region=execution_region,
     )
@@ -5511,6 +5565,8 @@ def preview_external_expense_rows(
     public_rows: list[Dict[str, Any]] = []
     for source_row in rows:
         row = {key: value for key, value in source_row.items() if key != "request_data"}
+        request_data = source_row.get("request_data") or {}
+        row["workbench_sheet"] = workbench_sheet_name(request_data.get("source_sheet"), request_data.get("raw_extra"))
         approval_no = row.get("approval_no") or ""
         if approval_no in conflict_approval_nos:
             row["source_conflict"] = True
@@ -8230,6 +8286,7 @@ def export_batch(
     finance_review: str = "",
     general_manager_approval: str = "",
     source_sheet: str = "",
+    workbench_sheet: str = "",
     dingtalk_lifecycle: str = "active",
     execution_region: str = "",
     user: Dict[str, Any] = Depends(current_user),
@@ -8248,6 +8305,7 @@ def export_batch(
                 finance_review=finance_review,
                 general_manager_approval=general_manager_approval,
                 source_sheet=source_sheet,
+                workbench_sheet=workbench_sheet,
                 dingtalk_lifecycle=resolved_lifecycle,
                 execution_region=execution_region,
             )

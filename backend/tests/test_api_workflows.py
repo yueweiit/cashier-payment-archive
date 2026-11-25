@@ -1208,6 +1208,85 @@ def test_request_grid_preferences_are_saved_per_user():
         assert invalid.status_code == 400
 
 
+def test_workbench_sheet_groups_keep_original_access_and_do_not_restore_terminated_only_tabs():
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": "公司Sheet归组"}).json()["batch"]["id"]
+        def insert(sheet, subject=None, status="RUNNING"):
+            result = client.post(f"/api/batches/{batch_id}/requests", json={
+                "source_sheet": sheet, "amount": 100,
+                "raw_extra": {"external_source": {"approval_status": status, "service_subject": subject}},
+            })
+            assert result.status_code == 200, result.text
+            return result.json()["request"]["id"]
+
+        development = insert("凌翔产品&开发")
+        purchasing = insert("凌翔供应链及采购执行单元")
+        latin_cn = insert("LatínGo拉丁购", "拉丁购/拉丁购")
+        latin_int = insert("LatínGo拉丁购", "LATINGO")
+        terminated = insert("拉丁购LATINGO", "拉丁购/拉丁购", "TERMINATED")
+        deleted_tab = insert("待删旧分组", status="TERMINATED")
+        listing = client.get(f"/api/batches/{batch_id}/requests")
+        groups = {row["id"]: row["workbench_sheet"] for row in listing.json()["requests"]}
+        assert groups == {development: "广州凌翔", purchasing: "广州凌翔", latin_cn: "拉丁购", latin_int: "LATINGO"}
+        filtered = client.get(f"/api/batches/{batch_id}/requests", params={"workbench_sheet": "广州凌翔"}).json()
+        assert {row["source_sheet"] for row in filtered["requests"]} == {"凌翔产品&开发", "凌翔供应链及采购执行单元"}
+        get_batch = lambda: client.get(f"/api/batches/{batch_id}").json()["batch"]
+        batch = get_batch()
+        assert batch["workbench_sheet_order"] == ["广州凌翔", "拉丁购", "LATINGO", "待删旧分组"]
+        ordered = client.put(f"/api/batches/{batch_id}/sheet-order", json={
+            "sheet_order": ["LATINGO", "广州凌翔", "拉丁购"], "workbench_groups": True,
+            "expected_batch_version": batch["version"],
+        })
+        assert ordered.status_code == 200, ordered.text
+        assert get_batch()["workbench_sheet_order"] == ["LATINGO", "广州凌翔", "拉丁购"]
+        assert "拉丁购LATINGO" not in get_batch()["sheet_order"]
+        assert "待删旧分组" not in get_batch()["sheet_order"]
+        inactive = client.get(f"/api/batches/{batch_id}/requests", params={"dingtalk_lifecycle": "inactive"}).json()
+        assert {row["id"]: row["workbench_sheet"] for row in inactive["requests"]} == {
+            terminated: "拉丁购", deleted_tab: "待删旧分组",
+        }
+
+        created_user = client.post("/api/admin/users", json={
+            "username": "limited-workbench-sheet", "password": "password123", "display_name": "分组权限用户",
+            "role": "business", "sheet_permissions": ["凌翔产品&开发"],
+        })
+        assert created_user.status_code == 200, created_user.text
+        login(client, "limited-workbench-sheet", "password123")
+        allowed = client.get(f"/api/batches/{batch_id}/requests", params={"workbench_sheet": "广州凌翔"}).json()["requests"]
+        assert [row["id"] for row in allowed] == [development]
+        assert get_batch()["workbench_sheet_targets"] == {"广州凌翔": "凌翔产品&开发"}
+
+
+def test_dingtalk_preview_and_import_use_same_workbench_sheet(monkeypatch):
+    approval_no = "DINGTALK-COMPANY-SHEET-GROUP"
+    source = external_expense_test_row(
+        approval_no, "398150", source_type="operation", execution_region="中国China",
+        source_sheet="凌翔供应链及采购执行单元", expected_payment_account="测试账户",
+        expected_payment_account_source="dingtalk_explicit",
+    )
+    monkeypatch.setattr(main_module, "preview_external_expenses", lambda **kwargs: {
+        "rows": [source], "applicant_options": [],
+    })
+    monkeypatch.setattr(main_module, "fetch_external_expenses", lambda items: [source])
+    with TestClient(app) as client:
+        login(client)
+        batch_id = client.post("/api/batches", json={"name": "钉钉拉取按公司"}).json()["batch"]["id"]
+        preview = client.post("/api/external-expenses/preview", json={
+            "batch_id": batch_id, "approval_no": approval_no, "source_types": ["operation"],
+        })
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["rows"][0]["workbench_sheet"] == "广州凌翔"
+        imported = client.post(f"/api/batches/{batch_id}/imports/external-expenses", json={
+            "items": [{"source_type": "operation", "source_id": "398150"}],
+        })
+        assert imported.status_code == 200 and imported.json()["imported_rows"] == 1, imported.text
+        row = client.get(f"/api/batches/{batch_id}/requests", params={"workbench_sheet": "广州凌翔"}).json()["requests"][0]
+        assert row["source_sheet"] == "凌翔供应链及采购执行单元"
+        assert row["workbench_sheet"] == "广州凌翔"
+        assert row["expected_payment_account"] == "测试账户"
+
+
 def test_empty_sheet_registry_and_business_sheet_boundaries():
     with TestClient(app) as admin_client, TestClient(app) as business_client:
         login(admin_client)

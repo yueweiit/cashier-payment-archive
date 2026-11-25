@@ -78,6 +78,7 @@ import { AppNavigation, type AppTab } from "./AppNavigation";
 import { MexicoTrackingPage } from "./MexicoTrackingPage";
 import { defaultDailyPayablesExportRange, shanghaiIsoDate, validateDailyPayablesExportRange } from "./dailyPayablesExport";
 import { matchesPaymentStatusFilter, paymentStatusCounts, requestCanAddPayment, requestIsCompleted, requestIsPaymentRefused, requestOutstandingAmount, requestPaymentStatus } from "./paymentStatus";
+import { batchWorkbenchSheetOrder, canRenameWorkbenchSheet, moveToWorkbenchSheet, normalizeWorkbenchSheet, requestWorkbenchSheet, shouldResetWorkbenchSheets, withoutWorkbenchSheet, workbenchGridColumnOrder, workbenchGridColumnVisible, workbenchSheetTarget } from "./workbenchSheets";
 
 type Tab = AppTab;
 type RequestEditorTab = "request" | "approval" | "payments" | "workflow" | "attachments";
@@ -172,7 +173,7 @@ const fieldLabels: Record<string, string> = {
   remark: "备注",
   overdue_status: "逾期情况",
   payer: "付款人",
-  source_sheet: "来源 Sheet",
+  source_sheet: "所属 Sheet",
   currency: "货币类型",
   base_amount_cny: "折合人民币金额",
   fx_rate_cny_per_unit: "人民币兑本币汇率",
@@ -232,7 +233,6 @@ const gridColumns: GridColumn[] = [
 
 const defaultVisibleGridColumnKeys = new Set<keyof PaymentRequest>([
   "dingding_id",
-  "source_sheet",
   "payment_account",
   "expected_payment_account",
   "summary",
@@ -2100,7 +2100,11 @@ function ExternalExpenseImportDialog({
                     <td>{row.source_label}</td>
                     <td>{row.application_date || "—"}</td>
                     <td className="mono">{row.approval_no || "—"}</td>
-                    <td title={row.applicant_id ? `钉钉用户 ID：${row.applicant_id}` : undefined}><strong>{row.applicant || "—"}</strong><small>{row.applicant_department || ""}</small></td>
+                    <td title={row.applicant_id ? `钉钉用户 ID：${row.applicant_id}` : undefined}>
+                      <strong>{row.applicant || "—"}</strong>
+                      <small>{row.original_applicant_department || row.applicant_department || ""}</small>
+                      {row.workbench_sheet && <small>导入归组：{row.workbench_sheet}</small>}
+                    </td>
                     <td><ExternalApprovalBadge status={row.approval_status} result={row.approval_result} /></td>
                     <td className="external-summary-cell" title={row.summary}>{row.summary || "—"}</td>
                     <td className="amount">{row.amount === undefined || row.amount === null ? "—" : formatMoney(row.amount, row.currency)}</td>
@@ -2177,6 +2181,7 @@ function Workspace({
   const [editingSheet, setEditingSheet] = useState<{ key: string; value: string } | null>(null);
   const [newSheetName, setNewSheetName] = useState<string | null>(null);
   const [sheetOrder, setSheetOrder] = useState<string[]>([]);
+  const sheetStateBatchRef = useRef<number | null>(null);
   const [draggedSheet, setDraggedSheet] = useState<string | null>(null);
   const [sheetDropTarget, setSheetDropTarget] = useState<{ key: string; position: "before" | "after" } | null>(null);
   const [sheetOrderSaving, setSheetOrderSaving] = useState(false);
@@ -2255,12 +2260,16 @@ function Workspace({
     loadRequests().catch((err) => setMessage((err as Error).message));
   }, [selectedBatch?.id, refreshToken, filters.dingtalk_lifecycle]);
 
+  const serverSheetOrderKey = JSON.stringify(batchWorkbenchSheetOrder(selectedBatch));
   useEffect(() => {
-    setSheetOrder(selectedBatch?.sheet_order || []);
+    const batchId = selectedBatch?.id ?? null;
+    if (!shouldResetWorkbenchSheets(sheetStateBatchRef.current, batchId, hasUnsavedChanges)) return;
+    sheetStateBatchRef.current = batchId;
+    setSheetOrder(JSON.parse(serverSheetOrderKey) as string[]);
     setDeletedSheetNames(new Set());
     setDraggedSheet(null);
     setSheetDropTarget(null);
-  }, [selectedBatch?.id, selectedBatch?.sheet_order]);
+  }, [selectedBatch?.id, serverSheetOrderKey, hasUnsavedChanges]);
 
   const sheetTabs = useMemo(
     () => getSheetTabs(gridRows, sheetOrder, deletedSheetNames),
@@ -2270,16 +2279,16 @@ function Workspace({
   const visibleGridColumns = useMemo(() => {
     const byKey = new Map(gridColumns.map((column) => [String(column.key), column]));
     const hidden = new Set(gridPreference.hidden);
-    return gridPreference.order
+    return workbenchGridColumnOrder(gridPreference.order)
       .map((key) => byKey.get(key))
-      .filter((column): column is GridColumn => Boolean(column) && !hidden.has(String(column!.key)));
+      .filter((column): column is GridColumn => Boolean(column) && workbenchGridColumnVisible(String(column!.key), hidden));
   }, [gridPreference]);
   const visibleActiveRows = useMemo(() => visibleRows.filter((row) => !row.__deleted), [visibleRows]);
   const hasActiveExportFilter = activeSheet !== ALL_SHEET || Object.entries(filters).some(([key, value]) => (
     key === "dingtalk_lifecycle" ? value !== "active" : value.trim()
   ));
   const activeSheetRows = useMemo(
-    () => (activeSheet === ALL_SHEET ? [] : gridRows.filter((row) => normalizeSheetName(row.source_sheet) === activeSheet)),
+    () => (activeSheet === ALL_SHEET ? [] : gridRows.filter((row) => requestWorkbenchSheet(row) === activeSheet)),
     [activeSheet, gridRows],
   );
   const visibleTotals = useMemo(
@@ -2310,9 +2319,10 @@ function Workspace({
             ? "refused"
             : filters.finance_review === "已完成" ? "completed" : "all";
   const firstVisibleSheet = sheetTabs.find((tab) => tab.key !== ALL_SHEET)?.key || "";
-  const defaultSourceSheet = activeSheet === ALL_SHEET
+  const defaultWorkbenchSheet = activeSheet === ALL_SHEET
     ? (user.role === "business" ? firstVisibleSheet : "手工录入")
     : activeSheet;
+  const defaultSourceSheet = workbenchSheetTarget(defaultWorkbenchSheet, selectedBatch, gridRows);
   const canManageBatchOperations = user.role !== "business";
   const canManageSheets = user.role !== "business";
   const canArchiveBatch = ["finance", "general_manager", "admin"].includes(user.role);
@@ -2371,7 +2381,7 @@ function Workspace({
     setSheetOrder(nextOrder);
     setSheetOrderSaving(true);
     try {
-      await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
+      await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version, true);
       await reloadBatches();
       setMessage("Sheet 顺序已保存");
     } catch (error) {
@@ -2591,9 +2601,9 @@ function Workspace({
       const savedSheetOrder = getSheetTabs(gridRows, sheetOrder, deletedSheetNames)
         .filter((tab) => tab.key !== ALL_SHEET && !deletedSheetNames.has(tab.key))
         .map((tab) => tab.key);
-      const sheetOrderChanged = !sameSheetOrder(savedSheetOrder, selectedBatch.sheet_order || []);
+      const sheetOrderChanged = !sameSheetOrder(savedSheetOrder, batchWorkbenchSheetOrder(selectedBatch));
       if (canManageSheets && sheetOrderChanged) {
-        await api.updateSheetOrder(selectedBatch.id, savedSheetOrder, batchVersion);
+        await api.updateSheetOrder(selectedBatch.id, savedSheetOrder, batchVersion, true);
       }
       setSheetOrder(savedSheetOrder);
       setReason("");
@@ -2622,7 +2632,7 @@ function Workspace({
     setEditorDirty(false);
     setReason("");
     setDeletedSheetNames(new Set());
-    setSheetOrder(selectedBatch?.sheet_order || []);
+    setSheetOrder(batchWorkbenchSheetOrder(selectedBatch));
     await loadRequests();
     setMessage("未保存修改已放弃");
   }
@@ -2656,7 +2666,7 @@ function Workspace({
     Object.entries(exportFilters).forEach(([key, value]) => {
       if (value) params.set(key, value);
     });
-    if (activeSheet !== ALL_SHEET) params.set("source_sheet", activeSheet);
+    if (activeSheet !== ALL_SHEET) params.set("workbench_sheet", activeSheet);
     window.open(`/api/batches/${selectedBatch.id}/export.xlsx?${params.toString()}`, "_blank");
   }
 
@@ -2743,7 +2753,7 @@ function Workspace({
   }
 
   function addBlankRow() {
-    const row = { ...emptyRequest, __localId: newLocalId(), __isNew: true, source_sheet: defaultSourceSheet };
+    const row = { ...emptyRequest, __localId: newLocalId(), __isNew: true, source_sheet: defaultSourceSheet, workbench_sheet: defaultWorkbenchSheet };
     setGridRows([...gridRows, row]);
     const nextDirty = new Set(dirtyCells);
     nextDirty.add(`${row.__localId}:source_sheet`);
@@ -2780,7 +2790,7 @@ function Workspace({
     const nextOrder = [...sheetTabs.filter((tab) => tab.key !== ALL_SHEET).map((tab) => tab.key), name];
     setSheetOrderSaving(true);
     try {
-      await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
+      await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version, true);
       setSheetOrder(nextOrder);
       setFilters({
         q: "",
@@ -2817,7 +2827,11 @@ function Workspace({
 
   function beginRenameSheet(sheetKey: string) {
     if (!canManageSheets || sheetKey === ALL_SHEET) return;
-    const rowsInSheet = gridRows.filter((row) => normalizeSheetName(row.source_sheet) === sheetKey);
+    if (!canRenameWorkbenchSheet(sheetKey, selectedBatch, gridRows)) {
+      setMessage("该组织分组由归组规则管理，不能通过重命名修改原始部门");
+      return;
+    }
+    const rowsInSheet = gridRows.filter((row) => requestWorkbenchSheet(row) === sheetKey);
     if (rowsInSheet.length > 0 && rowsInSheet.every((row) => row.__deleted)) return;
     setNewSheetName(null);
     setActiveSheet(sheetKey);
@@ -2827,6 +2841,11 @@ function Workspace({
   async function commitRenameSheet() {
     if (!editingSheet) return;
     const oldName = editingSheet.key;
+    if (!canRenameWorkbenchSheet(oldName, selectedBatch, gridRows)) {
+      setEditingSheet(null);
+      setMessage("该组织分组由归组规则管理，不能通过重命名修改原始部门");
+      return;
+    }
     const rawNewName = editingSheet.value.trim();
     if (!rawNewName) {
       setMessage("Sheet 名称不能为空，已取消重命名");
@@ -2843,14 +2862,14 @@ function Workspace({
       setEditingSheet(null);
       return;
     }
-    const affectedRows = gridRows.filter((row) => normalizeSheetName(row.source_sheet) === oldName);
+    const affectedRows = gridRows.filter((row) => requestWorkbenchSheet(row) === oldName);
     if (affectedRows.length === 0) {
       setEditingSheet(null);
       if (!selectedBatch) return;
       const nextOrder = sheetOrder.map((name) => name === oldName ? newName : name);
       setSheetOrderSaving(true);
       try {
-        await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version);
+        await api.updateSheetOrder(selectedBatch.id, nextOrder, selectedBatch.version, true);
         setSheetOrder(nextOrder);
         setActiveSheet(newName);
         await reloadBatches();
@@ -2864,7 +2883,8 @@ function Workspace({
     }
     const nextDirty = new Set(dirtyCells);
     affectedRows.forEach((row) => nextDirty.add(`${row.__localId}:source_sheet`));
-    setGridRows(gridRows.map((row) => (normalizeSheetName(row.source_sheet) === oldName ? { ...row, source_sheet: newName } : row)));
+    const rawTarget = workbenchSheetTarget(newName, selectedBatch, gridRows);
+    setGridRows(gridRows.map((row) => (requestWorkbenchSheet(row) === oldName ? moveToWorkbenchSheet(row, newName, rawTarget) : row)));
     setDirtyCells(nextDirty);
     setSheetOrder((current) => {
       const next = current.map((name) => name === oldName ? newName : name);
@@ -2906,16 +2926,17 @@ function Workspace({
   function markMoveSelected() {
     if (!canManageSheets || !canEditGrid || !bulkMoveTargetSheet) return;
     const targetSheet = normalizeSheetName(bulkMoveTargetSheet);
+    const rawTarget = workbenchSheetTarget(targetSheet, selectedBatch, gridRows);
     const selected = new Set(selectedRows);
     const nextDirty = new Set(dirtyCells);
     let changedCount = 0;
     const nextRows = gridRows.map((row) => {
-      if (!row.id || !selected.has(row.id) || row.__deleted || normalizeSheetName(row.source_sheet) === targetSheet) {
+      if (!row.id || !selected.has(row.id) || row.__deleted || requestWorkbenchSheet(row) === targetSheet) {
         return row;
       }
       nextDirty.add(`${row.__localId}:source_sheet`);
       changedCount += 1;
-      return { ...row, source_sheet: targetSheet };
+      return moveToWorkbenchSheet(row, targetSheet, rawTarget);
     });
     if (changedCount === 0) {
       setMessage(`所选记录已经位于 Sheet“${targetSheet}”`);
@@ -3305,7 +3326,7 @@ function Workspace({
               <AlignLeft size={16} />{wrapText ? "取消换行" : "换行"}
             </button>
             {canCreateRequests && (
-              <button className="primary-button" onClick={() => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet })} onKeyDown={(event) => activateButtonByKeyboard(event, () => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet }))}>
+              <button className="primary-button" onClick={() => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet, workbench_sheet: defaultWorkbenchSheet })} onKeyDown={(event) => activateButtonByKeyboard(event, () => openRequestEditor({ ...emptyRequest, source_sheet: defaultSourceSheet, workbench_sheet: defaultWorkbenchSheet }))}>
                 <Plus size={16} />新增请款
               </button>
             )}
@@ -3496,6 +3517,7 @@ function Workspace({
             onEdit={openRequestEditor}
             onSave={saveGridChanges}
             defaultSourceSheet={defaultSourceSheet}
+            defaultWorkbenchSheet={defaultWorkbenchSheet}
             wrapText={wrapText}
             headerLanguage={gridHeaderLanguage}
             onCurrencyChange={requestCurrencyConversion}
@@ -3729,31 +3751,33 @@ function ColumnSettingsDialog({
   onClose: () => void;
   onSaved: (preference: RequestGridPreference) => void;
 }) {
-  const [order, setOrder] = useState<string[]>(preference.order);
-  const [hidden, setHidden] = useState<Set<string>>(new Set(preference.hidden));
+  const [order, setOrder] = useState<string[]>(workbenchGridColumnOrder(preference.order));
+  const [hidden, setHidden] = useState<Set<string>>(new Set(preference.hidden.filter((key) => key !== "expected_payment_account")));
   const [dragged, setDragged] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const columnByKey = useMemo(() => new Map(gridColumns.map((column) => [String(column.key), column])), []);
 
   function move(key: string, offset: number) {
+    if (key === "expected_payment_account") return;
     const index = order.indexOf(key);
     const target = index + offset;
     if (index < 0 || target < 0 || target >= order.length) return;
     const next = [...order];
     [next[index], next[target]] = [next[target], next[index]];
-    setOrder(next);
+    setOrder(workbenchGridColumnOrder(next));
   }
 
   function dropBefore(target: string) {
     if (!dragged || dragged === target) return;
     const next = order.filter((key) => key !== dragged);
     next.splice(next.indexOf(target), 0, dragged);
-    setOrder(next);
+    setOrder(workbenchGridColumnOrder(next));
     setDragged(null);
   }
 
   function toggle(key: string, visible: boolean) {
+    if (key === "expected_payment_account") return;
     const next = new Set(hidden);
     if (visible) next.delete(key);
     else if (order.length - next.size > 1) next.add(key);
@@ -3762,7 +3786,7 @@ function ColumnSettingsDialog({
 
   function reset() {
     const next = defaultGridPreference();
-    setOrder(next.order);
+    setOrder(workbenchGridColumnOrder(next.order));
     setHidden(new Set(next.hidden));
   }
 
@@ -3785,8 +3809,8 @@ function ColumnSettingsDialog({
     <Modal title={es ? "Configurar columnas" : "列设置"} onClose={saving ? () => undefined : onClose} className="column-settings-modal">
       <p className="form-hint">
         {es
-          ? "El estado de pago queda fijo a la izquierda y los adjuntos a la derecha. Arrastre las demás columnas para ordenarlas."
-          : "付款状态固定在左侧，附件固定在右侧；其余列可拖拽排序或隐藏。"}
+          ? "El estado de pago y la cuenta de pago prevista se mantienen a la izquierda; los adjuntos a la derecha. Arrastre las demás columnas para ordenarlas."
+          : "付款状态和预计支付账户保持在左侧，附件固定在右侧；其余列可拖拽排序或隐藏。"}
       </p>
       <div className="column-settings-fixed">
         <span>{es ? "Fija: Estado de pago" : "固定：付款状态"}</span>
@@ -3796,12 +3820,13 @@ function ColumnSettingsDialog({
         {order.map((key, index) => {
           const column = columnByKey.get(key);
           if (!column) return null;
-          const visible = !hidden.has(key);
+          const visible = workbenchGridColumnVisible(key, hidden);
+          const fixed = key === "expected_payment_account";
           return (
             <div
               className={`column-setting-row${dragged === key ? " dragging" : ""}`}
               key={key}
-              draggable
+              draggable={!fixed}
               onDragStart={() => setDragged(key)}
               onDragOver={(event) => event.preventDefault()}
               onDrop={() => dropBefore(key)}
@@ -3809,12 +3834,12 @@ function ColumnSettingsDialog({
             >
               <span className="column-drag-handle" aria-hidden="true">⋮⋮</span>
               <label>
-                <input type="checkbox" checked={visible} onChange={(event) => toggle(key, event.target.checked)} />
+                <input type="checkbox" checked={visible} disabled={fixed} onChange={(event) => toggle(key, event.target.checked)} />
                 <span>{es ? column.labelEs : column.labelZh}</span>
               </label>
               <div className="column-order-buttons">
-                <button type="button" className="icon-button" disabled={index === 0} onClick={() => move(key, -1)} aria-label={es ? "Subir" : "上移"}>↑</button>
-                <button type="button" className="icon-button" disabled={index === order.length - 1} onClick={() => move(key, 1)} aria-label={es ? "Bajar" : "下移"}>↓</button>
+                <button type="button" className="icon-button" disabled={fixed || index === 0} onClick={() => move(key, -1)} aria-label={es ? "Subir" : "上移"}>↑</button>
+                <button type="button" className="icon-button" disabled={fixed || index === order.length - 1} onClick={() => move(key, 1)} aria-label={es ? "Bajar" : "下移"}>↓</button>
               </div>
             </div>
           );
@@ -4337,7 +4362,6 @@ function MobileRequestCardList({
               {row.dingding_id && <small className="mono">{row.dingding_id}</small>}
             </div>
             <dl className="mobile-request-context">
-              <div><dt>{labels.company}</dt><dd>{row.source_sheet || "—"}</dd></div>
               <div><dt>{labels.applicant}</dt><dd>{applicant}</dd></div>
               <div><dt>{labels.accountNature}</dt><dd>{row.payment_account || "—"}</dd></div>
               <div><dt>{labels.expectedPaymentAccount}</dt><dd>{row.expected_payment_account || "—"}</dd></div>
@@ -4385,6 +4409,7 @@ function EditablePaymentGrid({
   onEdit,
   onSave,
   defaultSourceSheet,
+  defaultWorkbenchSheet,
   wrapText,
   headerLanguage,
   canEditField,
@@ -4403,6 +4428,7 @@ function EditablePaymentGrid({
   readOnly: boolean;
   onSave: () => void;
   defaultSourceSheet: string;
+  defaultWorkbenchSheet: string;
   wrapText: boolean;
   headerLanguage: GridHeaderLanguage;
   canEditField: (field: keyof PaymentRequest) => boolean;
@@ -4543,7 +4569,7 @@ function EditablePaymentGrid({
       matrix.forEach((sourceRow, rowOffset) => {
         const targetRowIndex = activeCell.row + rowOffset;
         while (targetRowIndex >= nextRows.length) {
-          nextRows.push({ ...emptyRequest, __localId: newLocalId(), __isNew: true, source_sheet: defaultSourceSheet });
+          nextRows.push({ ...emptyRequest, __localId: newLocalId(), __isNew: true, source_sheet: defaultSourceSheet, workbench_sheet: defaultWorkbenchSheet });
         }
         let targetRow = { ...nextRows[targetRowIndex] };
         sourceRow.forEach((cellValue, colOffset) => {
@@ -6547,7 +6573,7 @@ function getSheetTabs(
     }
   });
   rows.forEach((row) => {
-    const sheetName = normalizeSheetName(row.source_sheet);
+    const sheetName = requestWorkbenchSheet(row);
     const count = counts.get(sheetName) || { active: 0, deleted: 0 };
     if (row.__deleted) {
       count.deleted += 1;
@@ -6588,10 +6614,7 @@ function nextSheetName(tabs: Array<{ key: string }>) {
 }
 
 function normalizeSheetName(sheetName?: string) {
-  const normalized = String(sheetName || "").trim();
-  if (!normalized) return "未分 Sheet";
-  const legacyMouldMatch = normalized.match(/^(赣瑞模具|志威模具)\s*(?:[（(]\s*7\s*月\s*(?:前|后)\s*[）)]|7\s*月\s*(?:前|后))$/);
-  return legacyMouldMatch?.[1] || normalized;
+  return normalizeWorkbenchSheet(sheetName);
 }
 
 function selectOptionsForField(field: keyof PaymentRequest, currentValue: string) {
@@ -6631,7 +6654,7 @@ function rowMatchesFilters(
   },
   activeSheet: string,
 ) {
-  if (activeSheet !== ALL_SHEET && normalizeSheetName(row.source_sheet) !== activeSheet) return false;
+  if (activeSheet !== ALL_SHEET && requestWorkbenchSheet(row) !== activeSheet) return false;
   const q = filters.q.trim().toLowerCase();
   if (q) {
     const haystack = [
@@ -6712,7 +6735,7 @@ function stripGridRow(row: GridRow): Partial<PaymentRequest> {
 
 function withoutDerivedPaymentFields(request: Partial<PaymentRequest>): Partial<PaymentRequest> {
   const output: Partial<PaymentRequest> = {};
-  Object.entries(request).forEach(([key, value]) => {
+  Object.entries(withoutWorkbenchSheet(request)).forEach(([key, value]) => {
     if (key === "id" || key === "version" || key === "updated_at" || calculatedRequestFields.has(key as keyof PaymentRequest)) return;
     output[key as keyof PaymentRequest] = value as never;
   });

@@ -206,6 +206,8 @@ export type Batch = {
   status: "draft" | "archived";
   source_file?: string;
   sheet_order?: string[];
+  workbench_sheet_order?: string[];
+  workbench_sheet_targets?: Record<string, string>;
   request_count?: number;
   total_amount?: number;
   total_paid_amount?: number;
@@ -309,6 +311,7 @@ export type PaymentRequest = {
   overdue_status?: string;
   payer?: string;
   source_sheet?: string;
+  workbench_sheet?: string;
   source_row?: number;
   payment_count?: number;
   updated_at?: string;
@@ -360,6 +363,7 @@ export type ExternalExpensePreviewRow = {
   applicant: string;
   applicant_department?: string;
   original_applicant_department?: string;
+  workbench_sheet?: string;
   approval_status: "COMPLETED" | "RUNNING" | string;
   approval_result?: string;
   summary: string;
@@ -926,10 +930,10 @@ export const api = {
   rolloverBatch: (sourceBatchId: number, payload: RolloverPayload) =>
     request<{ batch: Batch; copied_count: number; copy_mode: RolloverCopyMode; operation_id: string; workflow_check_unavailable?: boolean }>(`/api/batches/${sourceBatchId}/rollover`, { method: "POST", body: JSON.stringify(payload) }),
   batch: (id: number) => request<{ batch: Batch; stats: Array<Record<string, unknown>> }>(`/api/batches/${id}`),
-  updateSheetOrder: (id: number, sheetOrder: string[], expectedBatchVersion: number) =>
+  updateSheetOrder: (id: number, sheetOrder: string[], expectedBatchVersion: number, workbenchGroups = false) =>
     request<{ batch: Batch }>(`/api/batches/${id}/sheet-order`, {
       method: "PUT",
-      body: JSON.stringify({ sheet_order: sheetOrder, expected_batch_version: expectedBatchVersion }),
+      body: JSON.stringify({ sheet_order: sheetOrder, expected_batch_version: expectedBatchVersion, ...(workbenchGroups ? { workbench_groups: true } : {}) }),
     }),
   archive: (id: number, expectedBatchVersion: number) => request<{ batch: Batch }>(`/api/batches/${id}/archive?expected_batch_version=${expectedBatchVersion}`, { method: "POST" }),
   unarchive: (id: number, expectedBatchVersion: number) => request<{ batch: Batch }>(`/api/batches/${id}/unarchive?expected_batch_version=${expectedBatchVersion}`, { method: "POST" }),
